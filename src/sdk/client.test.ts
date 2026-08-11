@@ -1,7 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { StubServer } from "../../test/support/stub-server.js";
-import { Comfy } from "./client.js";
+import { BASE_URL_ENV_VAR, Comfy } from "./client.js";
 import { IdempotencyKeyReuse, QueueFull, WorkflowFormatUi } from "./exceptions.js";
 
 describe("Comfy", () => {
@@ -11,10 +11,14 @@ describe("Comfy", () => {
   beforeEach(async () => {
     server = new StubServer();
     await server.start();
-    client = new Comfy(server.baseUrl);
+    // Clients read their target from the environment, so pointing them at the
+    // stub is part of standing it up.
+    vi.stubEnv(BASE_URL_ENV_VAR, server.baseUrl);
+    client = new Comfy();
   });
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     await server.stop();
   });
 

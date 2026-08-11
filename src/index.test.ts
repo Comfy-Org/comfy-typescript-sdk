@@ -4,7 +4,7 @@ import { Comfy, ComfyError, Job, Asset, Workflow } from "./index.js";
 
 describe("public surface", () => {
   it("constructs a client and exposes assets/workflows/jobs namespaces", () => {
-    const client = new Comfy("http://127.0.0.1:8189/");
+    const client = new Comfy();
     expect(client).toBeInstanceOf(Comfy);
     expect(client.assets).toBeDefined();
     expect(client.workflows).toBeDefined();
