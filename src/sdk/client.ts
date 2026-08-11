@@ -1,10 +1,11 @@
 /**
  * `Comfy` — the client integrators import.
  *
- * Runs an API-format workflow against any Comfy API v2 surface (self-hosted
- * proxy, Comfy Cloud, serverless) — the only per-surface difference is the
- * base URL and an optional key — and owns everything a generator cannot
- * produce: local blake3 dedup-upload, `core/ASSET` substitution, idempotent
+ * Runs an API-format workflow against any Comfy API v2 surface (Comfy Cloud,
+ * serverless, self-hosted proxy) — the only per-surface difference is the
+ * `COMFY_BASE_URL` environment variable and an optional key — and owns
+ * everything a generator cannot produce: local blake3 dedup-upload,
+ * `core/ASSET` substitution, idempotent
  * submit, live SSE with a poll-authoritative backstop, range-aware
  * downloads, and typed errors. It is layered over `../low` (the generated
  * types/validators + thin transport).
@@ -17,8 +18,9 @@
  * ```ts
  * import { Comfy } from "@comfyorg/sdk";
  *
- * const client = new Comfy("http://127.0.0.1:8189"); // self-hosted, no key
- * // const client = new Comfy({ apiKey: "ck_..." });   // Comfy Cloud (default base URL)
+ * const client = new Comfy({ apiKey: "ck_..." }); // Comfy Cloud
+ * // COMFY_BASE_URL=http://127.0.0.1:8189 in the environment targets a
+ * // self-hosted proxy instead, where no key is needed.
  *
  * const wf = await client.workflows.fromFile("workflow_api.json");
  * const asset = client.assets.fromFile("photo.png"); // lazy; uploaded on use
@@ -48,11 +50,44 @@ import { WorkflowFactory } from "./workflows.js";
 
 // How long to keep retrying a full queue before giving up (ms).
 const QUEUE_RETRY_BUDGET_MS = 60_000;
-/** Base URL of the hosted Comfy Cloud deployment, used when none is given.
- * Self-hosted ComfyUI and serverless deployments must pass their own baseUrl. */
+/** Base URL of the hosted Comfy Cloud deployment — where a client points by default. */
 export const COMFY_CLOUD_BASE_URL = "https://cloud.comfy.org";
+/** Environment variable that redirects a client at another deployment. */
+export const BASE_URL_ENV_VAR = "COMFY_BASE_URL";
 
 const DEFAULT_RETRY_AFTER_S = 2;
+
+/**
+ * Comfy Cloud, unless `COMFY_BASE_URL` names another deployment.
+ *
+ * Read per construction rather than at module load so a process can point
+ * successive clients at different deployments. An unset-or-blank variable
+ * means Comfy Cloud, so `COMFY_BASE_URL=` in a shell profile or `.env` is not
+ * an error; a runtime with no `process` (a browser) simply never sees one.
+ */
+function resolveBaseUrl(): string {
+  const raw = globalThis.process?.env?.[BASE_URL_ENV_VAR]?.trim();
+  if (!raw) return COMFY_CLOUD_BASE_URL;
+  let parsed: URL | undefined;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    parsed = undefined;
+  }
+  // A query or fragment would land in the middle of every request URL, since
+  // the transport builds those by appending the API path to this string.
+  const valid =
+    parsed !== undefined &&
+    (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+    parsed.search === "" &&
+    parsed.hash === "";
+  if (!valid) {
+    throw new TypeError(
+      `${BASE_URL_ENV_VAR} must be an http(s) URL with no query or fragment (e.g. "http://127.0.0.1:8189"), got ${JSON.stringify(raw)}`,
+    );
+  }
+  return raw;
+}
 
 export interface ComfyOptions {
   apiKey?: string;
@@ -78,8 +113,8 @@ function guardUiFormat(workflow: Workflow): void {
  * Holds the three factories you build work from ({@link Comfy.assets},
  * {@link Comfy.workflows}, {@link Comfy.jobs}) and submits graphs via
  * {@link Comfy.run} (submit, then poll to terminal) or {@link Comfy.submit}
- * (submit and return immediately). Defaults to Comfy Cloud; pass a base URL
- * to target a self-hosted or serverless deployment.
+ * (submit and return immediately). Targets Comfy Cloud unless the
+ * `COMFY_BASE_URL` environment variable names another deployment.
  */
 export class Comfy {
   private readonly low: ComfyLow;
@@ -87,15 +122,16 @@ export class Comfy {
   readonly workflows: WorkflowFactory;
   readonly jobs: JobFactory;
 
-  /** Connect to the hosted Comfy Cloud deployment. */
-  constructor(options?: ComfyOptions);
-  /** Connect to a specific deployment — self-hosted ComfyUI, or a serverless one. */
-  constructor(baseUrl: string, options?: ComfyOptions);
-  constructor(baseUrlOrOptions?: string | ComfyOptions, maybeOptions: ComfyOptions = {}) {
-    const isUrl = typeof baseUrlOrOptions === "string";
-    const baseUrl = isUrl ? baseUrlOrOptions : COMFY_CLOUD_BASE_URL;
-    const options = isUrl ? maybeOptions : (baseUrlOrOptions ?? {});
-    this.low = new ComfyLow(baseUrl, options.apiKey, {
+  /** Connect to Comfy Cloud, or to whatever deployment `COMFY_BASE_URL` names. */
+  constructor(options: ComfyOptions = {}) {
+    // Untyped JS callers get no compile error for the old positional base URL,
+    // and it would otherwise be ignored silently.
+    if (typeof (options as unknown) === "string") {
+      throw new TypeError(
+        `Comfy takes no base URL; set ${BASE_URL_ENV_VAR} in the environment to target another deployment`,
+      );
+    }
+    this.low = new ComfyLow(resolveBaseUrl(), options.apiKey, {
       timeoutMs: options.timeoutMs,
       fetch: options.fetch,
       clientInfo: options.clientInfo,

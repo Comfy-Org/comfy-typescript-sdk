@@ -21,10 +21,11 @@
 ---
 
 TypeScript SDK for running ComfyUI workflows via the **Comfy API v2**. The
-same code runs against three surfaces — a self-hosted ComfyUI (through
-[`comfy-api-proxy`](https://github.com/Comfy-Org/comfy-api-proxy)), Comfy
-Cloud, or a serverless deployment — changing only the base URL and an
-optional API key. It mirrors the behavior of the
+same code runs against three surfaces — Comfy Cloud, a serverless
+deployment, or a self-hosted ComfyUI (through
+[`comfy-api-proxy`](https://github.com/Comfy-Org/comfy-api-proxy)) — changing
+only the `COMFY_BASE_URL` environment variable and an optional API key. It
+mirrors the behavior of the
 [Python SDK](https://github.com/Comfy-Org/comfy-python-sdk) (`comfy-sdk`):
 upload/dedup inputs, submit a workflow, wait for it, download the outputs —
 collapsed here to a single async client (no separate sync/async API;
@@ -33,8 +34,8 @@ JavaScript is async-native).
 ```ts
 import { Comfy } from "@comfyorg/sdk";
 
-const client = new Comfy("http://127.0.0.1:8189"); // local proxy, no key needed
-// const client = new Comfy({ apiKey: "..." }); // Comfy Cloud (default base URL)
+const client = new Comfy({ apiKey: "..." }); // Comfy Cloud
+// COMFY_BASE_URL=http://127.0.0.1:8189 targets a local proxy instead (no key needed)
 
 const wf = await client.workflows.fromFile("workflow_api.json");
 const asset = client.assets.fromFile("photo.png"); // lazy; hashed + uploaded on first use
@@ -64,29 +65,47 @@ await job.getOutputs("13")[0].toFile("out.png");
 
 ## Auth, per surface
 
-| Surface                                                            | Auth                                            |
-| ------------------------------------------------------------------ | ----------------------------------------------- |
-| Self-hosted proxy (`comfy-api-proxy` in front of your own ComfyUI) | none — do **not** pass `apiKey`                 |
-| Comfy Cloud                                                        | `new Comfy(baseUrl, { apiKey: "comfyui-..." })` |
-| Serverless                                                         | `new Comfy(baseUrl, { apiKey: "comfyui-..." })` |
+| Surface                                                            | Auth                                   |
+| ------------------------------------------------------------------ | -------------------------------------- |
+| Self-hosted proxy (`comfy-api-proxy` in front of your own ComfyUI) | none — do **not** pass `apiKey`        |
+| Comfy Cloud                                                        | `new Comfy({ apiKey: "comfyui-..." })` |
+| Serverless                                                         | `new Comfy({ apiKey: "comfyui-..." })` |
 
 The client only attaches the `Authorization` header to requests aimed at its
-own `baseUrl`'s origin. If the server hands back an absolute URL on a
+own target deployment's origin. If the server hands back an absolute URL on a
 different host (for example a job's `events`/`cancel` link, or a redirect on
 an asset download), the key is not sent there — see "Typed errors" below for
 the exception classes this surface can raise.
 
 The SDK identifies itself via `User-Agent` (for support + usage analytics);
-no other data is collected. Pass `clientInfo` to `new Comfy(baseUrl, { ... })`
+no other data is collected. Pass `clientInfo` to `new Comfy({ ... })`
 to append your own app's name to it, for example when attributing traffic
 from a Worker built on top of this SDK.
+
+## Targeting another deployment
+
+`new Comfy()` points at Comfy Cloud and takes no base-URL argument. To run
+against a serverless deployment or a self-hosted instance behind
+`comfy-api-proxy`, set `COMFY_BASE_URL` in the environment:
+
+```bash
+export COMFY_BASE_URL="https://<deployment>.run.comfy.app"  # serverless
+export COMFY_BASE_URL="http://127.0.0.1:8189"               # self-hosted proxy
+```
+
+It is read each time a client is constructed, must be an `http(s)` URL, and
+an unset or blank value (including whitespace-only) means Comfy Cloud.
+
+Upgrading from an earlier version: `new Comfy(url, opts)` becomes
+`new Comfy(opts)` with `COMFY_BASE_URL` set. A positional string now throws a
+`TypeError` rather than being silently ignored.
 
 ## Quickstart
 
 ```ts
 import { Comfy } from "@comfyorg/sdk";
 
-const client = new Comfy("http://127.0.0.1:8189");
+const client = new Comfy({ apiKey: "comfyui-..." });
 
 const wf = await client.workflows.fromFile("workflow_api.json");
 const job = await client.run(wf); // submit + poll to a terminal state; throws on failure
