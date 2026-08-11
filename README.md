@@ -93,8 +93,12 @@ export COMFY_BASE_URL="https://<deployment>.run.comfy.app"  # serverless
 export COMFY_BASE_URL="http://127.0.0.1:8189"               # self-hosted proxy
 ```
 
-It is read each time a client is constructed, must be an `http(s)` URL, and an
-unset or empty value means Comfy Cloud.
+It is read each time a client is constructed, must be an `http(s)` URL, and
+an unset or blank value (including whitespace-only) means Comfy Cloud.
+
+Upgrading from an earlier version: `new Comfy(url, opts)` becomes
+`new Comfy(opts)` with `COMFY_BASE_URL` set. A positional string now throws a
+`TypeError` rather than being silently ignored.
 
 ## Quickstart
 

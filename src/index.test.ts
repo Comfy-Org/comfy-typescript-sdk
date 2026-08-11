@@ -1,9 +1,15 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { Comfy, ComfyError, Job, Asset, Workflow } from "./index.js";
+import { BASE_URL_ENV_VAR, Comfy, ComfyError, Job, Asset, Workflow } from "./index.js";
 
 describe("public surface", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("constructs a client and exposes assets/workflows/jobs namespaces", () => {
+    // An invalid COMFY_BASE_URL in the ambient shell would otherwise throw here.
+    vi.stubEnv(BASE_URL_ENV_VAR, undefined);
     const client = new Comfy();
     expect(client).toBeInstanceOf(Comfy);
     expect(client.assets).toBeDefined();
