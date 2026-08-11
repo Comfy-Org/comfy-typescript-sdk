@@ -68,15 +68,22 @@ const DEFAULT_RETRY_AFTER_S = 2;
 function resolveBaseUrl(): string {
   const raw = globalThis.process?.env?.[BASE_URL_ENV_VAR]?.trim();
   if (!raw) return COMFY_CLOUD_BASE_URL;
-  let protocol: string | undefined;
+  let parsed: URL | undefined;
   try {
-    protocol = new URL(raw).protocol;
+    parsed = new URL(raw);
   } catch {
-    protocol = undefined;
+    parsed = undefined;
   }
-  if (protocol !== "http:" && protocol !== "https:") {
+  // A query or fragment would land in the middle of every request URL, since
+  // the transport builds those by appending the API path to this string.
+  const valid =
+    parsed !== undefined &&
+    (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+    parsed.search === "" &&
+    parsed.hash === "";
+  if (!valid) {
     throw new TypeError(
-      `${BASE_URL_ENV_VAR} must be an http(s) URL (e.g. "http://127.0.0.1:8189"), got ${JSON.stringify(raw)}`,
+      `${BASE_URL_ENV_VAR} must be an http(s) URL with no query or fragment (e.g. "http://127.0.0.1:8189"), got ${JSON.stringify(raw)}`,
     );
   }
   return raw;
