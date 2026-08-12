@@ -36,6 +36,7 @@ import { ApiError, ComfyLow, type ComfyLowOptions } from "../low/index.js";
 import { abortableSleep } from "./abortable-sleep.js";
 import { AssetFactory } from "./assets.js";
 import {
+  extraDataFor,
   findAssetHandles,
   looksLikeUiFormat,
   newIdempotencyKey,
@@ -168,17 +169,24 @@ export class Comfy {
    * alongside the workflow, and is unrelated to the `Idempotency-Key`: it
    * does not affect idempotency and is never persisted or logged by this
    * SDK. Omit it and no `extra_data` is sent at all.
+   *
+   * Pass `embedWorkflow: true` to embed the materialized graph as output
+   * metadata (`extra_data.extra_pnginfo.workflow`), so it can be recovered
+   * later from a generated image — useful when debugging. Off by default.
    */
   async submit(
     workflow: Workflow,
-    options: { idempotencyKey?: string; apiKey?: string; signal?: AbortSignal } = {},
+    options: {
+      idempotencyKey?: string;
+      apiKey?: string;
+      embedWorkflow?: boolean;
+      signal?: AbortSignal;
+    } = {},
   ): Promise<Job> {
     guardUiFormat(workflow);
     const graph = await this.materialize(workflow, options.signal);
     const key = options.idempotencyKey ?? newIdempotencyKey();
-    // A falsy apiKey (undefined or "") means "no key" — send no extra_data,
-    // matching the Python SDK's behavior so the two stay in lockstep.
-    const extraData = options.apiKey ? { api_key_comfy_org: options.apiKey } : undefined;
+    const extraData = extraDataFor(options.apiKey, options.embedWorkflow ? graph : undefined);
     const deadline = Date.now() + QUEUE_RETRY_BUDGET_MS;
     for (;;) {
       try {
@@ -203,9 +211,18 @@ export class Comfy {
   /** Submit, then poll to terminal (authoritative). Throws on failure. */
   async run(
     workflow: Workflow,
-    options: { timeoutMs?: number; apiKey?: string; signal?: AbortSignal } = {},
+    options: {
+      timeoutMs?: number;
+      apiKey?: string;
+      embedWorkflow?: boolean;
+      signal?: AbortSignal;
+    } = {},
   ): Promise<Job> {
-    const job = await this.submit(workflow, { apiKey: options.apiKey, signal: options.signal });
+    const job = await this.submit(workflow, {
+      apiKey: options.apiKey,
+      embedWorkflow: options.embedWorkflow,
+      signal: options.signal,
+    });
     return options.timeoutMs === undefined
       ? job.result(options.signal)
       : runWithTimeout(job, options.timeoutMs, options.signal);

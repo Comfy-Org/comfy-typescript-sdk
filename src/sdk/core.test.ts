@@ -6,6 +6,7 @@ import {
   type AssetHandleLike,
   assetReference,
   backoffSchedule,
+  extraDataFor,
   findAssetHandles,
   isTerminal,
   substituteAssetHandles,
@@ -63,6 +64,32 @@ describe("assetReference", () => {
     expect(assetReference("id1", { hash: null, filePath: "" })).toEqual({
       __type: "core/ASSET",
       info: { id: "id1" },
+    });
+  });
+});
+
+describe("extraDataFor", () => {
+  it("returns undefined when neither an apiKey nor a workflow graph is given", () => {
+    expect(extraDataFor(undefined, undefined)).toBeUndefined();
+    expect(extraDataFor("", undefined)).toBeUndefined(); // empty string is falsy, like no key
+  });
+
+  it("carries only api_key_comfy_org when just an apiKey is given", () => {
+    expect(extraDataFor("comfyui-test-key", undefined)).toEqual({
+      api_key_comfy_org: "comfyui-test-key",
+    });
+  });
+
+  it("carries only extra_pnginfo.workflow when just a graph is given", () => {
+    const graph = { "1": { inputs: { seed: 42 } } };
+    expect(extraDataFor(undefined, graph)).toEqual({ extra_pnginfo: { workflow: graph } });
+  });
+
+  it("merges both keys when both are given", () => {
+    const graph = { "1": {} };
+    expect(extraDataFor("comfyui-test-key", graph)).toEqual({
+      api_key_comfy_org: "comfyui-test-key",
+      extra_pnginfo: { workflow: graph },
     });
   });
 });

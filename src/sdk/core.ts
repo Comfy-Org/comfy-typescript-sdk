@@ -9,7 +9,7 @@
 
 import { randomUUID } from "node:crypto";
 
-import type { AssetReference } from "../low/index.js";
+import type { AssetReference, PostJobsData } from "../low/index.js";
 
 // Terminal job states. `canceling` is deliberately NOT terminal —
 // cancellation takes effect at node/step boundaries and can take seconds.
@@ -18,6 +18,35 @@ export const SUCCESS = "succeeded";
 
 export function newIdempotencyKey(): string {
   return randomUUID();
+}
+
+/**
+ * Wire shape of `extra_data` on `POST /jobs`. Extends the generated
+ * `PostJobsData["body"]["extra_data"]` with `extra_pnginfo`, which isn't in
+ * the synced spec yet; this local extension can be dropped once
+ * `pnpm generate` picks up the server-side addition.
+ */
+export type ExtraData = NonNullable<PostJobsData["body"]["extra_data"]> & {
+  extra_pnginfo?: { workflow: Record<string, unknown> };
+};
+
+/**
+ * Build the wire `extra_data` object: the partner-node API key and/or the
+ * materialized graph embedded as `extra_pnginfo.workflow` — the same key
+ * local ComfyUI's `SaveImage` writes into output PNG metadata, so the graph
+ * can be recovered later from a generated image. Returns `undefined` when
+ * neither is given, so callers omit `extra_data` from the request entirely
+ * rather than sending `{}`. Mirrors `comfy_sdk._core.extra_data_for` in the
+ * Python SDK.
+ */
+export function extraDataFor(
+  apiKey: string | undefined,
+  workflowGraph: Record<string, unknown> | undefined,
+): ExtraData | undefined {
+  const data: ExtraData = {};
+  if (apiKey) data.api_key_comfy_org = apiKey;
+  if (workflowGraph !== undefined) data.extra_pnginfo = { workflow: workflowGraph };
+  return Object.keys(data).length > 0 ? data : undefined;
 }
 
 export function isTerminal(status: string): boolean {

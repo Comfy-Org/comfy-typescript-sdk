@@ -67,6 +67,70 @@ describe("Comfy", () => {
     expect(server.state.lastPostJobsBody).not.toHaveProperty("extra_data");
   });
 
+  it("submit() with embedWorkflow: false sends no extra_data (matches the default)", async () => {
+    const wf = client.workflows.fromJson({ "1": {} });
+    await client.submit(wf, { embedWorkflow: false });
+
+    expect(server.state.lastPostJobsBody).not.toHaveProperty("extra_data");
+  });
+
+  it("submit() with embedWorkflow sends the materialized graph as extra_data.extra_pnginfo.workflow", async () => {
+    const wf = client.workflows.fromJson({ "1": { inputs: { seed: 42 } } });
+    await client.submit(wf, { embedWorkflow: true });
+
+    expect(server.state.lastPostJobsBody).toMatchObject({
+      workflow: { "1": { inputs: { seed: 42 } } },
+      extra_data: { extra_pnginfo: { workflow: { "1": { inputs: { seed: 42 } } } } },
+    });
+    expect(server.state.lastPostJobsBody).not.toHaveProperty("extra_data.api_key_comfy_org");
+  });
+
+  it("submit() with embedWorkflow embeds the materialized graph, not the pre-materialization one (asset handle substituted)", async () => {
+    const wf = client.workflows.fromJson({ "1": { inputs: {} } });
+    const asset = client.assets.fromBytes(new Uint8Array([1, 2, 3]), { filename: "in.png" });
+    wf.setInput("1", "image", asset);
+
+    await client.submit(wf, { embedWorkflow: true });
+
+    const body = server.state.lastPostJobsBody as {
+      workflow: unknown;
+      extra_data: { extra_pnginfo: { workflow: unknown } };
+    };
+    // The embedded graph is byte-for-byte the same object that was submitted
+    // as `workflow` — i.e. post asset-substitution, not the caller's handle.
+    expect(body.extra_data.extra_pnginfo.workflow).toEqual(body.workflow);
+    const embedded = body.extra_data.extra_pnginfo.workflow as Record<
+      string,
+      { inputs: { image: unknown } }
+    >;
+    expect(embedded["1"].inputs.image).toEqual({
+      __type: "core/ASSET",
+      info: { id: asset.id, hash: expect.any(String), file_path: "in.png" },
+    });
+  });
+
+  it("submit() with embedWorkflow and apiKey merges both keys in extra_data", async () => {
+    const wf = client.workflows.fromJson({ "1": {} });
+    await client.submit(wf, { embedWorkflow: true, apiKey: "comfyui-test-key" });
+
+    expect(server.state.lastPostJobsBody).toMatchObject({
+      extra_data: {
+        api_key_comfy_org: "comfyui-test-key",
+        extra_pnginfo: { workflow: { "1": {} } },
+      },
+    });
+  });
+
+  it("run() threads embedWorkflow through to submit()", async () => {
+    server.state.pollsToSucceed = 1;
+    const wf = client.workflows.fromJson({ "1": {} });
+    await client.run(wf, { embedWorkflow: true });
+
+    expect(server.state.lastPostJobsBody).toMatchObject({
+      extra_data: { extra_pnginfo: { workflow: { "1": {} } } },
+    });
+  });
+
   it("run() submits and polls to completion end-to-end", async () => {
     server.state.pollsToSucceed = 2;
     const wf = client.workflows.fromJson({ "1": {} });
