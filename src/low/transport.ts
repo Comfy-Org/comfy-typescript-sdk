@@ -27,7 +27,13 @@
  */
 
 import { errorFromEnvelope } from "./errors.js";
-import type { Asset, AssetFromHashData, Job, PostJobsData } from "./generated/types.gen.js";
+import type {
+  Asset,
+  AssetFromHashData,
+  Job,
+  JobWorkflowResponse,
+  PostJobsData,
+} from "./generated/types.gen.js";
 import { iterateSse, type RawEvent } from "./sse.js";
 import { SDK_VERSION } from "./version.js";
 
@@ -74,13 +80,10 @@ export interface AssetContentUrl {
  * that pinned a workflow version (a job submitted through this SDK today
  * always gets `"api"`).
  */
-export type JobWorkflowFormat = "save" | "api";
+export type JobWorkflowFormat = JobWorkflowResponse["format"];
 
-/** Return shape of {@link ComfyLow.getJobWorkflow}. */
-export interface JobWorkflowResult {
-  workflow: Record<string, unknown>;
-  format: JobWorkflowFormat;
-}
+/** Return shape of {@link ComfyLow.getJobWorkflow} — the generated response schema. */
+export type JobWorkflowResult = JobWorkflowResponse;
 
 function looksLikePath(value: string): boolean {
   return value.startsWith("http") || value.startsWith("/");
@@ -413,6 +416,14 @@ export class ComfyLow {
     return this.parseOrRaise<AssetContentUrl>(response, [200, 206]); // always throws here
   }
 
+  /** `DELETE /api/v2/assets/{id}` — removes the asset record and its content. */
+  async deleteAsset(assetId: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+    const response = await this.request("DELETE", `/assets/${encodeURIComponent(assetId)}`, {
+      signal: options.signal,
+    });
+    await this.parseOrRaise<void>(response, [204]);
+  }
+
   // -- jobs -----------------------------------------------------------------
 
   /**
@@ -449,16 +460,7 @@ export class ComfyLow {
     return this.parseOrRaise<Job>(response, [200]);
   }
 
-  /**
-   * `GET /api/v2/jobs/{id}/workflow` — the graph that produced this job.
-   *
-   * Not yet in the vendored spec: the server endpoint is still in review, so
-   * this is hand-written rather than generated, and is intentionally left
-   * out of {@link OPERATION_IDS} (which must match `spec/openapi.yaml`
-   * exactly). Once the spec re-syncs and `pnpm generate` picks up the
-   * operation, this method and {@link JobWorkflowResult} can move onto the
-   * generated client.
-   */
+  /** `GET /api/v2/jobs/{id}/workflow` — the graph that produced this job. */
   async getJobWorkflow(
     jobIdOrUrl: string,
     options: { signal?: AbortSignal } = {},
@@ -512,9 +514,11 @@ export const OPERATION_IDS = [
   "assetFromHash",
   "headAssetByHash",
   "getAsset",
+  "deleteAsset",
   "getAssetContent",
   "postJobs",
   "getJob",
+  "getJobWorkflow",
   "getJobEvents",
   "cancelJob",
 ] as const;
@@ -525,9 +529,11 @@ export const OPERATION_METHODS: Record<(typeof OPERATION_IDS)[number], keyof Com
   assetFromHash: "assetFromHash",
   headAssetByHash: "headAssetByHash",
   getAsset: "getAsset",
+  deleteAsset: "deleteAsset",
   getAssetContent: "getAssetContent",
   postJobs: "postJobs",
   getJob: "getJob",
+  getJobWorkflow: "getJobWorkflow",
   getJobEvents: "getJobEvents",
   cancelJob: "cancelJob",
 };
