@@ -60,6 +60,11 @@ export class Output {
     return this.model.content_type;
   }
 
+  /** ID of the job that produced this output. */
+  get jobId(): string | undefined {
+    return this.model.job_id ?? undefined;
+  }
+
   /**
    * Stream this output to `path` and resolve to that same path.
    *

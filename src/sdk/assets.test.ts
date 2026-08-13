@@ -44,6 +44,15 @@ describe("AssetFactory / Asset", () => {
     expect(server.state.uploadCount).toBe(0);
   });
 
+  it("jobId and expiresAt are absent for an uploaded asset (no producing job)", async () => {
+    const asset = assets.fromBytes(new Uint8Array([1, 2, 3]), { filename: "x.bin" });
+    expect(asset.jobId).toBeUndefined();
+    expect(asset.expiresAt).toBeUndefined();
+    await asset.commit();
+    expect(asset.jobId).toBeUndefined();
+    expect(asset.expiresAt).toBeUndefined();
+  });
+
   it("file uploads stream a disk-backed Blob (fromFile stays lazy end to end)", async () => {
     // The real "not buffered whole" guarantee is exercised at the transport
     // level (transport.test.ts asserts the server sees multiple `data`

@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { StubServer } from "../../test/support/stub-server.js";
 import { ComfyLow } from "../low/index.js";
+import { JobFactory } from "./jobs.js";
 import { Output } from "./outputs.js";
 
 describe("Output", () => {
@@ -51,6 +52,14 @@ describe("Output", () => {
     expect(out.id).toBe("asset_out_01");
     expect(out.sizeBytes).toBe(10);
     expect(out.contentType).toBe("image/png");
+    // The fixture model above carries no job_id.
+    expect(out.jobId).toBeUndefined();
+  });
+
+  it("jobId reflects the producing job's id, once resolved through a real job poll", async () => {
+    const job = await new JobFactory(low).get("job_producer_01");
+    await job.result();
+    expect(job.outputs[0]?.jobId).toBe("job_producer_01");
   });
 
   it("toFile streams the full content to disk", async () => {
