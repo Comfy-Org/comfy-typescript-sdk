@@ -74,12 +74,19 @@ export interface ServerState {
    * so a test can assert an aborted caller signal cancels the in-flight
    * request instead of waiting it out. */
   hangJobPoll: boolean;
+  /** Asset ids already deleted — GET/DELETE for these 404 asset_not_found,
+   * matching the real server treating a repeat delete as "gone". */
+  deletedAssets: Set<string>;
+  /** When set, DELETE for this asset id responds 409 asset_in_use instead
+   * of deleting it (simulates an asset still referenced by a workflow). */
+  deleteInUseAssetId: string | null;
 
   // --- counters tests assert on ---
   uploadCount: number;
   uploadDataEvents: number;
   fromHashCount: number;
   headCount: number;
+  deleteCount: number;
   jobPollCount: number;
   eventsConnectCount: number;
   submitCount: number;
@@ -121,10 +128,13 @@ function defaultState(): ServerState {
     contentRedirectLocation: null,
     getAssetHashOverride: undefined,
     hangJobPoll: false,
+    deletedAssets: new Set(),
+    deleteInUseAssetId: null,
     uploadCount: 0,
     uploadDataEvents: 0,
     fromHashCount: 0,
     headCount: 0,
+    deleteCount: 0,
     jobPollCount: 0,
     eventsConnectCount: 0,
     submitCount: 0,
@@ -281,11 +291,19 @@ export class StubServer {
     if (req.method === "GET") {
       let m = /^\/api\/v2\/assets\/([^/]+)\/content$/.exec(path);
       if (m) {
+        if (state.deletedAssets.has(m[1])) {
+          sendError(res, 404, "asset_not_found", "asset not found");
+          return;
+        }
         this.serveContent(req, res, path);
         return;
       }
       m = /^\/api\/v2\/assets\/([^/]+)$/.exec(path);
       if (m) {
+        if (state.deletedAssets.has(m[1])) {
+          sendError(res, 404, "asset_not_found", "asset not found");
+          return;
+        }
         const hash =
           state.getAssetHashOverride !== undefined ? state.getAssetHashOverride : state.serverHash;
         sendJson(res, 200, assetJson(m[1], hash, false, 33));
@@ -324,6 +342,28 @@ export class StubServer {
         return;
       }
       await readBody(req);
+      sendError(res, 404, "not_found");
+      return;
+    }
+
+    if (req.method === "DELETE") {
+      const m = /^\/api\/v2\/assets\/([^/]+)$/.exec(path);
+      if (m) {
+        const id = decodeURIComponent(m[1]);
+        state.deleteCount += 1;
+        if (state.deleteInUseAssetId === id) {
+          sendError(res, 409, "asset_in_use", "asset is referenced by another resource");
+          return;
+        }
+        if (state.deletedAssets.has(id)) {
+          sendError(res, 404, "asset_not_found", "asset not found");
+          return;
+        }
+        state.deletedAssets.add(id);
+        res.writeHead(204);
+        res.end();
+        return;
+      }
       sendError(res, 404, "not_found");
       return;
     }

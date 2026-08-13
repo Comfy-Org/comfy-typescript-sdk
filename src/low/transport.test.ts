@@ -7,9 +7,11 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { StubServer } from "../../test/support/stub-server.js";
 import {
+  ApiError,
   BlobNotFound,
   HashMismatch,
   IdempotencyKeyReuse,
+  NotFound,
   QueueFull,
   Unauthorized,
 } from "./errors.js";
@@ -193,6 +195,28 @@ describe("ComfyLow transport", () => {
   it("cancelJob returns the canceling state", async () => {
     const job = await low.cancelJob("job_01");
     expect(job.status).toBe("canceling");
+  });
+
+  // -- deleteAsset (hand-written; not yet in spec/openapi.yaml) --------------
+
+  it("deleteAsset removes the asset; a subsequent getAsset 404s", async () => {
+    await low.deleteAsset("asset_1");
+    expect(server.state.deleteCount).toBe(1);
+    await expect(low.getAsset("asset_1")).rejects.toBeInstanceOf(NotFound);
+  });
+
+  it("deleteAsset on an already-deleted asset surfaces NotFound (not a silent no-op)", async () => {
+    await low.deleteAsset("asset_1");
+    await expect(low.deleteAsset("asset_1")).rejects.toBeInstanceOf(NotFound);
+    expect(server.state.deleteCount).toBe(2);
+  });
+
+  it("deleteAsset on an in-use asset surfaces the 409 asset_in_use as a typed ApiError", async () => {
+    server.state.deleteInUseAssetId = "asset_locked";
+    const err = await low.deleteAsset("asset_locked").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe("asset_in_use");
+    expect((err as ApiError).httpStatus).toBe(409);
   });
 
   // -- User-Agent identification ---------------------------------------------

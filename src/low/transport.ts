@@ -385,6 +385,22 @@ export class ComfyLow {
     return this.parseOrRaise<AssetContentUrl>(response, [200, 206]); // always throws here
   }
 
+  /**
+   * `DELETE /api/v2/assets/{id}` — removes the asset record and its content.
+   *
+   * Not yet in the vendored spec: the endpoint is still moving through the
+   * canonical contract, so this is hand-written rather than generated, and
+   * is intentionally left out of {@link OPERATION_IDS} (which must match
+   * `spec/openapi.yaml` exactly). Once the spec re-syncs and `pnpm generate`
+   * picks up the operation, this method moves onto the generated client.
+   */
+  async deleteAsset(assetId: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+    const response = await this.request("DELETE", `/assets/${encodeURIComponent(assetId)}`, {
+      signal: options.signal,
+    });
+    await this.parseOrRaise<void>(response, [204]);
+  }
+
   // -- jobs -----------------------------------------------------------------
 
   /**
