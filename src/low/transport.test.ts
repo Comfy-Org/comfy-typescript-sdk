@@ -10,6 +10,7 @@ import {
   BlobNotFound,
   HashMismatch,
   IdempotencyKeyReuse,
+  NotFound,
   QueueFull,
   Unauthorized,
 } from "./errors.js";
@@ -193,6 +194,24 @@ describe("ComfyLow transport", () => {
   it("cancelJob returns the canceling state", async () => {
     const job = await low.cancelJob("job_01");
     expect(job.status).toBe("canceling");
+  });
+
+  // -- getJobWorkflow (hand-written; not yet in spec/openapi.yaml) -----------
+
+  it("getJobWorkflow returns the graph alongside its format", async () => {
+    server.state.jobWorkflow = { workflow: { "1": { class_type: "KSampler" } }, format: "api" };
+    const result = await low.getJobWorkflow("job_01");
+    expect(result).toEqual({ workflow: { "1": { class_type: "KSampler" } }, format: "api" });
+  });
+
+  it("getJobWorkflow surfaces the pinned save-format graph", async () => {
+    server.state.jobWorkflow = { workflow: { nodes: [] }, format: "save" };
+    const result = await low.getJobWorkflow("job_01");
+    expect(result.format).toBe("save");
+  });
+
+  it("getJobWorkflow 404s -> NotFound for a job with no workflow recorded", async () => {
+    await expect(low.getJobWorkflow("job_01")).rejects.toBeInstanceOf(NotFound);
   });
 
   // -- User-Agent identification ---------------------------------------------
