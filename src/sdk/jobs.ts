@@ -49,7 +49,7 @@ export class Job {
     return this.model.id;
   }
 
-  /** Last known status — `queued`, `running`, `succeeded`, `canceled`, `failed`, `expired`. Reflects the most recent fetch, not necessarily the server's current state. */
+  /** Last known status — `queued`, `running`, `canceling`, `succeeded`, `canceled`, `failed`, `expired`. Reflects the most recent fetch, not necessarily the server's current state. */
   get status(): string {
     return this.model.status;
   }
@@ -130,12 +130,6 @@ export class Job {
   /**
    * Fetch the graph that produced this job via
    * `GET /api/v2/jobs/{id}/workflow`.
-   *
-   * **Depends on a server endpoint currently in review.** Until it ships,
-   * expect a 404 from the server (surfaced as this SDK's usual `NotFound`)
-   * rather than a working response — see `low.getJobWorkflow`, which is
-   * hand-written for the same reason (the spec doesn't know this operation
-   * yet).
    *
    * `format` tells you which shape you got: `"api"` is the executed graph,
    * with frontend-only constructs (Note nodes, Get/Set) already resolved
