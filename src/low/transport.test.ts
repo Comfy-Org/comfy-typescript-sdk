@@ -10,6 +10,7 @@ import {
   BlobNotFound,
   HashMismatch,
   IdempotencyKeyReuse,
+  NotFound,
   QueueFull,
   Unauthorized,
 } from "./errors.js";
@@ -193,6 +194,41 @@ describe("ComfyLow transport", () => {
   it("cancelJob returns the canceling state", async () => {
     const job = await low.cancelJob("job_01");
     expect(job.status).toBe("canceling");
+  });
+
+  // -- getJobWorkflow (hand-written; not yet in spec/openapi.yaml) -----------
+
+  it("getJobWorkflow returns the graph alongside its format", async () => {
+    server.state.jobWorkflow = { workflow: { "1": { class_type: "KSampler" } }, format: "api" };
+    const result = await low.getJobWorkflow("job_01");
+    expect(result).toEqual({ workflow: { "1": { class_type: "KSampler" } }, format: "api" });
+  });
+
+  it("getJobWorkflow surfaces the pinned save-format graph", async () => {
+    server.state.jobWorkflow = { workflow: { nodes: [] }, format: "save" };
+    const result = await low.getJobWorkflow("job_01");
+    expect(result.format).toBe("save");
+  });
+
+  it("getJobWorkflow 404s -> NotFound for a job with no workflow recorded", async () => {
+    await expect(low.getJobWorkflow("job_01")).rejects.toBeInstanceOf(NotFound);
+  });
+
+  it("getJobWorkflow given a job path (e.g. urls.self) hits the workflow sub-resource, not the job itself", async () => {
+    server.state.jobWorkflow = { workflow: { "1": { class_type: "KSampler" } }, format: "api" };
+    const job = await low.getJob("job_01");
+    expect(job.urls.self).toBe("/api/v2/jobs/job_01"); // relative path, same-origin
+    const result = await low.getJobWorkflow(job.urls.self);
+    expect(result).toEqual({ workflow: { "1": { class_type: "KSampler" } }, format: "api" });
+  });
+
+  it("getJobWorkflow given an absolute job URL (e.g. urls.self) hits the workflow sub-resource, not the job itself", async () => {
+    server.state.jobWorkflow = { workflow: { nodes: [] }, format: "save" };
+    server.state.jobUrlsOrigin = server.baseUrl;
+    const job = await low.getJob("job_01");
+    expect(job.urls.self).toBe(`${server.baseUrl}/api/v2/jobs/job_01`); // absolute
+    const result = await low.getJobWorkflow(job.urls.self);
+    expect(result).toEqual({ workflow: { nodes: [] }, format: "save" });
   });
 
   // -- User-Agent identification ---------------------------------------------

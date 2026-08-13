@@ -74,6 +74,12 @@ export interface ServerState {
    * so a test can assert an aborted caller signal cancels the in-flight
    * request instead of waiting it out. */
   hangJobPoll: boolean;
+  /**
+   * `GET /jobs/{id}/workflow` response body. `null` (the default) makes the
+   * stub 404 with `job_not_found`, matching a job that has no workflow on
+   * record.
+   */
+  jobWorkflow: { workflow: Record<string, unknown>; format: "save" | "api" } | null;
 
   // --- counters tests assert on ---
   uploadCount: number;
@@ -121,6 +127,7 @@ function defaultState(): ServerState {
     contentRedirectLocation: null,
     getAssetHashOverride: undefined,
     hangJobPoll: false,
+    jobWorkflow: null,
     uploadCount: 0,
     uploadDataEvents: 0,
     fromHashCount: 0,
@@ -296,6 +303,11 @@ export class StubServer {
         this.serveEvents(res);
         return;
       }
+      m = /^\/api\/v2\/jobs\/([^/]+)\/workflow$/.exec(path);
+      if (m) {
+        this.serveJobWorkflow(res);
+        return;
+      }
       m = /^\/api\/v2\/jobs\/([^/]+)$/.exec(path);
       if (m) {
         this.serveJob(m[1], res);
@@ -374,6 +386,15 @@ export class StubServer {
     const status = terminal ? state.terminalStatus : "running";
     const outputs = status === "succeeded" ? [OUTPUT] : [];
     sendJson(res, 200, jobJson(jobId, status, outputs, state.jobUrlsOrigin));
+  }
+
+  private serveJobWorkflow(res: ServerResponse): void {
+    const { jobWorkflow } = this.state;
+    if (jobWorkflow === null) {
+      sendError(res, 404, "job_not_found", "no workflow recorded for this job");
+      return;
+    }
+    sendJson(res, 200, jobWorkflow);
   }
 
   private serveEvents(res: ServerResponse): void {

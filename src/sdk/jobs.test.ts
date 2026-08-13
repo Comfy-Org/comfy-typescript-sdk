@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { StubServer } from "../../test/support/stub-server.js";
 import { ComfyLow } from "../low/index.js";
-import { JobFailed } from "./exceptions.js";
+import { JobFailed, NotFound } from "./exceptions.js";
 import { JobFactory } from "./jobs.js";
 
 describe("Job", () => {
@@ -41,6 +41,30 @@ describe("Job", () => {
     const job = await jobs.get("job_01");
     await job.cancel();
     expect(job.status).toBe("canceling");
+  });
+
+  it("workflow() surfaces the executed graph with format 'api'", async () => {
+    server.state.jobWorkflow = {
+      workflow: { "1": { class_type: "KSampler", inputs: {} } },
+      format: "api",
+    };
+    const job = await jobs.get("job_01");
+    const result = await job.getWorkflow();
+    expect(result.format).toBe("api");
+    expect(result.workflow).toEqual({ "1": { class_type: "KSampler", inputs: {} } });
+  });
+
+  it("workflow() surfaces the pinned authoring graph with format 'save'", async () => {
+    server.state.jobWorkflow = { workflow: { nodes: [], links: [] }, format: "save" };
+    const job = await jobs.get("job_01");
+    const result = await job.getWorkflow();
+    expect(result.format).toBe("save");
+    expect(result.workflow).toEqual({ nodes: [], links: [] });
+  });
+
+  it("workflow() raises the SDK's normal NotFound, not something bespoke, for a job with none recorded", async () => {
+    const job = await jobs.get("job_01");
+    await expect(job.getWorkflow()).rejects.toBeInstanceOf(NotFound);
   });
 
   it("events() consumes the full typed SSE frame sequence to terminal", async () => {

@@ -67,8 +67,36 @@ export interface AssetContentUrl {
   expiresAt: Date | null;
 }
 
+/**
+ * `"api"` — the executed graph; API-format, so frontend-only constructs
+ * (Note nodes, Get/Set) are already resolved away. `"save"` — the authoring
+ * workflow at the version the job ran, un-mangled; only present for a job
+ * that pinned a workflow version (a job submitted through this SDK today
+ * always gets `"api"`).
+ */
+export type JobWorkflowFormat = "save" | "api";
+
+/** Return shape of {@link ComfyLow.getJobWorkflow}. */
+export interface JobWorkflowResult {
+  workflow: Record<string, unknown>;
+  format: JobWorkflowFormat;
+}
+
 function looksLikePath(value: string): boolean {
   return value.startsWith("http") || value.startsWith("/");
+}
+
+/**
+ * Job base path from a bare id or a follow-up URL/path (e.g. `urls.self`).
+ * Unlike `getJob`/`cancelJob`/`getJobEvents`, whose `jobIdOrUrl` URL branch
+ * IS the pre-built target, `getJobWorkflow` has no `urls.workflow` link to
+ * receive verbatim — a URL input is the job's own address, and `/workflow`
+ * must be appended to it the same as it would be to a bare id. Strips one
+ * trailing slash so the append never double-slashes.
+ */
+function jobBasePath(jobIdOrUrl: string): string {
+  if (!looksLikePath(jobIdOrUrl)) return `/jobs/${encodeURIComponent(jobIdOrUrl)}`;
+  return jobIdOrUrl.replace(/\/$/, "");
 }
 
 function buildUserAgent(clientInfo?: string): string {
@@ -419,6 +447,26 @@ export class ComfyLow {
     const path = looksLikePath(jobIdOrUrl) ? jobIdOrUrl : `/jobs/${encodeURIComponent(jobIdOrUrl)}`;
     const response = await this.request("GET", path, { signal: options.signal });
     return this.parseOrRaise<Job>(response, [200]);
+  }
+
+  /**
+   * `GET /api/v2/jobs/{id}/workflow` — the graph that produced this job.
+   *
+   * Not yet in the vendored spec: the server endpoint is still in review, so
+   * this is hand-written rather than generated, and is intentionally left
+   * out of {@link OPERATION_IDS} (which must match `spec/openapi.yaml`
+   * exactly). Once the spec re-syncs and `pnpm generate` picks up the
+   * operation, this method and {@link JobWorkflowResult} can move onto the
+   * generated client.
+   */
+  async getJobWorkflow(
+    jobIdOrUrl: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<JobWorkflowResult> {
+    const response = await this.request("GET", `${jobBasePath(jobIdOrUrl)}/workflow`, {
+      signal: options.signal,
+    });
+    return this.parseOrRaise<JobWorkflowResult>(response, [200]);
   }
 
   /**
