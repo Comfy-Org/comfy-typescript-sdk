@@ -274,9 +274,9 @@ controls per-request:
   specific workflow version.
 
 Jobs submitted through this SDK always get `"api"` today, since v2
-submission has no version-pinning fields yet. It 404s under the same
-conditions rehydrating the job itself does — unknown ID, not yours, or past
-retention.
+submission has no version-pinning fields yet. It 404s for an unknown ID, a job that
+is not yours, a job past retention, or a job whose workflow the server no
+longer holds.
 
 ## Typed errors
 
