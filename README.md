@@ -166,6 +166,15 @@ nothing.
 rehydrate a handle for an asset that is already committed) for less common
 cases — see the type definitions for details.
 
+A committed asset also exposes `jobId` — the ID of the job that produced it,
+`undefined` for an asset you uploaded yourself (which has no producing job)
+— and `expiresAt`, its retention deadline (`undefined` if it never expires).
+Delete one with `asset.delete()` on a handle you already hold (throws if the
+handle was never committed — there's nothing to delete yet), or
+`client.assets.delete(id)` to delete by UUID without fetching first. Deleting
+needs a `comfy-api-proxy` new enough to serve `DELETE /api/v2/assets/{id}`;
+an older proxy returns `405`.
+
 ## Live progress
 
 `job.events()` is a typed, auto-reconnecting async iterator over the job's
@@ -221,7 +230,8 @@ await client.run(wf, { timeoutMs: 60_000 });
 
 A finished job exposes its results as output handles — `job.outputs`, or
 `job.getOutputs(nodeId)` to filter to one node. Each is an asset you can pull
-down whichever way suits the caller:
+down whichever way suits the caller, and each carries `jobId` — the ID of
+the job that produced it, for tracing a file back to the job that made it:
 
 ```ts
 const out = job.getOutputs("13")[0];
@@ -242,6 +252,31 @@ storage URL: whoever holds it can read the asset until `expiresAt` with no API
 key of their own. On a self-hosted proxy it's the content endpoint (normal auth
 still applies) and `expiresAt` is `null`. It works on every backend and never
 downloads the bytes first.
+
+## The workflow behind a job
+
+A job handle rehydrated by ID alone — `await client.jobs.get(jobId)` — has
+no record of what it ran; `job.getWorkflow()` recovers it:
+
+```ts
+const job = await client.jobs.get(jobId);
+const { workflow, format } = await job.getWorkflow();
+```
+
+`format` says which shape you got, and callers must branch on it — which one
+comes back depends on how the job was submitted, not on anything the caller
+controls per-request:
+
+- `"api"` — the executed graph: frontend-only constructs (Note nodes,
+  Get/Set) are already resolved away.
+- `"save"` — the authoring workflow at the version the job ran, canvas
+  layout and editor-only nodes intact. Only returned for a job pinned to a
+  specific workflow version.
+
+Jobs submitted through this SDK always get `"api"` today, since v2
+submission has no version-pinning fields yet. It 404s for an unknown ID, a job that
+is not yours, a job past retention, or a job whose workflow the server no
+longer holds.
 
 ## Typed errors
 
