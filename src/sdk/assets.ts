@@ -108,6 +108,8 @@ export class Asset {
   private hashValue?: string;
   private idValue?: string;
   private createdNewValue: boolean | null = null;
+  private jobIdValue?: string;
+  private expiresAtValue?: string;
 
   constructor(low: ComfyLow, source: Source) {
     this.low = low;
@@ -129,6 +131,16 @@ export class Asset {
     return this.createdNewValue;
   }
 
+  /** ID of the job that produced this asset. `undefined` for an uploaded asset (no producing job) and always `undefined` before commit. */
+  get jobId(): string | undefined {
+    return this.jobIdValue;
+  }
+
+  /** Retention deadline for this asset, or `undefined` if it does not expire (or before commit). */
+  get expiresAt(): string | undefined {
+    return this.expiresAtValue;
+  }
+
   /** The local blake3 (computed once, lazily). */
   async hash(): Promise<string> {
     this.hashValue ??= await this.source.hasher();
@@ -144,6 +156,8 @@ export class Asset {
     this.idValue = asset.id;
     if (asset.hash) this.hashValue = asset.hash;
     this.createdNewValue = asset.created_new ?? null;
+    this.jobIdValue = asset.job_id ?? undefined;
+    this.expiresAtValue = asset.expires_at ?? undefined;
   }
 
   /** Force the hash/dedup/upload now; return the asset UUID. */

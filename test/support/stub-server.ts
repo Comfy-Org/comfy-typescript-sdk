@@ -424,7 +424,9 @@ export class StubServer {
     state.jobPollCount += 1;
     const terminal = state.jobPollCount >= state.pollsToSucceed;
     const status = terminal ? state.terminalStatus : "running";
-    const outputs = status === "succeeded" ? [OUTPUT] : [];
+    // Stamp the polled job's own id as job_id, matching a real server: an
+    // output belongs to the job that produced it.
+    const outputs = status === "succeeded" ? [{ ...OUTPUT, job_id: jobId }] : [];
     sendJson(res, 200, jobJson(jobId, status, outputs, state.jobUrlsOrigin));
   }
 
