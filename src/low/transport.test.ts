@@ -214,6 +214,23 @@ describe("ComfyLow transport", () => {
     await expect(low.getJobWorkflow("job_01")).rejects.toBeInstanceOf(NotFound);
   });
 
+  it("getJobWorkflow given a job path (e.g. urls.self) hits the workflow sub-resource, not the job itself", async () => {
+    server.state.jobWorkflow = { workflow: { "1": { class_type: "KSampler" } }, format: "api" };
+    const job = await low.getJob("job_01");
+    expect(job.urls.self).toBe("/api/v2/jobs/job_01"); // relative path, same-origin
+    const result = await low.getJobWorkflow(job.urls.self);
+    expect(result).toEqual({ workflow: { "1": { class_type: "KSampler" } }, format: "api" });
+  });
+
+  it("getJobWorkflow given an absolute job URL (e.g. urls.self) hits the workflow sub-resource, not the job itself", async () => {
+    server.state.jobWorkflow = { workflow: { nodes: [] }, format: "save" };
+    server.state.jobUrlsOrigin = server.baseUrl;
+    const job = await low.getJob("job_01");
+    expect(job.urls.self).toBe(`${server.baseUrl}/api/v2/jobs/job_01`); // absolute
+    const result = await low.getJobWorkflow(job.urls.self);
+    expect(result).toEqual({ workflow: { nodes: [] }, format: "save" });
+  });
+
   // -- User-Agent identification ---------------------------------------------
 
   it("sends a default User-Agent identifying the SDK + node runtime", async () => {

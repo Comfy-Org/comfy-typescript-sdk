@@ -86,6 +86,19 @@ function looksLikePath(value: string): boolean {
   return value.startsWith("http") || value.startsWith("/");
 }
 
+/**
+ * Job base path from a bare id or a follow-up URL/path (e.g. `urls.self`).
+ * Unlike `getJob`/`cancelJob`/`getJobEvents`, whose `jobIdOrUrl` URL branch
+ * IS the pre-built target, `getJobWorkflow` has no `urls.workflow` link to
+ * receive verbatim — a URL input is the job's own address, and `/workflow`
+ * must be appended to it the same as it would be to a bare id. Strips one
+ * trailing slash so the append never double-slashes.
+ */
+function jobBasePath(jobIdOrUrl: string): string {
+  if (!looksLikePath(jobIdOrUrl)) return `/jobs/${encodeURIComponent(jobIdOrUrl)}`;
+  return jobIdOrUrl.replace(/\/$/, "");
+}
+
 function buildUserAgent(clientInfo?: string): string {
   const base = `comfy-sdk-typescript/${SDK_VERSION} (node ${process.version})`;
   if (!clientInfo) return base;
@@ -450,10 +463,9 @@ export class ComfyLow {
     jobIdOrUrl: string,
     options: { signal?: AbortSignal } = {},
   ): Promise<JobWorkflowResult> {
-    const path = looksLikePath(jobIdOrUrl)
-      ? jobIdOrUrl
-      : `/jobs/${encodeURIComponent(jobIdOrUrl)}/workflow`;
-    const response = await this.request("GET", path, { signal: options.signal });
+    const response = await this.request("GET", `${jobBasePath(jobIdOrUrl)}/workflow`, {
+      signal: options.signal,
+    });
     return this.parseOrRaise<JobWorkflowResult>(response, [200]);
   }
 
