@@ -10,7 +10,12 @@
  * in the Python SDK — one async class since JS is async-native.
  */
 
-import type { ComfyLow, Job as LowJob, Output as LowOutput } from "../low/index.js";
+import type {
+  ComfyLow,
+  Job as LowJob,
+  JobWorkflowResult,
+  Output as LowOutput,
+} from "../low/index.js";
 import { abortableSleep } from "./abortable-sleep.js";
 import { backoffSchedule, isTerminal, SUCCESS } from "./core.js";
 import { eventFromRaw, type ComfyEvent, type StatusChange } from "./events.js";
@@ -120,6 +125,26 @@ export class Job {
       this.low.cancelJob(this.model.urls.cancel || this.model.id, { signal }),
     );
     return this;
+  }
+
+  /**
+   * Fetch the graph that produced this job via
+   * `GET /api/v2/jobs/{id}/workflow`.
+   *
+   * **Depends on a server endpoint currently in review.** Until it ships,
+   * expect a 404 from the server (surfaced as this SDK's usual `NotFound`)
+   * rather than a working response — see `low.getJobWorkflow`, which is
+   * hand-written for the same reason (the spec doesn't know this operation
+   * yet).
+   *
+   * `format` tells you which shape you got: `"api"` is the executed graph,
+   * with frontend-only constructs (Note nodes, Get/Set) already resolved
+   * away. `"save"` is the authoring workflow at the version the job ran,
+   * un-mangled — only returned for a job that pinned a workflow version; a
+   * job submitted through this SDK today always gets `"api"`.
+   */
+  async getWorkflow(signal?: AbortSignal): Promise<JobWorkflowResult> {
+    return translate(() => this.low.getJobWorkflow(this.model.id, { signal }));
   }
 
   /**

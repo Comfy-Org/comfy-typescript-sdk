@@ -14,7 +14,17 @@ export const zAsset = z.object({
     created_new: z.boolean().optional(),
     created_at: z.iso.datetime(),
     url: z.url(),
-    url_expires_at: z.iso.datetime()
+    url_expires_at: z.iso.datetime(),
+    expires_at: z.iso.datetime().nullish(),
+    job_id: z.string().nullish()
+});
+
+/**
+ * The workflow behind a job. See GET /api/v2/jobs/{id}/workflow's description for exactly when `format` is `save` vs `api`.
+ */
+export const zJobWorkflowResponse = z.object({
+    workflow: z.record(z.string(), z.unknown()),
+    format: z.enum(['save', 'api'])
 });
 
 /**
@@ -34,7 +44,7 @@ export const zJobStatus = z.enum([
 ]);
 
 /**
- * Embedded follow-up links — follow these, don't build URLs.
+ * Embedded follow-up links — follow these, don't build URLs. A link is either an absolute URL or a host-relative reference (leading `/`) that already includes any prefix the serving surface is mounted under (e.g. a serverless gateway's `/deployment/{deployment_id}/api/v2`). Clients MUST resolve a host-relative link against the request origin (scheme + authority), never against a configured base URL — joining it to a base URL that carries the same mount prefix duplicates the prefix.
  */
 export const zJobUrls = z.object({
     self: z.string(),
@@ -80,7 +90,8 @@ export const zOutput = z.object({
     id: z.string(),
     hash: z.string().nullable(),
     url: z.url(),
-    url_expires_at: z.iso.datetime()
+    url_expires_at: z.iso.datetime(),
+    job_id: z.string().nullish()
 });
 
 /**
@@ -119,6 +130,12 @@ export const zJob = z.object({
  * (404), `idempotency_key_reuse` (422),
  * `queue_full` (429 + Retry-After), `insufficient_credits` (402),
  * `not_found` (404), `unauthorized` (401), `forbidden` (403).
+ * Deployment-scoped surfaces add: `deployment_not_ready` (429 +
+ * Retry-After — the deployment can still reach ready; retry) and
+ * `deployment_stopped` (422 — terminal deployment state; a retry
+ * cannot succeed without operator action). A 429 is disambiguated
+ * by `error.code` alone; clients should treat any 429 + Retry-After
+ * as "back off and retry".
  *
  */
 export const zErrorEnvelope = z.object({
@@ -148,7 +165,8 @@ export const zPostAssetsBody = z.object({
     content_type: z.string(),
     file_path: z.string(),
     expected_hash: z.string().optional(),
-    tags: z.array(z.string()).optional()
+    tags: z.array(z.string()).optional(),
+    expires_in: z.int().gte(60).lte(604800).optional()
 });
 
 export const zPostAssetsHeaders = z.object({
@@ -163,7 +181,8 @@ export const zPostAssetsResponse = zAsset;
 export const zAssetFromHashBody = z.object({
     hash: z.string(),
     file_path: z.string().optional(),
-    tags: z.array(z.string()).optional()
+    tags: z.array(z.string()).optional(),
+    expires_in: z.int().gte(60).lte(604800).optional()
 });
 
 /**
@@ -174,6 +193,15 @@ export const zAssetFromHashResponse = zAsset;
 export const zHeadAssetByHashPath = z.object({
     hash: z.string()
 });
+
+export const zDeleteAssetPath = z.object({
+    id: z.string()
+});
+
+/**
+ * Record deleted.
+ */
+export const zDeleteAssetResponse = z.void();
 
 export const zGetAssetPath = z.object({
     id: z.string()
@@ -221,6 +249,15 @@ export const zGetJobPath = z.object({
  * The job.
  */
 export const zGetJobResponse = zJob;
+
+export const zGetJobWorkflowPath = z.object({
+    id: z.string()
+});
+
+/**
+ * The workflow graph.
+ */
+export const zGetJobWorkflowResponse = zJobWorkflowResponse;
 
 export const zGetJobEventsPath = z.object({
     id: z.string()

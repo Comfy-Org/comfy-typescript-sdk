@@ -170,6 +170,20 @@ export class Asset {
     await this.commit(signal);
     return assetReference(this.idValue!, { hash: this.hashValue, filePath: this.source.filePath });
   }
+
+  /**
+   * Delete this asset from storage. The handle has no id afterward, so a
+   * further `commit()` would re-hash/re-upload as if this were a fresh
+   * handle rather than raise. Throws if this handle was never committed —
+   * there is nothing to delete yet.
+   */
+  async delete(signal?: AbortSignal): Promise<void> {
+    if (this.idValue === undefined) {
+      throw new Error("cannot delete an uncommitted asset");
+    }
+    await translate(() => this.low.deleteAsset(this.idValue!, { signal }));
+    this.idValue = undefined;
+  }
 }
 
 /** `client.assets` — alternative constructors for {@link Asset}. */
@@ -235,6 +249,11 @@ export class AssetFactory {
     });
     asset.adopt(model);
     return asset;
+  }
+
+  /** Delete an asset by UUID, without fetching it first. */
+  async delete(assetId: string, signal?: AbortSignal): Promise<void> {
+    await translate(() => this.low.deleteAsset(assetId, { signal }));
   }
 }
 

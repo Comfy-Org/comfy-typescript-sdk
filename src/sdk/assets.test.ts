@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { StubServer } from "../../test/support/stub-server.js";
 import { ComfyLow } from "../low/index.js";
 import { AssetFactory } from "./assets.js";
-import { HashMismatch } from "./exceptions.js";
+import { HashMismatch, NotFound } from "./exceptions.js";
 
 describe("AssetFactory / Asset", () => {
   let server: StubServer;
@@ -121,5 +121,33 @@ describe("AssetFactory / Asset", () => {
     expect(server.state.lastUploadContentLength).toBeGreaterThanOrEqual(
       Buffer.byteLength("downloaded-bytes"),
     );
+  });
+
+  // -- delete -----------------------------------------------------------
+
+  it("delete() removes a committed asset and clears its id", async () => {
+    const asset = assets.fromBytes(new Uint8Array([1, 2, 3]), { filename: "z.bin" });
+    const id = await asset.commit();
+    await asset.delete();
+    expect(asset.id).toBeUndefined();
+    expect(server.state.deleteCount).toBe(1);
+    expect(server.state.deletedAssets.has(id)).toBe(true);
+  });
+
+  it("delete() on an uncommitted asset throws without calling the server", async () => {
+    const asset = assets.fromBytes(new Uint8Array([1]), { filename: "z.bin" });
+    await expect(asset.delete()).rejects.toThrow(/uncommitted/);
+    expect(server.state.deleteCount).toBe(0);
+  });
+
+  it("assets.delete(id) deletes by id without fetching first", async () => {
+    await assets.delete("asset_existing");
+    expect(server.state.deleteCount).toBe(1);
+    expect(server.state.deletedAssets.has("asset_existing")).toBe(true);
+  });
+
+  it("a repeat delete of the same id surfaces the typed NotFound error", async () => {
+    await assets.delete("asset_gone");
+    await expect(assets.delete("asset_gone")).rejects.toBeInstanceOf(NotFound);
   });
 });

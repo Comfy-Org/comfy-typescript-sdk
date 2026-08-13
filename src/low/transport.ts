@@ -27,7 +27,13 @@
  */
 
 import { errorFromEnvelope } from "./errors.js";
-import type { Asset, AssetFromHashData, Job, PostJobsData } from "./generated/types.gen.js";
+import type {
+  Asset,
+  AssetFromHashData,
+  Job,
+  JobWorkflowResponse,
+  PostJobsData,
+} from "./generated/types.gen.js";
 import { iterateSse, type RawEvent } from "./sse.js";
 import { SDK_VERSION } from "./version.js";
 
@@ -67,8 +73,33 @@ export interface AssetContentUrl {
   expiresAt: Date | null;
 }
 
+/**
+ * `"api"` — the executed graph; API-format, so frontend-only constructs
+ * (Note nodes, Get/Set) are already resolved away. `"save"` — the authoring
+ * workflow at the version the job ran, un-mangled; only present for a job
+ * that pinned a workflow version (a job submitted through this SDK today
+ * always gets `"api"`).
+ */
+export type JobWorkflowFormat = JobWorkflowResponse["format"];
+
+/** Return shape of {@link ComfyLow.getJobWorkflow} — the generated response schema. */
+export type JobWorkflowResult = JobWorkflowResponse;
+
 function looksLikePath(value: string): boolean {
   return value.startsWith("http") || value.startsWith("/");
+}
+
+/**
+ * Job base path from a bare id or a follow-up URL/path (e.g. `urls.self`).
+ * Unlike `getJob`/`cancelJob`/`getJobEvents`, whose `jobIdOrUrl` URL branch
+ * IS the pre-built target, `getJobWorkflow` has no `urls.workflow` link to
+ * receive verbatim — a URL input is the job's own address, and `/workflow`
+ * must be appended to it the same as it would be to a bare id. Strips one
+ * trailing slash so the append never double-slashes.
+ */
+function jobBasePath(jobIdOrUrl: string): string {
+  if (!looksLikePath(jobIdOrUrl)) return `/jobs/${encodeURIComponent(jobIdOrUrl)}`;
+  return jobIdOrUrl.replace(/\/$/, "");
 }
 
 function buildUserAgent(clientInfo?: string): string {
@@ -385,6 +416,14 @@ export class ComfyLow {
     return this.parseOrRaise<AssetContentUrl>(response, [200, 206]); // always throws here
   }
 
+  /** `DELETE /api/v2/assets/{id}` — removes the asset record and its content. */
+  async deleteAsset(assetId: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+    const response = await this.request("DELETE", `/assets/${encodeURIComponent(assetId)}`, {
+      signal: options.signal,
+    });
+    await this.parseOrRaise<void>(response, [204]);
+  }
+
   // -- jobs -----------------------------------------------------------------
 
   /**
@@ -419,6 +458,17 @@ export class ComfyLow {
     const path = looksLikePath(jobIdOrUrl) ? jobIdOrUrl : `/jobs/${encodeURIComponent(jobIdOrUrl)}`;
     const response = await this.request("GET", path, { signal: options.signal });
     return this.parseOrRaise<Job>(response, [200]);
+  }
+
+  /** `GET /api/v2/jobs/{id}/workflow` — the graph that produced this job. */
+  async getJobWorkflow(
+    jobIdOrUrl: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<JobWorkflowResult> {
+    const response = await this.request("GET", `${jobBasePath(jobIdOrUrl)}/workflow`, {
+      signal: options.signal,
+    });
+    return this.parseOrRaise<JobWorkflowResult>(response, [200]);
   }
 
   /**
@@ -464,9 +514,11 @@ export const OPERATION_IDS = [
   "assetFromHash",
   "headAssetByHash",
   "getAsset",
+  "deleteAsset",
   "getAssetContent",
   "postJobs",
   "getJob",
+  "getJobWorkflow",
   "getJobEvents",
   "cancelJob",
 ] as const;
@@ -477,9 +529,11 @@ export const OPERATION_METHODS: Record<(typeof OPERATION_IDS)[number], keyof Com
   assetFromHash: "assetFromHash",
   headAssetByHash: "headAssetByHash",
   getAsset: "getAsset",
+  deleteAsset: "deleteAsset",
   getAssetContent: "getAssetContent",
   postJobs: "postJobs",
   getJob: "getJob",
+  getJobWorkflow: "getJobWorkflow",
   getJobEvents: "getJobEvents",
   cancelJob: "cancelJob",
 };
