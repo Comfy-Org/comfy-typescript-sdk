@@ -136,12 +136,15 @@ to sign. `.github/CODEOWNERS` makes every file require review from
   time, so the committed value is a placeholder. `pnpm build` regenerates
   `src/low/version.ts` from whatever `package.json` says, so a version edit
   shows up as an unexpected dirty file.
+- **`oxfmt` formats Markdown, not just TypeScript.** `pnpm format:check` fails
+  on an unformatted `.md` file, so a docs-only PR can fail the `test` job. Run
+  `pnpm format` after editing any Markdown.
 - **Tests are colocated** (`src/**/*.test.ts`) and run against
   `test/support/stub-server.ts`, a real Node `http` stub of the v2 API — there
   is no request-mocking library. Add a scenario to `ServerState` rather than
   intercepting `fetch`.
-- **`src/` ships in the published package** (`files: ["dist", "src",
-  "!src/**/*.test.ts"]`), so source comments are published too.
+- **`src/` ships in the published package**, not just `dist/` — see the `files`
+  field in `package.json` — so source comments are published too.
 - This SDK deliberately mirrors the Python SDK's structure (stub server, drift
   check, hygiene check, generated/hand-written split). When changing one of
   those shared mechanisms, check whether the sibling needs the same change.
