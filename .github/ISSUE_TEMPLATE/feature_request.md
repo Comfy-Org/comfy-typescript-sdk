@@ -1,10 +1,9 @@
 ---
 name: Feature request
 about: Submit a feature request for this repo.
-title: ''
+title: ""
 labels: enhancement
-assignees: ''
-
+assignees: ""
 ---
 
 **Describe the solution you'd like**
@@ -20,6 +19,7 @@ considered, including whether the low-level escape hatch
 (`@comfyorg/sdk/low`) already covers it.
 
 **Environment**
+
 - `@comfyorg/sdk` version: <!-- `npm ls @comfyorg/sdk` -->
 - Node version: <!-- `node --version` -->
 - Which surface: <!-- Comfy Cloud / serverless deployment / self-hosted via comfy-api-proxy -->

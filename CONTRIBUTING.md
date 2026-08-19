@@ -73,14 +73,14 @@ or test. The test suite runs entirely against an in-process stub server
 Run these before pushing. They are exactly what `.github/workflows/ci.yml`
 runs, in the same order, so a green local run is a good predictor of green CI.
 
-| Check | Command | What fails it |
-| --- | --- | --- |
-| Lint | `pnpm lint` | `oxlint` findings |
-| Format | `pnpm format:check` | anything `oxfmt` would reformat |
-| Types | `pnpm typecheck` | `tsc --noEmit` errors |
+| Check         | Command                 | What fails it                                 |
+| ------------- | ----------------------- | --------------------------------------------- |
+| Lint          | `pnpm lint`             | `oxlint` findings                             |
+| Format        | `pnpm format:check`     | anything `oxfmt` would reformat               |
+| Types         | `pnpm typecheck`        | `tsc --noEmit` errors                         |
 | Codegen drift | `pnpm check:spec-drift` | `src/low/generated/*` is stale or hand-edited |
-| Tests | `pnpm test` | a failing `vitest` test |
-| Build | `pnpm build` | `tsc` cannot emit `dist/` |
+| Tests         | `pnpm test`             | a failing `vitest` test                       |
+| Build         | `pnpm build`            | `tsc` cannot emit `dist/`                     |
 
 All six in one go:
 
@@ -153,7 +153,7 @@ Rules that will save you a CI round trip:
   contract change — open an issue describing what you need rather than
   patching the vendored copy in a pull request.
 
-Behavior that is *not* generated lives in the hand-written low layer
+Behavior that is _not_ generated lives in the hand-written low layer
 (`src/low/transport.ts`, `errors.ts`, `sse.ts`, and the aggregator
 `src/low/index.ts`) and in the high-level client under `src/sdk/`. That is
 where a fix normally belongs. Note that `src/low/index.ts` is hand-written and

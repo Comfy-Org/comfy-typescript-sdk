@@ -1,10 +1,9 @@
 ---
 name: Bug report
 about: Create a bug report to help us improve.
-title: ''
+title: ""
 labels: bug
-assignees: ''
-
+assignees: ""
 ---
 
 **Describe the bug**
@@ -25,12 +24,14 @@ import { Comfy } from "@comfyorg/sdk";
 A clear and concise description of what you expected to happen.
 
 **Environment**
+
 - `@comfyorg/sdk` version: <!-- `npm ls @comfyorg/sdk` -->
 - Node version: <!-- `node --version` (the SDK requires >=22) -->
 - OS:
 - Which surface: <!-- Comfy Cloud / serverless deployment / self-hosted via comfy-api-proxy -->
 
 **Nice to have**
+
 - [ ] The full error, including any `code` / `status` on a thrown SDK error
 - [ ] Terminal output or stack trace
 - [ ] Whether it worked on an earlier SDK version (which one?)
