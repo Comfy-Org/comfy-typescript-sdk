@@ -169,6 +169,9 @@ describe("Job", () => {
     const iterator = job.events(controller.signal);
     setTimeout(() => controller.abort(), 300);
     await expect(iterator.next()).rejects.toBeTruthy(); // aborted mid reconnect-pause
+    // The server asked for 5s; a bare "paused longer than 300ms" assertion
+    // would also pass on a 301ms pause that ignored the header entirely.
+    expect(vi.mocked(abortableSleep)).toHaveBeenCalledWith(5_000, controller.signal);
     // One SSE attempt, one poll refresh (that precedes the pause) beyond
     // jobs.get()'s own poll above — at the old fixed 100ms cadence, a 300ms
     // window would have produced several of each. This is the

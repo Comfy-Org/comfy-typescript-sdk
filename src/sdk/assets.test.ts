@@ -132,6 +132,18 @@ describe("AssetFactory / Asset", () => {
     );
   });
 
+  it("fromUrl treats an uppercase scheme as absolute, not as a path joined to baseUrl", async () => {
+    server.state.contentBytes = Buffer.from("downloaded-bytes");
+    // URL schemes are case-insensitive, but low.request detects an absolute
+    // URL with a case-sensitive "http" prefix — unnormalized, this would be
+    // fetched from baseUrl + "HTTP://..." instead of from the host given.
+    const upper = `${server.baseUrl}/api/v2/assets/whatever/content`.replace(/^http:/, "HTTP:");
+    const target = `${server.baseUrl}/api/v2/assets/whatever/content`;
+    expect(await (await assets.fromUrl(upper)).hash()).toBe(
+      await (await assets.fromUrl(target)).hash(),
+    );
+  });
+
   it("fromUrl routes the download through the client's injected fetch, not a raw global fetch", async () => {
     server.state.contentBytes = Buffer.from("downloaded-bytes");
     let injectedFetchCalls = 0;

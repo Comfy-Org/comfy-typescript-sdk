@@ -246,7 +246,11 @@ export class AssetFactory {
    * same as every other call, and can be cancelled via `signal`.
    */
   async fromUrl(url: string, options: { signal?: AbortSignal } = {}): Promise<Asset> {
-    const response = await this.low.request("GET", url, {
+    // Normalized because low.request recognizes an absolute URL by a
+    // case-sensitive "http" prefix; an uppercase scheme would otherwise be
+    // joined to baseUrl and fetched from the wrong host.
+    const target = new URL(url);
+    const response = await this.low.request("GET", target.href, {
       signal: options.signal,
       redirect: "follow",
     });
@@ -254,7 +258,7 @@ export class AssetFactory {
       throw new Error(`failed to download ${url}: HTTP ${response.status}`);
     }
     const data = new Uint8Array(await response.arrayBuffer());
-    const filename = basename(new URL(url).pathname) || "download.bin";
+    const filename = basename(target.pathname) || "download.bin";
     const contentType = response.headers.get("Content-Type")?.split(";")[0] || undefined;
     return new Asset(this.low, bytesSource(data, filename, contentType));
   }
