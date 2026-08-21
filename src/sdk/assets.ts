@@ -238,11 +238,18 @@ export class AssetFactory {
     return new Asset(this.low, bytesSource(data, options.filename, options.contentType));
   }
 
-  /** Client-side download (not a server-side fetch): the bytes must
+  /**
+   * Client-side download (not a server-side fetch): the bytes must
    * transit the same blake3 -> dedup -> upload pipeline as every other
-   * source. */
-  async fromUrl(url: string): Promise<Asset> {
-    const response = await fetch(url, { redirect: "follow" });
+   * source. Routed through `low.request` (not a raw `fetch`) so this
+   * download honors the client's injected `fetch` and default timeout the
+   * same as every other call, and can be cancelled via `signal`.
+   */
+  async fromUrl(url: string, options: { signal?: AbortSignal } = {}): Promise<Asset> {
+    const response = await this.low.request("GET", url, {
+      signal: options.signal,
+      redirect: "follow",
+    });
     if (!response.ok) {
       throw new Error(`failed to download ${url}: HTTP ${response.status}`);
     }

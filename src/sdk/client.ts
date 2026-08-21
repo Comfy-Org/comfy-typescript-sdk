@@ -151,9 +151,11 @@ export class Comfy {
   }
 
   /**
-   * Submit a workflow. Retries `queue_full` with `Retry-After`. An aborted
-   * `signal` stops asset materialization, the submit request, and the
-   * `queue_full` retry pause.
+   * Submit a workflow. Retries any 429 that carries `Retry-After` (e.g.
+   * `queue_full`, a serverless `deployment_not_ready` cold start);
+   * `queue_full` also retries without one, in case the server omits it. An
+   * aborted `signal` stops asset materialization, the submit request, and
+   * the retry pause.
    *
    * Sends an auto-generated `Idempotency-Key` so the server rejects an
    * accidental exact resend of *this* request (`422 idempotency_key_reuse`)
@@ -191,8 +193,17 @@ export class Comfy {
       } catch (exc) {
         if (!(exc instanceof ApiError)) throw exc;
         const err = toSdkError(exc);
-        if (err instanceof QueueFull && Date.now() < deadline) {
-          await abortableSleep((err.retryAfter || DEFAULT_RETRY_AFTER_S) * 1000, options.signal);
+        // Per spec, any 429 with Retry-After means back off and retry; fall
+        // back to a default pause for queue_full specifically, since a
+        // server may omit the header on that code today.
+        const retryDelayS =
+          exc.retryAfter ?? (err instanceof QueueFull ? DEFAULT_RETRY_AFTER_S : null);
+        // Clamp the sleep to what's left of the budget: a malicious or
+        // misbehaving server's Retry-After (e.g. 86400s) must not sleep past
+        // it — the loop-entry check alone doesn't bound the sleep itself.
+        const remainingMs = deadline - Date.now();
+        if (exc.httpStatus === 429 && retryDelayS !== null && remainingMs > 0) {
+          await abortableSleep(Math.min(retryDelayS * 1000, remainingMs), options.signal);
           continue;
         }
         throw err;

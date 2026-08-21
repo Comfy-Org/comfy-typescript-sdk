@@ -10,6 +10,7 @@
  * in the Python SDK — one async class since JS is async-native.
  */
 
+import { ApiError } from "../low/index.js";
 import type {
   ComfyLow,
   Job as LowJob,
@@ -25,6 +26,11 @@ import { Output } from "./outputs.js";
 // Pause before reconnecting an SSE stream that dropped mid-job, without a
 // terminal frame having been seen.
 const RECONNECT_PAUSE_MS = 100;
+// Ceiling on a server-supplied 429 Retry-After used as the reconnect pause —
+// this loop has no overall deadline of its own (only an optional caller
+// signal), so an unbounded value from a malicious/misbehaving server would
+// otherwise stall reconnection indefinitely.
+const MAX_RECONNECT_PAUSE_MS = 60_000;
 
 /**
  * A handle to one submitted job — rehydratable from its ID alone via
@@ -156,6 +162,7 @@ export class Job {
     let lastProgress = Number.NEGATIVE_INFINITY;
     for (;;) {
       let terminalSeen = false;
+      let reconnectPauseMs: number = RECONNECT_PAUSE_MS;
       try {
         for await (const raw of this.low.getJobEvents(eventsUrl, { signal })) {
           const event = eventFromRaw(raw, (data) => this.bindOutput(data as unknown as LowOutput));
@@ -175,7 +182,19 @@ export class Job {
         // A caller abort must propagate (and stop the loop), not be
         // swallowed as an ordinary mid-stream drop.
         if (signal?.aborted) throw exc;
-        // Connection dropped mid-stream — reconnect below.
+        if (exc instanceof ApiError) {
+          // 501 means this deployment doesn't serve live SSE at all; the
+          // poll path is the permanent substitute, not something to
+          // reconnect from — reconnecting would just repeat the same 501.
+          if (exc.httpStatus === 501) return;
+          // Back off for as long as the server asked, instead of hammering
+          // it at the fixed reconnect cadence it is trying to shed.
+          if (exc.httpStatus === 429 && exc.retryAfter != null) {
+            reconnectPauseMs = Math.min(exc.retryAfter * 1000, MAX_RECONNECT_PAUSE_MS);
+          }
+        }
+        // Connection dropped mid-stream (or an unrecognized ApiError) —
+        // reconnect below.
       }
       if (terminalSeen) return;
       // Stream ended without a terminal frame. Poll the authoritative
@@ -190,7 +209,7 @@ export class Job {
         yield statusChange;
         return;
       }
-      await abortableSleep(RECONNECT_PAUSE_MS, signal);
+      await abortableSleep(reconnectPauseMs, signal);
     }
   }
 }

@@ -357,11 +357,18 @@ export class ComfyLow {
   /**
    * `GET /api/v2/assets/{id}/content` — raw, streamed, range-aware body.
    * Returns the response itself (escape hatch); the caller reads
-   * `response.body`.
+   * `response.body`. No default timeout, matching {@link getJobEvents}: the
+   * default `AbortSignal.timeout` covers body consumption too, and a
+   * download larger than the default deadline allows must not be killed
+   * mid-transfer (pass `timeoutMs` to opt back into a deadline).
    */
   async getAssetContent(
     assetId: string,
-    options: { range?: readonly [number, number]; signal?: AbortSignal } = {},
+    options: {
+      range?: readonly [number, number];
+      signal?: AbortSignal;
+      timeoutMs?: number | null;
+    } = {},
   ): Promise<Response> {
     const headers: Record<string, string> = {};
     if (options.range) {
@@ -370,6 +377,7 @@ export class ComfyLow {
     const response = await this.request("GET", `/assets/${encodeURIComponent(assetId)}/content`, {
       headers,
       signal: options.signal,
+      timeoutMs: options.timeoutMs ?? null,
     });
     if (response.status !== 200 && response.status !== 206) {
       await this.parseOrRaise(response, [200, 206]);
