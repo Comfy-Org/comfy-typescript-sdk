@@ -12,6 +12,7 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 import type { ComfyLow, Output as LowOutput } from "../low/index.js";
+import { translate } from "./exceptions.js";
 
 /**
  * One file produced by one node of a finished job.
@@ -71,10 +72,24 @@ export class Output {
    * Bytes are piped straight to disk, so an output larger than memory is
    * fine. `range: [first, last]` fetches only that slice and is **inclusive
    * of both ends** (HTTP `Range: bytes=first-last`), so `[0, 4]` yields the
-   * first five bytes.
+   * first five bytes. No default timeout, so a large download is not killed
+   * mid-transfer; pass `timeoutMs`/`signal` to bound or cancel it.
    */
-  async toFile(path: string, options: { range?: readonly [number, number] } = {}): Promise<string> {
-    const response = await this.low.getAssetContent(this.model.id, { range: options.range });
+  async toFile(
+    path: string,
+    options: {
+      range?: readonly [number, number];
+      signal?: AbortSignal;
+      timeoutMs?: number | null;
+    } = {},
+  ): Promise<string> {
+    const response = await translate(() =>
+      this.low.getAssetContent(this.model.id, {
+        range: options.range,
+        signal: options.signal,
+        timeoutMs: options.timeoutMs,
+      }),
+    );
     if (!response.body) throw new Error(`empty response body for asset ${this.model.id}`);
     await pipeline(Readable.fromWeb(response.body), createWriteStream(path));
     return path;
@@ -85,10 +100,22 @@ export class Output {
    *
    * Convenient for small outputs; prefer {@link Output.toFile} for large
    * ones, since this buffers the whole body. `range` is inclusive — see
-   * {@link Output.toFile}.
+   * {@link Output.toFile}, including the no-default-timeout behavior.
    */
-  async toBytes(options: { range?: readonly [number, number] } = {}): Promise<Uint8Array> {
-    const response = await this.low.getAssetContent(this.model.id, { range: options.range });
+  async toBytes(
+    options: {
+      range?: readonly [number, number];
+      signal?: AbortSignal;
+      timeoutMs?: number | null;
+    } = {},
+  ): Promise<Uint8Array> {
+    const response = await translate(() =>
+      this.low.getAssetContent(this.model.id, {
+        range: options.range,
+        signal: options.signal,
+        timeoutMs: options.timeoutMs,
+      }),
+    );
     return new Uint8Array(await response.arrayBuffer());
   }
 
@@ -100,9 +127,10 @@ export class Output {
    * object-storage backend (Cloud/serverless) this is a signed URL and
    * `expiresAt` is set; on a self-hosted proxy (which serves the bytes
    * inline) it's this asset's own content URL and `expiresAt` is `null`.
-   * Works on every backend and never throws.
+   * Works on every backend and never throws for either shape — only a
+   * genuine failure maps to the usual typed error.
    */
   async getDownloadUrl(): Promise<{ url: string; expiresAt: Date | null }> {
-    return this.low.getAssetContentUrl(this.model.id);
+    return translate(() => this.low.getAssetContentUrl(this.model.id));
   }
 }
