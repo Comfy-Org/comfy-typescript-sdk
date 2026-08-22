@@ -1,0 +1,64 @@
+# Description: Team-gated multi-model Cursor review — a thin caller for the
+# reusable workflow in Comfy-Org/github-workflows, which is the single source of
+# truth for the panel, judge, prompts, and scripts. Triggered by the
+# 'cursor-review' label.
+#
+# Access control (team-only, two layers):
+#   1. Only users with triage permission or higher can apply a label in a public
+#      repo, so the public cannot trigger this.
+#   2. The reusable workflow's secret-bearing jobs do not run on fork PRs (forks
+#      get no secrets), so CURSOR_API_KEY is reachable only on internal branches.
+name: CI - Cursor Review
+
+on:
+  pull_request:
+    types: [labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  # Re-labeling cancels an in-flight run for the same PR + label.
+  group: cursor-review-pr-${{ github.event.pull_request.number }}-${{ github.event.label.name }}
+  cancel-in-progress: true
+
+jobs:
+  cursor-review:
+    # No job-level `if:` — the reusable workflow's gate job owns all gating
+    # (fork skip, skip-cursor-review, trigger label, same-commit dedupe). A
+    # caller-side `if:` on `labeled` would make the `unlabeled` trigger dead
+    # code, so removing skip-cursor-review would never re-fire the review, and
+    # it would duplicate the `review_label` default as a literal that can
+    # silently desync from it.
+    # SHA-pinned. Bump this SHA to pick up upstream changes; keep
+    # `workflows_ref` matching so prompts/scripts load from the same commit as
+    # the workflow definition.
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@6a374b7c0d6ea603dad12a7dcbf80e6d65e314e1 # github-workflows main (6a374b7)
+    with:
+      # Repo-specific generated/heavy paths. These go to
+      # extra_generated_globs, not diff_excludes: only this input feeds the
+      # shared check-pr-size classifier, so matching files drop out of BOTH the
+      # diff_size_cap count AND the reviewed diff. Under diff_excludes they
+      # would still be charged against the cap, and a regeneration of
+      # src/low/generated/** could push the PR over it and skip the whole
+      # panel — including the hand-written changes riding along with it.
+      # Supplying this REPLACES the default list, so the defaults are restated
+      # verbatim first. Plain globs, not git pathspecs (no `:!` prefix — that
+      # is diff_excludes' syntax and is matched literally here). Lockfiles are
+      # already classifier built-ins, so pnpm-lock.yaml needs no entry.
+      extra_generated_globs: >-
+        **/node_modules/**
+        **/dist/**
+        **/vendor/**
+        **/*.generated.*
+        **/*.min.js
+        **/*.min.css
+        assets/**
+        src/low/generated/**
+      # Load the prompts/scripts from the same ref as `uses:`.
+      workflows_ref: 6a374b7c0d6ea603dad12a7dcbf80e6d65e314e1
+    secrets:
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+      # Optional — enables start/complete Slack DMs to the triggerer.
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
