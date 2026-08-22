@@ -25,29 +25,37 @@ concurrency:
 
 jobs:
   cursor-review:
-    if: github.event.action == 'labeled' && github.event.label.name == 'cursor-review'
+    # No job-level `if:` — the reusable workflow's gate job owns all gating
+    # (fork skip, skip-cursor-review, trigger label, same-commit dedupe). A
+    # caller-side `if:` on `labeled` would make the `unlabeled` trigger dead
+    # code, so removing skip-cursor-review would never re-fire the review, and
+    # it would duplicate the `review_label` default as a literal that can
+    # silently desync from it.
     # SHA-pinned. Bump this SHA to pick up upstream changes; keep
     # `workflows_ref` matching so prompts/scripts load from the same commit as
     # the workflow definition.
     uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@6a374b7c0d6ea603dad12a7dcbf80e6d65e314e1 # github-workflows main (6a374b7)
     with:
-      # Overriding diff_excludes replaces the reusable default wholesale, so
-      # this restates the generated/vendored defaults and adds this repo's
-      # generated and heavy paths.
-      diff_excludes: >-
-        :!**/package-lock.json
-        :!**/yarn.lock
-        :!**/pnpm-lock.yaml
-        :!**/node_modules/**
-        :!**/.claude/**
-        :!**/dist/**
-        :!**/vendor/**
-        :!**/*.generated.*
-        :!**/*.min.js
-        :!**/*.min.css
-        :!pnpm-lock.yaml
-        :!assets/**
-        :!src/low/generated/**
+      # Repo-specific generated/heavy paths. These go to
+      # extra_generated_globs, not diff_excludes: only this input feeds the
+      # shared check-pr-size classifier, so matching files drop out of BOTH the
+      # diff_size_cap count AND the reviewed diff. Under diff_excludes they
+      # would still be charged against the cap, and a regeneration of
+      # src/low/generated/** could push the PR over it and skip the whole
+      # panel — including the hand-written changes riding along with it.
+      # Supplying this REPLACES the default list, so the defaults are restated
+      # verbatim first. Plain globs, not git pathspecs (no `:!` prefix — that
+      # is diff_excludes' syntax and is matched literally here). Lockfiles are
+      # already classifier built-ins, so pnpm-lock.yaml needs no entry.
+      extra_generated_globs: >-
+        **/node_modules/**
+        **/dist/**
+        **/vendor/**
+        **/*.generated.*
+        **/*.min.js
+        **/*.min.css
+        assets/**
+        src/low/generated/**
       # Load the prompts/scripts from the same ref as `uses:`.
       workflows_ref: 6a374b7c0d6ea603dad12a7dcbf80e6d65e314e1
     secrets:

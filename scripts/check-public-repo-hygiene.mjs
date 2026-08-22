@@ -82,9 +82,9 @@ const PUBLIC_COMFY_ORG_REPOS = new Set([
   "ComfyUI",
   // Reusable GitHub Actions workflows (cursor-review and friends). Verified
   // public: `gh repo view Comfy-Org/github-workflows` reports
-  // visibility=PUBLIC. It has to be public for a `uses:` reference from this
-  // repo to resolve at all -- a private reusable workflow would fail the run,
-  // so a passing cursor-review run is itself evidence of its visibility.
+  // visibility=PUBLIC. That check is the only admissible evidence -- a
+  // resolving `uses:` reference proves nothing, since GitHub lets private and
+  // internal repos share reusable workflows with other repos in the same org.
   "github-workflows",
 ]);
 // CODEOWNERS team handles (`@Comfy-Org/<team>`) are inherently public on a
