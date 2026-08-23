@@ -306,6 +306,10 @@ are only exposed by direct `ComfyLow` calls.
 
 All extend a shared `ComfyError` (`code`, `httpStatus`, `details`).
 
+`QueueFull.retryAfter` is nullable when the server omits the header. This is a
+breaking type change from earlier releases: check for `null` before using it in
+duration arithmetic or custom backoff logic.
+
 ```ts
 import { JobFailed, MissingAsset } from "@comfyorg/sdk";
 
