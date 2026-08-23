@@ -49,6 +49,8 @@ export interface ServerState {
    * fallback exists for.
    */
   omitQueueFullRetryAfter: boolean;
+  /** When true, an SSE 429 omits its `Retry-After` header. */
+  omitEventsRetryAfter: boolean;
   /** POST /jobs returns this error envelope instead of 201. */
   jobError: { status: number; code: string } | null;
   /** Number of GET /jobs/{id} polls before the job reports terminal. */
@@ -147,6 +149,7 @@ function defaultState(): ServerState {
     queueFullCode: "queue_full",
     retryAfterHeader: "0",
     omitQueueFullRetryAfter: false,
+    omitEventsRetryAfter: false,
     jobError: null,
     pollsToSucceed: 1,
     terminalStatus: "succeeded",
@@ -468,7 +471,10 @@ export class StubServer {
     const state = this.state;
     state.eventsConnectCount += 1;
     if (state.eventsStatus !== null) {
-      const headers = state.eventsStatus === 429 ? { "Retry-After": state.retryAfterHeader } : {};
+      const headers =
+        state.eventsStatus === 429 && !state.omitEventsRetryAfter
+          ? { "Retry-After": state.retryAfterHeader }
+          : {};
       sendJson(
         res,
         state.eventsStatus,

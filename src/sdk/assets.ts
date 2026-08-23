@@ -242,8 +242,9 @@ export class AssetFactory {
    * Client-side download (not a server-side fetch): the bytes must
    * transit the same blake3 -> dedup -> upload pipeline as every other
    * source. Routed through `low.request` (not a raw `fetch`) so this
-   * download honors the client's injected `fetch` and default timeout the
-   * same as every other call, and can be cancelled via `signal`.
+   * download honors the client's injected `fetch`. No default timeout is
+   * imposed on the body transfer; pass `signal` to cancel it. A non-2xx
+   * response throws a plain `Error` containing the HTTP status.
    */
   async fromUrl(url: string, options: { signal?: AbortSignal } = {}): Promise<Asset> {
     // Normalized because low.request recognizes an absolute URL by a
@@ -253,6 +254,7 @@ export class AssetFactory {
     const response = await this.low.request("GET", target.href, {
       signal: options.signal,
       redirect: "follow",
+      timeoutMs: null,
     });
     if (!response.ok) {
       throw new Error(`failed to download ${url}: HTTP ${response.status}`);

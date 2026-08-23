@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { StubServer } from "../../test/support/stub-server.js";
 import { ComfyLow } from "../low/index.js";
@@ -158,6 +158,25 @@ describe("AssetFactory / Asset", () => {
     // Checked before any commit()/upload call, so this isolates the download
     // itself — a raw global `fetch(...)` in `fromUrl` would leave this at 0.
     expect(injectedFetchCalls).toBeGreaterThan(0);
+  });
+
+  it("fromUrl disables the client's default timeout for the download", async () => {
+    let receivedSignal: AbortSignal | null | undefined;
+    const inspectingFetch = vi.fn<typeof fetch>(async (_input, init) => {
+      receivedSignal = init?.signal;
+      return new Response("downloaded-bytes", { status: 200 });
+    });
+    const noTimeoutAssets = new AssetFactory(
+      new ComfyLow("https://api.example.test", undefined, {
+        fetch: inspectingFetch,
+        timeoutMs: 1,
+      }),
+    );
+
+    await noTimeoutAssets.fromUrl("https://cdn.example.test/large.bin");
+
+    expect(inspectingFetch).toHaveBeenCalledOnce();
+    expect(receivedSignal).toBeUndefined();
   });
 
   it("fromUrl attaches the bearer token same-origin but not to a third-party origin", async () => {

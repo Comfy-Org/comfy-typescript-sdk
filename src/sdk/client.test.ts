@@ -115,6 +115,21 @@ describe("Comfy", () => {
     expect(server.state.submitCount).toBe(3); // 2 x deployment_not_ready + 1 success
   });
 
+  it.each(["-1", "NaN"])(
+    "submit() uses the default pause for invalid Retry-After %s",
+    async (value) => {
+      server.state.queueFullTimes = 1;
+      server.state.retryAfterHeader = value;
+      vi.mocked(abortableSleep).mockImplementationOnce(() => Promise.resolve());
+      const wf = client.workflows.fromJson({ "1": {} });
+
+      await client.submit(wf);
+
+      expect(abortableSleep).toHaveBeenCalledWith(2_000, undefined);
+      expect(server.state.submitCount).toBe(2);
+    },
+  );
+
   it("submit() clamps a 429 Retry-After far larger than the retry budget, instead of sleeping past it", async () => {
     server.state.queueFullTimes = 1;
     server.state.retryAfterHeader = "86400"; // 24h — a malicious/misbehaving server value

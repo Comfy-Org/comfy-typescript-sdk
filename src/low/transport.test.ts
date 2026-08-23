@@ -122,9 +122,7 @@ describe("ComfyLow transport", () => {
     expect(result.expiresAt).toBeNull();
   });
 
-  it("getAssetContentUrl never throws for a real 404 — no, it maps to the usual typed error", async () => {
-    // Sanity check that a genuine failure still surfaces via the existing
-    // error mapping rather than being swallowed by the "never throws" cases.
+  it("getAssetContentUrl maps a real 404 to the usual typed error", async () => {
     await expect(low.getAssetContentUrl("")).rejects.toBeTruthy();
   });
 
@@ -382,6 +380,14 @@ describe("ComfyLow transport", () => {
   it("falls back to a null retryAfter (not NaN) for a Retry-After in HTTP-date form", async () => {
     server.state.queueFullTimes = 1;
     server.state.retryAfterHeader = "Wed, 21 Oct 2026 07:28:00 GMT";
+    const err = await low.postJobs({ "1": {} }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(QueueFull);
+    expect((err as QueueFull).retryAfter).toBeNull();
+  });
+
+  it.each(["-1", "NaN"])("treats an invalid Retry-After value %s as absent", async (value) => {
+    server.state.queueFullTimes = 1;
+    server.state.retryAfterHeader = value;
     const err = await low.postJobs({ "1": {} }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(QueueFull);
     expect((err as QueueFull).retryAfter).toBeNull();

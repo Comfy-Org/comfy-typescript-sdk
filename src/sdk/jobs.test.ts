@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StubServer } from "../../test/support/stub-server.js";
 import { ComfyLow } from "../low/index.js";
 import { abortableSleep } from "./abortable-sleep.js";
-import { JobFailed, NotFound } from "./exceptions.js";
+import { Forbidden, JobFailed, NotFound } from "./exceptions.js";
 import { JobFactory } from "./jobs.js";
 
 // Spies on (not replaces) abortableSleep by default, so every other test
@@ -179,6 +179,53 @@ describe("Job", () => {
     expect(server.state.eventsConnectCount).toBe(1);
     expect(server.state.jobPollCount).toBe(2);
   }, 2000);
+
+  it("events() uses the default backoff when a 429 omits Retry-After", async () => {
+    server.state.eventsStatus = 429;
+    server.state.eventsErrorCode = "too_many_streams";
+    server.state.omitEventsRetryAfter = true;
+    server.state.pollsToSucceed = 1_000_000;
+    const job = await jobs.get("job_01");
+    const controller = new AbortController();
+    vi.mocked(abortableSleep).mockImplementationOnce((_ms, signal) => {
+      controller.abort();
+      return Promise.reject(signal?.reason);
+    });
+
+    await expect(job.events(controller.signal).next()).rejects.toBeTruthy();
+    expect(abortableSleep).toHaveBeenCalledWith(2_000, controller.signal);
+    expect(server.state.eventsConnectCount).toBe(1);
+  });
+
+  it.each(["-1", "NaN"])(
+    "events() uses the default backoff for invalid Retry-After %s",
+    async (value) => {
+      server.state.eventsStatus = 429;
+      server.state.eventsErrorCode = "too_many_streams";
+      server.state.retryAfterHeader = value;
+      server.state.pollsToSucceed = 1_000_000;
+      const job = await jobs.get("job_01");
+      const controller = new AbortController();
+      vi.mocked(abortableSleep).mockImplementationOnce((_ms, signal) => {
+        controller.abort();
+        return Promise.reject(signal?.reason);
+      });
+
+      await expect(job.events(controller.signal).next()).rejects.toBeTruthy();
+      expect(abortableSleep).toHaveBeenCalledWith(2_000, controller.signal);
+      expect(server.state.eventsConnectCount).toBe(1);
+    },
+  );
+
+  it("events() translates a non-retryable protocol error instead of reconnecting", async () => {
+    server.state.eventsStatus = 403;
+    server.state.eventsErrorCode = "forbidden";
+    const job = await jobs.get("job_01");
+
+    await expect(job.events().next()).rejects.toBeInstanceOf(Forbidden);
+    expect(server.state.eventsConnectCount).toBe(1);
+    expect(server.state.jobPollCount).toBe(1);
+  });
 
   it("events() clamps an absurd SSE 429 Retry-After to MAX_RECONNECT_PAUSE_MS, instead of pausing for it verbatim", async () => {
     server.state.eventsStatus = 429;

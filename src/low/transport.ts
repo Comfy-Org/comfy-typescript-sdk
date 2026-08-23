@@ -152,7 +152,7 @@ function parseRetryAfter(response: Response): number | null {
   const raw = response.headers.get("Retry-After");
   if (raw === null) return null;
   const seconds = Number.parseInt(raw, 10);
-  return Number.isNaN(seconds) ? null : seconds;
+  return Number.isNaN(seconds) || seconds < 0 ? null : seconds;
 }
 
 /** Synchronous protocol bindings — async throughout (JS is async-native). */
@@ -395,9 +395,8 @@ export class ComfyLow {
    * {@link getAssetContent}), both so its `Location` can be read and so this
    * client's bearer token is never attached to the object-storage host. On a
    * self-hosted proxy (which serves the bytes inline, no redirect) this
-   * returns the endpoint's own absolute URL instead. Works on every backend
-   * and never throws for either shape — only a genuine failure maps to the
-   * usual typed error.
+   * returns the endpoint's own absolute URL instead. Works on every backend;
+   * a genuine failure maps to the usual typed error.
    */
   async getAssetContentUrl(
     assetId: string,

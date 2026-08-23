@@ -181,7 +181,7 @@ export class Comfy {
     // A falsy apiKey (undefined or "") means "no key" — send no extra_data,
     // matching the Python SDK's behavior so the two stay in lockstep.
     const extraData = options.apiKey ? { api_key_comfy_org: options.apiKey } : undefined;
-    const deadline = Date.now() + QUEUE_RETRY_BUDGET_MS;
+    const deadline = performance.now() + QUEUE_RETRY_BUDGET_MS;
     for (;;) {
       try {
         const job = await this.low.postJobs(graph, {
@@ -201,7 +201,7 @@ export class Comfy {
         // Clamp the sleep to what's left of the budget: a malicious or
         // misbehaving server's Retry-After (e.g. 86400s) must not sleep past
         // it — the loop-entry check alone doesn't bound the sleep itself.
-        const remainingMs = deadline - Date.now();
+        const remainingMs = deadline - performance.now();
         if (exc.httpStatus === 429 && retryDelayS !== null && remainingMs > 0) {
           await abortableSleep(Math.min(retryDelayS * 1000, remainingMs), options.signal);
           continue;

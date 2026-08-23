@@ -127,8 +127,7 @@ export class Output {
    * object-storage backend (Cloud/serverless) this is a signed URL and
    * `expiresAt` is set; on a self-hosted proxy (which serves the bytes
    * inline) it's this asset's own content URL and `expiresAt` is `null`.
-   * Works on every backend and never throws for either shape — only a
-   * genuine failure maps to the usual typed error.
+   * Works on every backend; a genuine failure maps to the usual typed error.
    */
   async getDownloadUrl(): Promise<{ url: string; expiresAt: Date | null }> {
     return translate(() => this.low.getAssetContentUrl(this.model.id));

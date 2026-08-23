@@ -20,12 +20,14 @@ import type {
 import { abortableSleep } from "./abortable-sleep.js";
 import { backoffSchedule, isTerminal, SUCCESS } from "./core.js";
 import { eventFromRaw, type ComfyEvent, type StatusChange } from "./events.js";
-import { JobFailed, translate } from "./exceptions.js";
+import { JobFailed, toSdkError, translate } from "./exceptions.js";
 import { Output } from "./outputs.js";
 
 // Pause before reconnecting an SSE stream that dropped mid-job, without a
 // terminal frame having been seen.
 const RECONNECT_PAUSE_MS = 100;
+// Match submit()'s fallback when a 429 omits a usable Retry-After value.
+const DEFAULT_429_RECONNECT_PAUSE_MS = 2_000;
 // Ceiling on a server-supplied 429 Retry-After used as the reconnect pause —
 // this loop has no overall deadline of its own (only an optional caller
 // signal), so an unbounded value from a malicious/misbehaving server would
@@ -183,18 +185,18 @@ export class Job {
         // swallowed as an ordinary mid-stream drop.
         if (signal?.aborted) throw exc;
         if (exc instanceof ApiError) {
-          // 501 means this deployment doesn't serve live SSE at all; the
-          // poll path is the permanent substitute, not something to
-          // reconnect from — reconnecting would just repeat the same 501.
+          // 501 means this deployment doesn't serve live SSE. End the
+          // iterator; callers can use wait() to poll for completion.
           if (exc.httpStatus === 501) return;
-          // Back off for as long as the server asked, instead of hammering
-          // it at the fixed reconnect cadence it is trying to shed.
-          if (exc.httpStatus === 429 && exc.retryAfter != null) {
-            reconnectPauseMs = Math.min(exc.retryAfter * 1000, MAX_RECONNECT_PAUSE_MS);
+          if (exc.httpStatus === 429) {
+            const retryAfterMs =
+              exc.retryAfter === null ? DEFAULT_429_RECONNECT_PAUSE_MS : exc.retryAfter * 1000;
+            reconnectPauseMs = Math.min(retryAfterMs, MAX_RECONNECT_PAUSE_MS);
+          } else {
+            throw toSdkError(exc);
           }
         }
-        // Connection dropped mid-stream (or an unrecognized ApiError) —
-        // reconnect below.
+        // Connection dropped mid-stream (or the server returned 429) — reconnect below.
       }
       if (terminalSeen) return;
       // Stream ended without a terminal frame. Poll the authoritative
