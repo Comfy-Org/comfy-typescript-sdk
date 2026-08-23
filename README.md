@@ -446,3 +446,7 @@ pnpm format           # oxfmt --write
 pnpm test:coverage    # vitest run --coverage
 pnpm check:spec-drift # fails if src/low/generated/* is stale vs. the spec
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contributor workflow —
+setup, the checks CI runs, and the rules around generated code. Release
+history is in [CHANGELOG.md](CHANGELOG.md).
