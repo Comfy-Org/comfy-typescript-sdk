@@ -59,11 +59,11 @@ export class IdempotencyKeyReuse extends ComfyError {}
 
 export class InsufficientCredits extends ComfyError {}
 
-/** Backpressure: the queue is full. `retryAfter` is seconds to wait. */
+/** Backpressure: the queue is full. `retryAfter` is seconds to wait when supplied. */
 export class QueueFull extends ComfyError {
-  readonly retryAfter: number;
+  readonly retryAfter: number | null;
 
-  constructor(message: string, options: ComfyErrorOptions & { retryAfter: number }) {
+  constructor(message: string, options: ComfyErrorOptions & { retryAfter: number | null }) {
     super(message, options);
     this.retryAfter = options.retryAfter;
   }
@@ -107,7 +107,7 @@ const BY_CODE: Record<string, ComfyErrorClass> = {
 export function toSdkError(exc: ApiError): ComfyError {
   if (exc.code === "queue_full") {
     return new QueueFull(exc.message, {
-      retryAfter: exc.retryAfter ?? 0,
+      retryAfter: exc.retryAfter,
       code: exc.code,
       httpStatus: exc.httpStatus,
       details: exc.details,

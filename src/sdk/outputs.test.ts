@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { StubServer } from "../../test/support/stub-server.js";
-import { ComfyLow } from "../low/index.js";
+import { ApiError, ComfyLow } from "../low/index.js";
+import { ComfyError, NotFound } from "./exceptions.js";
 import { JobFactory } from "./jobs.js";
 import { Output } from "./outputs.js";
 
@@ -104,6 +105,46 @@ describe("Output", () => {
     const result = await output().getDownloadUrl();
     expect(result.url).toBe(signedUrl);
     expect(result.expiresAt).toEqual(new Date("2026-07-22T00:01:00.000Z"));
+  });
+
+  // -- error translation ---------------------------------------------------
+  // A deleted asset 404s at every download method; the raw `low.ApiError`
+  // must surface as the SDK's typed NotFound (extends ComfyError), not leak
+  // through untranslated the way it did before `translate()` was wired in.
+
+  it("toFile raises the SDK's NotFound, not the raw low.ApiError, for a deleted asset", async () => {
+    server.state.deletedAssets.add("asset_out_01");
+    const dir = await mkdtemp(join(tmpdir(), "comfy-sdk-out-"));
+    try {
+      const err = await output()
+        .toFile(join(dir, "out.png"))
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(NotFound);
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err).not.toBeInstanceOf(ApiError);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("toBytes raises the SDK's NotFound, not the raw low.ApiError, for a deleted asset", async () => {
+    server.state.deletedAssets.add("asset_out_01");
+    const err = await output()
+      .toBytes()
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(NotFound);
+    expect(err).toBeInstanceOf(ComfyError);
+    expect(err).not.toBeInstanceOf(ApiError);
+  });
+
+  it("getDownloadUrl raises the SDK's NotFound, not the raw low.ApiError, for a deleted asset", async () => {
+    server.state.deletedAssets.add("asset_out_01");
+    const err = await output()
+      .getDownloadUrl()
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(NotFound);
+    expect(err).toBeInstanceOf(ComfyError);
+    expect(err).not.toBeInstanceOf(ApiError);
   });
 
   it("getDownloadUrl resolves each output of a multi-output job to its own distinct URL", async () => {

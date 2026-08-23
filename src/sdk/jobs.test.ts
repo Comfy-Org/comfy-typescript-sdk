@@ -1,9 +1,15 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { StubServer } from "../../test/support/stub-server.js";
 import { ComfyLow } from "../low/index.js";
-import { JobFailed, NotFound } from "./exceptions.js";
+import { abortableSleep } from "./abortable-sleep.js";
+import { Forbidden, JobFailed, NotFound } from "./exceptions.js";
 import { JobFactory } from "./jobs.js";
+
+// Spies on (not replaces) abortableSleep by default, so every other test
+// here still sleeps for real; only the clamp test below overrides a single
+// call to avoid actually waiting out a clamped-but-still-long pause.
+vi.mock("./abortable-sleep.js", { spy: true });
 
 describe("Job", () => {
   let server: StubServer;
@@ -19,6 +25,7 @@ describe("Job", () => {
 
   afterEach(async () => {
     await server.stop();
+    vi.mocked(abortableSleep).mockClear();
   });
 
   it("result() polls to a terminal state without ever touching SSE", async () => {
@@ -132,6 +139,114 @@ describe("Job", () => {
     // The first backoff step is 500ms; aborting mid-wait must interrupt
     // that sleep, not merely the in-flight fetch.
     expect(Date.now() - start).toBeLessThan(400);
+  }, 2000);
+
+  it("events() terminates on a 501 not_implemented instead of reconnect-storming", async () => {
+    server.state.eventsStatus = 501;
+    server.state.eventsErrorCode = "not_implemented";
+    server.state.pollsToSucceed = 1_000_000; // never terminal via polling either
+    const job = await jobs.get("job_01");
+    const events: unknown[] = [];
+    for await (const event of job.events()) {
+      events.push(event);
+    }
+    // 501 ends the generator directly — no fabricated terminal frame, no
+    // poll fallback, and exactly one SSE attempt (the whole point: the old
+    // catch swallowed this into a 100ms reconnect loop for the job's life).
+    expect(events).toEqual([]);
+    expect(server.state.eventsConnectCount).toBe(1);
+    // pollCount is 1 from jobs.get() above, not from events() — 501 must add none.
+    expect(server.state.jobPollCount).toBe(1);
+  });
+
+  it("events() honours Retry-After on a 429, instead of the fixed reconnect cadence", async () => {
+    server.state.eventsStatus = 429;
+    server.state.eventsErrorCode = "too_many_streams";
+    server.state.retryAfterHeader = "5"; // seconds — far longer than RECONNECT_PAUSE_MS (100ms)
+    server.state.pollsToSucceed = 1_000_000; // poll backstop never resolves either
+    const job = await jobs.get("job_01");
+    const controller = new AbortController();
+    const iterator = job.events(controller.signal);
+    setTimeout(() => controller.abort(), 300);
+    await expect(iterator.next()).rejects.toBeTruthy(); // aborted mid reconnect-pause
+    // The server asked for 5s; a bare "paused longer than 300ms" assertion
+    // would also pass on a 301ms pause that ignored the header entirely.
+    expect(vi.mocked(abortableSleep)).toHaveBeenCalledWith(5_000, controller.signal);
+    // One SSE attempt, one poll refresh (that precedes the pause) beyond
+    // jobs.get()'s own poll above — at the old fixed 100ms cadence, a 300ms
+    // window would have produced several of each. This is the
+    // request-amplification assertion.
+    expect(server.state.eventsConnectCount).toBe(1);
+    expect(server.state.jobPollCount).toBe(2);
+  }, 2000);
+
+  it("events() uses the default backoff when a 429 omits Retry-After", async () => {
+    server.state.eventsStatus = 429;
+    server.state.eventsErrorCode = "too_many_streams";
+    server.state.omitEventsRetryAfter = true;
+    server.state.pollsToSucceed = 1_000_000;
+    const job = await jobs.get("job_01");
+    const controller = new AbortController();
+    vi.mocked(abortableSleep).mockImplementationOnce((_ms, signal) => {
+      controller.abort();
+      return Promise.reject(signal?.reason);
+    });
+
+    await expect(job.events(controller.signal).next()).rejects.toBeTruthy();
+    expect(abortableSleep).toHaveBeenCalledWith(2_000, controller.signal);
+    expect(server.state.eventsConnectCount).toBe(1);
+  });
+
+  it.each(["-1", "NaN"])(
+    "events() uses the default backoff for invalid Retry-After %s",
+    async (value) => {
+      server.state.eventsStatus = 429;
+      server.state.eventsErrorCode = "too_many_streams";
+      server.state.retryAfterHeader = value;
+      server.state.pollsToSucceed = 1_000_000;
+      const job = await jobs.get("job_01");
+      const controller = new AbortController();
+      vi.mocked(abortableSleep).mockImplementationOnce((_ms, signal) => {
+        controller.abort();
+        return Promise.reject(signal?.reason);
+      });
+
+      await expect(job.events(controller.signal).next()).rejects.toBeTruthy();
+      expect(abortableSleep).toHaveBeenCalledWith(2_000, controller.signal);
+      expect(server.state.eventsConnectCount).toBe(1);
+    },
+  );
+
+  it("events() translates a non-retryable protocol error instead of reconnecting", async () => {
+    server.state.eventsStatus = 403;
+    server.state.eventsErrorCode = "forbidden";
+    const job = await jobs.get("job_01");
+
+    await expect(job.events().next()).rejects.toBeInstanceOf(Forbidden);
+    expect(server.state.eventsConnectCount).toBe(1);
+    expect(server.state.jobPollCount).toBe(1);
+  });
+
+  it("events() clamps an absurd SSE 429 Retry-After to MAX_RECONNECT_PAUSE_MS, instead of pausing for it verbatim", async () => {
+    server.state.eventsStatus = 429;
+    server.state.eventsErrorCode = "too_many_streams";
+    server.state.retryAfterHeader = "86400"; // 24h — a malicious/misbehaving server value
+    server.state.pollsToSucceed = 1_000_000; // poll backstop never resolves either
+    // Only this one call is overridden to resolve instantly, matching the
+    // client.ts clamp test; the loop's second (real) reconnect pause is
+    // still interrupted promptly by the abort below, so this never actually
+    // waits out the clamp — the clamp is verified from the captured value.
+    vi.mocked(abortableSleep).mockImplementationOnce(() => Promise.resolve());
+    const job = await jobs.get("job_01");
+    const controller = new AbortController();
+    const iterator = job.events(controller.signal);
+    setTimeout(() => controller.abort(), 50);
+    await expect(iterator.next()).rejects.toBeTruthy();
+    expect(abortableSleep).toHaveBeenCalled();
+    const [ms] = vi.mocked(abortableSleep).mock.calls[0];
+    // retryAfter * 1000 would be 86_400_000ms unclamped; MAX_RECONNECT_PAUSE_MS
+    // is 60_000ms — the regression this guards against.
+    expect(ms).toBe(60_000);
   }, 2000);
 
   it("events() stops promptly when its AbortSignal aborts during the reconnect pause", async () => {

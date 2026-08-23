@@ -352,6 +352,10 @@ longer holds.
 Protocol-level failures are raised as one exception class per error code, so
 you can catch what you actually expect instead of string-matching messages:
 
+Catch these SDK-level exceptions around `Comfy` methods. Public asset, job,
+event, and output helpers translate protocol errors; raw low-level exceptions
+are only exposed by direct `ComfyLow` calls.
+
 - `Unauthorized`, `Forbidden`, `NotFound`
 - `InvalidWorkflow` (and `WorkflowFormatUi`, for submitting a UI-export
   instead of an API-format graph)
@@ -364,12 +368,16 @@ you can catch what you actually expect instead of string-matching messages:
   so reusing your own explicit `idempotencyKey` throws this. After an ambiguous
   failure, poll or list your jobs instead of resubmitting with the same key.
 - `InsufficientCredits`
-- `QueueFull` (carries `retryAfter`; `submit()` already retries this one
-  transparently)
+- `QueueFull` (carries `retryAfter: number | null`; `submit()` retries 429
+  responses with `Retry-After` for a bounded budget, including deployment warm-up)
 - `JobFailed` — a job reached a non-`succeeded` terminal state (carries the
   node-level `error` detail when the platform provided one)
 
 All extend a shared `ComfyError` (`code`, `httpStatus`, `details`).
+
+`QueueFull.retryAfter` is nullable when the server omits the header. This is a
+breaking type change from earlier releases: check for `null` before using it in
+duration arithmetic or custom backoff logic.
 
 ```ts
 import { JobFailed, MissingAsset } from "@comfyorg/sdk";
