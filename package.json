@@ -37,6 +37,10 @@
     "./low": {
       "types": "./dist/low/index.d.ts",
       "default": "./dist/low/index.js"
+    },
+    "./errors": {
+      "types": "./dist/sdk/routerErrors.d.ts",
+      "default": "./dist/sdk/routerErrors.js"
     }
   },
   "scripts": {

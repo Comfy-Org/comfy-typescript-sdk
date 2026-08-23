@@ -456,6 +456,85 @@ try {
 }
 ```
 
+### Router errors (`comfy.models.run`)
+
+Model execution has its own error contract, and its own exception hierarchy to
+match. Every failure carries a coarse, machine-readable `error_type` on the
+`X-Comfy-Error-Type` response header; this SDK turns that value into one class
+per bucket, all descending from `RouterError`. The Python SDK spells every one
+of these names identically, so a snippet transfers between the two languages
+unchanged.
+
+They live in their own namespace because three of the names —
+`Unauthorized`, `Forbidden`, `InsufficientCredits` — are already taken above by
+the workflow-API exceptions, which are unrelated classes descending from
+`ComfyError`:
+
+```ts
+import { routerErrors } from "@comfyorg/sdk";
+// or, to import the classes directly:
+import { ContentPolicyViolation, InvalidInput } from "@comfyorg/sdk/errors";
+```
+
+The set is closed at eleven buckets in this release. Six are request-level:
+
+- `InvalidInput` — the request was rejected as invalid, by the model or before
+  dispatch. Carries `detail[]` (see below)
+- `ContentPolicyViolation` — the model's content policy refused the request.
+  Deterministic: retrying the same input will not succeed, which is why this is
+  a separate class from `ProviderError` rather than a flavor of it
+- `ProviderError` — the upstream model provider returned an error
+- `ProviderTimeout` — the upstream provider did not respond in time (a
+  Comfy-side deadline is `InternalError`, not this)
+- `InsufficientCredits`
+- `ModelNotFound`
+
+and five are transport-level: `Unauthorized`, `Forbidden`,
+`ConcurrencyLimitExceeded`, `ClientDisconnected`, `InternalError`.
+
+Every one of them carries `errorType`, `requestId` (the server-minted id off
+`X-Comfy-Request-Id` — the value to quote in a support request) and
+`httpStatus`.
+
+An `error_type` this release has never heard of — a newer server, three more
+buckets are already planned — surfaces as a plain `RouterError` carrying the
+raw value in `errorType`, never as an untyped throw. Catching `RouterError`
+therefore keeps working across a server upgrade.
+
+`InvalidInput` is the one class with extra structure. A model-level validation
+failure names the offending fields, and those entries stay structured rather
+than being flattened into the message:
+
+```ts
+try {
+  await comfy.models.run("owner/model", { prompt: "a cat" });
+} catch (err) {
+  if (err instanceof routerErrors.InvalidInput) {
+    for (const d of err.detail) {
+      console.error(d.loc.join("."), d.type, d.msg, d.ctx);
+      // e.g. "body.image_url" "image_too_small" "..." { min_width: 512 }
+    }
+  } else if (err instanceof routerErrors.ContentPolicyViolation) {
+    // Do not retry this one.
+  } else if (err instanceof routerErrors.RouterError) {
+    console.error(err.errorType, "request id:", err.requestId);
+  } else {
+    throw err;
+  }
+}
+```
+
+`d.type` is the provider's own specific reason (`image_too_small`,
+`greater_than`, `unsupported_audio_format`, `missing`, ...) and `d.ctx` is the
+bound it violated. Both are deliberately open — the provider vocabulary grows
+on the provider's release cycle, not this SDK's — so treat an unrecognized
+`type` as informational rather than switching exhaustively on it. `detail` is an
+empty array for a rejection that names no field.
+
+Note that `comfy.models.run` does not execute anything yet (see
+[Module-level config](#module-level-config-comfyconfig-and-comfymodels)); these
+classes are the error contract, shipped ahead of the call that raises them.
+
 ## Two layers
 
 - **`@comfyorg/sdk`** — the idiomatic client above: asset dedup/upload,
