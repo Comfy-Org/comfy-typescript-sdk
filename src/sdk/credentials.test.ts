@@ -3,14 +3,18 @@ import util from "node:util";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { withRouterStub } from "../../test/support/router-stub-server.js";
 import {
   Comfy,
   comfy,
+  COMFY_ROUTER_BASE_URL,
+  ComfyError,
   config,
   CREDENTIALS_ENV_VAR,
   MissingCredentials,
-  ModelRunNotImplemented,
+  resolveBaseUrl,
   resolveCredentials,
+  ROUTER_BASE_URL_ENV_VAR,
 } from "./index.js";
 
 const SECRET = "comfyui-test-credential-do-not-log";
@@ -20,11 +24,12 @@ beforeEach(() => {
   // The ambient shell may export a real key; neutralize it so these tests
   // measure the SDK rather than the operator's environment.
   vi.stubEnv(CREDENTIALS_ENV_VAR, undefined);
-  config({ credentials: undefined });
+  vi.stubEnv(ROUTER_BASE_URL_ENV_VAR, undefined);
+  config({ credentials: undefined, baseUrl: undefined });
 });
 
 afterEach(() => {
-  config({ credentials: undefined });
+  config({ credentials: undefined, baseUrl: undefined });
   vi.unstubAllEnvs();
   vi.unstubAllGlobals();
 });
@@ -147,14 +152,23 @@ describe("credential redaction", () => {
     expect((err as Error).stack ?? "").not.toContain(SECRET);
   });
 
-  it("keeps the credential out of an error thrown while it is configured", async () => {
-    config({ credentials: SECRET });
-    const err = await comfy.models
-      .run("owner/model", { prompt: SECRET })
-      .catch((exc: unknown) => exc);
-    expect(err).toBeInstanceOf(ModelRunNotImplemented);
-    assertRedacted("ModelRunNotImplemented", err);
-    expect((err as Error).stack ?? "").not.toContain(SECRET);
+  it("keeps the credential out of an error raised by a failed run", async () => {
+    await withRouterStub(async (server) => {
+      config({ credentials: SECRET, baseUrl: server.baseUrl });
+      server.state.status = 422;
+      server.state.errorType = "invalid_input";
+      server.state.body = {
+        detail: [{ loc: ["body", "prompt"], msg: "rejected", type: "value_error" }],
+      };
+      // The credential travels in the Authorization header and the input is
+      // echoed nowhere, so neither can reach the thrown error.
+      const err = await comfy.models
+        .run("owner/model", { prompt: SECRET })
+        .catch((exc: unknown) => exc);
+      expect(err).toBeInstanceOf(ComfyError);
+      assertRedacted("ComfyError", err);
+      expect((err as Error).stack ?? "").not.toContain(SECRET);
+    });
   });
 
   it("keeps the credential out of a config() type error", () => {
@@ -182,5 +196,63 @@ describe("credential redaction", () => {
     });
     await client.jobs.get("j1").catch(() => {});
     expect(auth).toBe(`Bearer ${SECRET}`);
+  });
+});
+
+describe("comfy.config({ baseUrl })", () => {
+  it("names the environment variable and the default host", () => {
+    expect(ROUTER_BASE_URL_ENV_VAR).toBe("COMFY_ROUTER_BASE_URL");
+    expect(COMFY_ROUTER_BASE_URL).toBe("https://api.comfy.org");
+  });
+
+  it("defaults to the Comfy API host when nothing is configured", () => {
+    expect(resolveBaseUrl()).toBe(COMFY_ROUTER_BASE_URL);
+  });
+
+  it("prefers an explicitly configured value over the environment", () => {
+    vi.stubEnv(ROUTER_BASE_URL_ENV_VAR, "https://from-env.invalid");
+    comfy.config({ baseUrl: "https://configured.invalid" });
+    expect(resolveBaseUrl()).toBe("https://configured.invalid");
+  });
+
+  it("falls back to the environment, and back to the default once cleared", () => {
+    vi.stubEnv(ROUTER_BASE_URL_ENV_VAR, "https://from-env.invalid");
+    expect(resolveBaseUrl()).toBe("https://from-env.invalid");
+    config({ baseUrl: "https://configured.invalid" });
+    config({ baseUrl: undefined });
+    expect(resolveBaseUrl()).toBe("https://from-env.invalid");
+    vi.stubEnv(ROUTER_BASE_URL_ENV_VAR, undefined);
+    expect(resolveBaseUrl()).toBe(COMFY_ROUTER_BASE_URL);
+  });
+
+  it("strips a trailing slash so a path is never appended to a double one", () => {
+    config({ baseUrl: "https://configured.invalid/" });
+    expect(resolveBaseUrl()).toBe("https://configured.invalid");
+  });
+
+  it("rejects a URL that would corrupt every request path", () => {
+    for (const bad of ["not-a-url", "ftp://x.invalid", "https://x.invalid?a=1", "https://x#f"]) {
+      expect(() => {
+        config({ baseUrl: bad });
+      }, bad).toThrow(TypeError);
+    }
+  });
+
+  it("rejects a malformed environment value rather than silently using the default", () => {
+    vi.stubEnv(ROUTER_BASE_URL_ENV_VAR, "not-a-url");
+    expect(() => resolveBaseUrl()).toThrow(TypeError);
+  });
+
+  it("is independent of the class client's own base URL setting", () => {
+    // Two surfaces, two settings — see COMFY_ROUTER_BASE_URL's doc comment.
+    config({ baseUrl: "https://router.invalid" });
+    expect(resolveBaseUrl()).toBe("https://router.invalid");
+    expect(COMFY_ROUTER_BASE_URL).not.toBe("https://cloud.comfy.org");
+  });
+
+  it("leaves the credential alone when only the base URL is set", () => {
+    config({ credentials: SECRET });
+    config({ baseUrl: "https://router.invalid" });
+    expect(resolveCredentials()).toBe(SECRET);
   });
 });

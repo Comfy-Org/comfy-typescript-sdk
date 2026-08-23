@@ -17,6 +17,24 @@ Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
 entry. See CONTRIBUTING.md.
 -->
 
+### Added
+
+- `comfy.models.run(model, input)` — run a partner model by its canonical
+  `{provider}/{model}` ID and get its native output back. Resolves only when
+  the generation is complete (one call; the server does any provider-side
+  polling internally) to a `{ data, requestId }` result: `data` is the
+  provider's payload untouched, typed `unknown` by default and narrowable with
+  `run<T>(...)`; `requestId` is the server's `X-Comfy-Request-Id`, present on
+  errors too via the thrown `ComfyError`. Sends an `Idempotency-Key` on every
+  call, and defaults to a 10-minute deadline (`timeoutMs` / `signal` to
+  override). Retries, cancellation and streaming are not included.
+- `comfy.config({ baseUrl })` and the `COMFY_ROUTER_BASE_URL` environment
+  variable point `comfy.models` at another deployment. This is the Comfy API
+  host that fronts the model router — a different surface from the class
+  client's `COMFY_BASE_URL`.
+- `ComfyError.requestId` — the `X-Comfy-Request-Id` of the call that failed,
+  or `null` when the response carried none.
+
 ## [0.1.7] - 2026-08-13
 
 ### Added

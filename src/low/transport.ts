@@ -102,8 +102,20 @@ function jobBasePath(jobIdOrUrl: string): string {
   return jobIdOrUrl.replace(/\/$/, "");
 }
 
-function buildUserAgent(clientInfo?: string): string {
-  const base = `comfy-sdk-typescript/${SDK_VERSION} (node ${process.version})`;
+/**
+ * The SDK's default `User-Agent`, optionally carrying a caller's own token.
+ * Exported because every Comfy surface this package speaks to should be
+ * attributable to the SDK in request logs, including the `comfy.models`
+ * router calls in `../sdk/models.ts`, which do not go through
+ * {@link ComfyLow}.
+ */
+export function buildUserAgent(clientInfo?: string): string {
+  // `process` is read defensively because this string is now built on the
+  // `comfy.models` path too, which a browser can reach — a bare `process`
+  // there is a ReferenceError, and a browser drops a caller-set `User-Agent`
+  // anyway (it is a forbidden header name), so degrading beats throwing.
+  const runtime = globalThis.process?.version;
+  const base = `comfy-sdk-typescript/${SDK_VERSION}${runtime ? ` (node ${runtime})` : ""}`;
   if (!clientInfo) return base;
   // A caller-set token goes verbatim into a header value; reject CR/LF so it
   // can never split/inject headers (undici would reject it anyway, but fail

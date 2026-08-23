@@ -93,7 +93,9 @@ import { comfy } from "@comfyorg/sdk";
 // or: import * as comfy from "@comfyorg/sdk";
 
 comfy.config({ credentials: "comfyui-..." });
-await comfy.models.run("owner/model", { prompt: "a cat" });
+const { data, requestId } = await comfy.models.run("fal-ai/flux-pro", {
+  prompt: "a cat",
+});
 ```
 
 `comfy.config({ credentials })` sets the credential for every subsequent
@@ -116,20 +118,85 @@ and any error this SDK throws are all safe to paste into a bug report. The
 same now holds for the class client: `console.log(client)` no longer prints
 the `apiKey` you constructed it with.
 
-**`comfy.models.run` does not execute anything yet.** It resolves credentials
-and raises, locally and without opening a socket:
+### `comfy.models.run(model, input)`
 
-| Situation                 | Error                    |
-| ------------------------- | ------------------------ |
-| no credentials configured | `MissingCredentials`     |
-| credentials present       | `ModelRunNotImplemented` |
+`model` is a canonical `{provider}/{model}` ID (`"fal-ai/flux-pro"`). `input`
+is the model's own native JSON input, forwarded to the provider unchanged —
+there is no Comfy envelope to wrap it in, so an integration already written
+against the provider keeps the request body it already has.
 
-Both are `ComfyError` subclasses. The second one is a placeholder: the Comfy
-API v2 spec this SDK generates its types from declares no model-execution
-route, and the request/response types have to come from the spec rather than
-be hand-written. **To run a model today, run its workflow graph** with the
-class client — `await new Comfy({ apiKey }).run(workflow)`, as in the
-Quickstart below.
+The promise resolves **only when the generation is complete**. One call is the
+whole contract: for a provider whose own API is submit-then-poll, the server
+does that polling inside the call rather than handing back a task handle, so
+there is nothing to poll and no job to track. M1 returns the final result
+only — no progress and no streaming.
+
+It resolves to a `{ data, requestId }` result:
+
+- **`data`** is the provider's native payload, exactly as it came off the
+  wire. It is typed `unknown` by default — deliberately not `any`, which would
+  silently switch type-checking off for every field you touch. Per-model
+  schemas are published by the server (each model serves its own OpenAPI
+  document), not baked into this package, so supply the type you have:
+  `await comfy.models.run<FluxOutput>("fal-ai/flux-pro", { prompt })`.
+- **`requestId`** is the server's `X-Comfy-Request-Id` for the call — the value
+  to quote in a support request, surfaced so you never have to go reading
+  response headers to find one. It is `null` only when the response carried no
+  such header, which a proxy error page generated before the request reached
+  Comfy genuinely does not.
+
+Note this wrapper is a **deliberate difference from the Python SDK**, which
+returns the payload directly. It matches the shape a TypeScript integration
+being ported from a comparable hosted-inference client already expects; it is
+an intentional asymmetry, not a parity gap.
+
+Failures raise a `ComfyError`, and `requestId` is on the error too — an error
+response is exactly when you need one. `code` carries the server's coarse
+failure bucket (`model_not_found`, `invalid_input`, `provider_timeout`,
+`content_policy_violation`, ...), and the familiar buckets keep their existing
+classes: `Unauthorized`, `Forbidden`, `InsufficientCredits`, and `NotFound`
+for an ID that names no model. A model-level validation failure keeps its
+per-field detail on `error.details.detail`.
+
+An `Idempotency-Key` is sent on every call; one is minted per call unless you
+pass your own. Supplying your own is what makes a retry of a call whose
+response you lost replay the original result instead of running — and billing
+— the model a second time.
+
+```ts
+const { data, requestId } = await comfy.models.run(
+  "fal-ai/flux-pro",
+  { prompt: "a cat" },
+  { timeoutMs: 300_000, signal: controller.signal },
+);
+```
+
+`run` accepts a third options argument: `signal` (an `AbortSignal`, re-thrown
+as your own abort rather than dressed up as an SDK error), `timeoutMs`, and
+`idempotencyKey`. The default deadline is **10 minutes** — minutes rather than
+seconds, because the finished generation is the response and a short default
+would abort work that had already been paid for. Pass `timeoutMs: null` to
+disable the deadline, and prefer pairing that with a `signal`.
+
+Retries and cancellation are not built in yet.
+
+### Pointing `comfy.models` somewhere else
+
+`comfy.models` talks to the Comfy API host that fronts the model router
+(`https://api.comfy.org`), which is **not** the same surface `new Comfy()`
+talks to: that one speaks the Comfy API v2 job/asset routes, which a
+self-hosted proxy or a serverless deployment also serves. They are two
+settings, and pointing one at the other 404s.
+
+Set `comfy.config({ baseUrl })`, or the `COMFY_ROUTER_BASE_URL` environment
+variable, to reach a staging deployment or a local stub — explicit config
+wins, and a value that is not an http(s) URL without query or fragment is an
+error rather than a silent fallback to the default. `COMFY_BASE_URL` is the
+class client's setting and is untouched by this.
+
+**To run a workflow _graph_** — your own ComfyUI node graph rather than a
+partner model — use the class client instead: `await new Comfy({ apiKey
+}).run(workflow)`, as in the Quickstart below.
 
 ### Module formats
 
