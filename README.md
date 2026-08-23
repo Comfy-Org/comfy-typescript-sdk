@@ -123,6 +123,47 @@ await job.wait(); // poll to terminal (adaptive backoff); or call job.refresh() 
 console.log(job.status, job.outputs);
 ```
 
+## Building a workflow
+
+`client.workflows` has three constructors for the same API-format graph, so
+the graph does not have to be a file on disk:
+
+| Constructor                             | Input                                                        |
+| --------------------------------------- | ------------------------------------------------------------ |
+| `await client.workflows.fromFile(path)` | a JSON file on disk (the only async one — it reads the file) |
+| `client.workflows.fromJson(graph)`      | an already-parsed graph object, used as-is (not copied)      |
+| `client.workflows.fromString(text)`     | JSON text you already hold in memory                         |
+
+`fromJson` is the one to reach for when your app builds the graph in code —
+a template it fills in per request — rather than shipping a
+`workflow_api.json` next to it:
+
+```ts
+const wf = client.workflows.fromJson({
+  "4": {
+    class_type: "CheckpointLoaderSimple",
+    inputs: { ckpt_name: "v1-5-pruned-emaonly.safetensors" },
+  },
+  "6": { class_type: "CLIPTextEncode", inputs: { text: "", clip: ["4", 1] } },
+  // … the rest of the graph
+  "9": { class_type: "SaveImage", inputs: { filename_prefix: "ComfyUI", images: ["8", 0] } },
+});
+
+wf.setInput("6", "text", "a red fox in the snow"); // fill the prompt in per request
+const job = await client.run(wf);
+```
+
+All three return the same `Workflow`, so everything else — `setInput`,
+embedded asset handles, `run`/`submit` — behaves identically no matter how
+the graph was constructed. The graph is the **API format** (ComfyUI's "Save
+(API Format)"): an object keyed by node id, where a link to another node's
+output is `[nodeId, slotIndex]`. It stays a plain mutable object as
+`wf.json` if you would rather edit it directly, and `setInput(nodeId, field,
+value)` is sugar for `wf.json[nodeId].inputs[field] = value` that also
+accepts an asset handle. None of the three validates the graph — a UI-format
+export is caught at submit time, where it throws `WorkflowFormatUi` locally
+before any request goes out.
+
 ## Partner (API) node auth
 
 Workflows that use partner/API nodes (Gemini, etc.) need a Comfy API key to
@@ -240,11 +281,39 @@ const data = await out.toBytes(); // buffer into memory
 await out.toFile("head.png", { range: [0, 1023] }); // range-aware: first 1 KiB only
 ```
 
+Outputs are not image-only: `out.type` is the kind discriminator —
+`"image" | "video" | "audio" | "text" | "file" | "latent"` — and
+`out.contentType` carries the MIME type the server reported. Every download
+method above works the same way on all of them, so a job that saved audio or
+video is read exactly like one that saved a PNG:
+
+```ts
+const [track] = job.getOutputs("9"); // e.g. a SaveAudioMP3 node
+track.type; // "audio"
+track.contentType; // "audio/mpeg"
+await track.toFile("track.mp3");
+```
+
 `getDownloadUrl()` hands back a fetchable URL instead of streaming the bytes
 through your process — give it to a browser, a CDN, or another service:
 
 ```ts
 const { url, expiresAt } = await out.getDownloadUrl();
+```
+
+That is what you want for media a browser plays rather than your server
+processes — the bytes never pass through your process at all. On Comfy Cloud
+and serverless the URL is self-authorizing, so a page can put it straight in
+an `<audio>`/`<video>` element with no API key of its own; on a self-hosted
+proxy it is the asset's content URL and normal auth still applies (see
+below).
+
+```ts
+const [track] = job.getOutputs("9");
+if (track.type === "audio") {
+  const { url } = await track.getDownloadUrl();
+  // hand `url` to the page: <audio src={url} controls />
+}
 ```
 
 On Comfy Cloud / serverless it's a short-lived, **self-authorizing** signed
