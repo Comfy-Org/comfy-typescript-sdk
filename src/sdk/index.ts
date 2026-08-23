@@ -6,6 +6,14 @@
  */
 
 export { Comfy, BASE_URL_ENV_VAR, COMFY_CLOUD_BASE_URL, type ComfyOptions } from "./client.js";
+export { comfy } from "./comfy.js";
+export {
+  config,
+  CREDENTIALS_ENV_VAR,
+  resolveCredentials,
+  type ComfyConfig,
+} from "./credentials.js";
+export { models, type Models } from "./models.js";
 export { Asset, AssetFactory } from "./assets.js";
 export { Workflow, WorkflowFactory, type WorkflowGraph } from "./workflows.js";
 export { Job, JobFactory } from "./jobs.js";
@@ -21,6 +29,8 @@ export {
   InvalidWorkflow,
   JobFailed,
   MissingAsset,
+  MissingCredentials,
+  ModelRunNotImplemented,
   NotFound,
   QueueFull,
   Unauthorized,

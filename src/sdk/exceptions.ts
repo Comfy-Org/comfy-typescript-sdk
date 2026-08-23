@@ -59,6 +59,29 @@ export class IdempotencyKeyReuse extends ComfyError {}
 
 export class InsufficientCredits extends ComfyError {}
 
+/**
+ * No credential was configured for a `comfy.*` call. Raised locally, before
+ * any request goes out, so a misconfigured process fails at the call site
+ * instead of as a 401 from the server.
+ *
+ * The message names the two ways to supply one and never echoes a
+ * credential — there is none to echo, and `credentials.test.ts` pins that.
+ */
+export class MissingCredentials extends ComfyError {}
+
+/**
+ * `comfy.models.run` was reached with credentials in hand, but this release
+ * has no model-execution route to call: the Comfy API v2 spec this SDK
+ * generates its types from declares no such operation (see
+ * `models.spec-contract.test.ts`, which fails the moment one appears).
+ *
+ * Placeholder — the request/response types must be generated from the spec
+ * rather than hand-written, so `run` cannot be implemented before the route
+ * is in `spec/openapi.yaml`. Running a workflow *graph* works today; the
+ * message points there.
+ */
+export class ModelRunNotImplemented extends ComfyError {}
+
 /** Backpressure: the queue is full. `retryAfter` is seconds to wait when supplied. */
 export class QueueFull extends ComfyError {
   readonly retryAfter: number | null;

@@ -82,6 +82,67 @@ no other data is collected. Pass `clientInfo` to `new Comfy({ ... })`
 to append your own app's name to it, for example when attributing traffic
 from a Worker built on top of this SDK.
 
+## Module-level config (`comfy.config`) and `comfy.models`
+
+Alongside the class client there is a module-level namespace, for apps that
+configure credentials once at startup rather than threading a client through
+every call site. Both import shapes reach the same members:
+
+```ts
+import { comfy } from "@comfyorg/sdk";
+// or: import * as comfy from "@comfyorg/sdk";
+
+comfy.config({ credentials: "comfyui-..." });
+await comfy.models.run("owner/model", { prompt: "a cat" });
+```
+
+`comfy.config({ credentials })` sets the credential for every subsequent
+`comfy.*` call in the process. If you set none, `COMFY_API_KEY` is read from
+the environment instead — explicit config always wins, and the variable is
+read per call, so rotating it mid-run is picked up. A blank or
+whitespace-only variable counts as unset, and a runtime with no `process` (a
+browser) simply never sees it. Pass `credentials: undefined` to clear a
+configured value and fall back to the environment again; passing an empty
+string is an error rather than a silent clear.
+
+Configuration is **process-global**, which is the point for a single-tenant
+app and the wrong tool for a multi-tenant server: if you need a different
+credential per request, keep using `new Comfy({ apiKey })`, which resolves
+per instance and is unaffected by `comfy.config`.
+
+The credential is held in a module-private binding and is never a property of
+anything the SDK hands back, so `JSON.stringify(comfy)`, `console.log(comfy)`
+and any error this SDK throws are all safe to paste into a bug report. The
+same now holds for the class client: `console.log(client)` no longer prints
+the `apiKey` you constructed it with.
+
+**`comfy.models.run` does not execute anything yet.** It resolves credentials
+and raises, locally and without opening a socket:
+
+| Situation                 | Error                    |
+| ------------------------- | ------------------------ |
+| no credentials configured | `MissingCredentials`     |
+| credentials present       | `ModelRunNotImplemented` |
+
+Both are `ComfyError` subclasses. The second one is a placeholder: the Comfy
+API v2 spec this SDK generates its types from declares no model-execution
+route, and the request/response types have to come from the spec rather than
+be hand-written. **To run a model today, run its workflow graph** with the
+class client — `await new Comfy({ apiKey }).run(workflow)`, as in the
+Quickstart below.
+
+### Module formats
+
+The package is **ESM-only** — it publishes no CommonJS build, and its
+`exports` map has a single `default` condition. In practice:
+
+- ESM consumers (`import`): supported, the primary path.
+- CommonJS consumers on Node >= 22.12: `require("@comfyorg/sdk")` works via
+  Node's built-in `require(esm)`. In TypeScript this needs `"module":
+"nodenext"`; under `"module": "node16"` a static import from a CommonJS
+  file is rejected (`TS1479`) and you need `await import("@comfyorg/sdk")`.
+- Node 22.0-22.11 CommonJS: use `await import("@comfyorg/sdk")`.
+
 ## Targeting another deployment
 
 `new Comfy()` points at Comfy Cloud and takes no base-URL argument. To run

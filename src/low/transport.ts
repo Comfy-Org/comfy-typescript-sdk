@@ -158,14 +158,21 @@ function parseRetryAfter(response: Response): number | null {
 /** Synchronous protocol bindings — async throughout (JS is async-native). */
 export class ComfyLow {
   private readonly baseUrl: string;
-  private readonly apiKey?: string;
+  /**
+   * An ECMAScript `#private` field, not a TypeScript `private` one: TS
+   * `private` is erased at runtime, so the key showed up in
+   * `JSON.stringify(client)` and `console.log(client)` — i.e. in every bug
+   * report that pasted a client. `#` is invisible to both.
+   * `credentials.test.ts` asserts it stays that way.
+   */
+  readonly #apiKey?: string;
   private readonly fetchImpl: typeof fetch;
   private readonly defaultTimeoutMs: number;
   private readonly userAgent: string;
 
   constructor(baseUrl: string, apiKey?: string, options: ComfyLowOptions = {}) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
-    this.apiKey = apiKey;
+    this.#apiKey = apiKey;
     this.fetchImpl = options.fetch ?? fetch;
     this.defaultTimeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.userAgent = buildUserAgent(options.clientInfo);
@@ -210,8 +217,8 @@ export class ComfyLow {
     // `getJobEvents` can be fed a server-returned absolute URL
     // (`model.urls.self/cancel/events`); if that ever points at a different
     // host, the bearer token must not follow it there.
-    if (this.apiKey && this.isSameOrigin(url)) {
-      headers.set("Authorization", `Bearer ${this.apiKey}`);
+    if (this.#apiKey && this.isSameOrigin(url)) {
+      headers.set("Authorization", `Bearer ${this.#apiKey}`);
     }
     if (extra) {
       for (const [key, value] of Object.entries(extra)) {
