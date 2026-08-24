@@ -9,11 +9,22 @@ export { Comfy, BASE_URL_ENV_VAR, COMFY_CLOUD_BASE_URL, type ComfyOptions } from
 export { comfy } from "./comfy.js";
 export {
   config,
+  COMFY_ROUTER_BASE_URL,
   CREDENTIALS_ENV_VAR,
+  resolveBaseUrl,
   resolveCredentials,
+  ROUTER_BASE_URL_ENV_VAR,
   type ComfyConfig,
 } from "./credentials.js";
-export { models, type Models } from "./models.js";
+export {
+  DEFAULT_RUN_TIMEOUT_MS,
+  ERROR_TYPE_HEADER,
+  models,
+  REQUEST_ID_HEADER,
+  type Models,
+  type RunOptions,
+  type RunResult,
+} from "./models.js";
 export { Asset, AssetFactory } from "./assets.js";
 export { Workflow, WorkflowFactory, type WorkflowGraph } from "./workflows.js";
 export { Job, JobFactory } from "./jobs.js";
@@ -22,6 +33,7 @@ export type { ComfyEvent, Log, OutputReady, Preview, Progress, StatusChange } fr
 export {
   BlobNotFound,
   ComfyError,
+  type ComfyErrorOptions,
   Forbidden,
   HashMismatch,
   IdempotencyKeyReuse,
@@ -30,7 +42,6 @@ export {
   JobFailed,
   MissingAsset,
   MissingCredentials,
-  ModelRunNotImplemented,
   NotFound,
   QueueFull,
   Unauthorized,
