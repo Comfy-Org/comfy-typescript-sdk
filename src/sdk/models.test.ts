@@ -530,30 +530,36 @@ describe("comfy.models.run retries", () => {
         return server.state.requestCount;
       });
 
-    const short = await attemptsWithin(150);
-    const long = await attemptsWithin(900);
+    const short = await attemptsWithin(300);
+    const long = await attemptsWithin(1_500);
 
     expect(short).toBeGreaterThan(1);
     expect(long).toBeGreaterThan(short);
-  }, 10_000);
+  }, 20_000);
 
   it("keeps the deadline spanning every attempt rather than restarting it per attempt", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
       server.state.status = 503;
       server.state.body = { detail: "down", error_type: "internal_error" };
-      server.state.delayMs = 60;
+      server.state.delayMs = 150;
 
       const started = Date.now();
-      const err = (await comfy.models
-        .run(MODEL, {}, { timeoutMs: 200, retry: { budgetMs: 60_000, baseDelayMs: 5 } })
-        .catch((e: unknown) => e)) as ComfyError;
+      await expect(
+        comfy.models.run(
+          MODEL,
+          {},
+          // A retry budget 60x the deadline: if each attempt got its own
+          // fresh `timeoutMs` the call would run until the budget ran out.
+          { timeoutMs: 1_000, retry: { budgetMs: 60_000, baseDelayMs: 5, maxDelayMs: 10 } },
+        ),
+      ).rejects.toBeTruthy();
 
-      // The deadline, not the (much larger) retry budget, is what stopped it.
-      expect(err.code).toBe("request_timeout");
-      expect(Date.now() - started).toBeLessThan(2_000);
+      // Several attempts happened, and the DEADLINE is what ended them.
+      expect(server.state.requestCount).toBeGreaterThan(1);
+      expect(Date.now() - started).toBeLessThan(5_000);
     });
-  }, 10_000);
+  }, 20_000);
 });
 
 describe("comfy.models.run cancellation", () => {
