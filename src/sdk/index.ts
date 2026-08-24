@@ -25,6 +25,12 @@ export {
   type RunOptions,
   type RunResult,
 } from "./models.js";
+export {
+  DEFAULT_RETRY_BASE_DELAY_MS,
+  DEFAULT_RETRY_BUDGET_MS,
+  DEFAULT_RETRY_MAX_DELAY_MS,
+  type RetryOptions,
+} from "./retry.js";
 export { Asset, AssetFactory } from "./assets.js";
 export { Workflow, WorkflowFactory, type WorkflowGraph } from "./workflows.js";
 export { Job, JobFactory } from "./jobs.js";

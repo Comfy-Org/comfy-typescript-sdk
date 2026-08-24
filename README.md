@@ -158,10 +158,7 @@ classes: `Unauthorized`, `Forbidden`, `InsufficientCredits`, and `NotFound`
 for an ID that names no model. A model-level validation failure keeps its
 per-field detail on `error.details.detail`.
 
-An `Idempotency-Key` is sent on every call; one is minted per call unless you
-pass your own. Supplying your own is what makes a retry of a call whose
-response you lost replay the original result instead of running — and billing
-— the model a second time.
+An `Idempotency-Key` is sent on every call; one is minted per call unless you pass your own. Every attempt within one call — the first and every retry — sends that same key, so a retry after a lost or 5xx-ed response is a replay rather than a second generation, and a second charge. Supplying your own key extends that across calls: a fresh `run` with a key you already used replays the original result instead of running the model again.
 
 ```ts
 const { data, requestId } = await comfy.models.run(
@@ -171,14 +168,43 @@ const { data, requestId } = await comfy.models.run(
 );
 ```
 
-`run` accepts a third options argument: `signal` (an `AbortSignal`, re-thrown
-as your own abort rather than dressed up as an SDK error), `timeoutMs`, and
-`idempotencyKey`. The default deadline is **10 minutes** — minutes rather than
-seconds, because the finished generation is the response and a short default
-would abort work that had already been paid for. Pass `timeoutMs: null` to
-disable the deadline, and prefer pairing that with a `signal`.
+`run` accepts a third options argument: `signal`, `timeoutMs`, `idempotencyKey`, and `retry`.
 
-Retries and cancellation are not built in yet.
+The default deadline is **10 minutes** — minutes rather than seconds, because the finished generation is the response and a short default would abort work that had already been paid for. It covers the whole call, retries included, rather than restarting per attempt. Pass `timeoutMs: null` to disable it, and prefer pairing that with a `signal`.
+
+#### Retries
+
+| Setting             | Default           | What it does                                                          |
+| ------------------- | ----------------- | --------------------------------------------------------------------- |
+| `retry.budgetMs`    | `120_000` (2 min) | Total wall clock, from the first attempt, in which retries may happen |
+| `retry.baseDelayMs` | `500`             | Backoff before the first retry; doubles per attempt                   |
+| `retry.maxDelayMs`  | `8_000`           | Ceiling for one backoff, applied before jitter                        |
+
+**Only a transport failure or a 5xx is retried.** A `404`, `409`, `422`, or a `content_policy_violation` is the server's answer about this request, and sending it again buys the same verdict twice — so those raise immediately. A terminal bucket that arrives under a 5xx (`X-Comfy-Error-Type: content_policy_violation`) is treated the same way.
+
+The bound is **elapsed time, not an attempt count**. On a route that holds the connection for the whole generation, "3 retries" says nothing about how long the call can take; a clock does. Each backoff is jittered — half the delay fixed, half random — so clients that failed against the same incident do not re-land on the recovering server as one wave. When the budget runs out, the last failure the server actually gave is what raises.
+
+Two attempts is a good rule of thumb for the default budget against a slow surface, and dozens against a fast-failing one; that is the point of budgeting by clock rather than by count.
+
+Pass `retry: false` for a single attempt, or narrow it per call:
+
+```ts
+await comfy.models.run("fal-ai/flux-pro", { prompt: "a cat" }, { retry: false });
+await comfy.models.run("fal-ai/flux-pro", { prompt: "a cat" }, { retry: { budgetMs: 30_000 } });
+```
+
+#### Cancelling a call
+
+Because the server holds the connection for the whole generation, "stop this one" is an ordinary request rather than an edge case — and it is also the cheap exit, since a call the client disconnects from is not billed. `signal` is what makes that reach the server:
+
+```ts
+const controller = new AbortController();
+document.querySelector("#cancel")?.addEventListener("click", () => controller.abort());
+
+await comfy.models.run("fal-ai/flux-pro", { prompt: "a cat" }, { signal: controller.signal });
+```
+
+The abort aborts the underlying connection, so the server observes a disconnect rather than a client that merely stopped listening, and it stops the retry loop between attempts as well as during one. It rejects with the standard `AbortError` — your own abort, re-thrown untouched rather than dressed up as an SDK error, so `err.name === "AbortError"` tells "I cancelled this" apart from a transport failure (a `TypeError`) and from this SDK's own deadline (a `ComfyError` with `code: "request_timeout"`).
 
 ### Pointing `comfy.models` somewhere else
 

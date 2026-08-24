@@ -42,6 +42,22 @@ export interface RouterServerState {
    * it — `hang` never gets as far as a `Response` object at all.
    */
   stallBody: boolean;
+  /**
+   * Answer the first N requests with {@link failStatus} (and
+   * {@link failErrorType}) before falling through to the normal response —
+   * the shape a client retry has to climb out of.
+   */
+  failTimes: number;
+  /** Status used by {@link failTimes}. */
+  failStatus: number;
+  /** `X-Comfy-Error-Type` sent with a {@link failTimes} response, or `null`. */
+  failErrorType: string | null;
+  /**
+   * Destroy the socket of the first N requests without answering at all — a
+   * transport failure rather than an HTTP one, which the client sees as a
+   * fetch rejection and not a status.
+   */
+  resetTimes: number;
 
   // --- what the last request carried, for tests to assert on ---
   requestCount: number;
@@ -54,8 +70,15 @@ export interface RouterServerState {
   lastAccept: string | null;
   lastUserAgent: string | null;
   /** Every `Idempotency-Key` seen, in order — so a test can prove two calls
-   * did not share one. */
+   * did not share one, and that two attempts of one call did. */
   idempotencyKeys: string[];
+  /**
+   * Requests whose connection the client closed before a response was
+   * finished. This is what a server-side `client_disconnected` is measured
+   * from, so it is how a test proves an abort reached the wire rather than
+   * merely abandoning a promise.
+   */
+  clientDisconnects: number;
 }
 
 function defaultState(): RouterServerState {
@@ -68,6 +91,10 @@ function defaultState(): RouterServerState {
     delayMs: 0,
     hang: false,
     stallBody: false,
+    failTimes: 0,
+    failStatus: 503,
+    failErrorType: null,
+    resetTimes: 0,
     requestCount: 0,
     lastMethod: null,
     lastPath: null,
@@ -78,6 +105,7 @@ function defaultState(): RouterServerState {
     lastAccept: null,
     lastUserAgent: null,
     idempotencyKeys: [],
+    clientDisconnects: 0,
   };
 }
 
@@ -136,6 +164,12 @@ export class RouterStubServer {
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const state = this.state;
+    // Registered before anything can answer: `close` without
+    // `writableFinished` is the socket going away mid-request, which is
+    // exactly what an aborted client looks like from here.
+    res.on("close", () => {
+      if (!res.writableFinished) state.clientDisconnects += 1;
+    });
     const raw = await readBody(req);
     state.requestCount += 1;
     state.lastMethod = req.method ?? null;
@@ -147,6 +181,12 @@ export class RouterStubServer {
     state.lastAccept = header(req, "accept");
     state.lastUserAgent = header(req, "user-agent");
     if (state.lastIdempotencyKey !== null) state.idempotencyKeys.push(state.lastIdempotencyKey);
+
+    if (state.resetTimes > 0) {
+      state.resetTimes -= 1;
+      req.socket.destroy(); // no status line at all — a transport failure
+      return;
+    }
 
     if (state.hang) return; // never answer; the client must give up on its own
 
@@ -164,6 +204,16 @@ export class RouterStubServer {
     const headers: Record<string, string> = { "Content-Type": state.contentType };
     if (state.requestId !== null) headers["X-Comfy-Request-Id"] = state.requestId;
     if (state.errorType !== null) headers["X-Comfy-Error-Type"] = state.errorType;
+
+    if (state.failTimes > 0) {
+      state.failTimes -= 1;
+      if (state.failErrorType !== null) headers["X-Comfy-Error-Type"] = state.failErrorType;
+      const failBody = JSON.stringify({ detail: "try again", error_type: state.failErrorType });
+      headers["Content-Length"] = String(Buffer.byteLength(failBody));
+      res.writeHead(state.failStatus, headers);
+      res.end(failBody);
+      return;
+    }
 
     if (state.stallBody) {
       // A Content-Length the body never reaches, so the client keeps reading.
