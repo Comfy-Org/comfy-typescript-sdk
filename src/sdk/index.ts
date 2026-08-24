@@ -47,3 +47,15 @@ export {
   Unauthorized,
   WorkflowFormatUi,
 } from "./exceptions.js";
+
+/**
+ * `routerErrors` — the typed exceptions for the Comfy Router error contract
+ * (`comfy.models.run`), one class per `error_type`, all descending from
+ * `routerErrors.RouterError`. Also reachable as `@comfyorg/sdk/errors`.
+ *
+ * They are namespaced rather than flattened into the exports above because
+ * three of the eleven names (`Unauthorized`, `Forbidden`,
+ * `InsufficientCredits`) are already taken here by the workflow-API
+ * exceptions, which descend from `ComfyError`. See `./routerErrors.ts`.
+ */
+export * as routerErrors from "./routerErrors.js";
