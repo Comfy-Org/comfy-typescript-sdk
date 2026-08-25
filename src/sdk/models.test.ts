@@ -27,6 +27,16 @@ function forbidNetwork(): ReturnType<typeof vi.fn> {
   return spy;
 }
 
+/** Poll `predicate` until it holds — for state a server updates on its own
+ * schedule (a socket closing), which has no promise to await. */
+async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error("timed out waiting for the stub server");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 /** Point the namespace at `server` with a credential configured. */
 function useStub(server: RouterStubServer): void {
   config({ credentials: CREDENTIAL, baseUrl: server.baseUrl });
@@ -307,7 +317,12 @@ describe("comfy.models.run failures", () => {
       server.state.errorType = "provider_timeout";
       server.state.body = { detail: "upstream took too long", error_type: "provider_timeout" };
 
-      const err = (await comfy.models.run(MODEL, {}).catch((e: unknown) => e)) as ComfyError;
+      // `retry: false` because this asserts the MAPPING of a 5xx, and a 5xx
+      // is retryable — left on, the call would spend its whole retry budget
+      // before raising the error under test.
+      const err = (await comfy.models
+        .run(MODEL, {}, { retry: false })
+        .catch((e: unknown) => e)) as ComfyError;
 
       expect(err).toBeInstanceOf(ComfyError);
       expect(err.code).toBe("provider_timeout");
@@ -348,7 +363,10 @@ describe("comfy.models.run failures", () => {
       server.state.body = "<html>Bad Gateway</html>";
       server.state.requestId = null;
 
-      const err = (await comfy.models.run(MODEL, {}).catch((e: unknown) => e)) as ComfyError;
+      // Same reason as above: a 502 is retryable, and this asserts mapping.
+      const err = (await comfy.models
+        .run(MODEL, {}, { retry: false })
+        .catch((e: unknown) => e)) as ComfyError;
 
       expect(err).toBeInstanceOf(ComfyError);
       expect(err.code).toBe("http_502");
@@ -385,6 +403,227 @@ describe("comfy.models.run failures", () => {
       expect(err.requestId).toBe("6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21");
     });
   });
+});
+
+describe("comfy.models.run retries", () => {
+  /** A retry policy with tiny delays, so a test exercises the loop rather
+   * than the default half-second backoff. */
+  const FAST = { budgetMs: 5_000, baseDelayMs: 5, maxDelayMs: 20 };
+
+  it("climbs out of a run of 5xx and resolves once the server recovers", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.failTimes = 2;
+      server.state.failStatus = 503;
+
+      const result = await comfy.models.run(MODEL, { prompt: "a cat" }, { retry: FAST });
+
+      expect(result.data).toEqual({ images: [{ url: "https://example.invalid/out.png" }] });
+      expect(server.state.requestCount).toBe(3);
+    });
+  });
+
+  it("retries a transport failure, where there is no status to read at all", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.resetTimes = 1; // socket destroyed mid-request
+
+      const result = await comfy.models.run(MODEL, {}, { retry: FAST });
+
+      expect(result.requestId).toBe("6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21");
+      expect(server.state.requestCount).toBe(2);
+    });
+  });
+
+  it("sends the SAME Idempotency-Key on every attempt of one logical call", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.failTimes = 2;
+
+      await comfy.models.run(MODEL, {}, { retry: FAST });
+
+      expect(server.state.idempotencyKeys).toHaveLength(3);
+      expect(new Set(server.state.idempotencyKeys).size).toBe(1);
+    });
+  });
+
+  it("mints a new key for the next call, so a retried call and a new call differ", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.failTimes = 1;
+      await comfy.models.run(MODEL, {}, { retry: FAST });
+      const firstCallKeys = [...server.state.idempotencyKeys];
+      await comfy.models.run(MODEL, {}, { retry: FAST });
+
+      expect(firstCallKeys).toHaveLength(2);
+      expect(new Set(firstCallKeys).size).toBe(1);
+      expect(server.state.idempotencyKeys.at(-1)).not.toBe(firstCallKeys[0]);
+    });
+  });
+
+  it("does not retry a verdict about the request — 404, 409, 422, content policy", async () => {
+    const cases: [number, string | null][] = [
+      [404, "model_not_found"],
+      [409, null],
+      [422, "invalid_input"],
+      [400, "content_policy_violation"],
+      // Same verdict, arriving under a 5xx: still not worth replaying.
+      [503, "content_policy_violation"],
+    ];
+    for (const [status, errorType] of cases) {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.status = status;
+        server.state.errorType = errorType;
+        server.state.body = { detail: "no", error_type: errorType };
+
+        await expect(comfy.models.run(MODEL, {}, { retry: FAST })).rejects.toBeInstanceOf(
+          ComfyError,
+        );
+        expect(server.state.requestCount, `${String(status)} ${String(errorType)}`).toBe(1);
+      });
+    }
+  });
+
+  it("makes the call a single attempt when retries are disabled", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 503;
+      server.state.body = { detail: "down", error_type: "internal_error" };
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { retry: false })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err.httpStatus).toBe(503);
+      expect(server.state.requestCount).toBe(1);
+    });
+  });
+
+  it("raises the server's own last failure when the budget runs out, not a synthetic one", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 500;
+      server.state.errorType = "internal_error";
+      server.state.body = { detail: "still broken", error_type: "internal_error" };
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { retry: { budgetMs: 120, baseDelayMs: 5, maxDelayMs: 10 } })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.httpStatus).toBe(500);
+      expect(err.message).toBe("still broken");
+      expect(server.state.requestCount).toBeGreaterThan(1);
+    });
+  });
+
+  it("bounds the retries by elapsed time, so a bigger budget buys more attempts", async () => {
+    const attemptsWithin = async (budgetMs: number): Promise<number> =>
+      withRouterStub(async (server) => {
+        useStub(server);
+        server.state.status = 503;
+        server.state.body = { detail: "down", error_type: "internal_error" };
+        await comfy.models
+          .run(MODEL, {}, { retry: { budgetMs, baseDelayMs: 10, maxDelayMs: 10 } })
+          .catch(() => undefined);
+        return server.state.requestCount;
+      });
+
+    const short = await attemptsWithin(300);
+    const long = await attemptsWithin(1_500);
+
+    expect(short).toBeGreaterThan(1);
+    expect(long).toBeGreaterThan(short);
+  }, 20_000);
+
+  it("keeps the deadline spanning every attempt rather than restarting it per attempt", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 503;
+      server.state.body = { detail: "down", error_type: "internal_error" };
+      server.state.delayMs = 150;
+
+      const started = Date.now();
+      await expect(
+        comfy.models.run(
+          MODEL,
+          {},
+          // A retry budget 60x the deadline: if each attempt got its own
+          // fresh `timeoutMs` the call would run until the budget ran out.
+          { timeoutMs: 1_000, retry: { budgetMs: 60_000, baseDelayMs: 5, maxDelayMs: 10 } },
+        ),
+      ).rejects.toBeTruthy();
+
+      // Several attempts happened, and the DEADLINE is what ended them.
+      expect(server.state.requestCount).toBeGreaterThan(1);
+      expect(Date.now() - started).toBeLessThan(5_000);
+    });
+  }, 20_000);
+});
+
+describe("comfy.models.run cancellation", () => {
+  it("aborts the underlying connection, so the server sees a disconnect", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.hang = true; // the request is open on the server when we abort
+      const controller = new AbortController();
+      const pending = comfy.models.run(MODEL, {}, { signal: controller.signal });
+
+      await waitFor(() => server.state.requestCount === 1);
+      controller.abort();
+      await expect(pending).rejects.toBeTruthy();
+
+      // Not merely an abandoned promise: the socket went away, which is what
+      // the server measures a client disconnect from.
+      await waitFor(() => server.state.clientDisconnects >= 1);
+      expect(server.state.clientDisconnects).toBeGreaterThanOrEqual(1);
+    });
+  }, 10_000);
+
+  it("rejects with a distinguishable abort, not a generic network error", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.hang = true;
+      const controller = new AbortController();
+      const pending = comfy.models.run(MODEL, {}, { signal: controller.signal });
+      await waitFor(() => server.state.requestCount === 1);
+      controller.abort();
+
+      const err = (await pending.catch((e: unknown) => e)) as Error;
+      // `AbortError` — told apart from a transport failure (`TypeError`) and
+      // from this SDK's own deadline (`ComfyError` / `request_timeout`).
+      expect(err.name).toBe("AbortError");
+      expect(err).not.toBeInstanceOf(ComfyError);
+      expect(err).not.toBeInstanceOf(TypeError);
+    });
+  }, 10_000);
+
+  it("stops the retry loop mid-backoff instead of letting the next attempt go out", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 503;
+      server.state.body = { detail: "down", error_type: "internal_error" };
+      const controller = new AbortController();
+
+      // A backoff long enough that only an abort can end the wait.
+      const pending = comfy.models.run(
+        MODEL,
+        {},
+        {
+          signal: controller.signal,
+          retry: { budgetMs: 60_000, baseDelayMs: 10_000, maxDelayMs: 10_000 },
+        },
+      );
+      await waitFor(() => server.state.requestCount === 1);
+      controller.abort();
+
+      const err = (await pending.catch((e: unknown) => e)) as Error;
+      expect(err.name).toBe("AbortError");
+      // The second attempt never went out.
+      expect(server.state.requestCount).toBe(1);
+    });
+  }, 10_000);
 });
 
 describe("comfy.models.run argument validation", () => {

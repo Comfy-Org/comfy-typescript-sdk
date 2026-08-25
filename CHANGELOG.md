@@ -27,7 +27,20 @@ entry. See CONTRIBUTING.md.
   `run<T>(...)`; `requestId` is the server's `X-Comfy-Request-Id`, present on
   errors too via the thrown `ComfyError`. Sends an `Idempotency-Key` on every
   call, and defaults to a 10-minute deadline (`timeoutMs` / `signal` to
-  override). Retries, cancellation and streaming are not included.
+  override). Streaming is not included.
+- Retries for `comfy.models.run`, bounded by **total elapsed time** rather than
+  an attempt count (`retry.budgetMs`, default 2 minutes) with jittered
+  exponential backoff. Only a transport failure or a 5xx is retried — a `404`,
+  `409`, `422` or `content_policy_violation` is the server's answer about the
+  request and raises immediately. Every attempt of one call replays that call's
+  single `Idempotency-Key`, so a retry cannot run (or bill) the model twice.
+  Pass `retry: false` for a single attempt.
+- Cancellation for `comfy.models.run` via `signal`: it aborts the underlying
+  connection, so the server observes a disconnect rather than a client that
+  stopped listening, and it stops the retry loop between attempts. The call
+  rejects with the standard `AbortError`, distinct from a transport failure and
+  from the SDK's own `request_timeout`. The `timeoutMs` deadline now spans every
+  attempt of a call rather than restarting per attempt.
 - `comfy.config({ baseUrl })` and the `COMFY_ROUTER_BASE_URL` environment
   variable point `comfy.models` at another deployment. This is the Comfy API
   host that fronts the model router — a different surface from the class

@@ -32,9 +32,27 @@
  * TypeScript integration from a comparable hosted-inference client, whose
  * result is wrapped the same way; matching that is worth more here than
  * matching the sibling SDK. It is an intentional difference, not a parity gap.
+ *
+ * # Retry, idempotency and cancellation
+ *
+ * These three are one design, not three features. Because the connection is
+ * held for the whole generation, a call can fail after the model already ran:
+ * a dropped socket, a 503 in front of a finished result, a client that gave
+ * up. Retrying that blindly would run — and bill — the model twice, so every
+ * attempt of one `run` replays that call's single `Idempotency-Key` and the
+ * server answers the repeat with the original response. Retries are bounded
+ * by wall clock rather than by an attempt count (see `./retry.ts`), and only
+ * a transport failure or a 5xx is retried at all.
+ *
+ * Cancellation is the other end of the same shape: minutes-long calls make
+ * "stop this" an ordinary request rather than an edge case, so `signal`
+ * aborts the socket — the server sees a disconnect, which is also the exit
+ * that is not billed — and stops the retry loop between attempts as well as
+ * during one.
  */
 
 import { buildUserAgent } from "../low/index.js";
+import { abortableSleep } from "./abortable-sleep.js";
 import { newIdempotencyKey } from "./core.js";
 import { resolveBaseUrl, resolveCredentials } from "./credentials.js";
 import {
@@ -46,6 +64,7 @@ import {
   NotFound,
   Unauthorized,
 } from "./exceptions.js";
+import { isRetryableStatus, nextAttemptDelayMs, resolveRetry, type RetryOptions } from "./retry.js";
 
 /**
  * Default deadline for one {@link Models.run} call, in milliseconds.
@@ -93,11 +112,21 @@ export interface RunResult<TData = unknown> {
 }
 
 export interface RunOptions {
-  /** Abort the call. Composed with the timeout below, so whichever fires
-   * first wins. */
+  /**
+   * Abort the call. Composed with the deadline below, so whichever fires
+   * first wins, and honoured between attempts as well as during one: an
+   * abort mid-backoff stops the retry loop instead of letting the next
+   * attempt go out.
+   *
+   * The abort reaches the socket, so the server sees a disconnect rather
+   * than a client that stopped listening — which on this route is also the
+   * cheap exit, since a disconnected call is not billed.
+   */
   signal?: AbortSignal;
   /**
-   * Per-call deadline in milliseconds. Omit for
+   * Per-call deadline in milliseconds, covering **every** attempt rather
+   * than each one separately — a retry eats into the same budget, so the
+   * call cannot outlive the deadline by retrying. Omit for
    * {@link DEFAULT_RUN_TIMEOUT_MS}; pass `null` to disable the deadline
    * entirely.
    */
@@ -107,8 +136,23 @@ export interface RunOptions {
    * which is what makes each `run` its own logical call; supply your own to
    * make a retry of a call whose response you lost replay the original
    * instead of running (and billing) the model a second time.
+   *
+   * Every attempt within one call — the first and each retry — sends the
+   * same key, whichever way it was obtained.
    */
   idempotencyKey?: string;
+  /**
+   * Retry policy for this call. Omit for the defaults in `./retry.ts`
+   * (`DEFAULT_RETRY_BUDGET_MS` of wall clock, jittered exponential backoff
+   * from `DEFAULT_RETRY_BASE_DELAY_MS`), or pass `false` to make the call a
+   * single attempt.
+   *
+   * Only a transport failure or a 5xx is retried. A `4xx` is the server's
+   * answer about this request — `content_policy_violation`, `invalid_input`,
+   * `model_not_found`, a `404`, a `409`, a `422` — and sending it again
+   * would buy the same verdict twice.
+   */
+  retry?: RetryOptions | false;
 }
 
 /**
@@ -177,17 +221,20 @@ function runUrl(baseUrl: string, id: ModelId): string {
 }
 
 /**
- * Compose the caller's signal with this call's deadline. `undefined` means
- * "no deadline and no caller signal", which is the only case where the
- * request runs unbounded.
+ * Compose the caller's signal with what is left of this call's deadline.
+ * `undefined` means "no deadline and no caller signal", which is the only
+ * case where the request runs unbounded.
+ *
+ * `remainingMs` is what remains of the *call's* deadline, not a fresh one per
+ * attempt: handing each retry a full `timeoutMs` would let a retrying call
+ * run for a multiple of the deadline its caller asked for.
  */
-function resolveSignal(
+function composeSignal(
   callerSignal: AbortSignal | undefined,
-  timeoutMs: number | null | undefined,
+  remainingMs: number | null,
 ): AbortSignal | undefined {
-  const effective = timeoutMs === undefined ? DEFAULT_RUN_TIMEOUT_MS : timeoutMs;
-  if (effective === null) return callerSignal;
-  const timeoutSignal = AbortSignal.timeout(effective);
+  if (remainingMs === null) return callerSignal;
+  const timeoutSignal = AbortSignal.timeout(Math.max(0, remainingMs));
   return callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
 }
 
@@ -314,42 +361,78 @@ async function run<TData = unknown>(
   }
 
   const url = runUrl(resolveBaseUrl(), id);
-  const signal = resolveSignal(options.signal, options.timeoutMs);
-  let response: Response;
-  let text: string;
-  try {
-    response = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${credentials}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        // Sent on every call. The server records the first response against
-        // this key and replays it for a repeat, so a retry of a call whose
-        // response was lost cannot run the model — or bill for it — twice.
-        "Idempotency-Key": options.idempotencyKey ?? newIdempotencyKey(),
-        "User-Agent": buildUserAgent(),
-      },
-      body: JSON.stringify(input),
-      signal,
-    });
-    // Inside the same `try` as the fetch on purpose: the deadline covers body
-    // consumption too, so a signal that fires while the result is still
-    // streaming rejects HERE, and translating it in only one of the two
-    // places would leak a bare DOMException out of the other.
-    text = await response.text();
-  } catch (exc) {
-    if (isTimeout(exc, options.signal)) {
-      const budget = options.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
-      throw new ComfyError(
-        `models.run("${model}") exceeded its ${String(budget)}ms deadline before the model finished; ` +
-          "raise it with timeoutMs, or pass timeoutMs: null and your own signal",
-        { code: "request_timeout", cause: exc },
-      );
-    }
-    throw exc;
-  }
+  // Minted once, outside the retry loop: every attempt of this one logical
+  // call sends the SAME key. The server records the first response against
+  // it and replays that for a repeat, so a retry after a lost or 5xx-ed
+  // response cannot run the model — or bill for it — a second time. A fresh
+  // `run` mints a fresh key and is a new logical call.
+  const idempotencyKey = options.idempotencyKey ?? newIdempotencyKey();
+  const headers = {
+    Authorization: `Bearer ${credentials}`,
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    "Idempotency-Key": idempotencyKey,
+    "User-Agent": buildUserAgent(),
+  };
+  const body = JSON.stringify(input);
 
+  const retry = resolveRetry(options.retry);
+  const timeoutMs = options.timeoutMs === undefined ? DEFAULT_RUN_TIMEOUT_MS : options.timeoutMs;
+  const startedAt = Date.now();
+  const deadlineAt = timeoutMs === null ? null : startedAt + timeoutMs;
+  /** What the retry policy needs off the clock, read fresh after a failure. */
+  const clock = () => ({
+    elapsedMs: Date.now() - startedAt,
+    remainingMs: deadlineAt === null ? null : deadlineAt - Date.now(),
+  });
+
+  let attempt = 0;
+  for (;;) {
+    const signal = composeSignal(options.signal, clock().remainingMs);
+    let response: Response;
+    let text: string;
+    try {
+      response = await fetch(url, { method: "POST", headers, body, signal });
+      // Inside the same `try` as the fetch on purpose: the deadline covers
+      // body consumption too, so a signal that fires while the result is
+      // still streaming rejects HERE, and translating it in only one of the
+      // two places would leak a bare DOMException out of the other.
+      text = await response.text();
+    } catch (exc) {
+      if (isTimeout(exc, options.signal)) {
+        throw new ComfyError(
+          `models.run("${model}") exceeded its ${String(timeoutMs)}ms deadline before the model finished; ` +
+            "raise it with timeoutMs, or pass timeoutMs: null and your own signal",
+          { code: "request_timeout", cause: exc },
+        );
+      }
+      // A caller's abort is theirs: never retried, never re-dressed.
+      if (options.signal?.aborted) throw exc;
+      const delay = nextAttemptDelayMs(attempt, retry, clock());
+      if (delay === null) throw exc;
+      // Abortable, so an abort during the backoff stops the loop here rather
+      // than sleeping out the delay and sending one more attempt.
+      await abortableSleep(delay, options.signal);
+      attempt += 1;
+      continue;
+    }
+
+    if (isRetryableStatus(response.status, response.headers.get(ERROR_TYPE_HEADER))) {
+      const delay = nextAttemptDelayMs(attempt, retry, clock());
+      if (delay !== null) {
+        await abortableSleep(delay, options.signal);
+        attempt += 1;
+        continue;
+      }
+      // Out of budget — fall through and raise the last failure the server
+      // actually gave, rather than a synthetic "retries exhausted".
+    }
+    return finish<TData>(model, response, text);
+  }
+}
+
+/** Turn the attempt that ended the retry loop into a result or an error. */
+function finish<TData>(model: string, response: Response, text: string): RunResult<TData> {
   const requestId = response.headers.get(REQUEST_ID_HEADER);
   if (!response.ok) throw errorFromResponse(response, text);
 
