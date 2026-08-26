@@ -66,37 +66,54 @@ not tell you this:
 
 ## 3. Public repo hygiene
 
-This repo is public and `scripts/check-public-repo-hygiene.mjs` runs as its own
-CI job. It scans every tracked text file (`git ls-files`), excluding only its
-own source and `src/low/generated/`. **This file is scanned too**, as is any
-doc, comment, test fixture, or commit-message-turned-doc you add. Three
-categories fail the build:
+This repo is public. `.github/workflows/public-repo-hygiene.yml` is a thin
+caller for the shared `public-repo-hygiene` reusable workflow in
+`Comfy-Org/github-workflows`; the checker **and** its known-public allowlist
+live there, pinned to the commit in the `uses:` line, and are never loaded from
+this repo's checkout. It scans every tracked text file (`git ls-files`).
+**This file is scanned too**, as is any doc, comment, test fixture, or
+commit-message-turned-doc you add. Three categories fail the build:
 
 1. **Ticket-shaped identifiers** — anything matching
    `\b[A-Z]{2,6}-\d{2,6}\b`. Note this is a shape, not a list of real team
-   keys, so an innocent-looking token can trip it; the allowlist covers only
-   things like `UTF-8`, `SHA-256`, `ISO-8601` and three specific RFC numbers.
-   Branch names in this repo use ticket-shaped prefixes — do not carry one into
-   a file.
+   keys, so an innocent-looking token can trip it; the built-in allowlist
+   covers only things like `UTF-8`, `SHA-256`, `ISO-8601` and public identifier
+   namespaces such as `CVE-`/`RFC-` by prefix. Branch names in this repo use
+   ticket-shaped prefixes — do not carry one into a file.
 2. **Internal collaboration-tool links** — Notion, Slack archive/client
    permalinks, Google Docs and Drive, Datadog, PostHog project URLs, the Linear
    app domain, and `incident-<number>` markers. Link to the public docs site,
    the GitHub issue, or nothing.
 3. **References to org repos or teams outside the known-public allowlist.**
-   `Comfy-Org/<name>` is default-deny: only the repos listed in the script are
-   accepted, and `@Comfy-Org/<team>` handles are limited to the two teams in
-   `.github/CODEOWNERS`. A new sibling repo needs an allowlist entry (with a
-   comment saying it is public) before you can reference it.
+   `Comfy-Org/<name>` is default-deny: only the repos in the shared
+   allowlist are accepted, and `@Comfy-Org/<team>` handles are limited to the
+   teams listed there (they cover the two in `.github/CODEOWNERS`).
 
-A genuine false positive is fixed by extending the allowlist in the script with
-a comment explaining why — not by deleting the check or excluding the file.
+Where a false positive gets fixed depends on the category, and none of it is
+in this repo's script tree:
 
-Keep this script in sync with `scripts/check_public_repo_hygiene.py` in the
-Python SDK, per the note at the top of the file.
+- A new public sibling repo or team (category 3) needs an entry in
+  `PUBLIC_COMFY_ORG_REPOS` / `PUBLIC_COMFY_ORG_TEAMS` in
+  `Comfy-Org/github-workflows` (`.github/public-repo-hygiene/`). That is one
+  reviewed PR there, then a bump of the pinned SHA here. The allowlist is
+  deliberately **not** a caller input — an allowlist a PR here could widen
+  would defeat the check.
+- An acronym that merely looks like a ticket ID (category 1) can be added via
+  the caller's `ticket_allowlist:` input in
+  `.github/workflows/public-repo-hygiene.yml`; it is additive only.
+- A file that genuinely should not be scanned can be dropped with the caller's
+  `exclude_paths:` input. Prefer fixing the content.
+
+Never fix a finding by editing the `uses:` line or `workflows_ref` — the
+reusable fails the run unless both are the same full 40-hex SHA. The pin is
+advanced by the bump fleet once this repo is in the
+`PUBLIC_REPO_HYGIENE_CALLERS` roster; do not hand-bump it without checking the
+upstream changelog.
 
 ## 4. Checks a PR must pass
 
-CI runs the `test` job on Node 22 **and** 24, plus two standalone jobs. Locally:
+CI runs the `test` job on Node 22 **and** 24, plus two standalone jobs and a
+separate hygiene workflow. Locally:
 
 ```bash
 pnpm install --frozen-lockfile
@@ -109,16 +126,19 @@ pnpm test             # vitest run
 pnpm build            # gen-version + tsc -> dist/
 ```
 
-The three other jobs:
+The three other checks:
 
 - **`build-check`** — `pnpm build`, then `pnpm pack`, then asserts the tarball
   contains `package/dist/index.js` and `package/dist/index.d.ts`. Touching
   `files`, `exports`, `main`, `types`, or `outDir` can break this while every
   other check stays green. Reproduce with
   `pnpm build && pnpm pack --pack-destination /tmp/pack-check && tar tzf /tmp/pack-check/*.tgz`.
-- **`public-repo-hygiene`** — `node scripts/check-public-repo-hygiene.mjs`.
-  Pure Node, no dependencies, so you can run it in a clean checkout without
-  installing anything.
+- **`hygiene / public-repo-hygiene`** — the shared reusable workflow (its own
+  workflow file, not a `ci.yml` job). No `pnpm` script; to reproduce locally,
+  check out `Comfy-Org/github-workflows` at the SHA pinned in
+  `.github/workflows/public-repo-hygiene.yml` and run
+  `python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root <this repo>`.
+  See section 3.
 - **`sdk-parity`** — `node scripts/sync-python-surface.mjs`. The only job that
   reaches the network. See section 6.
 

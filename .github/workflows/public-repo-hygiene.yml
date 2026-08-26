@@ -3,7 +3,7 @@
 # allowlist. This replaces the in-tree copy this repo used to carry.
 #
 # Why the checker is not in this repo any more: the old job ran
-# `scripts/check_public_repo_hygiene.py` straight out of the PR's own checkout,
+# `scripts/check-public-repo-hygiene.mjs` straight out of the PR's own checkout,
 # so a PR could widen the allowlist — or disable the scan — and go green. The
 # reusable loads the checker from the pinned `workflows_ref` commit instead, so
 # a PR here cannot reach it through this workflow's inputs. The allowlist is
