@@ -95,3 +95,25 @@ jobs:
             fi
           done
 
+  # Cross-SDK surface parity: keeps the committed snapshot of the Python SDK's
+  # public surface (parity/python-surface.json) honest. The parity ASSERTION
+  # itself runs offline in `pnpm test` (src/sdk/surface-parity.test.ts); this
+  # job is the half that needs the network, so a GitHub outage reddens one
+  # clearly-named job instead of the whole test matrix.
+  #
+  # A failure here means the Python SDK's surface moved, which is the drift the
+  # check exists to surface -- see scripts/sync-python-surface.mjs.
+  sdk-parity:
+    name: sdk-parity (python surface freshness)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Check the Python SDK surface snapshot is current
+        run: node scripts/sync-python-surface.mjs

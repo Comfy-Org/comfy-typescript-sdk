@@ -82,6 +82,160 @@ no other data is collected. Pass `clientInfo` to `new Comfy({ ... })`
 to append your own app's name to it, for example when attributing traffic
 from a Worker built on top of this SDK.
 
+## Module-level config (`comfy.config`) and `comfy.models`
+
+Alongside the class client there is a module-level namespace, for apps that
+configure credentials once at startup rather than threading a client through
+every call site. Both import shapes reach the same members:
+
+```ts
+import { comfy } from "@comfyorg/sdk";
+// or: import * as comfy from "@comfyorg/sdk";
+
+comfy.config({ credentials: "comfyui-..." });
+const { data, requestId } = await comfy.models.run("fal-ai/flux-pro", {
+  prompt: "a cat",
+});
+```
+
+`comfy.config({ credentials })` sets the credential for every subsequent
+`comfy.*` call in the process. If you set none, `COMFY_API_KEY` is read from
+the environment instead — explicit config always wins, and the variable is
+read per call, so rotating it mid-run is picked up. A blank or
+whitespace-only variable counts as unset, and a runtime with no `process` (a
+browser) simply never sees it. Pass `credentials: undefined` to clear a
+configured value and fall back to the environment again; passing an empty
+string is an error rather than a silent clear.
+
+Configuration is **process-global**, which is the point for a single-tenant
+app and the wrong tool for a multi-tenant server: if you need a different
+credential per request, keep using `new Comfy({ apiKey })`, which resolves
+per instance and is unaffected by `comfy.config`.
+
+The credential is held in a module-private binding and is never a property of
+anything the SDK hands back, so `JSON.stringify(comfy)`, `console.log(comfy)`
+and any error this SDK throws are all safe to paste into a bug report. The
+same now holds for the class client: `console.log(client)` no longer prints
+the `apiKey` you constructed it with.
+
+### `comfy.models.run(model, input)`
+
+`model` is a canonical `{provider}/{model}` ID (`"fal-ai/flux-pro"`). `input`
+is the model's own native JSON input, forwarded to the provider unchanged —
+there is no Comfy envelope to wrap it in, so an integration already written
+against the provider keeps the request body it already has.
+
+The promise resolves **only when the generation is complete**. One call is the
+whole contract: for a provider whose own API is submit-then-poll, the server
+does that polling inside the call rather than handing back a task handle, so
+there is nothing to poll and no job to track. M1 returns the final result
+only — no progress and no streaming.
+
+It resolves to a `{ data, requestId }` result:
+
+- **`data`** is the provider's native payload, exactly as it came off the
+  wire. It is typed `unknown` by default — deliberately not `any`, which would
+  silently switch type-checking off for every field you touch. Per-model
+  schemas are published by the server (each model serves its own OpenAPI
+  document), not baked into this package, so supply the type you have:
+  `await comfy.models.run<FluxOutput>("fal-ai/flux-pro", { prompt })`.
+- **`requestId`** is the server's `X-Comfy-Request-Id` for the call — the value
+  to quote in a support request, surfaced so you never have to go reading
+  response headers to find one. It is `null` only when the response carried no
+  such header, which a proxy error page generated before the request reached
+  Comfy genuinely does not.
+
+Note this wrapper is a **deliberate difference from the Python SDK**, which
+returns the payload directly. It matches the shape a TypeScript integration
+being ported from a comparable hosted-inference client already expects; it is
+an intentional asymmetry, not a parity gap.
+
+Failures raise a `ComfyError`, and `requestId` is on the error too — an error
+response is exactly when you need one. `code` carries the server's coarse
+failure bucket (`model_not_found`, `invalid_input`, `provider_timeout`,
+`content_policy_violation`, ...), and the familiar buckets keep their existing
+classes: `Unauthorized`, `Forbidden`, `InsufficientCredits`, and `NotFound`
+for an ID that names no model. A model-level validation failure keeps its
+per-field detail on `error.details.detail`.
+
+An `Idempotency-Key` is sent on every call; one is minted per call unless you pass your own. Every attempt within one call — the first and every retry — sends that same key, so a retry after a lost or 5xx-ed response is a replay rather than a second generation, and a second charge. Supplying your own key extends that across calls: a fresh `run` with a key you already used replays the original result instead of running the model again.
+
+```ts
+const { data, requestId } = await comfy.models.run(
+  "fal-ai/flux-pro",
+  { prompt: "a cat" },
+  { timeoutMs: 300_000, signal: controller.signal },
+);
+```
+
+`run` accepts a third options argument: `signal`, `timeoutMs`, `idempotencyKey`, and `retry`.
+
+The default deadline is **10 minutes** — minutes rather than seconds, because the finished generation is the response and a short default would abort work that had already been paid for. It covers the whole call, retries included, rather than restarting per attempt. Pass `timeoutMs: null` to disable it, and prefer pairing that with a `signal`.
+
+#### Retries
+
+| Setting             | Default           | What it does                                                          |
+| ------------------- | ----------------- | --------------------------------------------------------------------- |
+| `retry.budgetMs`    | `120_000` (2 min) | Total wall clock, from the first attempt, in which retries may happen |
+| `retry.baseDelayMs` | `500`             | Backoff before the first retry; doubles per attempt                   |
+| `retry.maxDelayMs`  | `8_000`           | Ceiling for one backoff, applied before jitter                        |
+
+**Only a transport failure or a 5xx is retried.** A `404`, `409`, `422`, or a `content_policy_violation` is the server's answer about this request, and sending it again buys the same verdict twice — so those raise immediately. A terminal bucket that arrives under a 5xx (`X-Comfy-Error-Type: content_policy_violation`) is treated the same way.
+
+The bound is **elapsed time, not an attempt count**. On a route that holds the connection for the whole generation, "3 retries" says nothing about how long the call can take; a clock does. Each backoff is jittered — half the delay fixed, half random — so clients that failed against the same incident do not re-land on the recovering server as one wave. When the budget runs out, the last failure the server actually gave is what raises.
+
+Two attempts is a good rule of thumb for the default budget against a slow surface, and dozens against a fast-failing one; that is the point of budgeting by clock rather than by count.
+
+Pass `retry: false` for a single attempt, or narrow it per call:
+
+```ts
+await comfy.models.run("fal-ai/flux-pro", { prompt: "a cat" }, { retry: false });
+await comfy.models.run("fal-ai/flux-pro", { prompt: "a cat" }, { retry: { budgetMs: 30_000 } });
+```
+
+#### Cancelling a call
+
+Because the server holds the connection for the whole generation, "stop this one" is an ordinary request rather than an edge case — and it is also the cheap exit, since a call the client disconnects from is not billed. `signal` is what makes that reach the server:
+
+```ts
+const controller = new AbortController();
+document.querySelector("#cancel")?.addEventListener("click", () => controller.abort());
+
+await comfy.models.run("fal-ai/flux-pro", { prompt: "a cat" }, { signal: controller.signal });
+```
+
+The abort aborts the underlying connection, so the server observes a disconnect rather than a client that merely stopped listening, and it stops the retry loop between attempts as well as during one. It rejects with the standard `AbortError` — your own abort, re-thrown untouched rather than dressed up as an SDK error, so `err.name === "AbortError"` tells "I cancelled this" apart from a transport failure (a `TypeError`) and from this SDK's own deadline (a `ComfyError` with `code: "request_timeout"`).
+
+### Pointing `comfy.models` somewhere else
+
+`comfy.models` talks to the Comfy API host that fronts the model router
+(`https://api.comfy.org`), which is **not** the same surface `new Comfy()`
+talks to: that one speaks the Comfy API v2 job/asset routes, which a
+self-hosted proxy or a serverless deployment also serves. They are two
+settings, and pointing one at the other 404s.
+
+Set `comfy.config({ baseUrl })`, or the `COMFY_ROUTER_BASE_URL` environment
+variable, to reach a staging deployment or a local stub — explicit config
+wins, and a value that is not an http(s) URL without query or fragment is an
+error rather than a silent fallback to the default. `COMFY_BASE_URL` is the
+class client's setting and is untouched by this.
+
+**To run a workflow _graph_** — your own ComfyUI node graph rather than a
+partner model — use the class client instead: `await new Comfy({ apiKey
+}).run(workflow)`, as in the Quickstart below.
+
+### Module formats
+
+The package is **ESM-only** — it publishes no CommonJS build, and its
+`exports` map has a single `default` condition. In practice:
+
+- ESM consumers (`import`): supported, the primary path.
+- CommonJS consumers on Node >= 22.12: `require("@comfyorg/sdk")` works via
+  Node's built-in `require(esm)`. In TypeScript this needs `"module":
+"nodenext"`; under `"module": "node16"` a static import from a CommonJS
+  file is rejected (`TS1479`) and you need `await import("@comfyorg/sdk")`.
+- Node 22.0-22.11 CommonJS: use `await import("@comfyorg/sdk")`.
+
 ## Targeting another deployment
 
 `new Comfy()` points at Comfy Cloud and takes no base-URL argument. To run
@@ -352,6 +506,10 @@ longer holds.
 Protocol-level failures are raised as one exception class per error code, so
 you can catch what you actually expect instead of string-matching messages:
 
+Catch these SDK-level exceptions around `Comfy` methods. Public asset, job,
+event, and output helpers translate protocol errors; raw low-level exceptions
+are only exposed by direct `ComfyLow` calls.
+
 - `Unauthorized`, `Forbidden`, `NotFound`
 - `InvalidWorkflow` (and `WorkflowFormatUi`, for submitting a UI-export
   instead of an API-format graph)
@@ -364,12 +522,16 @@ you can catch what you actually expect instead of string-matching messages:
   so reusing your own explicit `idempotencyKey` throws this. After an ambiguous
   failure, poll or list your jobs instead of resubmitting with the same key.
 - `InsufficientCredits`
-- `QueueFull` (carries `retryAfter`; `submit()` already retries this one
-  transparently)
+- `QueueFull` (carries `retryAfter: number | null`; `submit()` retries 429
+  responses with `Retry-After` for a bounded budget, including deployment warm-up)
 - `JobFailed` — a job reached a non-`succeeded` terminal state (carries the
   node-level `error` detail when the platform provided one)
 
 All extend a shared `ComfyError` (`code`, `httpStatus`, `details`).
+
+`QueueFull.retryAfter` is nullable when the server omits the header. This is a
+breaking type change from earlier releases: check for `null` before using it in
+duration arithmetic or custom backoff logic.
 
 ```ts
 import { JobFailed, MissingAsset } from "@comfyorg/sdk";
@@ -386,6 +548,85 @@ try {
   }
 }
 ```
+
+### Router errors (`comfy.models.run`)
+
+Model execution has its own error contract, and its own exception hierarchy to
+match. Every failure carries a coarse, machine-readable `error_type` on the
+`X-Comfy-Error-Type` response header; this SDK turns that value into one class
+per bucket, all descending from `RouterError`. The Python SDK spells every one
+of these names identically, so a snippet transfers between the two languages
+unchanged.
+
+They live in their own namespace because three of the names —
+`Unauthorized`, `Forbidden`, `InsufficientCredits` — are already taken above by
+the workflow-API exceptions, which are unrelated classes descending from
+`ComfyError`:
+
+```ts
+import { routerErrors } from "@comfyorg/sdk";
+// or, to import the classes directly:
+import { ContentPolicyViolation, InvalidInput } from "@comfyorg/sdk/errors";
+```
+
+The set is closed at eleven buckets in this release. Six are request-level:
+
+- `InvalidInput` — the request was rejected as invalid, by the model or before
+  dispatch. Carries `detail[]` (see below)
+- `ContentPolicyViolation` — the model's content policy refused the request.
+  Deterministic: retrying the same input will not succeed, which is why this is
+  a separate class from `ProviderError` rather than a flavor of it
+- `ProviderError` — the upstream model provider returned an error
+- `ProviderTimeout` — the upstream provider did not respond in time (a
+  Comfy-side deadline is `InternalError`, not this)
+- `InsufficientCredits`
+- `ModelNotFound`
+
+and five are transport-level: `Unauthorized`, `Forbidden`,
+`ConcurrencyLimitExceeded`, `ClientDisconnected`, `InternalError`.
+
+Every one of them carries `errorType`, `requestId` (the server-minted id off
+`X-Comfy-Request-Id` — the value to quote in a support request) and
+`httpStatus`.
+
+An `error_type` this release has never heard of — a newer server, three more
+buckets are already planned — surfaces as a plain `RouterError` carrying the
+raw value in `errorType`, never as an untyped throw. Catching `RouterError`
+therefore keeps working across a server upgrade.
+
+`InvalidInput` is the one class with extra structure. A model-level validation
+failure names the offending fields, and those entries stay structured rather
+than being flattened into the message:
+
+```ts
+try {
+  await comfy.models.run("owner/model", { prompt: "a cat" });
+} catch (err) {
+  if (err instanceof routerErrors.InvalidInput) {
+    for (const d of err.detail) {
+      console.error(d.loc.join("."), d.type, d.msg, d.ctx);
+      // e.g. "body.image_url" "image_too_small" "..." { min_width: 512 }
+    }
+  } else if (err instanceof routerErrors.ContentPolicyViolation) {
+    // Do not retry this one.
+  } else if (err instanceof routerErrors.RouterError) {
+    console.error(err.errorType, "request id:", err.requestId);
+  } else {
+    throw err;
+  }
+}
+```
+
+`d.type` is the provider's own specific reason (`image_too_small`,
+`greater_than`, `unsupported_audio_format`, `missing`, ...) and `d.ctx` is the
+bound it violated. Both are deliberately open — the provider vocabulary grows
+on the provider's release cycle, not this SDK's — so treat an unrecognized
+`type` as informational rather than switching exhaustively on it. `detail` is an
+empty array for a rejection that names no field.
+
+Note that `comfy.models.run` does not execute anything yet (see
+[Module-level config](#module-level-config-comfyconfig-and-comfymodels)); these
+classes are the error contract, shipped ahead of the call that raises them.
 
 ## Two layers
 
@@ -438,3 +679,7 @@ pnpm format           # oxfmt --write
 pnpm test:coverage    # vitest run --coverage
 pnpm check:spec-drift # fails if src/low/generated/* is stale vs. the spec
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contributor workflow —
+setup, the checks CI runs, and the rules around generated code. Release
+history is in [CHANGELOG.md](CHANGELOG.md).

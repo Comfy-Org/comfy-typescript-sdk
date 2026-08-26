@@ -102,8 +102,20 @@ function jobBasePath(jobIdOrUrl: string): string {
   return jobIdOrUrl.replace(/\/$/, "");
 }
 
-function buildUserAgent(clientInfo?: string): string {
-  const base = `comfy-sdk-typescript/${SDK_VERSION} (node ${process.version})`;
+/**
+ * The SDK's default `User-Agent`, optionally carrying a caller's own token.
+ * Exported because every Comfy surface this package speaks to should be
+ * attributable to the SDK in request logs, including the `comfy.models`
+ * router calls in `../sdk/models.ts`, which do not go through
+ * {@link ComfyLow}.
+ */
+export function buildUserAgent(clientInfo?: string): string {
+  // `process` is read defensively because this string is now built on the
+  // `comfy.models` path too, which a browser can reach — a bare `process`
+  // there is a ReferenceError, and a browser drops a caller-set `User-Agent`
+  // anyway (it is a forbidden header name), so degrading beats throwing.
+  const runtime = globalThis.process?.version;
+  const base = `comfy-sdk-typescript/${SDK_VERSION}${runtime ? ` (node ${runtime})` : ""}`;
   if (!clientInfo) return base;
   // A caller-set token goes verbatim into a header value; reject CR/LF so it
   // can never split/inject headers (undici would reject it anyway, but fail
@@ -152,20 +164,27 @@ function parseRetryAfter(response: Response): number | null {
   const raw = response.headers.get("Retry-After");
   if (raw === null) return null;
   const seconds = Number.parseInt(raw, 10);
-  return Number.isNaN(seconds) ? null : seconds;
+  return Number.isNaN(seconds) || seconds < 0 ? null : seconds;
 }
 
 /** Synchronous protocol bindings — async throughout (JS is async-native). */
 export class ComfyLow {
   private readonly baseUrl: string;
-  private readonly apiKey?: string;
+  /**
+   * An ECMAScript `#private` field, not a TypeScript `private` one: TS
+   * `private` is erased at runtime, so the key showed up in
+   * `JSON.stringify(client)` and `console.log(client)` — i.e. in every bug
+   * report that pasted a client. `#` is invisible to both.
+   * `credentials.test.ts` asserts it stays that way.
+   */
+  readonly #apiKey?: string;
   private readonly fetchImpl: typeof fetch;
   private readonly defaultTimeoutMs: number;
   private readonly userAgent: string;
 
   constructor(baseUrl: string, apiKey?: string, options: ComfyLowOptions = {}) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
-    this.apiKey = apiKey;
+    this.#apiKey = apiKey;
     this.fetchImpl = options.fetch ?? fetch;
     this.defaultTimeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.userAgent = buildUserAgent(options.clientInfo);
@@ -210,8 +229,8 @@ export class ComfyLow {
     // `getJobEvents` can be fed a server-returned absolute URL
     // (`model.urls.self/cancel/events`); if that ever points at a different
     // host, the bearer token must not follow it there.
-    if (this.apiKey && this.isSameOrigin(url)) {
-      headers.set("Authorization", `Bearer ${this.apiKey}`);
+    if (this.#apiKey && this.isSameOrigin(url)) {
+      headers.set("Authorization", `Bearer ${this.#apiKey}`);
     }
     if (extra) {
       for (const [key, value] of Object.entries(extra)) {
@@ -357,11 +376,18 @@ export class ComfyLow {
   /**
    * `GET /api/v2/assets/{id}/content` — raw, streamed, range-aware body.
    * Returns the response itself (escape hatch); the caller reads
-   * `response.body`.
+   * `response.body`. No default timeout, matching {@link getJobEvents}: the
+   * default `AbortSignal.timeout` covers body consumption too, and a
+   * download larger than the default deadline allows must not be killed
+   * mid-transfer (pass `timeoutMs` to opt back into a deadline).
    */
   async getAssetContent(
     assetId: string,
-    options: { range?: readonly [number, number]; signal?: AbortSignal } = {},
+    options: {
+      range?: readonly [number, number];
+      signal?: AbortSignal;
+      timeoutMs?: number | null;
+    } = {},
   ): Promise<Response> {
     const headers: Record<string, string> = {};
     if (options.range) {
@@ -370,6 +396,7 @@ export class ComfyLow {
     const response = await this.request("GET", `/assets/${encodeURIComponent(assetId)}/content`, {
       headers,
       signal: options.signal,
+      timeoutMs: options.timeoutMs ?? null,
     });
     if (response.status !== 200 && response.status !== 206) {
       await this.parseOrRaise(response, [200, 206]);
@@ -387,9 +414,8 @@ export class ComfyLow {
    * {@link getAssetContent}), both so its `Location` can be read and so this
    * client's bearer token is never attached to the object-storage host. On a
    * self-hosted proxy (which serves the bytes inline, no redirect) this
-   * returns the endpoint's own absolute URL instead. Works on every backend
-   * and never throws for either shape — only a genuine failure maps to the
-   * usual typed error.
+   * returns the endpoint's own absolute URL instead. Works on every backend;
+   * a genuine failure maps to the usual typed error.
    */
   async getAssetContentUrl(
     assetId: string,

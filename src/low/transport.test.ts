@@ -1,5 +1,7 @@
 import { readFileSync } from "node:fs";
 import { writeFile, mkdtemp, rm } from "node:fs/promises";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -120,9 +122,7 @@ describe("ComfyLow transport", () => {
     expect(result.expiresAt).toBeNull();
   });
 
-  it("getAssetContentUrl never throws for a real 404 — no, it maps to the usual typed error", async () => {
-    // Sanity check that a genuine failure still surfaces via the existing
-    // error mapping rather than being swallowed by the "never throws" cases.
+  it("getAssetContentUrl maps a real 404 to the usual typed error", async () => {
     await expect(low.getAssetContentUrl("")).rejects.toBeTruthy();
   });
 
@@ -385,6 +385,14 @@ describe("ComfyLow transport", () => {
     expect((err as QueueFull).retryAfter).toBeNull();
   });
 
+  it.each(["-1", "NaN"])("treats an invalid Retry-After value %s as absent", async (value) => {
+    server.state.queueFullTimes = 1;
+    server.state.retryAfterHeader = value;
+    const err = await low.postJobs({ "1": {} }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(QueueFull);
+    expect((err as QueueFull).retryAfter).toBeNull();
+  });
+
   // -- AbortSignal composition ------------------------------------------------
 
   it("an aborted caller signal cancels an in-flight request promptly, not just a later sleep", async () => {
@@ -399,5 +407,44 @@ describe("ComfyLow transport", () => {
     // actually composes the caller's signal into the request, not just the
     // default timeout.
     expect(Date.now() - start).toBeLessThan(500);
+  }, 2000);
+
+  // -- getAssetContent timeout -----------------------------------------------
+
+  it("getAssetContent has no default timeout — a slow body that outlives the client's configured timeoutMs still completes", async () => {
+    // A raw slow server, not StubServer: it streams a handful of chunks with
+    // a delay between them so the whole transfer outlives a short client
+    // timeoutMs, mirroring a large output that takes longer than the old
+    // fixed 30s deadline.
+    const CHUNK_DELAY_MS = 60;
+    const CHUNKS = 4; // ~240ms total, well past the 50ms client default below
+    const slowServer: Server = createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/octet-stream" });
+      let i = 0;
+      const sendNext = () => {
+        if (i >= CHUNKS) {
+          res.end();
+          return;
+        }
+        res.write(`chunk${i}-`);
+        i += 1;
+        setTimeout(sendNext, CHUNK_DELAY_MS);
+      };
+      sendNext();
+    });
+    await new Promise<void>((resolve) => slowServer.listen(0, "127.0.0.1", resolve));
+    const addr = slowServer.address() as AddressInfo;
+    // A client-level timeoutMs far shorter than the transfer: on unpatched
+    // code (no timeoutMs passed through to `request()`) this deadline
+    // covers body consumption and aborts mid-stream.
+    const slowLow = new ComfyLow(`http://127.0.0.1:${addr.port}`, undefined, { timeoutMs: 50 });
+    try {
+      const response = await slowLow.getAssetContent("whatever");
+      await expect(response.text()).resolves.toBe("chunk0-chunk1-chunk2-chunk3-");
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        slowServer.close((err) => (err ? reject(err) : resolve())),
+      );
+    }
   }, 2000);
 });

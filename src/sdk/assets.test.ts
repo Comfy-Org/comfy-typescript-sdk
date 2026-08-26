@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { StubServer } from "../../test/support/stub-server.js";
 import { ComfyLow } from "../low/index.js";
@@ -130,6 +130,79 @@ describe("AssetFactory / Asset", () => {
     expect(server.state.lastUploadContentLength).toBeGreaterThanOrEqual(
       Buffer.byteLength("downloaded-bytes"),
     );
+  });
+
+  it("fromUrl treats an uppercase scheme as absolute, not as a path joined to baseUrl", async () => {
+    server.state.contentBytes = Buffer.from("downloaded-bytes");
+    // URL schemes are case-insensitive, but low.request detects an absolute
+    // URL with a case-sensitive "http" prefix — unnormalized, this would be
+    // fetched from baseUrl + "HTTP://..." instead of from the host given.
+    const upper = `${server.baseUrl}/api/v2/assets/whatever/content`.replace(/^http:/, "HTTP:");
+    const target = `${server.baseUrl}/api/v2/assets/whatever/content`;
+    expect(await (await assets.fromUrl(upper)).hash()).toBe(
+      await (await assets.fromUrl(target)).hash(),
+    );
+  });
+
+  it("fromUrl routes the download through the client's injected fetch, not a raw global fetch", async () => {
+    server.state.contentBytes = Buffer.from("downloaded-bytes");
+    let injectedFetchCalls = 0;
+    const countingFetch: typeof fetch = (...args) => {
+      injectedFetchCalls += 1;
+      return fetch(...args);
+    };
+    const injectedAssets = new AssetFactory(
+      new ComfyLow(server.baseUrl, undefined, { fetch: countingFetch }),
+    );
+    await injectedAssets.fromUrl(`${server.baseUrl}/api/v2/assets/whatever/content`);
+    // Checked before any commit()/upload call, so this isolates the download
+    // itself — a raw global `fetch(...)` in `fromUrl` would leave this at 0.
+    expect(injectedFetchCalls).toBeGreaterThan(0);
+  });
+
+  it("fromUrl disables the client's default timeout for the download", async () => {
+    let receivedSignal: AbortSignal | null | undefined;
+    const inspectingFetch = vi.fn<typeof fetch>(async (_input, init) => {
+      receivedSignal = init?.signal;
+      return new Response("downloaded-bytes", { status: 200 });
+    });
+    const noTimeoutAssets = new AssetFactory(
+      new ComfyLow("https://api.example.test", undefined, {
+        fetch: inspectingFetch,
+        timeoutMs: 1,
+      }),
+    );
+
+    await noTimeoutAssets.fromUrl("https://cdn.example.test/large.bin");
+
+    expect(inspectingFetch).toHaveBeenCalledOnce();
+    expect(receivedSignal).toBeUndefined();
+  });
+
+  it("fromUrl attaches the bearer token same-origin but not to a third-party origin", async () => {
+    // Ported from transport.test.ts's cross-origin urls.self/events/cancel
+    // coverage — fromUrl's own routing through low.request (not a raw
+    // fetch) needs the same regression pin, so moving it back to a raw
+    // fetch later trips a test. Asserting the positive (same-origin) case
+    // too proves the negative isn't just vacuously true.
+    const thirdParty = new StubServer();
+    await thirdParty.start();
+    try {
+      server.state.contentBytes = Buffer.from("same-origin-bytes");
+      thirdParty.state.contentBytes = Buffer.from("third-party-bytes");
+      const authedAssets = new AssetFactory(new ComfyLow(server.baseUrl, "top-secret-key"));
+
+      // Same-origin download (the client's own baseUrl): the key IS sent.
+      await authedAssets.fromUrl(`${server.baseUrl}/api/v2/assets/whatever/content`);
+      expect(server.state.lastAuthorizationHeader).toBe("Bearer top-secret-key");
+
+      // Downloading from a third-party origin crosses origins — the key
+      // must NOT follow it there.
+      await authedAssets.fromUrl(`${thirdParty.baseUrl}/api/v2/assets/whatever/content`);
+      expect(thirdParty.state.lastAuthorizationHeader).toBeNull();
+    } finally {
+      await thirdParty.stop();
+    }
   });
 
   // -- delete -----------------------------------------------------------
