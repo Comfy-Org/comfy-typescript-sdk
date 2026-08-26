@@ -1,0 +1,76 @@
+{
+  "source": {
+    "repo": "Comfy-Org/comfy-python-sdk",
+    "ref": "refs/heads/main",
+    "files": [
+      "src/comfy_sdk/models.py",
+      "src/comfy_sdk/router_exceptions.py",
+      "src/comfy_sdk/exceptions.py",
+      "src/comfy_sdk/__init__.py"
+    ]
+  },
+  "modelsMethods": {
+    "Models": [
+      "run"
+    ],
+    "AsyncModels": [
+      "run"
+    ]
+  },
+  "routerErrorClasses": [
+    "RouterError",
+    "InvalidInput",
+    "ContentPolicyViolation",
+    "ProviderError",
+    "ProviderTimeout",
+    "InsufficientCredits",
+    "ModelNotFound",
+    "Unauthorized",
+    "Forbidden",
+    "ConcurrencyLimitExceeded",
+    "ClientDisconnected",
+    "InternalError"
+  ],
+  "routerErrorTypes": {
+    "InvalidInput": "invalid_input",
+    "ContentPolicyViolation": "content_policy_violation",
+    "ProviderError": "provider_error",
+    "ProviderTimeout": "provider_timeout",
+    "InsufficientCredits": "insufficient_credits",
+    "ModelNotFound": "model_not_found",
+    "Unauthorized": "unauthorized",
+    "Forbidden": "forbidden",
+    "ConcurrencyLimitExceeded": "concurrency_limit_exceeded",
+    "ClientDisconnected": "client_disconnected",
+    "InternalError": "internal_error"
+  },
+  "routerErrorTypeOrder": [
+    "invalid_input",
+    "content_policy_violation",
+    "provider_error",
+    "provider_timeout",
+    "insufficient_credits",
+    "model_not_found",
+    "unauthorized",
+    "forbidden",
+    "concurrency_limit_exceeded",
+    "client_disconnected",
+    "internal_error"
+  ],
+  "exportedErrorClasses": [
+    "BlobNotFound",
+    "ComfyError",
+    "Forbidden",
+    "HashMismatch",
+    "IdempotencyKeyReuse",
+    "InsufficientCredits",
+    "InvalidWorkflow",
+    "JobFailed",
+    "MissingApiKey",
+    "MissingAsset",
+    "NotFound",
+    "QueueFull",
+    "Unauthorized",
+    "WorkflowFormatUi"
+  ]
+}

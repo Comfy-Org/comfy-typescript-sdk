@@ -52,7 +52,9 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "check:spec-drift": "node scripts/check-spec-drift.mjs"
+    "check:spec-drift": "node scripts/check-spec-drift.mjs",
+    "check:sdk-parity": "node scripts/sync-python-surface.mjs",
+    "sync:python-surface": "node scripts/sync-python-surface.mjs --write"
   },
   "dependencies": {
     "eventsource-parser": "^3.0.0",

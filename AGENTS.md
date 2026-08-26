@@ -17,6 +17,7 @@ Generated, do **not** edit by hand:
 | `src/low/generated/zod.gen.ts`   | `pnpm generate`                                |
 | `src/low/generated/index.ts`     | `pnpm generate`                                |
 | `src/low/version.ts`             | `scripts/gen-version.mjs`, run by `pnpm build` |
+| `parity/python-surface.json`     | `pnpm sync:python-surface` (see section 6)     |
 
 `spec/openapi.yaml` is also off-limits: it is a vendored, one-way sync of the
 canonical Comfy API v2 contract with internal operations stripped (see
@@ -103,11 +104,12 @@ pnpm lint             # oxlint .
 pnpm format:check     # oxfmt --check .
 pnpm typecheck        # tsc --noEmit
 pnpm check:spec-drift # node scripts/check-spec-drift.mjs
+pnpm check:sdk-parity # node scripts/sync-python-surface.mjs (needs network)
 pnpm test             # vitest run
 pnpm build            # gen-version + tsc -> dist/
 ```
 
-The two other jobs:
+The three other jobs:
 
 - **`build-check`** — `pnpm build`, then `pnpm pack`, then asserts the tarball
   contains `package/dist/index.js` and `package/dist/index.d.ts`. Touching
@@ -117,6 +119,8 @@ The two other jobs:
 - **`public-repo-hygiene`** — `node scripts/check-public-repo-hygiene.mjs`.
   Pure Node, no dependencies, so you can run it in a clean checkout without
   installing anything.
+- **`sdk-parity`** — `node scripts/sync-python-surface.mjs`. The only job that
+  reaches the network. See section 6.
 
 A CLA check (`.github/workflows/cla.yml`) also runs; only the PR author needs
 to sign. `.github/CODEOWNERS` makes every file require review from
@@ -148,3 +152,28 @@ to sign. `.github/CODEOWNERS` makes every file require review from
 - This SDK deliberately mirrors the Python SDK's structure (stub server, drift
   check, hygiene check, generated/hand-written split). When changing one of
   those shared mechanisms, check whether the sibling needs the same change.
+
+## 6. Cross-SDK surface parity
+
+`src/sdk/surface-parity.test.ts` diffs this SDK's public surface against the
+Python SDK's and fails naming the symbol that diverged: the public method names
+under `models`, the router error class names, the `error_type` each of those
+classes maps to, and the error classes the package root re-exports.
+
+The Python side is read from `parity/python-surface.json`, a **committed
+snapshot** — generated, do not hand-edit. `parity/README.md` has the full
+mechanism; the short version is that the assertion runs offline against the
+snapshot in `pnpm test`, and the `sdk-parity` CI job re-derives the snapshot
+from the Python SDK's default branch over HTTPS so it cannot go quietly stale.
+
+Two things to know before you touch it:
+
+- **A `sdk-parity` failure is usually not about your branch.** It means the
+  Python SDK's surface moved. Run `pnpm sync:python-surface`, commit the
+  refreshed snapshot, then run `pnpm test` to see which symbols diverged.
+- **Deliberate divergences go in the `INTENTIONAL_ASYMMETRIES` allowlist** at
+  the top of the test, each with a stated reason. Three are declared today (the
+  result envelope, credential resolution, and the absence of a sync variant).
+  Anything not declared there fails. Adding an entry is a design decision — the
+  test also fails on an entry that no longer applies, so the list cannot rot
+  into a blanket exemption.
