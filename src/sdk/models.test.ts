@@ -310,6 +310,71 @@ describe("comfy.models.run failures", () => {
     }
   });
 
+  it("branches the two buckets only the header can name, off a shared status", async () => {
+    // `not_enabled` shares its 403 with `forbidden` and `service_unavailable`
+    // its 503 with a load balancer's own; the header is the only thing that
+    // tells them apart, and it is what `code` is read from. `routerErrors`
+    // carries the matching `instanceof`-able classes for the same buckets —
+    // see `routerErrors.test.ts`, which asserts them against `toRouterError`.
+    const cases: [number, string, string][] = [
+      [403, "not_enabled", "Comfy Router does not run this model yet for this workspace."],
+      [503, "service_unavailable", "a dependency is down; retry with backoff"],
+    ];
+    for (const [status, errorType, detail] of cases) {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.status = status;
+        server.state.errorType = errorType;
+        server.state.body = { detail, error_type: errorType };
+
+        // `retry: false` for the 503, which is retryable on purpose (the
+        // attempt count is asserted separately below); it costs the 403
+        // nothing, since a 403 is never retried either way.
+        const err = (await comfy.models
+          .run(MODEL, {}, { retry: false })
+          .catch((e: unknown) => e)) as ComfyError;
+
+        expect(err, errorType).toBeInstanceOf(ComfyError);
+        expect(err.code).toBe(errorType);
+        expect(err.httpStatus).toBe(status);
+        expect(err.message).toBe(detail);
+        expect(err.requestId).toBe("6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21");
+      });
+    }
+  });
+
+  it("does not read a header-less 403 as not_enabled", async () => {
+    // The rollout gate is a header, not a status. A 403 with no
+    // `X-Comfy-Error-Type` — a proxy ahead of the router, say — carries no
+    // evidence of which 403 it is, and must not be labelled the new bucket.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 403;
+      server.state.errorType = null;
+      server.state.body = { detail: "no" };
+
+      const err = (await comfy.models.run(MODEL, {}).catch((e: unknown) => e)) as ComfyError;
+
+      expect(err.code).not.toBe("not_enabled");
+      expect(err.code).toBe("http_403");
+      expect(err.httpStatus).toBe(403);
+    });
+
+    // With the body naming the bucket instead, the existing mapping still
+    // wins: `forbidden` is an entitlement decision, not the rollout gate.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 403;
+      server.state.errorType = null;
+      server.state.body = { detail: "no", error_type: "forbidden" };
+
+      const err = (await comfy.models.run(MODEL, {}).catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(Forbidden);
+      expect(err.code).toBe("forbidden");
+    });
+  });
+
   it("keeps an unmapped bucket branchable as the error code", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
@@ -459,6 +524,48 @@ describe("comfy.models.run retries", () => {
       expect(new Set(firstCallKeys).size).toBe(1);
       expect(server.state.idempotencyKeys.at(-1)).not.toBe(firstCallKeys[0]);
     });
+  });
+
+  it("retries a 503 that names service_unavailable, replaying the same Idempotency-Key", async () => {
+    // The one bucket whose condition clears on its own. The key is what makes
+    // the replay safe: the server answers the repeat with the original
+    // response rather than running — and billing — the model twice.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.failTimes = 1;
+      server.state.failStatus = 503;
+      server.state.failErrorType = "service_unavailable";
+
+      const result = await comfy.models.run(MODEL, { prompt: "a cat" }, { retry: FAST });
+
+      expect(result.data).toEqual({ images: [{ url: "https://example.invalid/out.png" }] });
+      expect(server.state.requestCount).toBe(2);
+      expect(server.state.idempotencyKeys).toHaveLength(2);
+      expect(server.state.idempotencyKeys[0]).toBe(server.state.idempotencyKeys[1]);
+    });
+  });
+
+  it("does not retry not_enabled, which no replay turns on", async () => {
+    // Terminal by contract, and on a 403 besides — one attempt either way.
+    // Asserted under a 5xx too, where only the bucket says not to retry.
+    for (const status of [403, 503]) {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.status = status;
+        server.state.errorType = "not_enabled";
+        server.state.body = {
+          detail: "Comfy Router does not run this model yet for this workspace.",
+          error_type: "not_enabled",
+        };
+
+        const err = (await comfy.models
+          .run(MODEL, {}, { retry: FAST })
+          .catch((e: unknown) => e)) as ComfyError;
+
+        expect(err.code, String(status)).toBe("not_enabled");
+        expect(server.state.requestCount, String(status)).toBe(1);
+      });
+    }
   });
 
   it("does not retry a verdict about the request — 404, 409, 422, content policy", async () => {

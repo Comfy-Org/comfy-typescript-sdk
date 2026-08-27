@@ -79,17 +79,30 @@ export const NO_RETRY: RetryPolicy = Object.freeze({
 /**
  * Failure buckets a replay cannot change.
  *
- * These are verdicts about the request itself, not about the server's health:
- * the same bytes sent again get the same answer, so retrying only spends time
- * and risks a second charge. They are checked against `X-Comfy-Error-Type`
- * because the router can answer with one of them under a 5xx (a policy
- * verdict reached inside a provider call, say), and status alone would then
- * read as "transient".
+ * These are verdicts about the caller or the request itself, not about the
+ * server's health: the same bytes sent again get the same answer, so retrying
+ * only spends time and risks a second charge. They are checked against
+ * `X-Comfy-Error-Type` because the router can answer with one of them under a
+ * 5xx (a policy verdict reached inside a provider call, say), and status
+ * alone would then read as "transient".
+ *
+ * `not_enabled` is here for that reason and not because of its status. It
+ * arrives on a `403`, which the `status < 500` rule already refuses to retry,
+ * so this entry changes nothing for a well-formed response — but the contract
+ * calls the bucket TERMINAL and says not to treat it as an outage, and a
+ * caller off the rollout ramp is the one who would otherwise spend a full
+ * retry budget on an answer that cannot change within it.
+ *
+ * The bucket that is deliberately NOT here is `service_unavailable`: it is
+ * the one answer whose condition clears on its own, so it stays retryable and
+ * a `503` carrying it climbs out through the ordinary backoff below, replayed
+ * under the call's own `Idempotency-Key`.
  */
 export const TERMINAL_ERROR_TYPES: ReadonlySet<string> = new Set([
   "content_policy_violation",
   "invalid_input",
   "model_not_found",
+  "not_enabled",
 ]);
 
 function nonNegative(value: number | undefined, fallback: number, label: string): number {
@@ -117,9 +130,11 @@ export function resolveRetry(options: RetryOptions | false | undefined): RetryPo
  *
  * Only 5xx — the server failed to answer for reasons that may not repeat.
  * Everything below 500 is the server's considered answer about this request
- * (`404`, `409`, `422`, a `content_policy_violation`), and resending it just
- * spends the same money on the same verdict. A 5xx that names a terminal
- * bucket in `X-Comfy-Error-Type` is treated as that verdict too.
+ * (`404`, `409`, `422`, a `content_policy_violation`, a `not_enabled`), and
+ * resending it just spends the same money on the same verdict. A 5xx that
+ * names a terminal bucket in `X-Comfy-Error-Type` is treated as that verdict
+ * too — and, in the other direction, a `503` naming `service_unavailable` is
+ * exactly what this is for.
  */
 export function isRetryableStatus(status: number, errorType: string | null): boolean {
   if (status < 500) return false;

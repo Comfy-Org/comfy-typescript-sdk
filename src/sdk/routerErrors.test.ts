@@ -8,18 +8,22 @@ import {
   ClientDisconnected,
   ConcurrencyLimitExceeded,
   ContentPolicyViolation,
+  DeadlineExceeded,
   ERROR_TYPE_HEADER,
   Forbidden,
   InsufficientCredits,
   InternalError,
   InvalidInput,
   ModelNotFound,
+  NotEnabled,
   ProviderError,
   ProviderTimeout,
+  RateLimited,
   REQUEST_ERROR_TYPES,
   REQUEST_ID_HEADER,
   ROUTER_ERROR_TYPES,
   RouterError,
+  ServiceUnavailable,
   TRANSPORT_ERROR_TYPES,
   Unauthorized,
   toRouterError,
@@ -40,6 +44,10 @@ const CLASSES: Array<[RouterErrorType, typeof RouterError]> = [
   ["concurrency_limit_exceeded", ConcurrencyLimitExceeded],
   ["client_disconnected", ClientDisconnected],
   ["internal_error", InternalError],
+  ["deadline_exceeded", DeadlineExceeded],
+  ["not_enabled", NotEnabled],
+  ["service_unavailable", ServiceUnavailable],
+  ["rate_limited", RateLimited],
 ];
 
 /**
@@ -63,11 +71,11 @@ async function raise(response: Response): Promise<never> {
 }
 
 describe("the closed error-type set", () => {
-  it("is the six request-level buckets plus the five transport-level ones", () => {
+  it("is the six request-level buckets plus the nine transport-level ones", () => {
     expect(REQUEST_ERROR_TYPES).toHaveLength(6);
-    expect(TRANSPORT_ERROR_TYPES).toHaveLength(5);
+    expect(TRANSPORT_ERROR_TYPES).toHaveLength(9);
     expect(ROUTER_ERROR_TYPES).toEqual([...REQUEST_ERROR_TYPES, ...TRANSPORT_ERROR_TYPES]);
-    expect(new Set(ROUTER_ERROR_TYPES).size).toBe(11);
+    expect(new Set(ROUTER_ERROR_TYPES).size).toBe(15);
   });
 
   it("has exactly one class per bucket, and no class outside it", () => {
@@ -231,10 +239,59 @@ describe("toRouterError", () => {
     expect(toRouterError(504, new Headers(), null)).toBeInstanceOf(ProviderTimeout);
   });
 
+  it("keeps naming the older bucket where two of them share a status", () => {
+    // `not_enabled`, `rate_limited` and `deadline_exceeded` share 403, 429 and
+    // 504 with an older bucket, and a response with no header carries no
+    // evidence of which one it is. The fallback table is for responses that
+    // never reached Router at all, so it keeps the answer it has always given
+    // rather than relabelling those failures on the least evidence available;
+    // the header is what disambiguates, and Router always sets it.
+    const headerless = new Headers();
+    expect(toRouterError(403, headerless, null)).toBeInstanceOf(Forbidden);
+    expect(toRouterError(403, headerless, null).errorType).toBe("forbidden");
+    expect(toRouterError(429, headerless, null)).toBeInstanceOf(ConcurrencyLimitExceeded);
+    expect(toRouterError(504, headerless, null)).toBeInstanceOf(ProviderTimeout);
+  });
+
   it("falls back to InternalError for a status with no mapping", () => {
+    // 503 is deliberately unmapped: far more often a load balancer with no
+    // Router behind it than Router's own `service_unavailable`, which arrives
+    // with the header set and resolves through it.
     const err = toRouterError(503, new Headers(), null);
     expect(err).toBeInstanceOf(InternalError);
     expect(err.message).toBe("HTTP 503");
+  });
+
+  it("resolves the buckets that only the header can name", () => {
+    const notEnabled = toRouterError(
+      403,
+      new Headers({ [ERROR_TYPE_HEADER]: "not_enabled", [REQUEST_ID_HEADER]: "req-403" }),
+      { detail: "Comfy Router is not switched on for this caller yet.", error_type: "not_enabled" },
+    );
+    expect(notEnabled).toBeInstanceOf(NotEnabled);
+    expect(notEnabled).not.toBeInstanceOf(Forbidden);
+    expect(notEnabled.errorType).toBe("not_enabled");
+    expect(notEnabled.httpStatus).toBe(403);
+    expect(notEnabled.requestId).toBe("req-403");
+    expect(notEnabled.message).toBe("Comfy Router is not switched on for this caller yet.");
+
+    const unavailable = toRouterError(
+      503,
+      new Headers({ [ERROR_TYPE_HEADER]: "service_unavailable", [REQUEST_ID_HEADER]: "req-503" }),
+      { detail: "a dependency is down; retry with backoff", error_type: "service_unavailable" },
+    );
+    expect(unavailable).toBeInstanceOf(ServiceUnavailable);
+    expect(unavailable).not.toBeInstanceOf(InternalError);
+    expect(unavailable.errorType).toBe("service_unavailable");
+    expect(unavailable.httpStatus).toBe(503);
+    expect(unavailable.requestId).toBe("req-503");
+
+    expect(
+      toRouterError(429, new Headers({ [ERROR_TYPE_HEADER]: "rate_limited" }), null),
+    ).toBeInstanceOf(RateLimited);
+    expect(
+      toRouterError(504, new Headers({ [ERROR_TYPE_HEADER]: "deadline_exceeded" }), null),
+    ).toBeInstanceOf(DeadlineExceeded);
   });
 
   it("leaves requestId null when the response carried no id", () => {

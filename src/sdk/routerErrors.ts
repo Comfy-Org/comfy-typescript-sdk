@@ -4,8 +4,8 @@
  *
  * Router answers every failure with a coarse, machine-readable bucket on the
  * `X-Comfy-Error-Type` response header (and, for the request-level body
- * shape, in `error_type` as well). The bucket set is *closed* at eleven
- * values in this release: six request-level and five transport-level. This
+ * shape, in `error_type` as well). The bucket set is *closed* at fifteen
+ * values in this release: six request-level and nine transport-level. This
  * module turns that value into a class an integrator can `catch`. The names
  * below are the shared set: the Python SDK spells every one of them
  * identically, so a snippet, a doc page or a forum answer transfers between
@@ -33,23 +33,32 @@
  * Two things this module deliberately does not do:
  *
  * - **It does not narrow `errorType` to the closed set at runtime.** A newer
- *   server may send a bucket this release has never heard of (three more are
- *   already planned), and an SDK that threw on an unrecognized value would
- *   fail hardest exactly when something has already gone wrong. An unknown
- *   bucket surfaces as a plain {@link RouterError} carrying the raw string;
- *   the contract says to treat one as `internal_error`.
- * - **It is not generated from `spec/openapi.yaml`.** The vendored v2 spec
- *   does not yet carry the Router error components, so the closed set is
- *   restated here and pinned by `routerErrors.test.ts`. When the components
- *   land in the spec, that test is where the two get reconciled.
+ *   server may send a bucket this release has never heard of, and an SDK
+ *   that threw on an unrecognized value would fail hardest exactly when
+ *   something has already gone wrong. An unknown bucket surfaces as a plain
+ *   {@link RouterError} carrying the raw string; the contract says to treat
+ *   one as `internal_error`.
+ * - **It is not generated from a spec.** Nothing in this repo generates code
+ *   from `spec/router-openapi.yaml`, so the closed set is restated here by
+ *   hand — but it is no longer restated *unchecked*:
+ *   `router-spec-coverage.test.ts` reads that vendored contract's
+ *   `x-comfy-error-types` and fails if a bucket, its tier, its order or its
+ *   class is missing on either side. A spec sync that adds a bucket is not
+ *   done until a class exists for it here.
  *
  * These classes are namespaced (`routerErrors.*`) rather than exported from
- * the package root because three of the eleven names — `Unauthorized`,
+ * the package root because three of the fifteen names — `Unauthorized`,
  * `Forbidden`, `InsufficientCredits` — already exist at the root as
  * workflow-API exceptions descending from `ComfyError`. The Python SDK has
  * the same three at the top level of `comfy_sdk`, so both SDKs resolve the
  * collision the same way: a dedicated module, and the class names themselves
  * left untouched.
+ *
+ * Four of the fifteen buckets — `deadline_exceeded`, `not_enabled`,
+ * `service_unavailable` and `rate_limited` — are newer than the Python SDK's
+ * table. Until its twin lands they are declared as leading this SDK in
+ * `surface-parity.test.ts`'s allowlist, which fails once the Python side
+ * catches up so the entry cannot outlive the lag.
  */
 
 /**
@@ -61,7 +70,8 @@
  * - `content_policy_violation` is **not** `provider_error`. A policy refusal
  *   is deterministic; retrying the identical input will not succeed.
  * - `provider_timeout` is an *upstream* stall, not a Comfy-side deadline. A
- *   deadline that expires on our side arrives as `internal_error`.
+ *   deadline that expires on our side shares the same `504` but arrives as
+ *   `deadline_exceeded`.
  */
 export const REQUEST_ERROR_TYPES = [
   "invalid_input",
@@ -73,9 +83,27 @@ export const REQUEST_ERROR_TYPES = [
 ] as const;
 
 /**
- * The five transport-level buckets. They are part of the same closed set — a
- * caller reads one value off one header — but they are raised before or
- * around the model call rather than derived from a provider response.
+ * The nine transport-level buckets, in the order the error contract lists
+ * them. They are part of the same closed set — a caller reads one value off
+ * one header — but they are raised before or around the model call rather
+ * than derived from a provider response.
+ *
+ * Three pairs here share an HTTP status and are separate buckets precisely
+ * because the status cannot tell them apart, so a caller that branches on
+ * status alone gets the wrong answer for one of each pair:
+ *
+ * - `403` is `forbidden` (an entitlement decision about this caller) **or**
+ *   `not_enabled` (a state of the Router rollout, nothing to do with the
+ *   caller's entitlements).
+ * - `429` is `concurrency_limit_exceeded` (clears when one of the caller's
+ *   own in-flight calls finishes) **or** `rate_limited` (clears only when a
+ *   time window rolls).
+ * - `504` is `provider_timeout` (the partner ran out of time) **or**
+ *   `deadline_exceeded` (Comfy stopped holding the connection).
+ *
+ * The header is what disambiguates each pair; `ERROR_TYPE_BY_STATUS` below
+ * is only consulted when there is no header at all, and it deliberately
+ * keeps naming the older member of each pair.
  */
 export const TRANSPORT_ERROR_TYPES = [
   "unauthorized",
@@ -83,12 +111,16 @@ export const TRANSPORT_ERROR_TYPES = [
   "concurrency_limit_exceeded",
   "client_disconnected",
   "internal_error",
+  "deadline_exceeded",
+  "not_enabled",
+  "service_unavailable",
+  "rate_limited",
 ] as const;
 
 /** The closed error-type set for this release: request-level, then transport-level. */
 export const ROUTER_ERROR_TYPES = [...REQUEST_ERROR_TYPES, ...TRANSPORT_ERROR_TYPES] as const;
 
-/** One of the eleven buckets this release knows about. */
+/** One of the fifteen buckets this release knows about. */
 export type RouterErrorType = (typeof ROUTER_ERROR_TYPES)[number];
 
 /** `X-Comfy-Error-Type` — the coarse bucket, set on every Router error response. */
@@ -234,7 +266,8 @@ export class ProviderError extends RouterError {
 
 /**
  * The upstream model provider did not respond in time. Distinct from a
- * Comfy-side deadline, which arrives as {@link InternalError}.
+ * Comfy-side deadline, which shares the same `504` but arrives as
+ * {@link DeadlineExceeded}.
  */
 export class ProviderTimeout extends RouterError {
   static override readonly errorType = "provider_timeout";
@@ -277,6 +310,59 @@ export class InternalError extends RouterError {
   static override readonly errorType = "internal_error";
 }
 
+/**
+ * Comfy stopped holding the connection at its own configured bound before an
+ * answer arrived. It shares `504` with {@link ProviderTimeout} and the pair
+ * says which side ran out of time; this one is Comfy's own bound, so nothing
+ * about the request was rejected and the same request may be retried. It says
+ * nothing about the charge: a provider generation that completed is billed
+ * regardless of whether the caller received the response. Retry it with the
+ * SAME `Idempotency-Key` — when the provider had already accepted the
+ * generation, the retry collects that generation rather than dispatching
+ * another, and a `Retry-After` on the `504` says when to ask.
+ */
+export class DeadlineExceeded extends RouterError {
+  static override readonly errorType = "deadline_exceeded";
+}
+
+/**
+ * Comfy Router is not switched on for this caller yet. Nothing about the
+ * request is wrong and the model exists, which is why this is not
+ * {@link ModelNotFound}; it shares `403` with {@link Forbidden} and is NOT
+ * the same thing, because `forbidden` is an entitlement decision about the
+ * caller while this is a state of the rollout. It is TERMINAL: do not retry,
+ * and do not treat it as an outage.
+ */
+export class NotEnabled extends RouterError {
+  static override readonly errorType = "not_enabled";
+}
+
+/**
+ * A service Comfy Router depends on is temporarily unavailable and the caller
+ * did nothing wrong. Retry it with backoff: it is the one bucket here whose
+ * condition clears on its own, without the caller changing the request and
+ * without a concurrency slot freeing, which is what distinguishes it from the
+ * other retryable answers ({@link ConcurrencyLimitExceeded},
+ * {@link DeadlineExceeded}). It is separate from {@link InternalError} —
+ * which is a `500` and means Router itself failed — so a client can tell
+ * "come back shortly" from "this call is not going to work".
+ */
+export class ServiceUnavailable extends RouterError {
+  static override readonly errorType = "service_unavailable";
+}
+
+/**
+ * The caller has spent an allowance measured over a WINDOW and must wait for
+ * that window to roll. It shares `429` with
+ * {@link ConcurrencyLimitExceeded} and is not the same thing: that one clears
+ * the moment one of the caller's own in-flight calls finishes, so retrying in
+ * seconds is right, whereas nothing the caller does drains this one early.
+ * `detail` names the window.
+ */
+export class RateLimited extends RouterError {
+  static override readonly errorType = "rate_limited";
+}
+
 type RouterErrorClass = new (message: string, options: RouterErrorOptions) => RouterError;
 
 const BY_ERROR_TYPE: Record<string, RouterErrorClass> = {
@@ -291,6 +377,10 @@ const BY_ERROR_TYPE: Record<string, RouterErrorClass> = {
   concurrency_limit_exceeded: ConcurrencyLimitExceeded,
   client_disconnected: ClientDisconnected,
   internal_error: InternalError,
+  deadline_exceeded: DeadlineExceeded,
+  not_enabled: NotEnabled,
+  service_unavailable: ServiceUnavailable,
+  rate_limited: RateLimited,
 };
 
 /**
@@ -299,6 +389,17 @@ const BY_ERROR_TYPE: Record<string, RouterErrorClass> = {
  * was reached, say. Mapping by status is strictly better than dropping every
  * such failure into {@link InternalError}, but it is a fallback: the header is
  * the contract, and Router sets it on every error response it writes.
+ *
+ * Which is why the buckets that SHARE a status with an older one are absent
+ * here, and adding them would be a regression rather than an improvement: a
+ * header-less `403` cannot be told from a `forbidden`, a header-less `429`
+ * from a `concurrency_limit_exceeded`, or a header-less `504` from a
+ * `provider_timeout`. Guessing the newer member of the pair would relabel
+ * failures this table has always classified, on exactly the responses that
+ * carry the least evidence. For the same reason a header-less `503` is left
+ * unmapped and falls through to {@link InternalError}: it is far more often
+ * a load balancer with no Router behind it than Router's own
+ * `service_unavailable`, and the header is what says which.
  */
 const ERROR_TYPE_BY_STATUS: Record<number, string> = {
   400: "invalid_input",

@@ -569,7 +569,7 @@ import { routerErrors } from "@comfyorg/sdk";
 import { ContentPolicyViolation, InvalidInput } from "@comfyorg/sdk/errors";
 ```
 
-The set is closed at eleven buckets in this release. Six are request-level:
+The set is closed at fifteen buckets in this release. Six are request-level:
 
 - `InvalidInput` — the request was rejected as invalid, by the model or before
   dispatch. Carries `detail[]` (see below)
@@ -578,21 +578,40 @@ The set is closed at eleven buckets in this release. Six are request-level:
   a separate class from `ProviderError` rather than a flavor of it
 - `ProviderError` — the upstream model provider returned an error
 - `ProviderTimeout` — the upstream provider did not respond in time (a
-  Comfy-side deadline is `InternalError`, not this)
+  Comfy-side deadline shares the same `504` but is `DeadlineExceeded`, not this)
 - `InsufficientCredits`
 - `ModelNotFound`
 
-and five are transport-level: `Unauthorized`, `Forbidden`,
-`ConcurrencyLimitExceeded`, `ClientDisconnected`, `InternalError`.
+and nine are transport-level: `Unauthorized`, `Forbidden`,
+`ConcurrencyLimitExceeded`, `ClientDisconnected`, `InternalError`,
+`DeadlineExceeded`, `NotEnabled`, `ServiceUnavailable`, `RateLimited`.
+
+Three of those transport buckets **share an HTTP status with an older one**,
+which is the whole reason to branch on the class rather than on `httpStatus`:
+
+- `403` is `Forbidden` (this credential is not entitled to this model) or
+  `NotEnabled` (Comfy Router is not switched on for this caller yet — nothing
+  about the request is wrong, and it is the answer every caller gets until the
+  rollout reaches them). `NotEnabled` is terminal: do not retry it, and do not
+  treat it as an outage.
+- `429` is `ConcurrencyLimitExceeded` (clears when one of your own in-flight
+  calls finishes) or `RateLimited` (clears only when a time window rolls).
+- `504` is `ProviderTimeout` (the partner ran out of time) or
+  `DeadlineExceeded` (Comfy stopped holding the connection).
+
+`ServiceUnavailable` (`503`) is the one bucket whose condition clears on its
+own, so it is the one refusal `comfy.models.run` retries by default —
+with backoff, replayed under the call's own `Idempotency-Key`. Everything
+below `500` is left alone, `NotEnabled` included.
 
 Every one of them carries `errorType`, `requestId` (the server-minted id off
 `X-Comfy-Request-Id` — the value to quote in a support request) and
 `httpStatus`.
 
-An `error_type` this release has never heard of — a newer server, three more
-buckets are already planned — surfaces as a plain `RouterError` carrying the
-raw value in `errorType`, never as an untyped throw. Catching `RouterError`
-therefore keeps working across a server upgrade.
+An `error_type` this release has never heard of — a newer server — surfaces as
+a plain `RouterError` carrying the raw value in `errorType`, never as an
+untyped throw. Catching `RouterError` therefore keeps working across a server
+upgrade.
 
 `InvalidInput` is the one class with extra structure. A model-level validation
 failure names the offending fields, and those entries stay structured rather
@@ -624,9 +643,16 @@ on the provider's release cycle, not this SDK's — so treat an unrecognized
 `type` as informational rather than switching exhaustively on it. `detail` is an
 empty array for a rejection that names no field.
 
-Note that `comfy.models.run` does not execute anything yet (see
-[Module-level config](#module-level-config-comfyconfig-and-comfymodels)); these
-classes are the error contract, shipped ahead of the call that raises them.
+These classes are the error **contract** — the shared vocabulary both SDKs
+spell identically, kept in step with the vendored `spec/router-openapi.yaml`.
+`comfy.models.run` today reports the same buckets through `ComfyError` instead:
+`err.code` is the `error_type` verbatim (`"not_enabled"`,
+`"service_unavailable"`, …), alongside `httpStatus`, `requestId` and
+`details`. So branch on `err.code` for a failure raised by `run()`, and use
+these classes when you are classifying a Router response yourself. Routing
+`run()`'s own failures through `RouterError` is a separate change: it would
+move `Unauthorized`, `Forbidden`, `InsufficientCredits` and `NotFound` out of
+the `ComfyError` hierarchy that catches them today.
 
 ## Two layers
 

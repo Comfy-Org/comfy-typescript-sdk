@@ -11,6 +11,7 @@ import {
   nextAttemptDelayMs,
   NO_RETRY,
   resolveRetry,
+  TERMINAL_ERROR_TYPES,
   type RetryPolicy,
 } from "./retry.js";
 
@@ -68,8 +69,26 @@ describe("isRetryableStatus", () => {
     expect(isRetryableStatus(503, "content_policy_violation")).toBe(false);
     expect(isRetryableStatus(500, "invalid_input")).toBe(false);
     expect(isRetryableStatus(500, "model_not_found")).toBe(false);
+    // The rollout gate is a verdict too: nothing about the request is wrong,
+    // and nothing a replay does turns the flag on.
+    expect(isRetryableStatus(503, "not_enabled")).toBe(false);
     // An unfamiliar bucket is not assumed terminal — a 5xx stays retryable.
     expect(isRetryableStatus(503, "provider_timeout")).toBe(true);
+  });
+
+  it("retries service_unavailable, the one bucket whose condition clears on its own", () => {
+    // The contract says to retry it with backoff, so it must NOT be terminal:
+    // a 503 naming it is precisely what the 5xx rule is for.
+    expect(isRetryableStatus(503, "service_unavailable")).toBe(true);
+    expect(TERMINAL_ERROR_TYPES.has("service_unavailable")).toBe(false);
+    expect(TERMINAL_ERROR_TYPES.has("not_enabled")).toBe(true);
+  });
+
+  it("leaves a 403 unretried whichever bucket names it", () => {
+    // `not_enabled` and `forbidden` share the status; neither is retryable,
+    // so the terminal-bucket entry above changes nothing for a 403.
+    expect(isRetryableStatus(403, "not_enabled")).toBe(false);
+    expect(isRetryableStatus(403, "forbidden")).toBe(false);
   });
 });
 
