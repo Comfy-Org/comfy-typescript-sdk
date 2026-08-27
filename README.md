@@ -125,6 +125,8 @@ is the model's own native JSON input, forwarded to the provider unchanged —
 there is no Comfy envelope to wrap it in, so an integration already written
 against the provider keeps the request body it already has.
 
+The route this posts to (`/v1/models/{provider}/{model}`) and the host it posts to by default (`https://api.comfy.org`) are both pinned to the vendored Router contract in `spec/router-openapi.yaml`: `src/sdk/router-spec-contract.test.ts` and `pnpm check:spec-drift` compare them against that file's `runRouterModel` path and `servers[0].url`, so a sync PR that moves either one fails CI instead of leaving `run` to 404. When that happens, the vendored spec is the side that is right — update `RUN_ROUTE_TEMPLATE` in `src/sdk/models.ts` for the route and `COMFY_ROUTER_BASE_URL` in `src/sdk/credentials.ts` for the host.
+
 The promise resolves **only when the generation is complete**. One call is the
 whole contract: for a provider whose own API is submit-then-poll, the server
 does that polling inside the call rather than handing back a task handle, so
