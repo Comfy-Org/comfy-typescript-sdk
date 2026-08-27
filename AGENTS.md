@@ -22,7 +22,9 @@ Generated, do **not** edit by hand:
 `spec/openapi.yaml` is also off-limits: it is a vendored, one-way sync of the
 canonical Comfy API v2 contract with internal operations stripped (see
 `spec/README.md`). Fix the contract upstream; do not patch the vendored copy to
-make codegen emit what you want.
+make codegen emit what you want. The same goes for `spec/router-openapi.yaml`,
+the vendored Comfy Router contract — nothing is generated from it, but
+`src/sdk/routerErrors.ts` is checked against it (section 2).
 
 Everything else under `src/` is hand-written — including `src/low/index.ts`,
 which is the aggregator for the whole low layer, **not** codegen output. Note
@@ -46,9 +48,11 @@ what is committed. There is no tolerance for whitespace or ordering.
 
 ## 2. Spec-coupled hand-written code
 
-Three hand-written things must be updated in lockstep when the spec changes.
-`src/low/spec-coverage.test.ts` fails otherwise, and the failure message will
-not tell you this:
+Four hand-written things must be updated in lockstep when a vendored spec
+changes. Three are coupled to `spec/openapi.yaml` and fail
+`src/low/spec-coverage.test.ts`; the fourth is coupled to
+`spec/router-openapi.yaml` and fails `src/sdk/router-spec-coverage.test.ts`.
+In neither case will the failure message tell you this:
 
 - **`src/low/transport.ts` — `OPERATION_IDS`.** Must equal, as a set, the
   `operationId` of every non-internal operation in `spec/openapi.yaml`. A spec
@@ -57,6 +61,16 @@ not tell you this:
 - **`src/low/transport.ts` — `OPERATION_METHODS`.** Maps every operation ID to
   a method name that must actually exist on `ComfyLow.prototype`. The test
   checks both directions of the mapping and the method's existence.
+- **`src/sdk/routerErrors.ts` — the closed `error_type` set.** Checked against
+  a _different_ spec: `spec/router-openapi.yaml`, whose
+  `components.schemas.RouterErrorType.x-comfy-error-types` names every bucket,
+  its tier and its meaning. `src/sdk/router-spec-coverage.test.ts` asserts the
+  buckets, their order, their tier split and the class per bucket in both
+  directions. Nothing is generated from that spec, so this test is its drift
+  check — a Router spec sync that adds a bucket is not done until a
+  `RouterError` subclass exists for it, named the PascalCase of the wire value.
+  Adding one usually also needs a `routerErrorClassesAheadOfPython` entry in
+  `src/sdk/surface-parity.test.ts` until the Python twin lands (section 6).
 - **`src/low/models.ts`.** Holds four schemas codegen cannot reach, because
   `@hey-api/openapi-ts` only emits types reachable from an operation's
   request/response: `StatusEvent`, `PreviewEvent`, `LogEvent` (reachable only
@@ -192,8 +206,16 @@ Two things to know before you touch it:
   Python SDK's surface moved. Run `pnpm sync:python-surface`, commit the
   refreshed snapshot, then run `pnpm test` to see which symbols diverged.
 - **Deliberate divergences go in the `INTENTIONAL_ASYMMETRIES` allowlist** at
-  the top of the test, each with a stated reason. Three are declared today (the
-  result envelope, credential resolution, and the absence of a sync variant).
-  Anything not declared there fails. Adding an entry is a design decision — the
-  test also fails on an entry that no longer applies, so the list cannot rot
-  into a blanket exemption.
+  the top of the test, each with a stated reason. Four are declared today (the
+  result envelope, credential resolution, the absence of a sync variant, and
+  the router buckets this SDK currently leads on). Anything not declared there
+  fails. Adding an entry is a design decision — the test also fails on an entry
+  that no longer applies, so the list cannot rot into a blanket exemption.
+- **A LEAD is not an asymmetry, and has its own field.** The two SDKs ship on
+  separate pull requests, so one of them carries a new Router bucket first.
+  `routerErrorClassesAheadOfPython` tolerates that in ONE direction —
+  TypeScript may lead, never lag — and the rot guard fails the moment the
+  Python snapshot grows the same name, which is the signal to delete the entry
+  rather than to grow it. Do not reach for it to excuse a class this SDK
+  invented: `router-spec-coverage.test.ts` only passes for a bucket the
+  vendored Router contract actually declares.

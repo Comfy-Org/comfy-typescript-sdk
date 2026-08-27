@@ -29,9 +29,14 @@
     "Forbidden",
     "ConcurrencyLimitExceeded",
     "ClientDisconnected",
-    "InternalError"
+    "InternalError",
+    "DeadlineExceeded",
+    "NotEnabled",
+    "ServiceUnavailable",
+    "RateLimited"
   ],
   "routerErrorTypes": {
+    "RouterError": "",
     "InvalidInput": "invalid_input",
     "ContentPolicyViolation": "content_policy_violation",
     "ProviderError": "provider_error",
@@ -42,7 +47,11 @@
     "Forbidden": "forbidden",
     "ConcurrencyLimitExceeded": "concurrency_limit_exceeded",
     "ClientDisconnected": "client_disconnected",
-    "InternalError": "internal_error"
+    "InternalError": "internal_error",
+    "DeadlineExceeded": "deadline_exceeded",
+    "NotEnabled": "not_enabled",
+    "ServiceUnavailable": "service_unavailable",
+    "RateLimited": "rate_limited"
   },
   "routerErrorTypeOrder": [
     "invalid_input",
@@ -55,8 +64,22 @@
     "forbidden",
     "concurrency_limit_exceeded",
     "client_disconnected",
-    "internal_error"
+    "internal_error",
+    "deadline_exceeded",
+    "not_enabled",
+    "service_unavailable",
+    "rate_limited"
   ],
+  "routerErrorTypeByStatus": {
+    "401": "unauthorized",
+    "402": "insufficient_credits",
+    "403": "forbidden",
+    "404": "model_not_found",
+    "429": "concurrency_limit_exceeded",
+    "499": "client_disconnected",
+    "502": "provider_error",
+    "504": "provider_timeout"
+  },
   "exportedErrorClasses": [
     "BlobNotFound",
     "ComfyError",
