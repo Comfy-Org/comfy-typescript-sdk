@@ -55,6 +55,14 @@ interface Asymmetry {
   readonly pythonAsyncModelsClasses?: readonly string[];
   /** Python error class name -> the TypeScript name carrying the same meaning. */
   readonly renamedErrorClasses?: Readonly<Record<string, string>>;
+  /**
+   * Router error classes this SDK has landed AHEAD of the Python one, as
+   * `[className, errorType]`. Tolerated in one direction only — TypeScript
+   * may lead, never lag — and only until the twin lands: the rot guard below
+   * fails the moment the Python snapshot grows the same name, so the entry
+   * cannot outlive the lag it describes.
+   */
+  readonly routerErrorClassesAheadOfPython?: readonly (readonly [string, string])[];
 }
 
 const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
@@ -90,6 +98,24 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
       "notices is missing here.",
     pythonAsyncModelsClasses: ["AsyncModels"],
   },
+  {
+    id: "router-buckets-ahead-of-python",
+    why:
+      "The Router contract closed its error-type set at fifteen buckets; the Python SDK's " +
+      "table still stops at the original eleven. These four are declared by the vendored " +
+      "spec/router-openapi.yaml and asserted against it by router-spec-coverage.test.ts, so " +
+      "they are the contract rather than a TypeScript invention — the two SDKs simply ship " +
+      "on separate pull requests and one of them goes first. This is a LEAD, not a design " +
+      "divergence: it is tolerated in one direction only, and the rot guard below fails as " +
+      "soon as the Python snapshot carries the same name, which is the signal to delete " +
+      "this entry rather than to grow it.",
+    routerErrorClassesAheadOfPython: [
+      ["DeadlineExceeded", "deadline_exceeded"],
+      ["NotEnabled", "not_enabled"],
+      ["ServiceUnavailable", "service_unavailable"],
+      ["RateLimited", "rate_limited"],
+    ],
+  },
 ];
 
 const RENAMES: Record<string, string> = Object.fromEntries(
@@ -98,6 +124,11 @@ const RENAMES: Record<string, string> = Object.fromEntries(
 const ASYNC_MODELS_CLASSES = new Set(
   INTENTIONAL_ASYMMETRIES.flatMap((a) => a.pythonAsyncModelsClasses ?? []),
 );
+const AHEAD_OF_PYTHON: readonly (readonly [string, string])[] = INTENTIONAL_ASYMMETRIES.flatMap(
+  (a) => a.routerErrorClassesAheadOfPython ?? [],
+);
+const AHEAD_CLASS_NAMES = new Set(AHEAD_OF_PYTHON.map(([className]) => className));
+const AHEAD_ERROR_TYPES = new Set(AHEAD_OF_PYTHON.map(([, errorType]) => errorType));
 
 interface PythonSurface {
   source: { repo: string; ref: string; files: string[] };
@@ -225,8 +256,15 @@ describe("cross-SDK surface parity", () => {
 
   it("spells the router error classes identically", async () => {
     const python = await loadPythonSurface();
+    // Filtered on BOTH sides, so the day the Python SDK catches up produces
+    // exactly ONE failure — the rot guard below, whose message says to delete
+    // the entry — rather than three that each describe the same lag.
     expect(
-      nameDivergences("routerErrors", python.routerErrorClasses, errorClassNames(routerErrors)),
+      nameDivergences(
+        "routerErrors",
+        python.routerErrorClasses.filter((name) => !AHEAD_CLASS_NAMES.has(name)),
+        errorClassNames(routerErrors).filter((name) => !AHEAD_CLASS_NAMES.has(name)),
+      ),
     ).toEqual([]);
   });
 
@@ -253,8 +291,42 @@ describe("cross-SDK surface parity", () => {
   it("covers the same `error_type` set", async () => {
     const python = await loadPythonSurface();
     expect(
-      nameDivergences("error_type", python.routerErrorTypeOrder, routerErrors.ROUTER_ERROR_TYPES),
+      nameDivergences(
+        "error_type",
+        python.routerErrorTypeOrder.filter((type) => !AHEAD_ERROR_TYPES.has(type)),
+        [...routerErrors.ROUTER_ERROR_TYPES].filter((type) => !AHEAD_ERROR_TYPES.has(type)),
+      ),
     ).toEqual([]);
+  });
+
+  it("keeps every declared lead live, and only in the leading direction", async () => {
+    // The same rot rule as the renames below, applied to the lead: an entry
+    // has to name a class this SDK really has, and it has to STOP naming one
+    // the Python SDK has caught up on — otherwise the allowlist would go on
+    // excusing a divergence that no longer exists and hide the next real one.
+    const python = await loadPythonSurface();
+    const pythonClasses = new Set(python.routerErrorClasses);
+    const pythonTypes = new Set(python.routerErrorTypeOrder);
+    const typescriptClasses = new Set(errorClassNames(routerErrors));
+
+    for (const [className, errorType] of AHEAD_OF_PYTHON) {
+      expect(
+        typescriptClasses.has(className),
+        `the allowlist says \`${className}\` leads the Python SDK, but this SDK does not export it`,
+      ).toBe(true);
+      expect(
+        (routerErrors as Record<string, unknown>)[className],
+        `\`${className}\` is not a router error class`,
+      ).toBeTypeOf("function");
+      expect(
+        (routerErrors as Record<string, typeof routerErrors.RouterError>)[className].errorType,
+      ).toBe(errorType);
+      expect(
+        pythonClasses.has(className) || pythonTypes.has(errorType),
+        `the Python SDK now carries \`${className}\` — delete its entry from ` +
+          "INTENTIONAL_ASYMMETRIES so the two tables are compared again",
+      ).toBe(false);
+    }
   });
 
   it("exports the same error class names from the package root", async () => {

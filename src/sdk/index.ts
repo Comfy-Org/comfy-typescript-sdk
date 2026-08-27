@@ -60,7 +60,7 @@ export {
  * `routerErrors.RouterError`. Also reachable as `@comfyorg/sdk/errors`.
  *
  * They are namespaced rather than flattened into the exports above because
- * three of the eleven names (`Unauthorized`, `Forbidden`,
+ * three of the fifteen names (`Unauthorized`, `Forbidden`,
  * `InsufficientCredits`) are already taken here by the workflow-API
  * exceptions, which descend from `ComfyError`. See `./routerErrors.ts`.
  */

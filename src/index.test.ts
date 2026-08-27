@@ -39,7 +39,7 @@ describe("public surface", () => {
 
   it("re-exports the Router error namespace from the package root", () => {
     expect(routerErrors.RouterError).toBeTypeOf("function");
-    expect(routerErrors.ROUTER_ERROR_TYPES).toHaveLength(11);
+    expect(routerErrors.ROUTER_ERROR_TYPES).toHaveLength(15);
     expect(new routerErrors.ContentPolicyViolation("boom")).toBeInstanceOf(
       routerErrors.RouterError,
     );
