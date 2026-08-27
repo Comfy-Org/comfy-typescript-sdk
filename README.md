@@ -613,6 +613,18 @@ a plain `RouterError` carrying the raw value in `errorType`, never as an
 untyped throw. Catching `RouterError` therefore keeps working across a server
 upgrade.
 
+A response carrying **no** bucket at all — a proxy, gateway or load balancer
+that answered before Router was reached — is classified from its HTTP status
+where the status has one plain reading (`401` → `Unauthorized`, `404` →
+`ModelNotFound`, `502` → `ProviderError`, and so on). Where it does not, the
+SDK says so rather than guessing: a header-less `400`, `422`, `500` or `503`
+raises the base `RouterError` with `errorType` empty and `httpStatus` intact.
+A `400` is `invalid_input` _or_ `content_policy_violation` and those differ in
+whether a retry can ever succeed, so guessing between them would be worse than
+saying nothing. This only ever applies to responses Router did not write —
+Router repeats the bucket on `X-Comfy-Error-Type` for every error it sends —
+and the Python SDK classifies the same responses the same way.
+
 `InvalidInput` is the one class with extra structure. A model-level validation
 failure names the offending fields, and those entries stay structured rather
 than being flattened into the message:

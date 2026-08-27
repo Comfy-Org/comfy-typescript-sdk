@@ -36,8 +36,10 @@
  *   server may send a bucket this release has never heard of, and an SDK
  *   that threw on an unrecognized value would fail hardest exactly when
  *   something has already gone wrong. An unknown bucket surfaces as a plain
- *   {@link RouterError} carrying the raw string; the contract says to treat
- *   one as `internal_error`.
+ *   {@link RouterError} carrying the raw string; the contract says a CALLER
+ *   should treat one as `internal_error`, which is advice for the caller and
+ *   not licence for this module to rewrite what the server said. A response
+ *   that named no bucket at all surfaces the same way with `errorType` empty.
  * - **It is not generated from a spec.** Nothing in this repo generates code
  *   from `spec/router-openapi.yaml`, so the closed set is restated here by
  *   hand — but it is no longer restated *unchecked*:
@@ -185,12 +187,19 @@ export interface RouterErrorOptions {
 export class RouterError extends Error {
   /**
    * The bucket instances of this class report when the caller does not pass
-   * one. On the base class it is `internal_error` because that is what the
-   * contract says to do with a bucket you do not recognize — but an unknown
-   * value read off the wire is preserved verbatim in {@link errorType}
-   * rather than being rewritten to it.
+   * one. On the base class it is the EMPTY STRING, which reads as "no bucket"
+   * — the base is reached only when the response named no bucket this release
+   * recognizes, and an unknown value read off the wire is preserved verbatim
+   * in {@link errorType} rather than being rewritten.
+   *
+   * It is deliberately not `internal_error`. That is a real member of the
+   * closed set, so defaulting to it would make "we could not tell" and "the
+   * server said Router itself failed" indistinguishable to a caller reading
+   * `errorType`, on exactly the responses that carry the least evidence. The
+   * Python SDK's base declares `error_type = ""` for the same reason, and
+   * `surface-parity.test.ts` now compares the two defaults.
    */
-  static readonly errorType: string = "internal_error";
+  static readonly errorType: string = "";
 
   /** The `error_type` bucket, exactly as it arrived. */
   readonly errorType: string;
@@ -385,10 +394,17 @@ const BY_ERROR_TYPE: Record<string, RouterErrorClass> = {
 
 /**
  * Last-resort bucket for a response that carried no `X-Comfy-Error-Type` and
- * no `error_type` in its body — a proxy or gateway that failed before Router
- * was reached, say. Mapping by status is strictly better than dropping every
- * such failure into {@link InternalError}, but it is a fallback: the header is
- * the contract, and Router sets it on every error response it writes.
+ * no `error_type` in its body — a proxy, gateway or load balancer that
+ * rejected the call before it reached Router, say, so that `catch
+ * (Unauthorized)` still fires for a rejected key. It is a fallback: the header
+ * is the contract, and Router repeats the bucket on it for every error
+ * response it writes, so nothing here is ever consulted for an answer Router
+ * itself sent.
+ *
+ * Read each entry as "what does an INTERMEDIARY's answer most likely mean",
+ * not "which bucket owns this status". This table is byte-for-byte the Python
+ * SDK's `_ERROR_TYPE_BY_STATUS`, and `surface-parity.test.ts` asserts that,
+ * so the same header-less response raises the same thing in both languages.
  *
  * Which is why the buckets that SHARE a status with an older one are absent
  * here, and adding them would be a regression rather than an improvement: a
@@ -396,18 +412,29 @@ const BY_ERROR_TYPE: Record<string, RouterErrorClass> = {
  * from a `concurrency_limit_exceeded`, or a header-less `504` from a
  * `provider_timeout`. Guessing the newer member of the pair would relabel
  * failures this table has always classified, on exactly the responses that
- * carry the least evidence. For the same reason a header-less `503` is left
- * unmapped and falls through to {@link InternalError}: it is far more often
- * a load balancer with no Router behind it than Router's own
- * `service_unavailable`, and the header is what says which.
+ * carry the least evidence.
+ *
+ * A status stays OUT of the table entirely when the plain HTTP reading does
+ * not pick ONE bucket, and such a response raises the base {@link RouterError}
+ * with the raw status and no bucket at all — which is the honest answer:
+ *
+ * - `400` carries either `invalid_input` or `content_policy_violation`, and
+ *   those differ in whether a retry can ever succeed. Guessing `invalid_input`
+ *   tells a caller to fix-and-retry what may be a deterministic refusal.
+ * - `422` has no bucket pinned to it by the contract at all: the per-field
+ *   validation response carries its bucket ONLY on `X-Comfy-Error-Type`, since
+ *   its body is the `detail[]` array and has no `error_type` field, so a
+ *   header-less `422` is genuinely ambiguous.
+ * - `503` from an intermediary is not Router's `service_unavailable`: that
+ *   bucket is Router's own statement that a dependency of ITS is briefly down,
+ *   and a gateway's `503` says nothing about whether the request ever reached
+ *   Router to have such a statement made about it.
  */
 const ERROR_TYPE_BY_STATUS: Record<number, string> = {
-  400: "invalid_input",
   401: "unauthorized",
   402: "insufficient_credits",
   403: "forbidden",
   404: "model_not_found",
-  422: "invalid_input",
   429: "concurrency_limit_exceeded",
   499: "client_disconnected",
   502: "provider_error",
@@ -463,7 +490,11 @@ function summarizeDetail(entries: readonly ValidationErrorDetail[]): string {
  * `error_type` second, in that order and not the other way around: the `422`
  * body is the per-field `detail[]` shape and carries no `error_type` of its
  * own, so the header is the only field present on every error response. A
- * response with neither falls back to {@link ERROR_TYPE_BY_STATUS}.
+ * response with neither falls back to {@link ERROR_TYPE_BY_STATUS}, and a
+ * status that table deliberately does not name — `400`, `422`, `503`, or any
+ * other — yields the base {@link RouterError} with an empty `errorType`,
+ * carrying the raw `httpStatus`. Guessing a bucket there would be worse than
+ * saying nothing; see that table for the per-status reasoning.
  *
  * An `error_type` outside the closed set yields a plain {@link RouterError}
  * carrying the unrecognized value — never a throw, and never a silent
@@ -475,7 +506,17 @@ export function toRouterError(status: number, headers: HeadersLike, body: unknow
 
   const headerType = headers.get(ERROR_TYPE_HEADER);
   const bodyType = typeof envelope.error_type === "string" ? envelope.error_type : null;
-  const errorType = headerType || bodyType || ERROR_TYPE_BY_STATUS[status] || "internal_error";
+  // Annotated rather than inferred: without `noUncheckedIndexedAccess` an
+  // index into a `Record<number, string>` types as `string`, which would hide
+  // the very "no bucket" case the next line exists to produce.
+  const statusType: string | undefined = ERROR_TYPE_BY_STATUS[status];
+  // No trailing `|| "internal_error"` here, deliberately: a response that
+  // named no bucket, on a status the table above does not map, has told us
+  // nothing about which bucket it is — and `internal_error` is a real member
+  // of the closed set rather than a way to say "unknown". Leaving this
+  // undefined lets the base class's own default ("") stand, which is what the
+  // Python SDK does with the same response.
+  const errorType = headerType || bodyType || statusType;
 
   const options: RouterErrorOptions = { errorType, requestId, httpStatus: status };
   // Own-property lookup only. A plain `BY_ERROR_TYPE[errorType]` would resolve
@@ -483,7 +524,10 @@ export function toRouterError(status: number, headers: HeadersLike, body: unknow
   // hand back something that is not a RouterError at all — and the whole point
   // of the unknown-bucket path is that a server value can never produce an
   // untyped throw.
-  const cls = Object.hasOwn(BY_ERROR_TYPE, errorType) ? BY_ERROR_TYPE[errorType] : undefined;
+  const cls =
+    errorType !== undefined && Object.hasOwn(BY_ERROR_TYPE, errorType)
+      ? BY_ERROR_TYPE[errorType]
+      : undefined;
 
   if (cls === InvalidInput) {
     const entries = Array.isArray(envelope.detail)

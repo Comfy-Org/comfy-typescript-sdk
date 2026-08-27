@@ -114,9 +114,20 @@ describe("the class hierarchy", () => {
     expect(err.stack).toContain(cls.name);
   });
 
-  it("defaults a bare RouterError to internal_error without rewriting a known one", () => {
-    expect(new RouterError("boom").errorType).toBe("internal_error");
+  it("defaults a bare RouterError to no bucket at all, without rewriting a known one", () => {
+    // The empty string reads as "no bucket", and it is deliberately NOT
+    // `internal_error`: that is a real member of the closed set, so
+    // defaulting to it would make "we could not tell which bucket this is"
+    // indistinguishable from "the server said Router itself failed". The
+    // Python SDK's base declares `error_type = ""` for the same reason and
+    // `surface-parity.test.ts` compares the two.
+    expect(new RouterError("boom").errorType).toBe("");
     expect(new RouterError("boom", { errorType: "queue_timeout" }).errorType).toBe("queue_timeout");
+    // Every subclass still reports its own bucket — the base default is not
+    // inherited by anything that declares one.
+    for (const [type, cls] of CLASSES) {
+      expect(new cls("boom").errorType).toBe(type);
+    }
   });
 
   it("carries requestId and httpStatus on every class, defaulting to null", () => {
@@ -253,13 +264,67 @@ describe("toRouterError", () => {
     expect(toRouterError(504, headerless, null)).toBeInstanceOf(ProviderTimeout);
   });
 
-  it("falls back to InternalError for a status with no mapping", () => {
-    // 503 is deliberately unmapped: far more often a load balancer with no
-    // Router behind it than Router's own `service_unavailable`, which arrives
-    // with the header set and resolves through it.
-    const err = toRouterError(503, new Headers(), null);
-    expect(err).toBeInstanceOf(InternalError);
-    expect(err.message).toBe("HTTP 503");
+  it("raises the base RouterError, with no bucket, for a status with no mapping", () => {
+    // A status the table deliberately does not name carries no evidence of
+    // which bucket it is, so the SDK says so rather than guessing. There is
+    // no trailing `|| "internal_error"` on the resolution: `internal_error`
+    // is a real bucket in the closed set, and answering with it here would
+    // put a claim on the wire that the response never made. The Python SDK
+    // does exactly this, and `surface-parity.test.ts` asserts the two tables
+    // and the two base defaults agree.
+    //
+    // - 400 carries either `invalid_input` or `content_policy_violation`, and
+    //   those differ in whether a retry can ever succeed.
+    // - 422's bucket rides ONLY on the header (its body is the `detail[]`
+    //   array and has no `error_type`), so a header-less one is ambiguous.
+    // - 503 from an intermediary is not Router's own `service_unavailable`.
+    // - 500 is not automatically Router's `internal_error` either.
+    for (const status of [400, 422, 503, 500, 418]) {
+      const err = toRouterError(status, new Headers(), null);
+      expect(err.constructor, `HTTP ${String(status)} should raise the base class`).toBe(
+        RouterError,
+      );
+      expect(err).not.toBeInstanceOf(InternalError);
+      expect(err).not.toBeInstanceOf(InvalidInput);
+      expect(err.errorType).toBe("");
+      expect(err.httpStatus).toBe(status);
+      expect(err.message).toBe(`HTTP ${String(status)}`);
+    }
+  });
+
+  it("still resolves a 400 or 422 that DOES name its bucket", () => {
+    // Dropping 400/422 from the status table changes the header-less case
+    // only. Router itself always sets `X-Comfy-Error-Type`, so the responses
+    // an integrator actually sees are unaffected — including the one the
+    // guess used to get wrong, a 422 refusal that is a deterministic content
+    // policy violation rather than something to fix and resend.
+    const invalid = toRouterError(422, new Headers({ [ERROR_TYPE_HEADER]: "invalid_input" }), {
+      detail: [{ loc: ["body", "prompt"], msg: "field required", type: "missing" }],
+    });
+    expect(invalid).toBeInstanceOf(InvalidInput);
+    expect(invalid.errorType).toBe("invalid_input");
+    expect((invalid as InvalidInput).detail).toHaveLength(1);
+    expect((invalid as InvalidInput).detail[0].type).toBe("missing");
+
+    const refused = toRouterError(
+      422,
+      new Headers({ [ERROR_TYPE_HEADER]: "content_policy_violation" }),
+      { detail: "refused" },
+    );
+    expect(refused).toBeInstanceOf(ContentPolicyViolation);
+    expect(refused).not.toBeInstanceOf(InvalidInput);
+    expect(refused.errorType).toBe("content_policy_violation");
+    expect(refused.message).toBe("refused");
+
+    // The body's `error_type` is the second source and works the same way —
+    // the request-level 400 shape carries one even when a header is stripped
+    // in transit.
+    const fromBody = toRouterError(400, new Headers(), {
+      detail: "no",
+      error_type: "invalid_input",
+    });
+    expect(fromBody).toBeInstanceOf(InvalidInput);
+    expect(fromBody.errorType).toBe("invalid_input");
   });
 
   it("resolves the buckets that only the header can name", () => {

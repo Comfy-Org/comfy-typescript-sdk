@@ -136,14 +136,36 @@ export function extractModelsMethods(source) {
 }
 
 /**
- * The router error hierarchy: the class names, and the wire `error_type` each
- * one maps to.
+ * The `error_type` declared on a class body, or `null` if it declares none.
+ *
+ * `null` and `""` are different answers and the caller decides which is legal:
+ * every class in the closed set must declare a NON-empty value, while the base
+ * `RouterError` must declare the empty one. Returning `null` for "absent"
+ * keeps that distinction readable at the call site.
+ */
+function declaredErrorType(body) {
+  const assignment = body
+    .map((line) => /^\s{4}error_type\s*(?::\s*str\s*)?=\s*"([^"]*)"/.exec(line))
+    .find(Boolean);
+  return assignment ? assignment[1] : null;
+}
+
+/**
+ * The router error hierarchy: the class names, the wire `error_type` each one
+ * maps to (**including the base class**), and the status -> bucket fallback
+ * table.
  *
  * The order comes from the `ROUTER_EXCEPTIONS` tuple rather than from the
  * class definitions, because that tuple is what the Python SDK derives its
  * own `ROUTER_ERROR_TYPES` from — reading it here means the manifest records
  * the same list the Python SDK publishes, not a re-derivation that could
  * disagree with it.
+ *
+ * The base class is in `errorTypes` on purpose. It used to be left out, which
+ * quietly excused the two SDKs disagreeing about what an UNRECOGNIZED bucket
+ * reads as — the one case the base class exists for. Its value is the empty
+ * string on both sides, and recording it is what lets the parity test compare
+ * the two defaults instead of papering over them.
  */
 export function extractRouterErrors(source) {
   if (!/^class RouterError\(/m.test(source)) {
@@ -162,7 +184,20 @@ export function extractRouterErrors(source) {
     fail(`${PYTHON_SOURCE_FILES.routerExceptions}: \`ROUTER_EXCEPTIONS\` listed zero classes.`);
   }
 
-  const errorTypes = {};
+  const baseBody = classBody(source, "RouterError");
+  if (baseBody === null) {
+    fail(`${PYTHON_SOURCE_FILES.routerExceptions}: \`RouterError\` has no readable body.`);
+  }
+  const baseErrorType = declaredErrorType(baseBody);
+  if (baseErrorType === null) {
+    fail(
+      `${PYTHON_SOURCE_FILES.routerExceptions}: \`RouterError\` declares no \`error_type\`. ` +
+        "The base class default is compared across the two SDKs, so an absent one is a " +
+        "broken extraction rather than agreement.",
+    );
+  }
+
+  const errorTypes = { RouterError: baseErrorType };
   for (const className of ordered) {
     const body = classBody(source, className);
     if (body === null) {
@@ -171,16 +206,14 @@ export function extractRouterErrors(source) {
           "but no such class is defined in the file.",
       );
     }
-    const assignment = body
-      .map((line) => /^\s{4}error_type\s*(?::\s*str\s*)?=\s*"([^"]*)"/.exec(line))
-      .find(Boolean);
-    if (!assignment || assignment[1] === "") {
+    const errorType = declaredErrorType(body);
+    if (errorType === null || errorType === "") {
       fail(
         `${PYTHON_SOURCE_FILES.routerExceptions}: ${className} declares no non-empty ` +
           "`error_type`. Every class in the closed set maps to exactly one wire value.",
       );
     }
-    errorTypes[className] = assignment[1];
+    errorTypes[className] = errorType;
   }
 
   return {
@@ -190,6 +223,38 @@ export function extractRouterErrors(source) {
     // `ROUTER_ERROR_TYPES` as the Python SDK publishes it: the tuple's order.
     errorTypeOrder: ordered.map((className) => errorTypes[className]),
   };
+}
+
+/**
+ * The status -> bucket fallback table, read off `_ERROR_TYPE_BY_STATUS`.
+ *
+ * This is a BEHAVIOUR, not a name, and a name-only parity check cannot see it:
+ * the two SDKs can spell every class identically and still raise different
+ * classes for the same header-less response, which is exactly what `400` and
+ * `422` used to do. Recording the table here is what lets
+ * `surface-parity.test.ts` assert the two fallbacks agree.
+ *
+ * Keys are stringified statuses, because that is what they become in JSON
+ * anyway — writing them that way keeps the manifest and the parsed object the
+ * same shape.
+ */
+export function extractErrorTypeByStatus(source) {
+  const table = /^_ERROR_TYPE_BY_STATUS[^=]*=\s*\{([\s\S]*?)^\}/m.exec(source);
+  if (!table) {
+    fail(`${PYTHON_SOURCE_FILES.routerExceptions}: no \`_ERROR_TYPE_BY_STATUS\` table found.`);
+  }
+
+  const byStatus = {};
+  for (const [, status, errorType] of table[1].matchAll(/^\s*(\d+)\s*:\s*"([^"]+)"/gm)) {
+    byStatus[status] = errorType;
+  }
+  if (Object.keys(byStatus).length === 0) {
+    fail(
+      `${PYTHON_SOURCE_FILES.routerExceptions}: \`_ERROR_TYPE_BY_STATUS\` yielded zero ` +
+        "entries. An empty fallback table would read as agreement with anything.",
+    );
+  }
+  return byStatus;
 }
 
 /** The names in a module's `__all__`, in declaration order. */
@@ -246,6 +311,7 @@ export function extractPythonSurface(sources, { repo, ref }) {
     routerErrorClasses: routerErrors.classes,
     routerErrorTypes: routerErrors.errorTypes,
     routerErrorTypeOrder: routerErrors.errorTypeOrder,
+    routerErrorTypeByStatus: extractErrorTypeByStatus(sources.routerExceptions),
     exportedErrorClasses: extractExportedErrorClasses(sources.exceptions, sources.packageInit),
   };
 }
