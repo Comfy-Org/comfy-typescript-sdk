@@ -5,9 +5,21 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # Daily, for `sdk-parity` alone (every other job is gated off below). That
+  # job is the only one whose input lives in ANOTHER repository: it re-derives
+  # the Python SDK's public surface from that repo's default branch, so a
+  # Python-side change is drift here the moment it merges there. On
+  # pull_request/push it would be noticed only whenever this repo's next PR
+  # happens to run CI, which can be days. 07:17 UTC is off the top of the hour
+  # on purpose -- GitHub delays cron runs that pile onto :00.
+  schedule:
+    - cron: "17 7 * * *"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # `github.event_name` is in the key so the daily scheduled run and a push to
+  # main -- which share a ref -- cannot cancel each other. PR and push refs
+  # never collide, so this changes nothing for them.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -17,6 +29,9 @@ jobs:
   test:
     name: Test (node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
+    # The daily schedule exists for `sdk-parity` only; this job's inputs all
+    # live in this repo and cannot change without a push.
+    if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +77,9 @@ jobs:
   build-check:
     name: build-check (publish dry run)
     runs-on: ubuntu-latest
+    # The daily schedule exists for `sdk-parity` only; this job's inputs all
+    # live in this repo and cannot change without a push.
+    if: github.event_name != 'schedule'
     steps:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -106,6 +124,12 @@ jobs:
   sdk-parity:
     name: sdk-parity (python surface freshness)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Only used by the two scheduled-run steps below, which file/close the
+      # sticky drift issue. A pull_request run never reaches them, and on a
+      # fork PR the token is read-only anyway.
+      issues: write
     steps:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -118,12 +142,68 @@ jobs:
       - name: Check the Python SDK surface snapshot is current
         run: node scripts/sync-python-surface.mjs
 
+      # A scheduled run has no PR to redden and nobody watching a check list,
+      # so its failure would be visible only to whoever thinks to open the
+      # Actions tab. Keep ONE open issue instead -- opened on the first failing
+      # run, commented on by each subsequent one so the history is on the
+      # thread rather than in N issues, and closed by the first run that
+      # passes again.
+      - name: Open or update the drift issue
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: "sdk-parity: the Python SDK surface snapshot is stale"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Exact title match off the plain issue list -- the search API is
+          # eventually consistent, and a miss here would open a second issue.
+          existing="$(gh issue list --state open --limit 100 --json number,title \
+            --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
+          body="$(printf '%s\n' \
+            "The daily \`sdk-parity\` run found \`parity/python-surface.json\` out of date with" \
+            "\`Comfy-Org/comfy-python-sdk@main\`. The Python SDK's public surface moved; this is" \
+            "the cross-SDK drift the check exists to surface, not a failure of this repository." \
+            "" \
+            "    pnpm sync:python-surface   # refresh the snapshot" \
+            "    pnpm test                  # see which symbols actually diverged" \
+            "" \
+            "Then either mirror the change here, or declare it in the intentional-asymmetry" \
+            "allowlist in \`src/sdk/surface-parity.test.ts\` with the reason." \
+            "" \
+            "Run: $RUN_URL")"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$TITLE" --body "$body"
+          fi
+
+      - name: Close the drift issue once the snapshot is current again
+        if: success() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: "sdk-parity: the Python SDK surface snapshot is stale"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          existing="$(gh issue list --state open --limit 100 --json number,title \
+            --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" \
+              --comment "The snapshot matches \`Comfy-Org/comfy-python-sdk@main\` again. Run: $RUN_URL"
+          fi
+
   # NEW -- regression guard for the internal-reference leak this repo already
   # had once (see scripts/check-public-repo-hygiene.mjs for what it looks for
   # and why). Public repo, so this stays a permanent gate, not a one-time fix.
   public-repo-hygiene:
     name: public-repo-hygiene
     runs-on: ubuntu-latest
+    # The daily schedule exists for `sdk-parity` only; this job's inputs all
+    # live in this repo and cannot change without a push.
+    if: github.event_name != 'schedule'
     steps:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

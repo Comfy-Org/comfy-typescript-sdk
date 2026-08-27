@@ -48,6 +48,29 @@ entry. See CONTRIBUTING.md.
 - `ComfyError.requestId` — the `X-Comfy-Request-Id` of the call that failed,
   or `null` when the response carried none.
 
+### Changed
+
+- **Behaviour change, in `routerErrors`.** An error response carrying **no**
+  `X-Comfy-Error-Type` header and no `error_type` in its body now raises the
+  base `RouterError` — with `httpStatus` intact and `errorType` empty — for any
+  status the fallback table does not name, which as of this entry includes
+  `400`, `422`, `500` and `503`. Previously a header-less `400` or `422` raised
+  `InvalidInput`, and every other unmapped status raised `InternalError`.
+  Neither guess was safe: a `400` is `invalid_input` **or**
+  `content_policy_violation`, and those differ in whether a retry can ever
+  succeed, so calling it `invalid_input` tells a caller to fix-and-resend what
+  may be a deterministic refusal; the contract pins no bucket to `422` at all,
+  since that response carries its bucket only on the header. Relatedly,
+  `RouterError.errorType` now defaults to `""` ("no bucket") rather than
+  `"internal_error"` — a real member of the closed set, which therefore could
+  not also mean "unknown". Both match the Python SDK, and the cross-SDK parity
+  check now compares the two fallback tables and the two base defaults rather
+  than class names alone. Responses that DO name their bucket — which is every
+  response Router itself writes, on any status — are unaffected. **No published
+  version is affected:** `routerErrors` has never shipped (it is absent from
+  `v0.1.7`, the latest release on npm), so this changes behaviour only for
+  callers building against `main`.
+
 ## [0.1.7] - 2026-08-13
 
 ### Added

@@ -4,9 +4,17 @@
  * Two SDKs maintained by separate PRs drift, and the drift is invisible until
  * somebody follows a Python example in TypeScript and the method is not there.
  * This test makes that visible at the point of change instead: it diffs the
- * public `models` method names, the router error class names, and the
- * `error_type` coverage of the two SDKs and fails naming the symbol that
- * diverged.
+ * public `models` method names, the router error class names, the
+ * `error_type` coverage of the two SDKs and the status -> bucket fallback
+ * table, and fails naming the symbol that diverged.
+ *
+ * Names alone are not enough, which is the lesson the fallback comparison
+ * encodes: the two SDKs can spell every class identically and still raise
+ * DIFFERENT classes for the same wire response. So two behaviours are compared
+ * here as well as the names — the status fallback table, and the base class's
+ * `error_type` default (the base is NOT excluded from the `error_type`
+ * comparison, and excluding it is what previously hid the two SDKs disagreeing
+ * about what an unrecognized bucket reads as).
  *
  * The Python side is read from `parity/python-surface.json`, a committed
  * snapshot; `scripts/sync-python-surface.mjs` refreshes it from the Python
@@ -23,7 +31,7 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
-import { extractRouterErrors } from "../../scripts/python-surface.mjs";
+import { extractErrorTypeByStatus, extractRouterErrors } from "../../scripts/python-surface.mjs";
 import * as sdk from "../index.js";
 import { models } from "./models.js";
 import * as routerErrors from "./routerErrors.js";
@@ -61,6 +69,12 @@ interface Asymmetry {
    * may lead, never lag — and only until the twin lands: the rot guard below
    * fails the moment the Python snapshot grows the same name, so the entry
    * cannot outlive the lag it describes.
+   *
+   * No asymmetry declares one today. `deadline_exceeded`, `not_enabled`,
+   * `service_unavailable` and `rate_limited` did until the Python SDK shipped
+   * all four, at which point the rot guard fired and the entry was deleted —
+   * which is the mechanism working, not a gap. The field stays because the
+   * next bucket will land on one side first too.
    */
   readonly routerErrorClassesAheadOfPython?: readonly (readonly [string, string])[];
 }
@@ -98,24 +112,6 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
       "notices is missing here.",
     pythonAsyncModelsClasses: ["AsyncModels"],
   },
-  {
-    id: "router-buckets-ahead-of-python",
-    why:
-      "The Router contract closed its error-type set at fifteen buckets; the Python SDK's " +
-      "table still stops at the original eleven. These four are declared by the vendored " +
-      "spec/router-openapi.yaml and asserted against it by router-spec-coverage.test.ts, so " +
-      "they are the contract rather than a TypeScript invention — the two SDKs simply ship " +
-      "on separate pull requests and one of them goes first. This is a LEAD, not a design " +
-      "divergence: it is tolerated in one direction only, and the rot guard below fails as " +
-      "soon as the Python snapshot carries the same name, which is the signal to delete " +
-      "this entry rather than to grow it.",
-    routerErrorClassesAheadOfPython: [
-      ["DeadlineExceeded", "deadline_exceeded"],
-      ["NotEnabled", "not_enabled"],
-      ["ServiceUnavailable", "service_unavailable"],
-      ["RateLimited", "rate_limited"],
-    ],
-  },
 ];
 
 const RENAMES: Record<string, string> = Object.fromEntries(
@@ -136,6 +132,7 @@ interface PythonSurface {
   routerErrorClasses: string[];
   routerErrorTypes: Record<string, string>;
   routerErrorTypeOrder: string[];
+  routerErrorTypeByStatus: Record<string, string>;
   exportedErrorClasses: string[];
 }
 
@@ -148,6 +145,7 @@ async function loadPythonSurface(): Promise<PythonSurface> {
     ["routerErrorClasses", surface.routerErrorClasses.length],
     ["routerErrorTypes", Object.keys(surface.routerErrorTypes).length],
     ["routerErrorTypeOrder", surface.routerErrorTypeOrder.length],
+    ["routerErrorTypeByStatus", Object.keys(surface.routerErrorTypeByStatus).length],
     ["exportedErrorClasses", surface.exportedErrorClasses.length],
   ];
   for (const [name, size] of sections) {
@@ -204,6 +202,51 @@ function nameDivergences(what: string, python: Iterable<string>, typescript: Ite
     }
   }
   return lines;
+}
+
+/**
+ * The status -> bucket fallback this SDK actually applies, derived by CALLING
+ * `toRouterError` rather than by reading its table.
+ *
+ * Reading the table would need it exported, which would widen the package's
+ * public surface for a test's benefit; worse, it would assert the table rather
+ * than the behaviour, and the two can part company (the trailing
+ * `|| "internal_error"` that used to sit on the resolution line was exactly
+ * such a divergence — invisible in the table, decisive in the answer). A
+ * status whose fallback resolves to no bucket at all yields the base
+ * `RouterError` with an empty `errorType`, and is simply absent here, which is
+ * how the Python table spells the same thing.
+ */
+function typescriptFallbackTable(): Record<string, string> {
+  // "No bucket" is whatever the base class reports, not a hardcoded "": that
+  // default is compared against Python by its own test below, so keying off
+  // it here means a regression in the default fails THAT test alone instead
+  // of reddening this one too with a derived symptom.
+  const noBucket = routerErrors.RouterError.errorType;
+  const table: Record<string, string> = {};
+  // Every status code an HTTP response can carry, not just the 4xx/5xx the
+  // table happens to name today — an entry that strayed outside that range
+  // must fail the comparison, not slip past the sweep.
+  for (let status = 100; status <= 599; status += 1) {
+    const error = routerErrors.toRouterError(status, new Headers(), null);
+    if (error.errorType !== noBucket) table[String(status)] = error.errorType;
+  }
+  return table;
+}
+
+/** Fallback-table divergences, one line per status, in both directions. */
+function fallbackDivergences(python: Record<string, string>, typescript: Record<string, string>) {
+  // Not `describe` — that name belongs to vitest's own import in this file.
+  const named = (bucket: string | undefined) =>
+    bucket === undefined ? "the base RouterError (no bucket)" : `\`${bucket}\``;
+  const statuses = [...new Set([...Object.keys(python), ...Object.keys(typescript)])].sort();
+  return statuses
+    .filter((status) => python[status] !== typescript[status])
+    .map(
+      (status) =>
+        `header-less HTTP ${status}: the TypeScript SDK raises ${named(typescript[status])} ` +
+        `but the Python SDK raises ${named(python[status])}`,
+    );
 }
 
 describe("cross-SDK surface parity", () => {
@@ -269,6 +312,9 @@ describe("cross-SDK surface parity", () => {
   });
 
   it("maps each router error class to the same `error_type`", async () => {
+    // `routerErrorTypes` includes the BASE class, deliberately: excluding it
+    // is what used to paper over TypeScript defaulting to `internal_error`
+    // where Python defaults to `""`.
     const python = await loadPythonSurface();
     const divergences: string[] = [];
     for (const [className, errorType] of Object.entries(python.routerErrorTypes)) {
@@ -297,6 +343,42 @@ describe("cross-SDK surface parity", () => {
         [...routerErrors.ROUTER_ERROR_TYPES].filter((type) => !AHEAD_ERROR_TYPES.has(type)),
       ),
     ).toEqual([]);
+  });
+
+  it("falls back from a bucket-less response to the same bucket", async () => {
+    // The behaviour a name-only check cannot see. Both SDKs consult a status
+    // table ONLY when a response carried no `X-Comfy-Error-Type` and no
+    // `error_type` in its body — a proxy or gateway that answered before
+    // Router was reached — and the two tables have to agree, or the same
+    // header-less response is a different `catch` branch in each language.
+    //
+    // `400` and `422` are the reason this test exists: TypeScript used to map
+    // both to `invalid_input`, so a header-less `422` raised `InvalidInput`
+    // here and the base `RouterError` in Python. Neither status pins one
+    // bucket — a `400` is `invalid_input` OR `content_policy_violation`, which
+    // differ in whether a retry can EVER succeed, and the contract pins no
+    // bucket to `422` at all — so both are absent from the table on both
+    // sides now.
+    const python = await loadPythonSurface();
+    const typescript = typescriptFallbackTable();
+    expect(
+      Object.keys(typescript).length,
+      "no status resolves to a bucket — the derivation is broken, not in parity",
+    ).toBeGreaterThan(0);
+    expect(fallbackDivergences(python.routerErrorTypeByStatus, typescript)).toEqual([]);
+  });
+
+  it("agrees on what a bucket-less response reads as", async () => {
+    // The base class default, compared rather than excluded. It is `""` on
+    // both sides — "no bucket" — and NOT `internal_error`, which is a real
+    // member of the closed set: defaulting to it would make "we could not
+    // tell" indistinguishable from "the server said Router itself failed".
+    // The `error_type` comparison above covers this too, now that the
+    // manifest records the base class; this asserts it by name so a future
+    // reader finds the decision rather than inferring it from a map entry.
+    const python = await loadPythonSurface();
+    expect(python.routerErrorTypes.RouterError, "the snapshot omits the base class").toBeDefined();
+    expect(routerErrors.RouterError.errorType).toBe(python.routerErrorTypes.RouterError);
   });
 
   it("keeps every declared lead live, and only in the leading direction", async () => {
@@ -375,5 +457,23 @@ describe("python surface extraction", () => {
       /ROUTER_EXCEPTIONS/,
     );
     expect(() => extractRouterErrors("# nothing here\n")).toThrow(/RouterError/);
+  });
+
+  it("refuses to yield an empty status fallback table", () => {
+    // Same rule for the fallback table: an absent or unreadable
+    // `_ERROR_TYPE_BY_STATUS` must be a hard failure, because an empty Python
+    // table would agree with any TypeScript one that also resolved nothing.
+    expect(() => extractErrorTypeByStatus("# nothing here\n")).toThrow(/_ERROR_TYPE_BY_STATUS/);
+    expect(() =>
+      extractErrorTypeByStatus("_ERROR_TYPE_BY_STATUS: dict[int, str] = {\n    # empty\n}\n"),
+    ).toThrow(/zero/);
+  });
+
+  it("reads every entry of the status fallback table", () => {
+    expect(
+      extractErrorTypeByStatus(
+        '_ERROR_TYPE_BY_STATUS: dict[int, str] = {\n    401: "unauthorized",\n    504: "provider_timeout",\n}\n',
+      ),
+    ).toEqual({ 401: "unauthorized", 504: "provider_timeout" });
   });
 });
