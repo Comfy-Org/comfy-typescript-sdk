@@ -61,7 +61,7 @@ jobs:
       - name: Type check
         run: pnpm typecheck
 
-      - name: Check generated code is in sync with spec/openapi.yaml
+      - name: Check the code coupled to spec/ is in sync with it
         run: node scripts/check-spec-drift.mjs
 
       - name: Run tests

@@ -70,6 +70,16 @@ entry. See CONTRIBUTING.md.
   version is affected:** `routerErrors` has never shipped (it is absent from
   `v0.1.7`, the latest release on npm), so this changes behaviour only for
   callers building against `main`.
+- **No behaviour change.** The route `comfy.models.run` posts to
+  (`/v1/models/{provider}/{model}`) and the default host
+  (`https://api.comfy.org`) are now pinned to `spec/router-openapi.yaml` — the
+  vendored Comfy Router contract — rather than only hard-coded. Both
+  `pnpm test` (`src/sdk/router-spec-contract.test.ts`) and
+  `pnpm check:spec-drift` compare them against that file's `runRouterModel`
+  path, its path parameters and its `servers[0].url`, so a sync that moves the
+  route reddens CI instead of leaving `run` to 404 against a route the SDK
+  still spells the old way. The URL it builds, and the percent-encoding of
+  each segment, are unchanged.
 
 ## [0.1.7] - 2026-08-13
 
