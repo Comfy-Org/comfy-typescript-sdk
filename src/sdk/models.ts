@@ -244,7 +244,7 @@ function parseModelId(model: string): ModelId {
  * the host. Publishing it would make an internal coupling point semver-
  * relevant and would add a TypeScript-only name to the cross-SDK surface.
  */
-export const RUN_ROUTE_TEMPLATE = "/v1/models/{provider}/{model}";
+export const RUN_ROUTE_TEMPLATE = "/v2/models/{provider}/{model}";
 
 /**
  * Substitute `{placeholder}` segments in an OpenAPI path template, percent-

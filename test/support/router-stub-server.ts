@@ -1,5 +1,5 @@
 /**
- * A Node `http`-only stub of the model-router surface (`/v1/models/...`).
+ * A Node `http`-only stub of the model-router surface (`/v2/models/...`).
  *
  * Separate from `stub-server.ts` on purpose: that one stubs the Comfy API v2
  * job/asset surface, which is a different host, a different path prefix and a

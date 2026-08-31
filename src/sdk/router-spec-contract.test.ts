@@ -7,7 +7,7 @@
  * it, and the one whose drift is silent: the ROUTE. `RUN_ROUTE_TEMPLATE` and
  * `COMFY_ROUTER_BASE_URL` are the SDK's copy of the path and host that
  * contract declares, and until this test existed nothing compared them — a
- * sync that moved `/v1/models/{provider}/{model}` (a version bump, a rename)
+ * sync that moved `/v2/models/{provider}/{model}` (a version bump, a rename)
  * would land green and `models.run` would 404 at runtime against a route the
  * SDK still spelled the old way. Nothing is generated from this spec, so there
  * is nothing to regenerate and byte-diff; the drift check is a comparison
@@ -100,7 +100,7 @@ describe("router route contract (spec/router-openapi.yaml)", () => {
       } finally {
         config({ credentials: undefined, baseUrl: undefined });
       }
-      expect(server.state.lastPath).toBe("/v1/models/fal%20ai/flux%23pro");
+      expect(server.state.lastPath).toBe("/v2/models/fal%20ai/flux%23pro");
     });
   });
 });

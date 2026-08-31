@@ -124,7 +124,7 @@ describe("comfy.models.run on success", () => {
       useStub(server);
       await comfy.models.run(MODEL, {});
       expect(server.state.lastMethod).toBe("POST");
-      expect(server.state.lastPath).toBe("/v1/models/fal-ai/flux-pro");
+      expect(server.state.lastPath).toBe("/v2/models/fal-ai/flux-pro");
     });
   });
 
