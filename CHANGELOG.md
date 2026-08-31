@@ -11,6 +11,15 @@ remain the authoritative record for those versions.
 
 ## [Unreleased]
 
+### Fixed
+
+- `models.run` now posts to `POST {routerBaseUrl}/v2/models/{provider}/{model}`.
+  The Comfy Router service moved its model routes from `/v1/models` to
+  `/v2/models` and the SDK's path template was never updated, so
+  every `models.run` call answered a bare 404 against the live service. The
+  vendored `spec/router-openapi.yaml` is synced to the same contract in this
+  change, and the router-spec contract test re-pins the two together.
+
 <!--
 Add user-visible changes here under Added / Changed / Deprecated / Removed /
 Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
