@@ -55,7 +55,9 @@ jobs:
       # are classifier built-ins already. `src/low/generated/` is machine-
       # produced by @hey-api/openapi-ts from spec/openapi.yaml — the sibling
       # hand-written files under `src/low/` and `src/sdk/` must stay visible to
-      # the panel.
+      # the panel. `assets/` is listed by exact file, not `assets/**`: the glob
+      # would make anything later added there permanently invisible to review
+      # with nothing regenerating or drift-checking the path.
       extra_generated_globs: >-
         **/node_modules/**
         **/dist/**
@@ -64,7 +66,7 @@ jobs:
         **/*.min.js
         **/*.min.css
         src/low/generated/**
-        assets/**
+        assets/logo.svg
       # Load the prompts/scripts from the same ref as `uses:`.
       workflows_ref: ffcc3f5b4dfc568e846e769c4f4df4f749c7887b
     secrets:
