@@ -10,6 +10,7 @@
  * in the Python SDK — one async class since JS is async-native.
  */
 
+import { ApiError } from "../low/index.js";
 import type {
   ComfyLow,
   Job as LowJob,
@@ -19,12 +20,19 @@ import type {
 import { abortableSleep } from "./abortable-sleep.js";
 import { backoffSchedule, isTerminal, SUCCESS } from "./core.js";
 import { eventFromRaw, type ComfyEvent, type StatusChange } from "./events.js";
-import { JobFailed, translate } from "./exceptions.js";
+import { JobFailed, toSdkError, translate } from "./exceptions.js";
 import { Output } from "./outputs.js";
 
 // Pause before reconnecting an SSE stream that dropped mid-job, without a
 // terminal frame having been seen.
 const RECONNECT_PAUSE_MS = 100;
+// Match submit()'s fallback when a 429 omits a usable Retry-After value.
+const DEFAULT_429_RECONNECT_PAUSE_MS = 2_000;
+// Ceiling on a server-supplied 429 Retry-After used as the reconnect pause —
+// this loop has no overall deadline of its own (only an optional caller
+// signal), so an unbounded value from a malicious/misbehaving server would
+// otherwise stall reconnection indefinitely.
+const MAX_RECONNECT_PAUSE_MS = 60_000;
 
 /**
  * A handle to one submitted job — rehydratable from its ID alone via
@@ -156,6 +164,7 @@ export class Job {
     let lastProgress = Number.NEGATIVE_INFINITY;
     for (;;) {
       let terminalSeen = false;
+      let reconnectPauseMs: number = RECONNECT_PAUSE_MS;
       try {
         for await (const raw of this.low.getJobEvents(eventsUrl, { signal })) {
           const event = eventFromRaw(raw, (data) => this.bindOutput(data as unknown as LowOutput));
@@ -175,7 +184,19 @@ export class Job {
         // A caller abort must propagate (and stop the loop), not be
         // swallowed as an ordinary mid-stream drop.
         if (signal?.aborted) throw exc;
-        // Connection dropped mid-stream — reconnect below.
+        if (exc instanceof ApiError) {
+          // 501 means this deployment doesn't serve live SSE. End the
+          // iterator; callers can use wait() to poll for completion.
+          if (exc.httpStatus === 501) return;
+          if (exc.httpStatus === 429) {
+            const retryAfterMs =
+              exc.retryAfter === null ? DEFAULT_429_RECONNECT_PAUSE_MS : exc.retryAfter * 1000;
+            reconnectPauseMs = Math.min(retryAfterMs, MAX_RECONNECT_PAUSE_MS);
+          } else {
+            throw toSdkError(exc);
+          }
+        }
+        // Connection dropped mid-stream (or the server returned 429) — reconnect below.
       }
       if (terminalSeen) return;
       // Stream ended without a terminal frame. Poll the authoritative
@@ -190,7 +211,7 @@ export class Job {
         yield statusChange;
         return;
       }
-      await abortableSleep(RECONNECT_PAUSE_MS, signal);
+      await abortableSleep(reconnectPauseMs, signal);
     }
   }
 }

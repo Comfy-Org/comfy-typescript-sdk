@@ -20,6 +20,7 @@ export * from "./models.js";
 export * from "./errors.js";
 export { type RawEvent, iterateSse } from "./sse.js";
 export {
+  buildUserAgent,
   ComfyLow,
   OPERATION_IDS,
   OPERATION_METHODS,

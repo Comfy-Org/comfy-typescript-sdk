@@ -29,14 +29,28 @@ export interface ServerState {
    * there.
    */
   jobUrlsOrigin: string | null;
-  /** POST /jobs returns 429 queue_full this many times before succeeding. */
+  /** POST /jobs returns a 429 (see `queueFullCode`) this many times before succeeding. */
   queueFullTimes: number;
+  /** The `error.code` sent with the `queueFullTimes` 429 responses. Defaults
+   * to `"queue_full"`; set to e.g. `"deployment_not_ready"` to simulate a
+   * different 429-with-Retry-After code the client must also retry. */
+  queueFullCode: string;
   /**
-   * The `Retry-After` header value sent with a `queue_full` response.
-   * Defaults to the delay-seconds form ("0"); set to an HTTP-date string to
-   * exercise the client's fallback for a form it does not parse.
+   * The `Retry-After` header value sent with a `queueFullTimes` 429
+   * response. Defaults to the delay-seconds form ("0"); set to an HTTP-date
+   * string to exercise the client's fallback for a form it does not parse.
    */
   retryAfterHeader: string;
+  /**
+   * When true, the `queueFullTimes` 429 response omits the `Retry-After`
+   * header entirely, instead of sending `retryAfterHeader`'s value —
+   * present-but-empty and truly absent are different fixture shapes, and
+   * absence is the real-server case the client's `DEFAULT_RETRY_AFTER_S`
+   * fallback exists for.
+   */
+  omitQueueFullRetryAfter: boolean;
+  /** When true, an SSE 429 omits its `Retry-After` header. */
+  omitEventsRetryAfter: boolean;
   /** POST /jobs returns this error envelope instead of 201. */
   jobError: { status: number; code: string } | null;
   /** Number of GET /jobs/{id} polls before the job reports terminal. */
@@ -45,6 +59,15 @@ export interface ServerState {
   terminalStatus: string;
   /** SSE behavior: "reconnect" drops the first stream before terminal. */
   sseMode: "normal" | "reconnect";
+  /**
+   * When non-null, `GET /jobs/{id}/events` answers with this HTTP status and
+   * an error envelope (`eventsErrorCode`) instead of opening the stream —
+   * simulates a deployment that doesn't serve live events at all (501) or
+   * one shedding load (429, using `retryAfterHeader` for the header value).
+   */
+  eventsStatus: number | null;
+  /** Error `code` sent with `eventsStatus`. */
+  eventsErrorCode: string;
   /** Progress value the first (dropped) reconnect stream emits. */
   firstReconnectProgress: number;
   /** Progress value the normal / reconnected stream emits. */
@@ -123,11 +146,16 @@ function defaultState(): ServerState {
     requireAuth: false,
     jobUrlsOrigin: null,
     queueFullTimes: 0,
+    queueFullCode: "queue_full",
     retryAfterHeader: "0",
+    omitQueueFullRetryAfter: false,
+    omitEventsRetryAfter: false,
     jobError: null,
     pollsToSucceed: 1,
     terminalStatus: "succeeded",
     sseMode: "normal",
+    eventsStatus: null,
+    eventsErrorCode: "not_implemented",
     firstReconnectProgress: 0.4,
     progressValue: 0.5,
     contentRedirectOrigin: null,
@@ -442,6 +470,19 @@ export class StubServer {
   private serveEvents(res: ServerResponse): void {
     const state = this.state;
     state.eventsConnectCount += 1;
+    if (state.eventsStatus !== null) {
+      const headers =
+        state.eventsStatus === 429 && !state.omitEventsRetryAfter
+          ? { "Retry-After": state.retryAfterHeader }
+          : {};
+      sendJson(
+        res,
+        state.eventsStatus,
+        { error: { code: state.eventsErrorCode, message: "err" } },
+        headers,
+      );
+      return;
+    }
     res.writeHead(200, { "Content-Type": "text/event-stream" });
 
     const frame = (event: string, data: unknown) => {
@@ -517,12 +558,10 @@ export class StubServer {
 
     if (state.queueFullTimes > 0) {
       state.queueFullTimes -= 1;
-      sendJson(
-        res,
-        429,
-        { error: { code: "queue_full", message: "full" } },
-        { "Retry-After": state.retryAfterHeader },
-      );
+      const headers = state.omitQueueFullRetryAfter
+        ? {}
+        : { "Retry-After": state.retryAfterHeader };
+      sendJson(res, 429, { error: { code: state.queueFullCode, message: "full" } }, headers);
       return;
     }
 

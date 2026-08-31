@@ -44,6 +44,13 @@ describe("toSdkError", () => {
     expect(sdkError).toBeInstanceOf(QueueFull);
     expect((sdkError as QueueFull).retryAfter).toBe(5);
   });
+
+  it("preserves an absent retryAfter on QueueFull", () => {
+    const apiError = new ApiError("full", { code: "queue_full", httpStatus: 429 });
+    const sdkError = toSdkError(apiError);
+    expect(sdkError).toBeInstanceOf(QueueFull);
+    expect((sdkError as QueueFull).retryAfter).toBeNull();
+  });
 });
 
 describe("translate", () => {

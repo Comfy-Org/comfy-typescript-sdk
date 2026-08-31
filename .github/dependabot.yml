@@ -1,0 +1,41 @@
+# Dependency updates for a published package: its dependency tree ships to
+# every consumer, so a CVE in a transitive dependency is a consumer problem.
+#
+# Grouping is deliberate. This is a small repo with a small review pool, so
+# minor/patch bumps arrive as one PR per ecosystem per week instead of one per
+# dependency. Major bumps stay ungrouped and individual — those are the ones
+# that need a real read.
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      npm-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"

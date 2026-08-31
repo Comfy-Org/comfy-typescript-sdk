@@ -15,19 +15,35 @@ export interface ComfyErrorOptions {
   code?: string;
   httpStatus?: number;
   details?: Record<string, unknown> | null;
+  /** See {@link ComfyError.requestId}. */
+  requestId?: string | null;
+  /** The underlying failure, when this error wraps one (a fetch abort, say). */
+  cause?: unknown;
 }
 
 export class ComfyError extends Error {
   readonly code?: string;
   readonly httpStatus?: number;
   readonly details: Record<string, unknown> | null;
+  /**
+   * Server-generated identifier for the call that failed, read off the
+   * `X-Comfy-Request-Id` response header — the value to quote in a support
+   * request, so a user never has to inspect headers to find one.
+   *
+   * `null` when there was no response to read it from (a connection failure,
+   * a client-side timeout) or when the response carried no such header —
+   * which a proxy or load-balancer error page, generated before the request
+   * reached Comfy, genuinely does not.
+   */
+  readonly requestId: string | null;
 
   constructor(message: string, options: ComfyErrorOptions = {}) {
-    super(message);
+    super(message, "cause" in options ? { cause: options.cause } : undefined);
     this.name = new.target.name;
     this.code = options.code;
     this.httpStatus = options.httpStatus;
     this.details = options.details ?? null;
+    this.requestId = options.requestId ?? null;
   }
 }
 
@@ -59,11 +75,21 @@ export class IdempotencyKeyReuse extends ComfyError {}
 
 export class InsufficientCredits extends ComfyError {}
 
-/** Backpressure: the queue is full. `retryAfter` is seconds to wait. */
-export class QueueFull extends ComfyError {
-  readonly retryAfter: number;
+/**
+ * No credential was configured for a `comfy.*` call. Raised locally, before
+ * any request goes out, so a misconfigured process fails at the call site
+ * instead of as a 401 from the server.
+ *
+ * The message names the two ways to supply one and never echoes a
+ * credential — there is none to echo, and `credentials.test.ts` pins that.
+ */
+export class MissingCredentials extends ComfyError {}
 
-  constructor(message: string, options: ComfyErrorOptions & { retryAfter: number }) {
+/** Backpressure: the queue is full. `retryAfter` is seconds to wait when supplied. */
+export class QueueFull extends ComfyError {
+  readonly retryAfter: number | null;
+
+  constructor(message: string, options: ComfyErrorOptions & { retryAfter: number | null }) {
     super(message, options);
     this.retryAfter = options.retryAfter;
   }
@@ -107,7 +133,7 @@ const BY_CODE: Record<string, ComfyErrorClass> = {
 export function toSdkError(exc: ApiError): ComfyError {
   if (exc.code === "queue_full") {
     return new QueueFull(exc.message, {
-      retryAfter: exc.retryAfter ?? 0,
+      retryAfter: exc.retryAfter,
       code: exc.code,
       httpStatus: exc.httpStatus,
       details: exc.details,
