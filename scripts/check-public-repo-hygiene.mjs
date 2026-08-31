@@ -76,16 +76,17 @@ const PUBLIC_COMFY_ORG_REPOS = new Set([
   "comfy-cloud-mcp-server",
   "Comfy-Desktop",
   "comfy-python-sdk",
+  // Reusable GitHub Actions workflows (cursor-review and friends). Verified
+  // public: unauthenticated GET https://github.com/Comfy-Org/github-workflows
+  // returns 200. That check is the ONLY basis for an entry here -- a resolving
+  // `uses:` reference is not evidence, because a private repo can share its
+  // reusable workflows org-internally (Settings > Actions > access), so a
+  // passing run says nothing about visibility.
+  "github-workflows",
   "comfy-swift-sdk",
   "comfy-typescript-sdk",
   "ComfyUI_frontend",
   "ComfyUI",
-  // Reusable GitHub Actions workflows (cursor-review and friends). Verified
-  // public: `gh repo view Comfy-Org/github-workflows` reports
-  // visibility=PUBLIC. That check is the only admissible evidence -- a
-  // resolving `uses:` reference proves nothing, since GitHub lets private and
-  // internal repos share reusable workflows with other repos in the same org.
-  "github-workflows",
 ]);
 // CODEOWNERS team handles (`@Comfy-Org/<team>`) are inherently public on a
 // public repo -- GitHub renders the CODEOWNERS owners to anyone who can see the
