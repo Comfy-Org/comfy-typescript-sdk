@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.svg" alt="Comfy" width="130"/>
+<img src="https://raw.githubusercontent.com/Comfy-Org/comfy-typescript-sdk/main/assets/logo.svg" alt="Comfy" width="130"/>
 
 <h1>comfy-typescript-sdk</h1>
 
