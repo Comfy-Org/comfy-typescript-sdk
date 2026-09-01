@@ -1,6 +1,9 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/Comfy-Org/comfy-typescript-sdk/main/assets/logo.svg" alt="Comfy" width="130"/>
+<!-- Pinned to a commit SHA, not `main`: npm freezes each version's README text, so a
+     mutable ref would 404 on every already-published page if assets/ ever moves.
+     Re-pin this when assets/logo.svg changes. -->
+<img src="https://raw.githubusercontent.com/Comfy-Org/comfy-typescript-sdk/5ca3792f0e6c0d9d4ec58c0d9b411df51a71fd3e/assets/logo.svg" alt="Comfy" width="130"/>
 
 <h1>comfy-typescript-sdk</h1>
 
