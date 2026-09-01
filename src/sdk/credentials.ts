@@ -34,7 +34,7 @@ export const CREDENTIALS_ENV_VAR = "COMFY_API_KEY";
  * talks the Comfy API v2 job/asset surface (`/api/v2/...`), which a
  * self-hosted proxy or a serverless deployment also serves; the model router
  * is a hosted, partner-model gateway on its own host and its own
- * `/v1/models/...` routes. Pointing one at the other would 404, so they are
+ * `/v2/models/...` routes. Pointing one at the other would 404, so they are
  * two settings rather than one.
  */
 export const COMFY_ROUTER_BASE_URL = "https://api.comfy.org";

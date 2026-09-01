@@ -7,7 +7,7 @@ here is enforced by CI — see `.github/workflows/ci.yml` and `scripts/`.
 
 This is the trap that costs a round trip: a hand-edit to generated code reads
 fine in review, passes lint/typecheck/tests, and then fails the CI step
-`Check generated code is in sync with spec/openapi.yaml`.
+`Check the code coupled to spec/ is in sync with it`.
 
 Generated, do **not** edit by hand:
 
@@ -44,15 +44,20 @@ pnpm check:spec-drift  # same check CI runs (node scripts/check-spec-drift.mjs)
 
 `scripts/check-spec-drift.mjs` regenerates into a temp directory using the same
 `openapi-ts.config.ts` and compares the three files above byte-for-byte against
-what is committed. There is no tolerance for whitespace or ordering.
+what is committed. There is no tolerance for whitespace or ordering. It then
+runs a second, unrelated check that needs no codegen — the Router route against
+`spec/router-openapi.yaml` (section 2) — and reports both, so a stale
+regeneration cannot hide a moved route.
 
 ## 2. Spec-coupled hand-written code
 
-Four hand-written things must be updated in lockstep when a vendored spec
+Five hand-written things must be updated in lockstep when a vendored spec
 changes. Three are coupled to `spec/openapi.yaml` and fail
-`src/low/spec-coverage.test.ts`; the fourth is coupled to
-`spec/router-openapi.yaml` and fails `src/sdk/router-spec-coverage.test.ts`.
-In neither case will the failure message tell you this:
+`src/low/spec-coverage.test.ts`; the other two are coupled to
+`spec/router-openapi.yaml` and fail `src/sdk/router-spec-coverage.test.ts` and
+`src/sdk/router-spec-contract.test.ts` respectively. Only the route check
+(fourth below) names the constant to fix; for the rest the failure message will
+not tell you this:
 
 - **`src/low/transport.ts` — `OPERATION_IDS`.** Must equal, as a set, the
   `operationId` of every non-internal operation in `spec/openapi.yaml`. A spec
@@ -71,6 +76,18 @@ In neither case will the failure message tell you this:
   `RouterError` subclass exists for it, named the PascalCase of the wire value.
   Adding one usually also needs a `routerErrorClassesAheadOfPython` entry in
   `src/sdk/surface-parity.test.ts` until the Python twin lands (section 6).
+- **`src/sdk/models.ts` — `RUN_ROUTE_TEMPLATE`, and `src/sdk/credentials.ts` —
+  `COMFY_ROUTER_BASE_URL`.** The path `comfy.models.run` posts to and the host
+  it posts to by default, checked against `spec/router-openapi.yaml`'s
+  `runRouterModel` path, its path parameters and its `servers[0].url`. Checked
+  in two places on purpose: `src/sdk/router-spec-contract.test.ts` compares the
+  live constants in `pnpm test`, and `scripts/check-spec-drift.mjs` compares
+  the same constants read out of their source text (plain Node, no TypeScript
+  loader) so `pnpm check:spec-drift` reddens too. Both messages name the
+  constant to update. The vendored spec is the side that is right — a Router
+  sync that moves the route is not done until the constant follows, and until
+  it does `comfy.models.run` 404s. The shared spec reader is
+  `scripts/router-route-contract.mjs`.
 - **`src/low/models.ts`.** Holds four schemas codegen cannot reach, because
   `@hey-api/openapi-ts` only emits types reachable from an operation's
   request/response: `StatusEvent`, `PreviewEvent`, `LogEvent` (reachable only

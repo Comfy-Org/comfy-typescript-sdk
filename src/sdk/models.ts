@@ -171,11 +171,19 @@ export interface Models {
   ): Promise<RunResult<TData>>;
 }
 
-/** A canonical model ID split into the two path segments that address it. */
-interface ModelId {
+/**
+ * A canonical model ID split into the two path segments that address it.
+ *
+ * A `type` rather than an `interface` so it carries an implicit index
+ * signature and can be passed to {@link fillRoute}, which looks its values up
+ * by the placeholder name it read out of the template. The two field names
+ * ARE the two path parameters `RUN_ROUTE_TEMPLATE` names, and the contract
+ * test asserts that agreement against the vendored spec.
+ */
+type ModelId = {
   provider: string;
   model: string;
-}
+};
 
 /**
  * Split `{provider}/{model}` into its segments.
@@ -216,8 +224,51 @@ function parseModelId(model: string): ModelId {
   return { provider: segments[0], model: segments[1] };
 }
 
+/**
+ * The Router route {@link Models.run} posts to, written as the OpenAPI path
+ * template rather than as an interpolated string.
+ *
+ * It is a named constant so that it can be compared, character for character,
+ * against the path the vendored Router contract declares for
+ * `operationId: runRouterModel` — `src/sdk/router-spec-contract.test.ts` and
+ * `scripts/check-spec-drift.mjs` both make that comparison. Before this,
+ * `spec/router-openapi.yaml` moving this route (a version bump, a rename) was
+ * a change no gate in this repo could see: the sync would land green and
+ * `models.run` would start 404ing against a route the SDK still spelled the
+ * old way. The template is the SDK's copy of the contract, so it is the thing
+ * worth pinning.
+ *
+ * Deliberately NOT re-exported from `./index.js`: it is the anchor for that
+ * drift gate, not a knob a caller configures — the route a call goes to is
+ * the SDK's business, and `comfy.config({ baseUrl })` is how a caller retargets
+ * the host. Publishing it would make an internal coupling point semver-
+ * relevant and would add a TypeScript-only name to the cross-SDK surface.
+ */
+export const RUN_ROUTE_TEMPLATE = "/v2/models/{provider}/{model}";
+
+/**
+ * Substitute `{placeholder}` segments in an OpenAPI path template, percent-
+ * encoding each value.
+ *
+ * `encodeURIComponent` per segment, not on the assembled path: a `/` inside a
+ * value has to stay encoded, or a value could add a path segment of its own.
+ * An unknown placeholder throws rather than being left in the path — a URL
+ * with a literal `{...}` in it is a request that goes out and fails
+ * confusingly at the server, and the only way to get one here is for
+ * {@link RUN_ROUTE_TEMPLATE} and this call site to have drifted apart.
+ */
+function fillRoute(template: string, values: Readonly<Record<string, string>>): string {
+  return template.replaceAll(/\{(\w+)\}/g, (_match, name: string) => {
+    const value = values[name];
+    if (typeof value !== "string") {
+      throw new Error(`route template "${template}" has no value for {${name}}`);
+    }
+    return encodeURIComponent(value);
+  });
+}
+
 function runUrl(baseUrl: string, id: ModelId): string {
-  return `${baseUrl}/v1/models/${encodeURIComponent(id.provider)}/${encodeURIComponent(id.model)}`;
+  return `${baseUrl}${fillRoute(RUN_ROUTE_TEMPLATE, id)}`;
 }
 
 /**
