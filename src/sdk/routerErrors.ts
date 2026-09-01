@@ -132,7 +132,7 @@ export const ERROR_TYPE_HEADER = "X-Comfy-Error-Type";
 export const REQUEST_ID_HEADER = "X-Comfy-Request-Id";
 
 /**
- * One model-level validation failure, in the fal/FastAPI `detail[]` form.
+ * One model-level validation failure, in the FastAPI `detail[]` form.
  *
  * `type` is the SPECIFIC provider reason (`value_error`, `missing`,
  * `image_too_small`, `unsupported_audio_format`, `greater_than`,
