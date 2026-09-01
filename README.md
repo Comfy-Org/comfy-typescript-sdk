@@ -503,6 +503,58 @@ submission has no version-pinning fields yet. It 404s for an unknown ID, a job t
 is not yours, a job past retention, or a job whose workflow the server no
 longer holds.
 
+## Reading what a run printed
+
+`job.getLogs()` fetches the job's execution log. It is a resource of its own,
+not a field on the job, so running and polling a job never downloads it — you
+pay for a log only when you ask for one:
+
+```ts
+// submit() + wait(), not run(): run() throws JobFailed on a failed job and
+// the exception carries no handle, so there would be nothing left to ask for
+// a log — which is exactly when you want one.
+const job = await client.submit(wf);
+await job.wait();
+
+const logs = await job.getLogs();
+if (logs !== null) {
+  console.log(logs.text);
+}
+```
+
+`null` is an ordinary answer, not an error, and the reasons are deliberately
+not distinguished: the deployment does not capture logs at all (Comfy Cloud
+and self-hosted never do — only serverless deployments have them), the job has
+not finished, it predates log capture, the run was killed before the worker
+could report an outcome (an out-of-memory kill, a crashed worker, a timeout, a
+job past its maximum runtime), capture failed, or the job ran on the
+public demo deployment, which captures a log but withholds it from the
+anonymous callers that surface accepts.
+
+The killed-run case is a known gap rather than an oversight: a log is read
+back off the worker, so a run the platform killed never produced one — the
+failures you most want a log for are the ones least likely to have left one.
+
+Do not branch on which one it is — a `null` never says. But one of them
+resolves itself: a job that has not finished may have a log once it does, so
+call again after a terminal status. `null` on a job that has already finished
+is final, and so is `null` from a deployment that offers no log link at all.
+
+Nothing is cached — each call re-reads, so that retry works. On a log that did
+land:
+
+- `text` is untrusted output. A workflow chooses what goes in it, so render it
+  as plain text rather than interpreting it.
+- `truncated` means the _beginning_ was dropped and you have the tail, which
+  is where a failure normally is. True with an empty `text` means the log was
+  captured and then shed entirely to fit — which is not the same as never
+  having had one.
+- `capturedAt` is a `Date`.
+- `complete` means nothing more will be appended. Always true today, since a
+  log is read back off the worker once, when the run ends.
+
+Live log streaming is not available yet.
+
 ## Typed errors
 
 Protocol-level failures are raised as one exception class per error code, so

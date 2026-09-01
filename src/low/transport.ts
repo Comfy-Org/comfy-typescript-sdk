@@ -31,6 +31,7 @@ import type {
   Asset,
   AssetFromHashData,
   Job,
+  JobLogs,
   JobWorkflowResponse,
   PostJobsData,
 } from "./generated/types.gen.js";
@@ -498,6 +499,33 @@ export class ComfyLow {
   }
 
   /**
+   * `GET /api/v2/jobs/{id}/logs` — what the run printed, or `null` on 204.
+   *
+   * 204 is the contract's normal answer for a job with no log, so it is a
+   * value here rather than an error; anything other than `200` still throws.
+   * Checked on the status, before {@link parseOrRaise} — that collapses ANY
+   * empty body to `{}`, so routing the 204 through it would hand back a
+   * `JobLogs` whose every field is undefined. The guard is on `204`
+   * specifically, not on emptiness: a contract-violating empty `200` is not
+   * this method's to paper over, and is handled no differently here than by
+   * any other operation.
+   *
+   * Unlike `getJobWorkflow`, a URL input here IS the pre-built target: it
+   * comes from `urls.logs`, which already points at this resource.
+   */
+  async getJobLogs(
+    jobIdOrUrl: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<JobLogs | null> {
+    const path = looksLikePath(jobIdOrUrl)
+      ? jobIdOrUrl
+      : `/jobs/${encodeURIComponent(jobIdOrUrl)}/logs`;
+    const response = await this.request("GET", path, { signal: options.signal });
+    if (response.status === 204) return null;
+    return this.parseOrRaise<JobLogs>(response, [200]);
+  }
+
+  /**
    * `GET /api/v2/jobs/{id}/events` — raw live SSE iterator (escape hatch).
    * No reconnection here; a single connection's frames. `../sdk` adds the
    * reconnect loop. No default timeout: an idle stream must not time out
@@ -545,6 +573,7 @@ export const OPERATION_IDS = [
   "postJobs",
   "getJob",
   "getJobWorkflow",
+  "getJobLogs",
   "getJobEvents",
   "cancelJob",
 ] as const;
@@ -560,6 +589,7 @@ export const OPERATION_METHODS: Record<(typeof OPERATION_IDS)[number], keyof Com
   postJobs: "postJobs",
   getJob: "getJob",
   getJobWorkflow: "getJobWorkflow",
+  getJobLogs: "getJobLogs",
   getJobEvents: "getJobEvents",
   cancelJob: "cancelJob",
 };

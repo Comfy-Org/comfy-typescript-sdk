@@ -197,6 +197,47 @@ describe("ComfyLow transport", () => {
     expect(job.status).toBe("canceling");
   });
 
+  // -- getJobLogs -------------------------------------------------------
+
+  // The bare-id arm of the path ternary: Job.getLogs only ever passes
+  // urls.logs, which is always a path or URL, so nothing else in the suite
+  // reaches this branch — and getJobLogs ships on the published low surface,
+  // where a wrong template would go out green.
+  it("getJobLogs given a bare id hits the logs sub-resource", async () => {
+    server.state.jobLogs = {
+      text: "printed",
+      truncated: false,
+      captured_at: "2026-07-10T18:25:00Z",
+      complete: true,
+    };
+    const logs = await low.getJobLogs("job_01");
+    expect(logs?.text).toBe("printed");
+    expect(server.state.lastJobLogsPath).toBe("/api/v2/jobs/job_01/logs");
+  });
+
+  it("getJobLogs given a job logs URL uses it verbatim", async () => {
+    server.state.jobLogs = {
+      text: "printed",
+      truncated: false,
+      captured_at: "2026-07-10T18:25:00Z",
+      complete: true,
+    };
+    const job = await low.getJob("job_01");
+    expect(job.urls.logs).toBe("/api/v2/jobs/job_01/logs");
+    expect(await low.getJobLogs(job.urls.logs!)).not.toBeNull();
+    expect(server.state.lastJobLogsPath).toBe("/api/v2/jobs/job_01/logs");
+  });
+
+  it("getJobLogs returns null on 204 rather than an empty object", async () => {
+    server.state.jobLogs = null;
+    expect(await low.getJobLogs("job_01")).toBeNull();
+  });
+
+  it("getJobLogs 404s -> NotFound for a job that cannot be read", async () => {
+    server.state.jobLogsNotFound = true;
+    await expect(low.getJobLogs("job_01")).rejects.toBeInstanceOf(NotFound);
+  });
+
   // -- getJobWorkflow ---------------------------------------------------
 
   it("getJobWorkflow returns the graph alongside its format", async () => {
@@ -313,7 +354,7 @@ describe("ComfyLow transport", () => {
 
   // -- cross-origin bearer-token leak (FIX 1) -------------------------------
 
-  it("does not attach the bearer token to a server-supplied cross-origin urls.self/events/cancel", async () => {
+  it("does not attach the bearer token to a server-supplied cross-origin urls.self/events/cancel/logs", async () => {
     const authed = new ComfyLow(server.baseUrl, "top-secret-key");
     const attacker = new StubServer();
     await attacker.start();
@@ -340,6 +381,16 @@ describe("ComfyLow transport", () => {
 
       // And for cancel.
       await authed.cancelJob(job.urls.cancel);
+      expect(attacker.state.lastAuthorizationHeader).toBeNull();
+
+      // And for the logs resource, the fourth server-supplied link.
+      attacker.state.jobLogs = {
+        text: "printed",
+        truncated: false,
+        captured_at: "2026-07-10T18:25:00Z",
+        complete: true,
+      };
+      await authed.getJobLogs(job.urls.logs!);
       expect(attacker.state.lastAuthorizationHeader).toBeNull();
     } finally {
       await attacker.stop();
