@@ -18,7 +18,9 @@
  *   `fetch`/undici streams the encoded body to the wire.
  * - **per-request timeout/abort** — every method accepts `signal` and
  *   `timeoutMs`; `AbortSignal.any` composes a caller's signal with this
- *   client's default timeout (or overrides/disables it per call).
+ *   client's default timeout (or overrides/disables it per call), and
+ *   `./dispatcher.ts` derives undici's own inactivity limits from the same
+ *   deadline so that a signal is genuinely the only clock on the request.
  *
  * This layer contains no orchestration, retries, hashing, or SSE
  * reconnection — those live in `../sdk`. Mirrors `comfy_low.transport` in
@@ -26,6 +28,7 @@
  * the package README for why).
  */
 
+import { withInactivityLimits } from "./dispatcher.js";
 import { errorFromEnvelope } from "./errors.js";
 import type {
   Asset,
@@ -246,13 +249,23 @@ export class ComfyLow {
     return headers;
   }
 
+  /**
+   * This request's deadline in milliseconds: the caller's `timeoutMs`, this
+   * client's default when they passed none, or `null` for no deadline. Split
+   * out from {@link resolveSignal} because the deadline drives two things now
+   * — the abort signal and the transport's own inactivity limits (see
+   * `./dispatcher.ts`) — and they must be derived from the same number.
+   */
+  private effectiveTimeoutMs(timeoutMs: number | null | undefined): number | null {
+    return timeoutMs === undefined ? this.defaultTimeoutMs : timeoutMs;
+  }
+
   private resolveSignal(
     callerSignal: AbortSignal | undefined,
-    timeoutMs: number | null | undefined,
+    effectiveTimeoutMs: number | null,
   ): AbortSignal | undefined {
-    const effective = timeoutMs === undefined ? this.defaultTimeoutMs : timeoutMs;
-    if (effective === null) return callerSignal;
-    const timeoutSignal = AbortSignal.timeout(effective);
+    if (effectiveTimeoutMs === null) return callerSignal;
+    const timeoutSignal = AbortSignal.timeout(effectiveTimeoutMs);
     return callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
   }
 
@@ -269,14 +282,25 @@ export class ComfyLow {
       headers.set("Content-Type", "application/json");
       body = JSON.stringify(options.json);
     }
-    const signal = this.resolveSignal(options.signal, options.timeoutMs);
-    return this.fetchImpl(url, {
-      method,
-      headers,
-      body,
-      signal,
-      redirect: options.redirect ?? "follow",
-    });
+    const timeoutMs = this.effectiveTimeoutMs(options.timeoutMs);
+    const signal = this.resolveSignal(options.signal, timeoutMs);
+    // `withInactivityLimits` is what keeps undici's own 300s headers/body
+    // timers from capping a longer deadline: they live on the dispatcher, out
+    // of `signal`'s reach, and firing one costs the caller the HTTP status and
+    // the server request id along with the request.
+    return this.fetchImpl(
+      url,
+      withInactivityLimits(
+        {
+          method,
+          headers,
+          body,
+          signal,
+          redirect: options.redirect ?? "follow",
+        },
+        timeoutMs,
+      ),
+    );
   }
 
   private async parseOrRaise<T>(response: Response, ok: readonly number[]): Promise<T> {
