@@ -96,7 +96,7 @@ import { comfy } from "@comfyorg/sdk";
 // or: import * as comfy from "@comfyorg/sdk";
 
 comfy.config({ credentials: "comfyui-..." });
-const { data, requestId } = await comfy.models.run("fal-ai/flux-pro", {
+const { data, requestId } = await comfy.models.run("bfl/flux-2-pro", {
   prompt: "a cat",
 });
 ```
@@ -123,7 +123,7 @@ the `apiKey` you constructed it with.
 
 ### `comfy.models.run(model, input)`
 
-`model` is a canonical `{provider}/{model}` ID (`"fal-ai/flux-pro"`). `input`
+`model` is a canonical `{provider}/{model}` ID (`"bfl/flux-2-pro"`). `input`
 is the model's own native JSON input, forwarded to the provider unchanged —
 there is no Comfy envelope to wrap it in, so an integration already written
 against the provider keeps the request body it already has.
@@ -143,7 +143,7 @@ It resolves to a `{ data, requestId }` result:
   silently switch type-checking off for every field you touch. Per-model
   schemas are published by the server (each model serves its own OpenAPI
   document), not baked into this package, so supply the type you have:
-  `await comfy.models.run<FluxOutput>("fal-ai/flux-pro", { prompt })`.
+  `await comfy.models.run<FluxOutput>("bfl/flux-2-pro", { prompt })`.
 - **`requestId`** is the server's `X-Comfy-Request-Id` for the call — the value
   to quote in a support request, surfaced so you never have to go reading
   response headers to find one. It is `null` only when the response carried no
@@ -167,7 +167,7 @@ An `Idempotency-Key` is sent on every call; one is minted per call unless you pa
 
 ```ts
 const { data, requestId } = await comfy.models.run(
-  "fal-ai/flux-pro",
+  "bfl/flux-2-pro",
   { prompt: "a cat" },
   { timeoutMs: 300_000, signal: controller.signal },
 );
@@ -194,8 +194,8 @@ Two attempts is a good rule of thumb for the default budget against a slow surfa
 Pass `retry: false` for a single attempt, or narrow it per call:
 
 ```ts
-await comfy.models.run("fal-ai/flux-pro", { prompt: "a cat" }, { retry: false });
-await comfy.models.run("fal-ai/flux-pro", { prompt: "a cat" }, { retry: { budgetMs: 30_000 } });
+await comfy.models.run("bfl/flux-2-pro", { prompt: "a cat" }, { retry: false });
+await comfy.models.run("bfl/flux-2-pro", { prompt: "a cat" }, { retry: { budgetMs: 30_000 } });
 ```
 
 #### Cancelling a call
@@ -206,7 +206,7 @@ Because the server holds the connection for the whole generation, "stop this one
 const controller = new AbortController();
 document.querySelector("#cancel")?.addEventListener("click", () => controller.abort());
 
-await comfy.models.run("fal-ai/flux-pro", { prompt: "a cat" }, { signal: controller.signal });
+await comfy.models.run("bfl/flux-2-pro", { prompt: "a cat" }, { signal: controller.signal });
 ```
 
 The abort aborts the underlying connection, so the server observes a disconnect rather than a client that merely stopped listening, and it stops the retry loop between attempts as well as during one. It rejects with the standard `AbortError` — your own abort, re-thrown untouched rather than dressed up as an SDK error, so `err.name === "AbortError"` tells "I cancelled this" apart from a transport failure (a `TypeError`) and from this SDK's own deadline (a `ComfyError` with `code: "request_timeout"`).
