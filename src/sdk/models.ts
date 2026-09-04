@@ -51,6 +51,7 @@
  * during one.
  */
 
+import { clampTimerMs, withInactivityLimits } from "../low/dispatcher.js";
 import { buildUserAgent } from "../low/index.js";
 import { abortableSleep } from "./abortable-sleep.js";
 import { newIdempotencyKey } from "./core.js";
@@ -285,7 +286,9 @@ function composeSignal(
   remainingMs: number | null,
 ): AbortSignal | undefined {
   if (remainingMs === null) return callerSignal;
-  const timeoutSignal = AbortSignal.timeout(Math.max(0, remainingMs));
+  // Clamped, not just floored at 0: past ~25 days `AbortSignal.timeout`
+  // schedules a delay `setTimeout` folds to 1 ms, aborting at once.
+  const timeoutSignal = AbortSignal.timeout(clampTimerMs(remainingMs));
   return callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
 }
 
@@ -439,11 +442,21 @@ async function run<TData = unknown>(
 
   let attempt = 0;
   for (;;) {
-    const signal = composeSignal(options.signal, clock().remainingMs);
+    const remainingMs = clock().remainingMs;
+    const signal = composeSignal(options.signal, remainingMs);
     let response: Response;
     let text: string;
     try {
-      response = await fetch(url, { method: "POST", headers, body, signal });
+      // `withInactivityLimits` derives undici's own headers/body timers from
+      // the same remaining budget as `signal`. Without it this call is capped
+      // at undici's 300s default however long the deadline says, which is
+      // fatal here specifically: the server holds this one request open for
+      // the whole generation, so nothing arrives on it — not even response
+      // headers — until the model has finished.
+      response = await fetch(
+        url,
+        withInactivityLimits({ method: "POST", headers, body, signal }, remainingMs),
+      );
       // Inside the same `try` as the fetch on purpose: the deadline covers
       // body consumption too, so a signal that fires while the result is
       // still streaming rejects HERE, and translating it in only one of the

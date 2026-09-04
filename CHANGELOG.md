@@ -13,6 +13,22 @@ remain the authoritative record for those versions.
 
 ### Fixed
 
+- A `timeoutMs` longer than five minutes is now honoured instead of being
+  silently capped at 300 s. On Node — the only runtime this package supports —
+  `fetch` is undici, whose `headersTimeout` and `bodyTimeout` both default to
+  300 s and live on the dispatcher, where no `AbortSignal` can reach them. Any
+  request that waited longer than that died as `TypeError: fetch failed` with
+  no HTTP status and no server request id, which hit `comfy.models.run`
+  hardest: it holds one request open for the whole generation, so nothing
+  arrives on it until the model finishes, and its own default deadline is
+  600 s. Both limits are now derived per request from the deadline the caller
+  actually asked for, and `timeoutMs: null` disables them the same way it
+  disables the deadline. A dispatcher already on the request — a `ProxyAgent`,
+  an mTLS agent, an egress policy — is delegated to rather than replaced, and a
+  client constructed with its own `fetch` is left alone entirely: `dispatcher`
+  is undici's own init key, so that transport stays the caller's to configure
+  (see `ComfyLowOptions.fetch`).
+
 - `models.run` now posts to `POST {routerBaseUrl}/v2/models/{provider}/{model}`.
   The Comfy Router service moved its model routes from `/v1/models` to
   `/v2/models` and the SDK's path template was never updated, so

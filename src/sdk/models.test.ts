@@ -2,6 +2,7 @@
  * the headers it sends and reads, its deadline, and its failures. */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { attachedDispatcher } from "../../test/support/dispatchers.js";
 import { RouterStubServer, withRouterStub } from "../../test/support/router-stub-server.js";
 import {
   comfy,
@@ -248,6 +249,47 @@ describe("comfy.models.run deadline", () => {
 
       expect(err).toBeInstanceOf(ComfyError);
       expect(err.code).toBe("request_timeout");
+    });
+  });
+
+  it("carries the deadline into undici's own inactivity limits, not just the signal", async () => {
+    // `models.run` holds one request open for the whole generation, so nothing
+    // — not even the response headers — arrives until the model is done. That
+    // is exactly what undici's 300s `headersTimeout`/`bodyTimeout` defaults cut
+    // short, out of any `AbortSignal`'s reach, so a longer deadline has to
+    // reach the dispatcher as well.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      let seen: RequestInit | undefined;
+      const realFetch = globalThis.fetch;
+      vi.stubGlobal("fetch", (url: string, init: RequestInit) => {
+        seen = init;
+        return realFetch(url, init);
+      });
+
+      await comfy.models.run(MODEL, {}, { timeoutMs: 660_000 });
+
+      const dispatcher = attachedDispatcher(seen);
+      expect(dispatcher?.headersTimeout).toBeGreaterThan(660_000);
+      expect(dispatcher?.bodyTimeout).toBeGreaterThan(660_000);
+    });
+  });
+
+  it("disables undici's inactivity limits when the deadline is disabled", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      let seen: RequestInit | undefined;
+      const realFetch = globalThis.fetch;
+      vi.stubGlobal("fetch", (url: string, init: RequestInit) => {
+        seen = init;
+        return realFetch(url, init);
+      });
+
+      await comfy.models.run(MODEL, {}, { timeoutMs: null });
+
+      const dispatcher = attachedDispatcher(seen);
+      expect(dispatcher?.headersTimeout).toBe(0);
+      expect(dispatcher?.bodyTimeout).toBe(0);
     });
   });
 
