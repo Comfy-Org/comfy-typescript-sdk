@@ -14,6 +14,7 @@ import { ApiError } from "../low/index.js";
 import type {
   ComfyLow,
   Job as LowJob,
+  JobLogs as LowJobLogs,
   JobWorkflowResult,
   Output as LowOutput,
 } from "../low/index.js";
@@ -22,6 +23,37 @@ import { backoffSchedule, isTerminal, SUCCESS } from "./core.js";
 import { eventFromRaw, type ComfyEvent, type StatusChange } from "./events.js";
 import { JobFailed, toSdkError, translate } from "./exceptions.js";
 import { Output } from "./outputs.js";
+
+/**
+ * What a run printed — the resolved form of {@link Job.getLogs}.
+ *
+ * Untrusted text: a workflow chooses what goes in it, so render `text` as
+ * plain text rather than interpreting it.
+ *
+ * `truncated` says the BEGINNING was discarded and this is the tail of a
+ * longer run, which is where a failure normally is. It describes the stored
+ * log, not the response, so it never means a caller asked for part of one;
+ * `truncated` with an empty `text` means the log was captured and then shed
+ * entirely to fit, which is not the same as never having had one.
+ *
+ * `complete` says no more output will be appended. Always true today, because
+ * a log is read back off the worker once, when the run ends.
+ */
+export type JobLogs = Readonly<{
+  text: string;
+  truncated: boolean;
+  capturedAt: Date;
+  complete: boolean;
+}>;
+
+function toJobLogs(raw: LowJobLogs): JobLogs {
+  return {
+    text: raw.text,
+    truncated: raw.truncated,
+    capturedAt: new Date(raw.captured_at),
+    complete: raw.complete,
+  };
+}
 
 // Pause before reconnecting an SSE stream that dropped mid-job, without a
 // terminal frame having been seen.
@@ -147,6 +179,50 @@ export class Job {
    */
   async getWorkflow(signal?: AbortSignal): Promise<JobWorkflowResult> {
     return translate(() => this.low.getJobWorkflow(this.model.id, { signal }));
+  }
+
+  /**
+   * Fetch what this run printed via `GET /api/v2/jobs/{id}/logs`, or `null`
+   * if there is no log to fetch.
+   *
+   * Fetched on demand and never cached: {@link Job.wait} and
+   * {@link Comfy.run} download no log, and a second call re-reads rather than
+   * replaying the first, so an early `null` on a job that had not finished
+   * cannot mask the log it went on to produce.
+   *
+   * `null` is every reason there is nothing to read, which the contract
+   * deliberately does not distinguish: this deployment does not capture logs
+   * at all (Comfy Cloud and self-hosted never do), the job has not finished,
+   * it predates log capture, the run was killed before the worker could report
+   * an outcome (an out-of-memory kill, a crashed worker, a timeout, a job past
+   * its maximum runtime), capture was attempted and failed, or the job ran on
+   * the public demo deployment, which captures a log but withholds it from
+   * anonymous callers. Do not branch on which — but a job that has not
+   * finished may have a log once it has, so a caller that wants one calls
+   * again after a terminal status.
+   *
+   * The killed-run case is a known gap rather than an oversight: a log is read
+   * back off the worker, so a run the platform killed never produced one. The
+   * failures a caller most wants a log for are the ones least likely to have
+   * left one.
+   *
+   * On a surface that offers a logs link, a missing job still rejects with the
+   * usual {@link NotFound}. Where there is no link there is no request, so a
+   * job that has expired or never existed resolves `null` too — the answer
+   * "this deployment has no logs" is reached without asking about the job.
+   */
+  async getLogs(signal?: AbortSignal): Promise<JobLogs | null> {
+    const url = this.model.urls.logs;
+    // No link means the surface serves no logs for any job, so the answer is
+    // known without a request. Never synthesized: the URL is the surface's to
+    // give, and building one here would turn a deployment that cannot answer
+    // into a 404 that looks like a missing job. Falsy, not `=== undefined`: a
+    // server that serializes an absent optional link as "" rather than
+    // omitting it would otherwise reach the transport and have `/jobs//logs`
+    // built for it, which is that same 404.
+    if (!url) return null;
+    const raw = await translate(() => this.low.getJobLogs(url, { signal }));
+    return raw === null ? null : toJobLogs(raw);
   }
 
   /**

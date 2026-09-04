@@ -66,6 +66,28 @@ export type Job = {
 };
 
 /**
+ * A job's captured execution log — the body of `GET /api/v2/jobs/{id}/logs`. Diagnostics, not a contract on content: this is whatever the workflow's own code and nodes wrote to standard output, in the order they wrote it, so nothing about its shape is stable between runs or between releases of a build. It is **untrusted text** — a workflow chooses what goes in it — and must be rendered as plain text rather than interpreted.
+ */
+export type JobLogs = {
+    /**
+     * The captured output.
+     */
+    text: string;
+    /**
+     * The BEGINNING of the captured output was discarded — `text` is the TAIL of a longer run. Implementations bound what they capture and store, so a workflow that prints megabytes keeps its last lines, where a failure normally is, instead of being dropped whole. True with an empty `text` means the log was captured and then shed entirely to fit. This describes the stored log, never the response: it does not mean a caller asked for part of one.
+     */
+    truncated: boolean;
+    /**
+     * When the run's output was read back off the worker.
+     */
+    captured_at: string;
+    /**
+     * No further output will be appended to this log. Always `true` today, because a log is read back off the worker once, when the run ends, so a log that exists is already whole. Sent so that a surface which later captures output while a run is still going can say so, and a client written now against `false` keeps working when it does. `false` does not promise that more output will arrive, only that this snapshot may not be the last one.
+     */
+    complete: boolean;
+};
+
+/**
  * The workflow behind a job. See GET /api/v2/jobs/{id}/workflow's description for exactly when `format` is `save` vs `api`.
  */
 export type JobWorkflowResponse = {
@@ -96,6 +118,11 @@ export type JobUrls = {
     self: string;
     events: string;
     cancel: string;
+    /**
+     * Where to read what this run printed. Present on any surface that captures execution logs, which is why it is the one link here that is optional: absent means this surface captures none, for any job, so a client can stop looking without spending a request on an answer it already has.
+     * Follow this link rather than building the path from the job id. The two are not interchangeable: a surface may be mounted under a prefix this link already carries and a hand-built path would not, and a surface that does not implement the operation at all answers a routing `404` — indistinguishable, to the client, from the `404` that means the job itself is gone. Present does NOT mean this job has a log, and it is deliberately not a signal about one: a surface that captures logs offers the link on every job, including those it will answer `204` for and those whose log it withholds. Read the log, not the link.
+     */
+    logs?: string;
 };
 
 /**
@@ -119,6 +146,9 @@ export type Progress = {
  * A committed job output. Outputs are assets: `id` is the asset UUID, retrievable via GET /api/v2/assets/{id} for as long as the job is retained. `hash` is lazily computed and may be null on the retrieval hot path.
  */
 export type Output = {
+    /**
+     * The workflow node that reported this file; empty when the worker named none.
+     */
     node_id: string;
     name: string;
     type: OutputType;
@@ -640,6 +670,53 @@ export type GetJobWorkflowResponses = {
 };
 
 export type GetJobWorkflowResponse = GetJobWorkflowResponses[keyof GetJobWorkflowResponses];
+
+export type GetJobLogsData = {
+    body?: never;
+    path: {
+        id: string;
+    };
+    query?: never;
+    url: '/api/v2/jobs/{id}/logs';
+};
+
+export type GetJobLogsErrors = {
+    /**
+     * `unauthorized` — missing or invalid credentials.
+     */
+    401: ErrorEnvelope;
+    /**
+     * `forbidden` — authenticated but not allowed.
+     */
+    403: ErrorEnvelope;
+    /**
+     * `not_found`.
+     */
+    404: ErrorEnvelope;
+    /**
+     * `rate_limited` — the caller has exceeded the request rate limit for this account. Account/rate-scoped, not job-specific — this can be returned even for a job id the caller doesn't own or that doesn't exist, without revealing which.
+     */
+    429: ErrorEnvelope;
+    /**
+     * `upstream_error` — an unexpected failure reaching or processing the request in this implementation's backing services. The message is always a generic, safe-to-display string; implementation detail (the specific upstream, its error text, transport failures) is never included here — see each implementation's own error-mapping notes. Every operation in this contract can fail this way.
+     */
+    500: ErrorEnvelope;
+};
+
+export type GetJobLogsError = GetJobLogsErrors[keyof GetJobLogsErrors];
+
+export type GetJobLogsResponses = {
+    /**
+     * The captured log.
+     */
+    200: JobLogs;
+    /**
+     * This job has no log. A normal answer, not an error — see the description for the cases it covers.
+     */
+    204: void;
+};
+
+export type GetJobLogsResponse = GetJobLogsResponses[keyof GetJobLogsResponses];
 
 export type GetJobEventsData = {
     body?: never;

@@ -103,6 +103,29 @@ export interface ServerState {
    * record.
    */
   jobWorkflow: { workflow: Record<string, unknown>; format: "save" | "api" } | null;
+  /**
+   * `GET /jobs/{id}/logs` response body. `null` (the default) answers 204,
+   * the contract's normal "this job has no log".
+   */
+  jobLogs: {
+    text: string;
+    truncated: boolean;
+    captured_at: string;
+    complete: boolean;
+  } | null;
+  /** When true, `GET /jobs/{id}/logs` 404s instead — the missing-job path. */
+  jobLogsNotFound: boolean;
+  /** Drops `urls.logs` from every job, standing in for a surface (Comfy Cloud,
+   * self-hosted) that serves no logs at all. */
+  omitLogsLink: boolean;
+  /** Serializes `urls.logs` as "" instead of omitting it — the shape a server
+   * that forgot an omit-empty tag would emit. */
+  emptyLogsLink: boolean;
+  /** Requests the logs resource has received, so a test can assert one was
+   * never made. */
+  jobLogsRequestCount: number;
+  /** Path of the most recent logs request, so a test can assert WHICH job was asked for. */
+  lastJobLogsPath: string | null;
   /** Asset ids already deleted — GET/DELETE for these 404 asset_not_found,
    * matching the real server treating a repeat delete as "gone". */
   deletedAssets: Set<string>;
@@ -163,6 +186,12 @@ function defaultState(): ServerState {
     getAssetHashOverride: undefined,
     hangJobPoll: false,
     jobWorkflow: null,
+    jobLogs: null,
+    jobLogsNotFound: false,
+    omitLogsLink: false,
+    emptyLogsLink: false,
+    jobLogsRequestCount: 0,
+    lastJobLogsPath: null,
     deletedAssets: new Set(),
     deleteInUseAssetId: null,
     uploadCount: 0,
@@ -201,6 +230,8 @@ function jobJson(
   status: string,
   outputs: unknown[] = [],
   urlsOrigin: string | null = null,
+  omitLogsLink = false,
+  emptyLogsLink = false,
 ) {
   const prefix = urlsOrigin ?? "";
   return {
@@ -219,6 +250,7 @@ function jobJson(
       self: `${prefix}/api/v2/jobs/${id}`,
       events: `${prefix}/api/v2/jobs/${id}/events`,
       cancel: `${prefix}/api/v2/jobs/${id}/cancel`,
+      ...(omitLogsLink ? {} : { logs: emptyLogsLink ? "" : `${prefix}/api/v2/jobs/${id}/logs` }),
     },
   };
 }
@@ -349,6 +381,12 @@ export class StubServer {
         this.serveEvents(res);
         return;
       }
+      m = /^\/api\/v2\/jobs\/([^/]+)\/logs$/.exec(path);
+      if (m) {
+        this.state.lastJobLogsPath = path;
+        this.serveJobLogs(res);
+        return;
+      }
       m = /^\/api\/v2\/jobs\/([^/]+)\/workflow$/.exec(path);
       if (m) {
         this.serveJobWorkflow(res);
@@ -378,7 +416,18 @@ export class StubServer {
       }
       const m = /^\/api\/v2\/jobs\/([^/]+)\/cancel$/.exec(path);
       if (m) {
-        sendJson(res, 200, jobJson(m[1], "canceling", [], state.jobUrlsOrigin));
+        sendJson(
+          res,
+          200,
+          jobJson(
+            m[1],
+            "canceling",
+            [],
+            state.jobUrlsOrigin,
+            state.omitLogsLink,
+            state.emptyLogsLink,
+          ),
+        );
         return;
       }
       await readBody(req);
@@ -455,7 +504,26 @@ export class StubServer {
     // Stamp the polled job's own id as job_id, matching a real server: an
     // output belongs to the job that produced it.
     const outputs = status === "succeeded" ? [{ ...OUTPUT, job_id: jobId }] : [];
-    sendJson(res, 200, jobJson(jobId, status, outputs, state.jobUrlsOrigin));
+    sendJson(
+      res,
+      200,
+      jobJson(jobId, status, outputs, state.jobUrlsOrigin, state.omitLogsLink, state.emptyLogsLink),
+    );
+  }
+
+  private serveJobLogs(res: ServerResponse): void {
+    const state = this.state;
+    state.jobLogsRequestCount += 1;
+    if (state.jobLogsNotFound) {
+      sendError(res, 404, "job_not_found", "no such job");
+      return;
+    }
+    if (state.jobLogs === null) {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    sendJson(res, 200, state.jobLogs);
   }
 
   private serveJobWorkflow(res: ServerResponse): void {
@@ -577,7 +645,11 @@ export class StubServer {
 
     const jobId = `job_${String(state.submitCount).padStart(2, "0")}`;
     if (typeof key === "string") state.idempotency.set(key, jobId);
-    sendJson(res, 201, jobJson(jobId, "queued", [], state.jobUrlsOrigin));
+    sendJson(
+      res,
+      201,
+      jobJson(jobId, "queued", [], state.jobUrlsOrigin, state.omitLogsLink, state.emptyLogsLink),
+    );
   }
 }
 

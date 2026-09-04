@@ -44,6 +44,23 @@ entry. See CONTRIBUTING.md.
 
 ### Added
 
+- `Job.getLogs()` fetches a job's execution log — what the run printed —
+  resolving to a `JobLogs` (`text`, `truncated`, `capturedAt`, `complete`) or
+  `null`. Fetched on demand and never cached: submitting and polling a job
+  downloads no log, and each call re-reads rather than replaying the first, so
+  polling for a log that has not landed yet works. `null` is an ordinary
+  answer covering every reason there is nothing to read — the deployment
+  captures no logs at all (Comfy Cloud and self-hosted never do; only
+  serverless deployments have them), the job has not finished, it predates
+  capture, the run was killed before the worker could report an outcome (an
+  out-of-memory kill, a crashed worker, a timeout, a job past its maximum
+  runtime), capture failed, or the job ran on the public demo deployment,
+  which captures a log but withholds it from anonymous callers — and the
+  contract deliberately does not distinguish them. Do not branch on which; a
+  job that has not finished may have a log once it has, so read again after a
+  terminal status. On a surface that offers a logs link a missing job still
+  rejects with `NotFound`; where there is no link there is no request, so that
+  job resolves `null` too.
 - `comfy.models.run(model, input)` — run a partner model by its canonical
   `{provider}/{model}` ID and get its native output back. Resolves only when
   the generation is complete (one call; the server does any provider-side

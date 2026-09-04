@@ -20,6 +20,16 @@ export const zAsset = z.object({
 });
 
 /**
+ * A job's captured execution log — the body of `GET /api/v2/jobs/{id}/logs`. Diagnostics, not a contract on content: this is whatever the workflow's own code and nodes wrote to standard output, in the order they wrote it, so nothing about its shape is stable between runs or between releases of a build. It is **untrusted text** — a workflow chooses what goes in it — and must be rendered as plain text rather than interpreted.
+ */
+export const zJobLogs = z.object({
+    text: z.string(),
+    truncated: z.boolean(),
+    captured_at: z.iso.datetime(),
+    complete: z.boolean()
+});
+
+/**
  * The workflow behind a job. See GET /api/v2/jobs/{id}/workflow's description for exactly when `format` is `save` vs `api`.
  */
 export const zJobWorkflowResponse = z.object({
@@ -49,7 +59,8 @@ export const zJobStatus = z.enum([
 export const zJobUrls = z.object({
     self: z.string(),
     events: z.string(),
-    cancel: z.string()
+    cancel: z.string(),
+    logs: z.string().optional()
 });
 
 /**
@@ -258,6 +269,15 @@ export const zGetJobWorkflowPath = z.object({
  * The workflow graph.
  */
 export const zGetJobWorkflowResponse = zJobWorkflowResponse;
+
+export const zGetJobLogsPath = z.object({
+    id: z.string()
+});
+
+export const zGetJobLogsResponse = z.union([
+    zJobLogs,
+    z.void()
+]);
 
 export const zGetJobEventsPath = z.object({
     id: z.string()
