@@ -39,6 +39,15 @@ entry. See CONTRIBUTING.md.
 
 ## [0.1.8] - 2026-09-01
 
+### Fixed
+
+- `models.run` now posts to `POST {routerBaseUrl}/v2/models/{provider}/{model}`.
+  The Comfy Router service moved its model routes from `/v1/models` to
+  `/v2/models` and the SDK's path template was never updated, so
+  every `models.run` call answered a bare 404 against the live service. The
+  vendored `spec/router-openapi.yaml` is synced to the same contract in this
+  change, and the router-spec contract test re-pins the two together.
+
 ### Added
 
 - `comfy.models.run(model, input)` — run a partner model by its canonical
@@ -92,24 +101,16 @@ entry. See CONTRIBUTING.md.
   version is affected:** `routerErrors` had never shipped before this release
   (it is absent from `v0.1.7`), so this changes behaviour only for callers who
   were building against `main`.
-- **No behaviour change.** The route `comfy.models.run` posts to and the
-  default host (`https://api.comfy.org`) are now pinned to
-  `spec/router-openapi.yaml` — the vendored Comfy Router contract — rather than
-  only hard-coded. Both `pnpm test` (`src/sdk/router-spec-contract.test.ts`)
-  and `pnpm check:spec-drift` compare them against that file's
-  `runRouterModel` path, its path parameters and its `servers[0].url`, so a
-  sync that moves the route reddens CI instead of leaving `run` to 404 against
-  a route the SDK still spells the old way. The URL it builds, and the
-  percent-encoding of each segment, are unchanged.
-
-### Fixed
-
-- `models.run` now posts to `POST {routerBaseUrl}/v2/models/{provider}/{model}`.
-  The Comfy Router service moved its model routes from `/v1/models` to
-  `/v2/models` and the SDK's path template was never updated, so
-  every `models.run` call answered a bare 404 against the live service. The
-  vendored `spec/router-openapi.yaml` is synced to the same contract in this
-  change, and the router-spec contract test re-pins the two together.
+- **No behaviour change.** The route `comfy.models.run` posts to
+  (`/v2/models/{provider}/{model}`) and the default host
+  (`https://api.comfy.org`) are now pinned to `spec/router-openapi.yaml` — the
+  vendored Comfy Router contract — rather than only hard-coded. Both
+  `pnpm test` (`src/sdk/router-spec-contract.test.ts`) and
+  `pnpm check:spec-drift` compare them against that file's `runRouterModel`
+  path, its path parameters and its `servers[0].url`, so a sync that moves the
+  route reddens CI instead of leaving `run` to 404 against a route the SDK
+  still spells the old way. The URL it builds, and the percent-encoding of
+  each segment, are unchanged.
 
 ## [0.1.7] - 2026-08-13
 
