@@ -11,6 +11,14 @@ remain the authoritative record for those versions.
 
 ## [Unreleased]
 
+<!--
+Add user-visible changes here under Added / Changed / Deprecated / Removed /
+Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
+entry. See CONTRIBUTING.md.
+-->
+
+## [0.1.8] - 2026-09-01
+
 ### Fixed
 
 - A `timeoutMs` longer than five minutes is now honoured instead of being
@@ -35,12 +43,6 @@ remain the authoritative record for those versions.
   every `models.run` call answered a bare 404 against the live service. The
   vendored `spec/router-openapi.yaml` is synced to the same contract in this
   change, and the router-spec contract test re-pins the two together.
-
-<!--
-Add user-visible changes here under Added / Changed / Deprecated / Removed /
-Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
-entry. See CONTRIBUTING.md.
--->
 
 ### Added
 
@@ -96,7 +98,7 @@ entry. See CONTRIBUTING.md.
   `v0.1.7`, the latest release on npm), so this changes behaviour only for
   callers building against `main`.
 - **No behaviour change.** The route `comfy.models.run` posts to
-  (`/v1/models/{provider}/{model}`) and the default host
+  (`/v2/models/{provider}/{model}`) and the default host
   (`https://api.comfy.org`) are now pinned to `spec/router-openapi.yaml` — the
   vendored Comfy Router contract — rather than only hard-coded. Both
   `pnpm test` (`src/sdk/router-spec-contract.test.ts`) and
@@ -265,7 +267,8 @@ First public release of the Comfy API v2 TypeScript SDK (`@comfyorg/sdk`).
   Cloud, and serverless: upload and dedup inputs, submit a workflow, follow it
   (poll or SSE), and download outputs. Requires Node >= 22.
 
-[Unreleased]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.4...v0.1.5
