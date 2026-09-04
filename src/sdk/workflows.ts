@@ -9,8 +9,6 @@
  * the Python SDK.
  */
 
-import { readFile } from "node:fs/promises";
-
 export type WorkflowGraph = Record<string, unknown>;
 
 /**
@@ -48,8 +46,14 @@ export class Workflow {
  * subgraphs land; in v1 it is purely local.
  */
 export class WorkflowFactory {
-  /** Read and parse an API-format workflow from a JSON file on disk. */
+  /**
+   * Read and parse an API-format workflow from a JSON file on disk.
+   *
+   * Node-only. In a browser, fetch the JSON yourself and use
+   * {@link WorkflowFactory.fromJson}.
+   */
   async fromFile(path: string): Promise<Workflow> {
+    const { readFile } = await import("node:fs/promises");
     const text = await readFile(path, "utf-8");
     return new Workflow(JSON.parse(text) as WorkflowGraph);
   }

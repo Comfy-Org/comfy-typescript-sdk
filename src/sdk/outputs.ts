@@ -7,10 +7,6 @@
  * `comfy_sdk.outputs` in the Python SDK.
  */
 
-import { createWriteStream } from "node:fs";
-import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
-
 import type { ComfyLow, Output as LowOutput } from "../low/index.js";
 import { translate } from "./exceptions.js";
 
@@ -74,6 +70,9 @@ export class Output {
    * of both ends** (HTTP `Range: bytes=first-last`), so `[0, 4]` yields the
    * first five bytes. No default timeout, so a large download is not killed
    * mid-transfer; pass `timeoutMs`/`signal` to bound or cancel it.
+   *
+   * Node-only. In a browser use {@link Output.toBytes} and hand the bytes to
+   * a Blob download.
    */
   async toFile(
     path: string,
@@ -91,6 +90,11 @@ export class Output {
       }),
     );
     if (!response.body) throw new Error(`empty response body for asset ${this.model.id}`);
+    const [{ createWriteStream }, { Readable }, { pipeline }] = await Promise.all([
+      import("node:fs"),
+      import("node:stream"),
+      import("node:stream/promises"),
+    ]);
     await pipeline(Readable.fromWeb(response.body), createWriteStream(path));
     return path;
   }
