@@ -17,7 +17,7 @@ Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
 entry. See CONTRIBUTING.md.
 -->
 
-## [0.1.8] - 2026-09-01
+## [0.1.9] - 2026-09-04
 
 ### Fixed
 
@@ -36,6 +36,10 @@ entry. See CONTRIBUTING.md.
   client constructed with its own `fetch` is left alone entirely: `dispatcher`
   is undici's own init key, so that transport stays the caller's to configure
   (see `ComfyLowOptions.fetch`).
+
+## [0.1.8] - 2026-09-01
+
+### Fixed
 
 - `models.run` now posts to `POST {routerBaseUrl}/v2/models/{provider}/{model}`.
   The Comfy Router service moved its model routes from `/v1/models` to
@@ -94,9 +98,9 @@ entry. See CONTRIBUTING.md.
   check now compares the two fallback tables and the two base defaults rather
   than class names alone. Responses that DO name their bucket — which is every
   response Router itself writes, on any status — are unaffected. **No published
-  version is affected:** `routerErrors` has never shipped (it is absent from
-  `v0.1.7`, the latest release on npm), so this changes behaviour only for
-  callers building against `main`.
+  version is affected:** `routerErrors` had never shipped before this release
+  (it is absent from `v0.1.7`), so this changes behaviour only for callers who
+  were building against `main`.
 - **No behaviour change.** The route `comfy.models.run` posts to
   (`/v2/models/{provider}/{model}`) and the default host
   (`https://api.comfy.org`) are now pinned to `spec/router-openapi.yaml` — the
@@ -267,7 +271,8 @@ First public release of the Comfy API v2 TypeScript SDK (`@comfyorg/sdk`).
   Cloud, and serverless: upload and dedup inputs, submit a workflow, follow it
   (poll or SSE), and download outputs. Requires Node >= 22.
 
-[Unreleased]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.5...v0.1.6
