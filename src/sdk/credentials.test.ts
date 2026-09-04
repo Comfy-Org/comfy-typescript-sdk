@@ -30,8 +30,12 @@ beforeEach(() => {
 
 afterEach(() => {
   config({ credentials: undefined, baseUrl: undefined });
-  vi.unstubAllEnvs();
+  // Globals first: two tests below stub `process` away entirely, and
+  // `unstubAllEnvs` restores through `globalThis.process.env`. Unstubbing
+  // envs while `process` is still gone throws inside the hook, which leaves
+  // the globals stubbed for every test after it.
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 describe("comfy.config({ credentials })", () => {

@@ -50,8 +50,8 @@ beforeEach(() => {
 
 afterEach(() => {
   config({ credentials: undefined, baseUrl: undefined });
-  vi.unstubAllEnvs();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 describe("the comfy.models namespace", () => {
