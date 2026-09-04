@@ -11,6 +11,14 @@ remain the authoritative record for those versions.
 
 ## [Unreleased]
 
+<!--
+Add user-visible changes here under Added / Changed / Deprecated / Removed /
+Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
+entry. See CONTRIBUTING.md.
+-->
+
+## [0.1.9] - 2026-09-04
+
 ### Fixed
 
 - A `timeoutMs` longer than five minutes is now honoured instead of being
@@ -29,18 +37,7 @@ remain the authoritative record for those versions.
   is undici's own init key, so that transport stays the caller's to configure
   (see `ComfyLowOptions.fetch`).
 
-- `models.run` now posts to `POST {routerBaseUrl}/v2/models/{provider}/{model}`.
-  The Comfy Router service moved its model routes from `/v1/models` to
-  `/v2/models` and the SDK's path template was never updated, so
-  every `models.run` call answered a bare 404 against the live service. The
-  vendored `spec/router-openapi.yaml` is synced to the same contract in this
-  change, and the router-spec contract test re-pins the two together.
-
-<!--
-Add user-visible changes here under Added / Changed / Deprecated / Removed /
-Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
-entry. See CONTRIBUTING.md.
--->
+## [0.1.8] - 2026-09-01
 
 ### Added
 
@@ -92,19 +89,27 @@ entry. See CONTRIBUTING.md.
   check now compares the two fallback tables and the two base defaults rather
   than class names alone. Responses that DO name their bucket — which is every
   response Router itself writes, on any status — are unaffected. **No published
-  version is affected:** `routerErrors` has never shipped (it is absent from
-  `v0.1.7`, the latest release on npm), so this changes behaviour only for
-  callers building against `main`.
-- **No behaviour change.** The route `comfy.models.run` posts to
-  (`/v1/models/{provider}/{model}`) and the default host
-  (`https://api.comfy.org`) are now pinned to `spec/router-openapi.yaml` — the
-  vendored Comfy Router contract — rather than only hard-coded. Both
-  `pnpm test` (`src/sdk/router-spec-contract.test.ts`) and
-  `pnpm check:spec-drift` compare them against that file's `runRouterModel`
-  path, its path parameters and its `servers[0].url`, so a sync that moves the
-  route reddens CI instead of leaving `run` to 404 against a route the SDK
-  still spells the old way. The URL it builds, and the percent-encoding of
-  each segment, are unchanged.
+  version is affected:** `routerErrors` had never shipped before this release
+  (it is absent from `v0.1.7`), so this changes behaviour only for callers who
+  were building against `main`.
+- **No behaviour change.** The route `comfy.models.run` posts to and the
+  default host (`https://api.comfy.org`) are now pinned to
+  `spec/router-openapi.yaml` — the vendored Comfy Router contract — rather than
+  only hard-coded. Both `pnpm test` (`src/sdk/router-spec-contract.test.ts`)
+  and `pnpm check:spec-drift` compare them against that file's
+  `runRouterModel` path, its path parameters and its `servers[0].url`, so a
+  sync that moves the route reddens CI instead of leaving `run` to 404 against
+  a route the SDK still spells the old way. The URL it builds, and the
+  percent-encoding of each segment, are unchanged.
+
+### Fixed
+
+- `models.run` now posts to `POST {routerBaseUrl}/v2/models/{provider}/{model}`.
+  The Comfy Router service moved its model routes from `/v1/models` to
+  `/v2/models` and the SDK's path template was never updated, so
+  every `models.run` call answered a bare 404 against the live service. The
+  vendored `spec/router-openapi.yaml` is synced to the same contract in this
+  change, and the router-spec contract test re-pins the two together.
 
 ## [0.1.7] - 2026-08-13
 
@@ -265,7 +270,9 @@ First public release of the Comfy API v2 TypeScript SDK (`@comfyorg/sdk`).
   Cloud, and serverless: upload and dedup inputs, submit a workflow, follow it
   (poll or SSE), and download outputs. Requires Node >= 22.
 
-[Unreleased]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.8...v0.1.9
+[0.1.8]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.4...v0.1.5
