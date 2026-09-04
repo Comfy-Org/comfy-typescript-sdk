@@ -58,12 +58,24 @@ const GLOBAL_DISPATCHER_KEY = Symbol.for("undici.globalDispatcher.1");
 const INACTIVITY_GRACE_MS = 30_000;
 
 /**
- * Both limits end up in a timer, and a delay past this wraps around and fires
- * immediately — the exact failure being fixed, one ceiling higher. Reaching it
- * needs a ~25-day deadline, past which no limit is expressible, so no limit is
- * imposed.
+ * The largest delay a timer can express. `setTimeout` — which both undici's
+ * limits and `AbortSignal.timeout` schedule on — clamps anything above this to
+ * 1 ms with a `TimeoutOverflowWarning`, so an unclamped delay past it fires
+ * immediately: the exact failure being fixed, one ceiling higher. Reaching it
+ * needs a ~25-day deadline.
  */
-const MAX_TIMER_MS = 2_147_483_647;
+export const MAX_TIMER_MS = 2_147_483_647;
+
+/**
+ * `ms` as a delay a timer will actually honour. Every clock derived from a
+ * deadline goes through here so the deadline and the inactivity limits agree
+ * about what is expressible: above {@link MAX_TIMER_MS} an `AbortSignal.timeout`
+ * would abort the request almost immediately instead of ~25 days later.
+ */
+export function clampTimerMs(ms: number): number {
+  if (Number.isNaN(ms)) return 0;
+  return Math.min(Math.max(0, ms), MAX_TIMER_MS);
+}
 
 /** The slice of undici's `Dispatcher` this module needs. */
 interface UndiciDispatcher {
@@ -111,12 +123,43 @@ export function delegateWithLimits(inner: UndiciDispatcher, limitMs: number): In
   };
 }
 
+/**
+ * Structural narrowing rather than a type assertion: the value comes off
+ * `globalThis` (or out of a caller's `init`), so `dispatch` is checked at
+ * runtime instead of asserted.
+ */
+function isDispatcher(candidate: unknown): candidate is UndiciDispatcher {
+  return (
+    typeof candidate === "object" &&
+    candidate !== null &&
+    "dispatch" in candidate &&
+    typeof candidate.dispatch === "function"
+  );
+}
+
 /** The process-wide undici dispatcher, or `undefined` off Node. */
 function globalDispatcher(): UndiciDispatcher | undefined {
-  const candidate = (globalThis as unknown as Record<symbol, UndiciDispatcher | undefined>)[
-    GLOBAL_DISPATCHER_KEY
-  ];
-  return typeof candidate?.dispatch === "function" ? candidate : undefined;
+  // Node installs the symbol lazily, when undici first initializes — which
+  // happens on the first *access* of an undici-backed global. Reading `fetch`
+  // is that access, so this guard is not just a runtime check: without it the
+  // first request in a process could look the symbol up before it exists and
+  // silently keep the 300 s cap, which is precisely the long call this module
+  // exists to protect.
+  if (typeof globalThis.fetch !== "function") return undefined;
+  const candidate: unknown = Reflect.get(globalThis, GLOBAL_DISPATCHER_KEY);
+  return isDispatcher(candidate) ? candidate : undefined;
+}
+
+/**
+ * `dispatcher` is undici's own non-standard `fetch` init key, and `@types/node`
+ * types it as undici's `Dispatcher` *class*. The delegate deliberately does not
+ * extend that class — undici only ever calls `.dispatch()` on the value, and
+ * extending it would mean depending on undici as a package rather than on the
+ * copy Node already ships. This function is the one place that crossing is
+ * expressed, so the rest of the module stays assertion-free.
+ */
+function asDispatcherInit(delegate: InactivityDispatcher): RequestInit["dispatcher"] {
+  return delegate as unknown as RequestInit["dispatcher"];
 }
 
 /**
@@ -125,25 +168,26 @@ function globalDispatcher(): UndiciDispatcher | undefined {
  * deadline its caller asked for. Returns `init` unchanged where there is no
  * undici dispatcher to delegate to.
  *
- * `dispatcher` is undici's own non-standard `fetch` init key, so this applies
- * to a caller-injected `fetch` as well: one that does not understand the key
- * ignores it, and one that wraps the platform `fetch` gets the fix rather than
- * silently losing it. The exception is a `fetch` from a *separately installed*
- * undici, which speaks its own package's handler protocol and cannot be handed
- * a delegate for the copy Node ships; such a caller wants
- * `setGlobalDispatcher` on their own undici instead, which this delegates to
- * untouched.
+ * A dispatcher already on `init` wins over the process-wide one and is what the
+ * delegate forwards to, so this only ever *adds* the two limits — it never
+ * replaces a transport the caller chose. That matters because the dispatcher is
+ * also where a `ProxyAgent`, an mTLS client certificate or an egress policy
+ * lives; dropping one would send the request, bearer token included, straight
+ * out instead.
+ *
+ * Only ever applied to a `fetch` this package knows is Node's own: the key is
+ * undici's, and a `fetch` from a *separately installed* undici speaks its own
+ * copy's handler protocol, which a delegate for the built-in copy cannot be
+ * handed. `ComfyLow` therefore skips this entirely when the caller injected
+ * their own `fetch` (see `ComfyLowOptions.fetch`).
  */
 export function withInactivityLimits(
   init: RequestInit,
   effectiveTimeoutMs: number | null,
 ): RequestInit {
-  const inner = globalDispatcher();
+  const carried: unknown = Reflect.get(init, "dispatcher");
+  const inner = isDispatcher(carried) ? carried : globalDispatcher();
   if (inner === undefined) return init;
   const delegate = delegateWithLimits(inner, inactivityLimitMs(effectiveTimeoutMs));
-  // undici types `dispatcher` as its own `Dispatcher` class, which this
-  // delegate deliberately does not extend — undici only ever calls
-  // `.dispatch()` on it, and extending the class would mean depending on
-  // undici as a package rather than on the copy Node already ships.
-  return { ...init, dispatcher: delegate as unknown as RequestInit["dispatcher"] };
+  return { ...init, dispatcher: asDispatcherInit(delegate) };
 }

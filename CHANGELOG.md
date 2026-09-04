@@ -23,7 +23,11 @@ remain the authoritative record for those versions.
   arrives on it until the model finishes, and its own default deadline is
   600 s. Both limits are now derived per request from the deadline the caller
   actually asked for, and `timeoutMs: null` disables them the same way it
-  disables the deadline.
+  disables the deadline. A dispatcher already on the request — a `ProxyAgent`,
+  an mTLS agent, an egress policy — is delegated to rather than replaced, and a
+  client constructed with its own `fetch` is left alone entirely: `dispatcher`
+  is undici's own init key, so that transport stays the caller's to configure
+  (see `ComfyLowOptions.fetch`).
 
 - `models.run` now posts to `POST {routerBaseUrl}/v2/models/{provider}/{model}`.
   The Comfy Router service moved its model routes from `/v1/models` to

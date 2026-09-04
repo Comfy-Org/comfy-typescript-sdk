@@ -28,7 +28,7 @@
  * the package README for why).
  */
 
-import { withInactivityLimits } from "./dispatcher.js";
+import { clampTimerMs, withInactivityLimits } from "./dispatcher.js";
 import { errorFromEnvelope } from "./errors.js";
 import type {
   Asset,
@@ -60,6 +60,15 @@ export interface RequestOptions {
 }
 
 export interface ComfyLowOptions {
+  /**
+   * Replaces the platform `fetch`. Supplying one also hands you the transport:
+   * this client stops attaching undici's per-request inactivity limits (see
+   * `./dispatcher.ts`), because `dispatcher` is undici's own non-standard init
+   * key and a delegate for the copy Node ships cannot be handed to a `fetch`
+   * from a separately installed undici. Own the limits yourself — with
+   * `setGlobalDispatcher` on your undici, or an `Agent` carrying
+   * `headersTimeout`/`bodyTimeout` — or requests still cap at undici's 300 s.
+   */
   fetch?: typeof fetch;
   timeoutMs?: number;
   /**
@@ -182,6 +191,12 @@ export class ComfyLow {
    */
   readonly #apiKey?: string;
   private readonly fetchImpl: typeof fetch;
+  /**
+   * Is `fetchImpl` the platform `fetch`, rather than one the caller injected?
+   * Only then is the transport ours to add undici's inactivity limits to — see
+   * {@link ComfyLowOptions.fetch}.
+   */
+  private readonly ownsTransport: boolean;
   private readonly defaultTimeoutMs: number;
   private readonly userAgent: string;
 
@@ -189,6 +204,7 @@ export class ComfyLow {
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.#apiKey = apiKey;
     this.fetchImpl = options.fetch ?? fetch;
+    this.ownsTransport = options.fetch === undefined;
     this.defaultTimeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.userAgent = buildUserAgent(options.clientInfo);
   }
@@ -265,7 +281,10 @@ export class ComfyLow {
     effectiveTimeoutMs: number | null,
   ): AbortSignal | undefined {
     if (effectiveTimeoutMs === null) return callerSignal;
-    const timeoutSignal = AbortSignal.timeout(effectiveTimeoutMs);
+    // Clamped for the same reason the inactivity limits are: past ~25 days
+    // `AbortSignal.timeout` schedules a delay `setTimeout` folds to 1 ms, so an
+    // unclamped deadline there aborts at once instead of never.
+    const timeoutSignal = AbortSignal.timeout(clampTimerMs(effectiveTimeoutMs));
     return callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
   }
 
@@ -284,23 +303,19 @@ export class ComfyLow {
     }
     const timeoutMs = this.effectiveTimeoutMs(options.timeoutMs);
     const signal = this.resolveSignal(options.signal, timeoutMs);
+    const init: RequestInit = {
+      method,
+      headers,
+      body,
+      signal,
+      redirect: options.redirect ?? "follow",
+    };
     // `withInactivityLimits` is what keeps undici's own 300s headers/body
     // timers from capping a longer deadline: they live on the dispatcher, out
     // of `signal`'s reach, and firing one costs the caller the HTTP status and
-    // the server request id along with the request.
-    return this.fetchImpl(
-      url,
-      withInactivityLimits(
-        {
-          method,
-          headers,
-          body,
-          signal,
-          redirect: options.redirect ?? "follow",
-        },
-        timeoutMs,
-      ),
-    );
+    // the server request id along with the request. Skipped for an injected
+    // `fetch`, whose transport is the caller's to configure.
+    return this.fetchImpl(url, this.ownsTransport ? withInactivityLimits(init, timeoutMs) : init);
   }
 
   private async parseOrRaise<T>(response: Response, ok: readonly number[]): Promise<T> {

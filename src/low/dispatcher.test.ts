@@ -12,18 +12,16 @@ import type { AddressInfo, Socket } from "node:net";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
-  delegateWithLimits,
-  inactivityLimitMs,
-  withInactivityLimits,
-  type InactivityDispatcher,
-} from "./dispatcher.js";
+  attachedDispatcher,
+  initWithDispatcher,
+  rawGlobalDispatcher,
+  recordGlobalDispatcher,
+} from "../../test/support/dispatchers.js";
+import { delegateWithLimits, inactivityLimitMs, withInactivityLimits } from "./dispatcher.js";
 import { ComfyLow } from "./transport.js";
 
 /** undici's own default for both limits — the wall this module removes. */
 const UNDICI_DEFAULT_MS = 300_000;
-
-/** The process-wide undici dispatcher this module delegates to. */
-const GLOBAL_DISPATCHER_KEY = Symbol.for("undici.globalDispatcher.1");
 
 /**
  * A server that accepts the connection and then never writes anything — the
@@ -57,9 +55,33 @@ class SilentServer {
   }
 }
 
+/** A server that answers immediately — for tests about what was sent, not about waiting. */
+class EchoServer {
+  private readonly server: Server;
+  baseUrl = "";
+
+  constructor() {
+    this.server = createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end("{}");
+    });
+  }
+
+  async start(): Promise<void> {
+    await new Promise<void>((resolve) => this.server.listen(0, "127.0.0.1", resolve));
+    const { port } = this.server.address() as AddressInfo;
+    this.baseUrl = `http://127.0.0.1:${String(port)}`;
+  }
+
+  async stop(): Promise<void> {
+    await new Promise<void>((resolve) => this.server.close(() => resolve()));
+  }
+}
+
 /** The `cause.code` undici attaches when one of its own timers fires. */
 function causeCode(error: unknown): unknown {
-  return (error as { cause?: { code?: unknown } }).cause?.code;
+  if (!(error instanceof Error) || !(error.cause instanceof Object)) return undefined;
+  return Reflect.get(error.cause, "code");
 }
 
 describe("inactivityLimitMs", () => {
@@ -151,19 +173,58 @@ describe("withInactivityLimits", () => {
     const init = withInactivityLimits({ method: "POST", signal }, 660_000);
     expect(init.method).toBe("POST");
     expect(init.signal).toBe(signal);
-    const dispatcher = init.dispatcher as unknown as InactivityDispatcher;
-    expect(dispatcher.headersTimeout).toBe(690_000);
-    expect(dispatcher.bodyTimeout).toBe(690_000);
+    expect(attachedDispatcher(init)?.headersTimeout).toBe(690_000);
+    expect(attachedDispatcher(init)?.bodyTimeout).toBe(690_000);
   });
 
-  it("delegates to the dispatcher the process already uses rather than pooling its own", () => {
-    // Nothing here constructs an `Agent`: the host's connection pools — and
-    // any proxy agent it installed — are what actually carry the request.
-    const inner = (globalThis as unknown as Record<symbol, unknown>)[GLOBAL_DISPATCHER_KEY];
-    expect(inner).toBeDefined();
-    const first = withInactivityLimits({}, 600_000).dispatcher;
-    const second = withInactivityLimits({}, 600_000).dispatcher;
-    expect(first).not.toBe(second);
+  it("dispatches through the process's own dispatcher rather than pooling its own", () => {
+    // The regression this guards is a fresh `Agent` per request: that would
+    // also produce a different object each time, so identity proves nothing —
+    // only where the dispatch LANDS does. Both requests have to arrive at the
+    // one dispatcher the process already had, connection pool and any proxy
+    // agent included.
+    const recorded = recordGlobalDispatcher();
+    try {
+      const first = attachedDispatcher(withInactivityLimits({}, 600_000));
+      const second = attachedDispatcher(withInactivityLimits({}, 600_000));
+      expect(first).toBeDefined();
+      expect(second).not.toBe(first);
+
+      expect(first?.dispatch({ method: "GET", path: "/one" }, {})).toBe(true);
+      expect(second?.dispatch({ method: "GET", path: "/two" }, {})).toBe(true);
+
+      expect(recorded.calls).toEqual([
+        { method: "GET", path: "/one", headersTimeout: 630_000, bodyTimeout: 630_000 },
+        { method: "GET", path: "/two", headersTimeout: 630_000, bodyTimeout: 630_000 },
+      ]);
+    } finally {
+      recorded.restore();
+    }
+  });
+
+  it("forwards to a dispatcher the init already carries instead of replacing it", () => {
+    // A caller's own dispatcher is where a ProxyAgent, an mTLS client
+    // certificate or an egress policy lives. Replacing it would send the
+    // request — bearer token included — straight out instead.
+    const seen: Record<string, unknown>[] = [];
+    const carried = {
+      dispatch(options: Record<string, unknown>) {
+        seen.push(options);
+        return true;
+      },
+    };
+    const recorded = recordGlobalDispatcher();
+    try {
+      const init = withInactivityLimits(initWithDispatcher(carried), 400_000);
+      attachedDispatcher(init)?.dispatch({ method: "POST", path: "/run" }, {});
+
+      expect(seen).toEqual([
+        { method: "POST", path: "/run", headersTimeout: 430_000, bodyTimeout: 430_000 },
+      ]);
+      expect(recorded.calls).toEqual([]);
+    } finally {
+      recorded.restore();
+    }
   });
 });
 
@@ -184,9 +245,13 @@ describe("undici's inactivity limits against a server that withholds headers", (
     // that `fetch` accepts this delegate and that the limits it injects are
     // the ones undici enforces. Without it the rest of this file would pass
     // against a dispatcher `fetch` quietly ignored.
-    const inner = (globalThis as unknown as Record<symbol, never>)[GLOBAL_DISPATCHER_KEY];
-    const dispatcher = delegateWithLimits(inner, 250);
-    const error = await fetch(server.baseUrl, { dispatcher } as RequestInit).then(
+    const inner = rawGlobalDispatcher();
+    expect(inner).toBeDefined();
+    if (inner === undefined) return;
+    const error = await fetch(
+      server.baseUrl,
+      initWithDispatcher(delegateWithLimits(inner, 250)),
+    ).then(
       () => undefined,
       (exc: unknown) => exc,
     );
@@ -213,7 +278,9 @@ describe("undici's inactivity limits against a server that withholds headers", (
 describe("ComfyLow hands every request limits derived from its own deadline", () => {
   // Table-driven across undici's 300s default, which is the point: the same
   // code path has to reach a dispatcher limit above the wall for a long
-  // deadline and below it for a short one.
+  // deadline and below it for a short one. Read off the process-wide
+  // dispatcher rather than a stubbed `fetch`, because that is the one place
+  // the limits are observable on the path a real caller takes.
   const cases: [label: string, timeoutMs: number | null | undefined, expected: number][] = [
     ["the client default when the caller passes none", undefined, 60_000],
     ["a deadline under undici's default", 120_000, 150_000],
@@ -222,7 +289,43 @@ describe("ComfyLow hands every request limits derived from its own deadline", ()
     ["no deadline at all", null, 0],
   ];
 
-  it.each(cases)("uses %s", async (_label, timeoutMs, expected) => {
+  let server: EchoServer;
+
+  beforeEach(async () => {
+    server = new EchoServer();
+    await server.start();
+  });
+
+  afterEach(async () => {
+    await server.stop();
+  });
+
+  it.each(cases)(
+    "uses %s",
+    async (_label, timeoutMs, expected) => {
+      const recorded = recordGlobalDispatcher({ forward: true });
+      try {
+        const low = new ComfyLow(server.baseUrl);
+        await low.request("GET", "/jobs/job_01", { timeoutMs });
+
+        expect(recorded.calls).toHaveLength(1);
+        expect(recorded.calls[0]?.headersTimeout).toBe(expected);
+        expect(recorded.calls[0]?.bodyTimeout).toBe(expected);
+        if (typeof timeoutMs === "number") {
+          expect(recorded.calls[0]?.headersTimeout).toBeGreaterThan(timeoutMs);
+        }
+      } finally {
+        recorded.restore();
+      }
+    },
+    10_000,
+  );
+
+  it("leaves an injected fetch's transport alone", async () => {
+    // `dispatcher` is undici's own init key, and an injected `fetch` may be a
+    // separately installed undici whose handler protocol a delegate for the
+    // copy Node ships cannot satisfy. Supplying a `fetch` takes the transport
+    // over, limits included — documented on `ComfyLowOptions.fetch`.
     let seen: RequestInit | undefined;
     const low = new ComfyLow("http://127.0.0.1:1", undefined, {
       fetch: (_url, init) => {
@@ -231,13 +334,10 @@ describe("ComfyLow hands every request limits derived from its own deadline", ()
       },
     });
 
-    await low.request("GET", "/jobs/job_01", { timeoutMs });
+    await low.request("GET", "/jobs/job_01", { timeoutMs: 660_000 });
 
-    const dispatcher = seen?.dispatcher as unknown as InactivityDispatcher;
-    expect(dispatcher.headersTimeout).toBe(expected);
-    expect(dispatcher.bodyTimeout).toBe(expected);
-    if (typeof timeoutMs === "number") {
-      expect(dispatcher.headersTimeout).toBeGreaterThan(timeoutMs);
-    }
+    expect(seen).toBeDefined();
+    expect(attachedDispatcher(seen)).toBeUndefined();
+    expect(Reflect.get(seen ?? {}, "dispatcher")).toBeUndefined();
   });
 });

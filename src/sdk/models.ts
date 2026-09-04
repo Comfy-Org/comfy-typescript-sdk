@@ -51,7 +51,7 @@
  * during one.
  */
 
-import { withInactivityLimits } from "../low/dispatcher.js";
+import { clampTimerMs, withInactivityLimits } from "../low/dispatcher.js";
 import { buildUserAgent } from "../low/index.js";
 import { abortableSleep } from "./abortable-sleep.js";
 import { newIdempotencyKey } from "./core.js";
@@ -286,7 +286,9 @@ function composeSignal(
   remainingMs: number | null,
 ): AbortSignal | undefined {
   if (remainingMs === null) return callerSignal;
-  const timeoutSignal = AbortSignal.timeout(Math.max(0, remainingMs));
+  // Clamped, not just floored at 0: past ~25 days `AbortSignal.timeout`
+  // schedules a delay `setTimeout` folds to 1 ms, aborting at once.
+  const timeoutSignal = AbortSignal.timeout(clampTimerMs(remainingMs));
   return callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
 }
 

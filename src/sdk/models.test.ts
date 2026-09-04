@@ -2,6 +2,7 @@
  * the headers it sends and reads, its deadline, and its failures. */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { attachedDispatcher } from "../../test/support/dispatchers.js";
 import { RouterStubServer, withRouterStub } from "../../test/support/router-stub-server.js";
 import {
   comfy,
@@ -268,12 +269,9 @@ describe("comfy.models.run deadline", () => {
 
       await comfy.models.run(MODEL, {}, { timeoutMs: 660_000 });
 
-      const dispatcher = seen?.dispatcher as unknown as {
-        headersTimeout: number;
-        bodyTimeout: number;
-      };
-      expect(dispatcher.headersTimeout).toBeGreaterThan(660_000);
-      expect(dispatcher.bodyTimeout).toBeGreaterThan(660_000);
+      const dispatcher = attachedDispatcher(seen);
+      expect(dispatcher?.headersTimeout).toBeGreaterThan(660_000);
+      expect(dispatcher?.bodyTimeout).toBeGreaterThan(660_000);
     });
   });
 
@@ -289,12 +287,9 @@ describe("comfy.models.run deadline", () => {
 
       await comfy.models.run(MODEL, {}, { timeoutMs: null });
 
-      const dispatcher = seen?.dispatcher as unknown as {
-        headersTimeout: number;
-        bodyTimeout: number;
-      };
-      expect(dispatcher.headersTimeout).toBe(0);
-      expect(dispatcher.bodyTimeout).toBe(0);
+      const dispatcher = attachedDispatcher(seen);
+      expect(dispatcher?.headersTimeout).toBe(0);
+      expect(dispatcher?.bodyTimeout).toBe(0);
     });
   });
 
