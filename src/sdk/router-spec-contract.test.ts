@@ -79,12 +79,12 @@ describe("router route contract (spec/router-openapi.yaml)", () => {
     await withRouterStub(async (server) => {
       config({ credentials: "comfyui-test-credential", baseUrl: server.baseUrl });
       try {
-        await comfy.models.run("fal-ai/flux-pro", {});
+        await comfy.models.run("bfl/flux-2-pro", {});
       } finally {
         config({ credentials: undefined, baseUrl: undefined });
       }
       expect(server.state.lastPath).toBe(
-        RUN_ROUTE_TEMPLATE.replace("{provider}", "fal-ai").replace("{model}", "flux-pro"),
+        RUN_ROUTE_TEMPLATE.replace("{provider}", "bfl").replace("{model}", "flux-2-pro"),
       );
     });
   });

@@ -6,7 +6,7 @@
  * import { comfy } from "@comfyorg/sdk";
  *
  * comfy.config({ credentials: "comfyui-..." });
- * const { data, requestId } = await comfy.models.run("fal-ai/flux-pro", {
+ * const { data, requestId } = await comfy.models.run("bfl/flux-2-pro", {
  *   prompt: "a cat",
  * });
  * ```

@@ -19,7 +19,7 @@ import {
 } from "./index.js";
 
 const CREDENTIAL = "comfyui-test-credential";
-const MODEL = "fal-ai/flux-pro";
+const MODEL = "bfl/flux-2-pro";
 
 /** Any socket attempt at all fails the test that made it. */
 function forbidNetwork(): ReturnType<typeof vi.fn> {
@@ -125,7 +125,7 @@ describe("comfy.models.run on success", () => {
       useStub(server);
       await comfy.models.run(MODEL, {});
       expect(server.state.lastMethod).toBe("POST");
-      expect(server.state.lastPath).toBe("/v2/models/fal-ai/flux-pro");
+      expect(server.state.lastPath).toBe("/v2/models/bfl/flux-2-pro");
     });
   });
 
@@ -316,12 +316,12 @@ describe("comfy.models.run failures", () => {
       server.state.errorType = "model_not_found";
       server.state.requestId = "req-404";
       server.state.body = {
-        detail: 'no model "fal-ai/flux-prro"; did you mean "fal-ai/flux-pro"?',
+        detail: 'no model "bfl/flux-2-prro"; did you mean "bfl/flux-2-pro"?',
         error_type: "model_not_found",
       };
 
       const err = (await comfy.models
-        .run("fal-ai/flux-prro", {})
+        .run("bfl/flux-2-prro", {})
         .catch((e: unknown) => e)) as ComfyError;
 
       expect(err).toBeInstanceOf(NotFound);
@@ -797,7 +797,7 @@ describe("comfy.models.run argument validation", () => {
     forbidNetwork();
     config({ credentials: CREDENTIAL });
     const err = (await comfy.models
-      .run("fal-ai/flux-pro/v1.1", {})
+      .run("bfl/flux-2-pro/v1.1", {})
       .catch((e: unknown) => e)) as Error;
     expect(err.message).toContain("variant");
   });
