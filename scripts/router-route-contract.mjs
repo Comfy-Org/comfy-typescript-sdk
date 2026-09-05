@@ -139,7 +139,40 @@ export async function readRouterRouteContract(specPath = ROUTER_SPEC_PATH) {
     runPath,
     serverUrl,
     parameterNames: pathParameterNames(doc, pathItem, pathItem.post),
+    retryAfterStatuses: retryAfterStatuses(doc, pathItem),
   };
+}
+
+/**
+ * The run route's error responses that declare a `Retry-After` header, as
+ * sorted numeric statuses.
+ *
+ * This is the contract half of `isCollectable` in `src/sdk/retry.ts`: that
+ * predicate accepts a same-key resend on exactly the statuses Router pairs
+ * with a pace, and it would be silently wrong — resending a deterministic
+ * refusal, or refusing to collect a generation Comfy is still holding — if the
+ * contract moved the header and nothing compared the two. Read off the run
+ * route rather than off the shared `components/responses`, because it is what
+ * THIS operation can answer with that the predicate is about.
+ */
+export function retryAfterStatuses(doc, pathItem) {
+  const responses = deref(doc, pathItem.post.responses ?? {});
+  const statuses = [];
+  for (const [status, rawResponse] of Object.entries(responses)) {
+    const response = deref(doc, rawResponse);
+    if (response === null || typeof response !== "object") continue;
+    const headers = response.headers ?? {};
+    if (Object.keys(headers).some((name) => name.toLowerCase() === "retry-after")) {
+      statuses.push(Number(status));
+    }
+  }
+  if (statuses.length === 0) {
+    fail(
+      `spec/router-openapi.yaml: ${RUN_OPERATION_ID} declares no response carrying a ` +
+        "`Retry-After` header. An empty list would read as agreement with any predicate.",
+    );
+  }
+  return statuses.sort((a, b) => a - b);
 }
 
 /**

@@ -31,9 +31,14 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
-import { extractErrorTypeByStatus, extractRouterErrors } from "../../scripts/python-surface.mjs";
+import {
+  extractErrorTypeByStatus,
+  extractRetryPolicyFields,
+  extractRouterErrors,
+} from "../../scripts/python-surface.mjs";
 import * as sdk from "../index.js";
 import { models } from "./models.js";
+import { DEFAULT_COLLECT_BUDGET_MS, DEFAULT_RETRY_BUDGET_MS, resolveRetry } from "./retry.js";
 import * as routerErrors from "./routerErrors.js";
 
 const MANIFEST_PATH = fileURLToPath(new URL("../../parity/python-surface.json", import.meta.url));
@@ -112,6 +117,17 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
       "notices is missing here.",
     pythonAsyncModelsClasses: ["AsyncModels"],
   },
+  {
+    id: "collect-switched-off-by-budget",
+    why:
+      "Python switches the collect loop off with a BOOLEAN (`RetryPolicy.retry_collectable=False`) " +
+      "beside its `collect_max_elapsed` budget; TypeScript has the budget only, and " +
+      "`collectBudgetMs: 0` is how it is switched off — the same way `budgetMs: 0` already " +
+      "switches ordinary retries off, so the option surface stays one kind of thing rather " +
+      "than a number and a flag that can disagree with each other. The BUDGET itself is " +
+      "compared for real below (`collect_max_elapsed` seconds against `DEFAULT_COLLECT_BUDGET_MS` " +
+      "milliseconds), so the sizing cannot drift; only the off-switch is spelled differently.",
+  },
 ];
 
 const RENAMES: Record<string, string> = Object.fromEntries(
@@ -134,6 +150,7 @@ interface PythonSurface {
   routerErrorTypeOrder: string[];
   routerErrorTypeByStatus: Record<string, string>;
   exportedErrorClasses: string[];
+  retryPolicyFields: Record<string, string>;
 }
 
 async function loadPythonSurface(): Promise<PythonSurface> {
@@ -147,6 +164,7 @@ async function loadPythonSurface(): Promise<PythonSurface> {
     ["routerErrorTypeOrder", surface.routerErrorTypeOrder.length],
     ["routerErrorTypeByStatus", Object.keys(surface.routerErrorTypeByStatus).length],
     ["exportedErrorClasses", surface.exportedErrorClasses.length],
+    ["retryPolicyFields", Object.keys(surface.retryPolicyFields).length],
   ];
   for (const [name, size] of sections) {
     if (size === 0) {
@@ -475,5 +493,59 @@ describe("python surface extraction", () => {
         '_ERROR_TYPE_BY_STATUS: dict[int, str] = {\n    401: "unauthorized",\n    504: "provider_timeout",\n}\n',
       ),
     ).toEqual({ 401: "unauthorized", 504: "provider_timeout" });
+  });
+});
+
+describe("the collect budget", () => {
+  it("is sized identically in both SDKs", async () => {
+    // The one number whose correctness IS the feature: a collect budget
+    // shorter than one Router deadline window can never start the attempt it
+    // exists for, so the two SDKs agreeing on the class but not on the bound
+    // would leave the same 504 collected in one language and raised in the
+    // other. Compared as a value, not as a name.
+    const { retryPolicyFields } = await loadPythonSurface();
+    const pythonSeconds = retryPolicyFields.collect_max_elapsed;
+    expect(
+      pythonSeconds,
+      "the Python SDK's RetryPolicy no longer declares `collect_max_elapsed` — see " +
+        "DEFAULT_COLLECT_BUDGET_MS in src/sdk/retry.ts",
+    ).toBeTruthy();
+    expect(Number(pythonSeconds) * 1000).toBe(DEFAULT_COLLECT_BUDGET_MS);
+
+    // And it is a SEPARATE budget on both sides, longer than the ordinary one.
+    expect(Number(retryPolicyFields.max_elapsed) * 1000).toBeLessThan(DEFAULT_RETRY_BUDGET_MS + 1);
+    expect(DEFAULT_COLLECT_BUDGET_MS).toBeGreaterThan(DEFAULT_RETRY_BUDGET_MS);
+  });
+
+  it("names the off-switch the two SDKs spell differently, and proves the TypeScript one", async () => {
+    // Python: `retry_collectable=False`. TypeScript: `collectBudgetMs: 0`.
+    // Declared as an intentional asymmetry above; asserted here so the entry
+    // cannot outlive either side of what it describes.
+    const { retryPolicyFields } = await loadPythonSurface();
+    expect(retryPolicyFields.retry_collectable).toBe("True");
+    expect(
+      INTENTIONAL_ASYMMETRIES.some((a) => a.id === "collect-switched-off-by-budget"),
+      "the collect off-switch asymmetry must stay declared while the two spellings differ",
+    ).toBe(true);
+    expect(resolveRetry({ collectBudgetMs: 0 }).collectBudgetMs).toBe(0);
+    // On by default on both sides.
+    expect(resolveRetry(undefined).collectBudgetMs).toBe(DEFAULT_COLLECT_BUDGET_MS);
+  });
+
+  it("refuses to yield an empty retry policy", () => {
+    // Same rule as every other extractor here: an unreadable `RetryPolicy`
+    // must be a hard failure, because an empty one would agree with any budget.
+    expect(() => extractRetryPolicyFields("# nothing here\n")).toThrow(/RetryPolicy/);
+    expect(() => extractRetryPolicyFields("@dataclass\nclass RetryPolicy:\n    pass\n")).toThrow(
+      /zero/,
+    );
+  });
+
+  it("reads a field and its default off a RetryPolicy body", () => {
+    expect(
+      extractRetryPolicyFields(
+        "class RetryPolicy:\n    max_elapsed: float = 60.0\n    retry_collectable: bool = True\n",
+      ),
+    ).toEqual({ max_elapsed: "60.0", retry_collectable: "True" });
   });
 });

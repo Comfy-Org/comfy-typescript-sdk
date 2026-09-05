@@ -17,6 +17,47 @@ Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
 entry. See CONTRIBUTING.md.
 -->
 
+### Added
+
+- `comfy.models.run` now COLLECTS a generation that is still running instead of
+  raising it. Comfy answers two failures with a `Retry-After` that means "the
+  generation your `Idempotency-Key` already names has not finished — wait, then
+  ask again for that one": a `409` carrying
+  `X-Comfy-Error-Type: concurrency_limit_exceeded` (an earlier attempt of this
+  same call is still in flight, which is what a re-send after a dropped
+  connection meets) and a `504` carrying `deadline_exceeded` (Comfy stopped
+  holding the connection at its own bound while the provider carried on). Both
+  used to be terminal here — the `409` because every sub-500 status is, and the
+  `504` because the two-minute retry budget was long spent by the time a
+  ten-minute deadline produced one — so a caller lost a generation that had
+  already been dispatched, and paid for. `run` now waits the interval the server
+  named, re-sends the same key, and resolves with the result: no second
+  dispatch, no second charge, nothing to enable. It has its own budget,
+  `retry.collectBudgetMs`, defaulting to 20 minutes (two Comfy deadline windows:
+  one to reach the `504`, one to collect what it left running); ordinary retries
+  still give up at `retry.budgetMs`. Set `collectBudgetMs: 0` to switch the
+  collect loop off alone, or `retry: false` to switch off both. A `409` carrying
+  no `Retry-After` is unchanged and still raises on the first attempt: that is
+  the deterministic key refusal, and the answer is a new key.
+- Every `ComfyError` now carries `retryAfter` and `idempotencyKey`, both `null`
+  unless the failure carried them. They are what a manual re-ask needs after the
+  collect budget is spent — the pace, and the key naming the generation Comfy is
+  still holding, including one `models.run` minted for you and that was
+  previously not visible anywhere. `routerErrors.RouterError` gains `retryAfter`
+  for the same reason.
+
+### Changed
+
+- The default `comfy.models.run` deadline (`DEFAULT_RUN_TIMEOUT_MS`) is now 20
+  minutes, up from 10. The deadline covers every attempt of a call rather than
+  each one separately, and Comfy's own deadline is 10 minutes — so the previous
+  default was exactly spent at the moment a `deadline_exceeded` `504` arrives,
+  and the collect above could never start under it. Successful calls are
+  unaffected: the deadline is a ceiling, not a wait. Pass `timeoutMs` for the
+  old bound, and note that a `timeoutMs` shorter than Comfy's 10-minute deadline
+  forfeits the `504` collect (the `409` collect still works inside a short one,
+  since that answer arrives in milliseconds).
+
 ## [0.1.9] - 2026-09-04
 
 ### Fixed

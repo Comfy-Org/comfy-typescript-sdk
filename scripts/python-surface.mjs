@@ -11,7 +11,8 @@
  * Importing `comfy_sdk` would need a Python toolchain, a virtualenv and the
  * SDK's own runtime dependencies installed inside a Node repo's CI — a lot of
  * moving parts for a check whose whole job is to be trustworthy. Parsing is
- * narrower: it reads four files and knows exactly four shapes. The cost is
+ * narrower: it reads a handful of files and knows exactly the shapes it names
+ * below — nothing here is a general Python parser. The cost is
  * that a sufficiently unusual refactor on the Python side could make an
  * extraction return nothing, which would silently read as "parity" — so every
  * extractor here throws on an empty result rather than returning one. A
@@ -29,6 +30,7 @@ export const PYTHON_SOURCE_FILES = {
   routerExceptions: "src/comfy_sdk/router_exceptions.py",
   exceptions: "src/comfy_sdk/exceptions.py",
   packageInit: "src/comfy_sdk/__init__.py",
+  retry: "src/comfy_sdk/retry.py",
 };
 
 /** The two `models` namespace classes: the sync client's, then the async client's. */
@@ -257,6 +259,39 @@ export function extractErrorTypeByStatus(source) {
   return byStatus;
 }
 
+/**
+ * The `RetryPolicy` dataclass's fields and their DEFAULTS, as source text.
+ *
+ * A behaviour, like the status fallback table, rather than a name: the two
+ * SDKs can spell every class identically and still bound the same failure
+ * differently. The collect loop is where that matters most, because its whole
+ * correctness is a number — a budget shorter than one Router deadline window
+ * can never start the attempt it exists for — so the parity test compares the
+ * VALUE and not just the presence of the field.
+ *
+ * Defaults are kept as text rather than parsed here: `True` and `1200.0` are
+ * Python literals, and turning them into JavaScript values is the comparison's
+ * job, not the extraction's.
+ */
+export function extractRetryPolicyFields(source) {
+  const body = classBody(source, "RetryPolicy");
+  if (body === null) {
+    fail(`${PYTHON_SOURCE_FILES.retry}: no \`class RetryPolicy\` found.`);
+  }
+  const fields = {};
+  for (const line of body) {
+    const match = /^\s{4}([a-z_]\w*)\s*:\s*[\w.|[\] ]+\s*=\s*(\S+)\s*$/.exec(line);
+    if (match) fields[match[1]] = match[2];
+  }
+  if (Object.keys(fields).length === 0) {
+    fail(
+      `${PYTHON_SOURCE_FILES.retry}: \`RetryPolicy\` yielded zero defaulted fields. An empty ` +
+        "policy would read as agreement with any budget.",
+    );
+  }
+  return fields;
+}
+
 /** The names in a module's `__all__`, in declaration order. */
 function dunderAll(source, file) {
   const block = /^__all__[^=]*=\s*\[([\s\S]*?)^\]/m.exec(source);
@@ -313,5 +348,6 @@ export function extractPythonSurface(sources, { repo, ref }) {
     routerErrorTypeOrder: routerErrors.errorTypeOrder,
     routerErrorTypeByStatus: extractErrorTypeByStatus(sources.routerExceptions),
     exportedErrorClasses: extractExportedErrorClasses(sources.exceptions, sources.packageInit),
+    retryPolicyFields: extractRetryPolicyFields(sources.retry),
   };
 }

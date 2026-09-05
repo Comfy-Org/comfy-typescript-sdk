@@ -6,7 +6,8 @@
       "src/comfy_sdk/models.py",
       "src/comfy_sdk/router_exceptions.py",
       "src/comfy_sdk/exceptions.py",
-      "src/comfy_sdk/__init__.py"
+      "src/comfy_sdk/__init__.py",
+      "src/comfy_sdk/retry.py"
     ]
   },
   "modelsMethods": {
@@ -95,5 +96,15 @@
     "QueueFull",
     "Unauthorized",
     "WorkflowFormatUi"
-  ]
+  ],
+  "retryPolicyFields": {
+    "max_elapsed": "60.0",
+    "initial_backoff": "0.5",
+    "backoff_factor": "2.0",
+    "max_backoff": "15.0",
+    "jitter": "True",
+    "retry_possibly_in_flight": "False",
+    "retry_collectable": "True",
+    "collect_max_elapsed": "1200.0"
+  }
 }

@@ -610,10 +610,9 @@ describe("comfy.models.run retries", () => {
     }
   });
 
-  it("does not retry a verdict about the request — 404, 409, 422, content policy", async () => {
+  it("does not retry a verdict about the request — 404, 422, content policy", async () => {
     const cases: [number, string | null][] = [
       [404, "model_not_found"],
-      [409, null],
       [422, "invalid_input"],
       [400, "content_policy_violation"],
       // Same verdict, arriving under a 5xx: still not worth replaying.
@@ -707,6 +706,187 @@ describe("comfy.models.run retries", () => {
       // Several attempts happened, and the DEADLINE is what ended them.
       expect(server.state.requestCount).toBeGreaterThan(1);
       expect(Date.now() - started).toBeLessThan(5_000);
+    });
+  }, 20_000);
+});
+
+describe("comfy.models.run collecting a generation under the same key", () => {
+  /** A collect budget short enough to run in a test, with the ordinary retry
+   * budget left generous so it is never what ended the loop. */
+  const COLLECT = { budgetMs: 60_000, baseDelayMs: 5, maxDelayMs: 10, collectBudgetMs: 5_000 };
+
+  it("does not read a bare 409 as an invitation to ask again", async () => {
+    // Split out of the verdict table above, and the split IS the point: the
+    // status alone says nothing. A 409 with no `X-Comfy-Error-Type` and no
+    // `Retry-After` is a deterministic refusal — a proxy's conflict, or the
+    // contract's spent-key case — and stays one attempt.
+    for (const errorType of [null, "invalid_input"]) {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.status = 409;
+        server.state.errorType = errorType;
+        server.state.body = { detail: "no", error_type: errorType };
+
+        await expect(comfy.models.run(MODEL, {}, { retry: COLLECT })).rejects.toBeInstanceOf(
+          ComfyError,
+        );
+        expect(server.state.requestCount, String(errorType)).toBe(1);
+      });
+    }
+  });
+
+  it("collects a 409 concurrency_limit_exceeded, re-asking under the SAME key", async () => {
+    // The shape a re-send after a dropped connection meets: an earlier attempt
+    // of this same call is still in flight, and Router answers the repeat with
+    // "wait, then ask again for it" rather than dispatching a second one.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.failTimes = 2;
+      server.state.failStatus = 409;
+      server.state.failErrorType = "concurrency_limit_exceeded";
+      server.state.failRetryAfter = "1";
+      server.state.idempotentReplayed = true;
+
+      const result = await comfy.models.run(MODEL, { prompt: "a cat" }, { retry: COLLECT });
+
+      expect(result.data).toEqual({ images: [{ url: "https://example.invalid/out.png" }] });
+      expect(server.state.requestCount).toBe(3);
+      // One key across all three — this is the whole reason the collect is
+      // safe. A fresh key would dispatch, and bill, a second generation.
+      expect(server.state.idempotencyKeys).toHaveLength(3);
+      expect(new Set(server.state.idempotencyKeys).size).toBe(1);
+    });
+  }, 20_000);
+
+  it("collects a 504 deadline_exceeded the same way", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.failTimes = 1;
+      server.state.failStatus = 504;
+      server.state.failErrorType = "deadline_exceeded";
+      server.state.failRetryAfter = "1";
+      server.state.idempotentReplayed = true;
+
+      const result = await comfy.models.run(MODEL, { prompt: "a cat" }, { retry: COLLECT });
+
+      expect(result.data).toEqual({ images: [{ url: "https://example.invalid/out.png" }] });
+      expect(server.state.requestCount).toBe(2);
+      expect(new Set(server.state.idempotencyKeys).size).toBe(1);
+    });
+  }, 20_000);
+
+  it("leaves a 504 with no Retry-After to the ordinary 5xx backoff", async () => {
+    // No header means Router holds no handle to collect from — so this is a
+    // plain 5xx, retried on `budgetMs` and this SDK's own jittered backoff
+    // rather than on a pace the server named. The distinction is invisible in
+    // the outcome, so it is asserted on the clock: the ordinary backoff here
+    // is milliseconds, while a collect would have been paced in seconds.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.failTimes = 1;
+      server.state.failStatus = 504;
+      server.state.failErrorType = "deadline_exceeded";
+      server.state.failRetryAfter = null;
+
+      const started = Date.now();
+      const result = await comfy.models.run(MODEL, {}, { retry: COLLECT });
+
+      expect(result.requestId).toBe("6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21");
+      expect(server.state.requestCount).toBe(2);
+      expect(Date.now() - started).toBeLessThan(500);
+    });
+  }, 20_000);
+
+  it("raises the server's own 409 once the collect budget is spent", async () => {
+    // Never a synthetic "retries exhausted": the last answer the server gave
+    // is what the caller sees, and it carries what a manual re-ask needs.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 409;
+      server.state.errorType = "concurrency_limit_exceeded";
+      server.state.retryAfter = "1";
+      server.state.body = {
+        detail: "already in progress",
+        error_type: "concurrency_limit_exceeded",
+      };
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { retry: { ...COLLECT, collectBudgetMs: 300 } })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("concurrency_limit_exceeded");
+      expect(err.httpStatus).toBe(409);
+      expect(err.message).toBe("already in progress");
+      expect(err.requestId).toBe("6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21");
+      // The two values a caller needs to re-ask by hand after the budget: the
+      // pace, and the key that names the generation Router is still holding.
+      expect(err.retryAfter).toBe(1);
+      expect(err.idempotencyKey).toBe(server.state.idempotencyKeys[0]);
+      expect(server.state.requestCount).toBeGreaterThan(1);
+    });
+  }, 20_000);
+
+  it("stops the collect at the caller's abort rather than sleeping out the pace", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 409;
+      server.state.errorType = "concurrency_limit_exceeded";
+      server.state.retryAfter = "1";
+      server.state.body = { detail: "still running", error_type: "concurrency_limit_exceeded" };
+
+      const controller = new AbortController();
+      const pending = comfy.models.run(MODEL, {}, { retry: COLLECT, signal: controller.signal });
+      await waitFor(() => server.state.requestCount >= 1);
+      controller.abort();
+
+      // The caller's own abort, re-thrown untouched — not dressed up as an
+      // SDK error, and not the 409 the collect was waiting to re-ask about.
+      const err = (await pending.catch((e: unknown) => e)) as Error;
+      expect(err.name).toBe("AbortError");
+      expect(server.state.requestCount).toBe(1);
+    });
+  }, 20_000);
+
+  it("collects nothing under retry: false, or with the collect budget switched off", async () => {
+    for (const retry of [false as const, { ...COLLECT, collectBudgetMs: 0 }]) {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.status = 409;
+        server.state.errorType = "concurrency_limit_exceeded";
+        server.state.retryAfter = "1";
+        server.state.body = { detail: "still running", error_type: "concurrency_limit_exceeded" };
+
+        const err = (await comfy.models
+          .run(MODEL, {}, { retry })
+          .catch((e: unknown) => e)) as ComfyError;
+
+        expect(err.httpStatus).toBe(409);
+        expect(err.retryAfter).toBe(1);
+        expect(server.state.requestCount, JSON.stringify(retry)).toBe(1);
+      });
+    }
+  });
+
+  it("keeps the call's own deadline as the cap over the collect budget", async () => {
+    // `collectBudgetMs` is generous and `timeoutMs` is not: the deadline wins,
+    // which is what makes a caller-supplied `timeoutMs` shorter than Router's
+    // own deadline forfeit the 504 collect.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 409;
+      server.state.errorType = "concurrency_limit_exceeded";
+      server.state.retryAfter = "1";
+      server.state.body = { detail: "still running", error_type: "concurrency_limit_exceeded" };
+
+      const started = Date.now();
+      const err = (await comfy.models
+        .run(MODEL, {}, { timeoutMs: 400, retry: { ...COLLECT, collectBudgetMs: 60_000 } })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err.httpStatus).toBe(409);
+      expect(server.state.requestCount).toBe(1);
+      expect(Date.now() - started).toBeLessThan(2_000);
     });
   }, 20_000);
 });
