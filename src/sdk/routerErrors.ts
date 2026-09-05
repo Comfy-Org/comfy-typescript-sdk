@@ -132,6 +132,45 @@ export const ERROR_TYPE_HEADER = "X-Comfy-Error-Type";
 export const REQUEST_ID_HEADER = "X-Comfy-Request-Id";
 
 /**
+ * `Retry-After` — seconds to wait before re-sending the SAME request under the
+ * SAME `Idempotency-Key`.
+ *
+ * Router sets it on exactly the two answers such a re-send can COLLECT from: a
+ * `409` naming `concurrency_limit_exceeded` (the original call for that key is
+ * still running) and a `504` naming `deadline_exceeded` (Comfy stopped holding
+ * the connection but still holds a handle to a generation the provider is
+ * running). Its absence is meaningful, not merely missing: it is Router saying
+ * there is nothing to collect, which is why `isCollectable` in `./retry.ts`
+ * gates on the header being present at all.
+ */
+export const RETRY_AFTER_HEADER = "Retry-After";
+
+/**
+ * Read `Retry-After` as a whole number of seconds, or `null`.
+ *
+ * The Router contract pins this header to `type: integer, minimum: 1`, so the
+ * delay-seconds form is the only one it can send and anything else — the
+ * HTTP-date form an intermediary may use, a decimal, a negative, a blank — is
+ * a value this SDK cannot pace from and reads as absent. Deliberately strict
+ * rather than `parseInt`: `parseInt` reads `"2 hours"` as `2` and would invent
+ * a pace out of a string that named none.
+ *
+ * `0` is kept and NOT flattened to `null`, because the two say different
+ * things. `null` means the response named nothing to collect; `0` means it did
+ * name a handle but paced it uselessly, and the caller of
+ * `nextCollectDelayMs` falls back to its own backoff for that one rather than
+ * spinning. See `./retry.ts`.
+ */
+export function parseRetryAfter(headers: HeadersLike): number | null {
+  const raw = headers.get(RETRY_AFTER_HEADER);
+  if (raw === null) return null;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const seconds = Number(trimmed);
+  return Number.isSafeInteger(seconds) ? seconds : null;
+}
+
+/**
  * One model-level validation failure, in the FastAPI `detail[]` form.
  *
  * `type` is the SPECIFIC provider reason (`value_error`, `missing`,
@@ -177,6 +216,8 @@ export interface RouterErrorOptions {
   requestId?: string | null;
   /** The HTTP status the failure arrived with. `null` when it was not an HTTP failure. */
   httpStatus?: number | null;
+  /** See {@link RouterError.retryAfter}. */
+  retryAfter?: number | null;
 }
 
 /**
@@ -215,6 +256,22 @@ export class RouterError extends Error {
   /** The HTTP status this failure arrived with, or `null`. */
   readonly httpStatus: number | null;
 
+  /**
+   * Seconds Router asked the caller to wait before re-sending this request
+   * under the same `Idempotency-Key`, off `Retry-After`; `null` when the
+   * response carried no usable one.
+   *
+   * It is on the BASE class rather than on the two buckets that can carry it,
+   * so a caller who caught a `RouterError` can pace a manual re-ask without
+   * first narrowing to a subclass — and so an unrecognized bucket from a newer
+   * server keeps a pace it sent. A non-null value on a
+   * {@link ConcurrencyLimitExceeded} `409` or a {@link DeadlineExceeded} `504`
+   * is Router saying it still holds the generation your key names; `models.run`
+   * already re-asks for you inside its collect budget, and this is what is left
+   * to re-ask with once that budget is spent.
+   */
+  readonly retryAfter: number | null;
+
   constructor(message: string, options: RouterErrorOptions = {}) {
     super(message);
     // Restore the prototype explicitly. Extending a built-in is the classic
@@ -229,6 +286,7 @@ export class RouterError extends Error {
     this.errorType = options.errorType ?? (new.target as typeof RouterError).errorType;
     this.requestId = options.requestId ?? null;
     this.httpStatus = options.httpStatus ?? null;
+    this.retryAfter = options.retryAfter ?? null;
   }
 }
 
@@ -304,7 +362,31 @@ export class Forbidden extends RouterError {
   static override readonly errorType = "forbidden";
 }
 
-/** Too many concurrent requests for this account. */
+/**
+ * Two different conditions share this bucket, and the STATUS is what says
+ * which — so a caller that branches on the class alone is answering the wrong
+ * question:
+ *
+ * - At **`429`** the account's slot pool is full: every call the workspace is
+ *   allowed to hold in flight is already held, and this one was refused before
+ *   it reached the model. It clears when one of the caller's OWN in-flight
+ *   calls finishes, which is what separates it from {@link RateLimited} on the
+ *   same status. Nothing is running under this request's key.
+ * - At **`409` with a {@link RouterError.retryAfter}** the same key is still
+ *   running: another call is already in flight for the `Idempotency-Key` this
+ *   request presented, and re-sending THAT SAME key after `Retry-After`
+ *   seconds collects its result rather than starting a second generation.
+ *   `models.run` re-asks for you, on the server's own pace, for as long as its
+ *   `retry.collectBudgetMs` allows — so a `409` that reaches a caller is one
+ *   that outlived that budget, and {@link RouterError.retryAfter} is the pace
+ *   to re-ask at manually.
+ *
+ * A `409` with NO `Retry-After` is neither of those: it is the contract's
+ * deterministic key refusal (the key names a different request, or its answer
+ * cannot be replayed), it arrives as {@link InvalidInput} rather than this
+ * class, and the answer is a NEW key. Waiting changes nothing there, which is
+ * why the header is absent.
+ */
 export class ConcurrencyLimitExceeded extends RouterError {
   static override readonly errorType = "concurrency_limit_exceeded";
 }
@@ -325,10 +407,22 @@ export class InternalError extends RouterError {
  * says which side ran out of time; this one is Comfy's own bound, so nothing
  * about the request was rejected and the same request may be retried. It says
  * nothing about the charge: a provider generation that completed is billed
- * regardless of whether the caller received the response. Retry it with the
- * SAME `Idempotency-Key` — when the provider had already accepted the
- * generation, the retry collects that generation rather than dispatching
- * another, and a `Retry-After` on the `504` says when to ask.
+ * regardless of whether the caller received the response.
+ *
+ * Retry it with the SAME `Idempotency-Key` — when the provider had already
+ * accepted the generation, the retry collects that generation rather than
+ * dispatching another, and the `Retry-After` on the `504` says when to ask.
+ * `models.run` performs that collect itself, paced by that header and
+ * bounded by `retry.collectBudgetMs` (twenty minutes by default: one Router
+ * deadline window to reach the `504`, one to collect what it left running), so
+ * this reaches a caller only once the collect budget or the call's own
+ * `timeoutMs` deadline is spent. {@link RouterError.retryAfter} carries the
+ * pace to re-ask at by hand after that.
+ *
+ * The `Retry-After` is present only when Comfy still holds a handle to a
+ * running generation. A `504` WITHOUT it — an intermediary's, or a bound that
+ * expired before the provider accepted anything — has nothing to collect, and
+ * the same-key re-send falls back to the ordinary 5xx backoff instead.
  */
 export class DeadlineExceeded extends RouterError {
   static override readonly errorType = "deadline_exceeded";
@@ -518,7 +612,12 @@ export function toRouterError(status: number, headers: HeadersLike, body: unknow
   // Python SDK does with the same response.
   const errorType = headerType || bodyType || statusType;
 
-  const options: RouterErrorOptions = { errorType, requestId, httpStatus: status };
+  const options: RouterErrorOptions = {
+    errorType,
+    requestId,
+    httpStatus: status,
+    retryAfter: parseRetryAfter(headers),
+  };
   // Own-property lookup only. A plain `BY_ERROR_TYPE[errorType]` would resolve
   // an `error_type` of `constructor` or `toString` off `Object.prototype` and
   // hand back something that is not a RouterError at all — and the whole point

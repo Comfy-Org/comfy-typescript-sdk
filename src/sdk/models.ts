@@ -44,6 +44,18 @@
  * by wall clock rather than by an attempt count (see `./retry.ts`), and only
  * a transport failure or a 5xx is retried at all.
  *
+ * On top of that sits a second, narrower loop the SERVER asks for. Router
+ * answers two failures with a `Retry-After` that means "the generation your
+ * key already names is still running — ask again for it": a `409` naming
+ * `concurrency_limit_exceeded` (an earlier attempt of this same call is still
+ * in flight, which is what a re-send after a dropped connection meets) and a
+ * `504` naming `deadline_exceeded` (Comfy stopped holding the connection at
+ * its own bound while the provider carried on). `run` COLLECTS those rather
+ * than raising them: it waits the interval the server named and re-asks under
+ * the same key, on its own longer budget, because a collect has to outlast the
+ * server-side deadline that produced it. When that budget runs out, the last
+ * answer the server actually gave is what raises — never a synthetic one.
+ *
  * Cancellation is the other end of the same shape: minutes-long calls make
  * "stop this" an ordinary request rather than an edge case, so `signal`
  * aborts the socket — the server sees a disconnect, which is also the exit
@@ -65,7 +77,15 @@ import {
   NotFound,
   Unauthorized,
 } from "./exceptions.js";
-import { isRetryableStatus, nextAttemptDelayMs, resolveRetry, type RetryOptions } from "./retry.js";
+import { parseRetryAfter } from "./routerErrors.js";
+import {
+  isCollectable,
+  isRetryableStatus,
+  nextAttemptDelayMs,
+  nextCollectDelayMs,
+  resolveRetry,
+  type RetryOptions,
+} from "./retry.js";
 
 /**
  * Default deadline for one {@link Models.run} call, in milliseconds.
@@ -77,11 +97,19 @@ import { isRetryableStatus, nextAttemptDelayMs, resolveRetry, type RetryOptions 
  * successful work that had already been metered upstream, which is the
  * expensive kind of timeout.
  *
+ * TWENTY minutes rather than ten, which is what it takes for the default to
+ * cover a collect. Router's own deadline is ten minutes, so a
+ * `deadline_exceeded` `504` arrives with a ten-minute deadline already spent
+ * and the same-key collect that answer invites could never start under it —
+ * the deadline covers every attempt of a call, not each one afresh. One window
+ * to reach the `504` and one to collect what it left running, which is the same
+ * derivation as `DEFAULT_COLLECT_BUDGET_MS` in `./retry.ts`.
+ *
  * Override it per call with `timeoutMs`, or disable it with `null` — and
  * prefer passing a `signal` to disabling it, since a request with no deadline
  * at all can hang until the process exits.
  */
-export const DEFAULT_RUN_TIMEOUT_MS = 600_000;
+export const DEFAULT_RUN_TIMEOUT_MS = 1_200_000;
 
 /** Response header carrying the server-generated id for a call. */
 export const REQUEST_ID_HEADER = "X-Comfy-Request-Id";
@@ -130,6 +158,16 @@ export interface RunOptions {
    * call cannot outlive the deadline by retrying. Omit for
    * {@link DEFAULT_RUN_TIMEOUT_MS}; pass `null` to disable the deadline
    * entirely.
+   *
+   * Because it spans every attempt, it is also the hard cap on the collect
+   * loop below, ahead of `retry.collectBudgetMs`: a `timeoutMs` SHORTER than
+   * Router's own ten-minute deadline forfeits the `504` collect outright,
+   * since the `504` cannot arrive before the deadline it is raised at has
+   * already fired the call's own. That is a deliberate ordering — the number
+   * a caller asked for wins — and it costs only that one case: the `409`
+   * collect after a dropped connection re-asks perfectly well inside a short
+   * deadline, because that answer arrives in milliseconds rather than at a
+   * ten-minute bound.
    */
   timeoutMs?: number | null;
   /**
@@ -148,10 +186,25 @@ export interface RunOptions {
    * from `DEFAULT_RETRY_BASE_DELAY_MS`), or pass `false` to make the call a
    * single attempt.
    *
-   * Only a transport failure or a 5xx is retried. A `4xx` is the server's
-   * answer about this request — `content_policy_violation`, `invalid_input`,
-   * `model_not_found`, a `404`, a `409`, a `422` — and sending it again
-   * would buy the same verdict twice.
+   * Two different resends live behind this one option, on two budgets:
+   *
+   * - **Retry** — a transport failure or a 5xx, on `budgetMs` and this
+   *   module's own jittered backoff. A `4xx` is the server's answer about
+   *   this request — `content_policy_violation`, `invalid_input`,
+   *   `model_not_found`, a `404`, a `422` — and sending it again would buy
+   *   the same verdict twice.
+   * - **Collect** — the two answers Router pairs with a `Retry-After` to say
+   *   "the generation your key already names is still running, ask again":
+   *   a `409` naming `concurrency_limit_exceeded` and a `504` naming
+   *   `deadline_exceeded`. Those are paced by that header rather than by the
+   *   backoff, and bounded by `collectBudgetMs` (twenty minutes by default)
+   *   rather than by `budgetMs`, because a collect has to outlast Router's
+   *   own deadline. Set `collectBudgetMs: 0` to switch the collect loop off
+   *   and have those answers raised instead.
+   *
+   * A `409` with no `Retry-After` is not collectable and is not retried: that
+   * is the contract's deterministic key refusal, and the answer is a new key.
+   * `retry: false` is one attempt, collect included.
    */
   retry?: RetryOptions | false;
 }
@@ -338,7 +391,11 @@ function describeValidationFailures(detail: readonly unknown[]): string {
  * this owes a caller today is a `code` to branch on, the status, the details
  * intact, and the request id.
  */
-function errorFromResponse(response: Response, bodyText: string): ComfyError {
+function errorFromResponse(
+  response: Response,
+  bodyText: string,
+  idempotencyKey: string,
+): ComfyError {
   const status = response.status;
   const requestId = response.headers.get(REQUEST_ID_HEADER);
   const headerType = response.headers.get(ERROR_TYPE_HEADER);
@@ -373,6 +430,13 @@ function errorFromResponse(response: Response, bodyText: string): ComfyError {
     // violated bound live in there, and the coarse `code` cannot express them.
     details: validationFailures ? { detail: validationFailures } : null,
     requestId,
+    // Both of these are what a caller needs to re-ask by hand once `run`'s own
+    // collect budget is spent: the key names the generation Router is still
+    // holding, and `Retry-After` is the pace it asked to be asked at. Reading
+    // them off a header in application code is exactly the afternoon
+    // `requestId` is already on the error to avoid.
+    retryAfter: parseRetryAfter(response.headers),
+    idempotencyKey,
   });
 }
 
@@ -467,7 +531,7 @@ async function run<TData = unknown>(
         throw new ComfyError(
           `models.run("${model}") exceeded its ${String(timeoutMs)}ms deadline before the model finished; ` +
             "raise it with timeoutMs, or pass timeoutMs: null and your own signal",
-          { code: "request_timeout", cause: exc },
+          { code: "request_timeout", cause: exc, idempotencyKey },
         );
       }
       // A caller's abort is theirs: never retried, never re-dressed.
@@ -481,7 +545,28 @@ async function run<TData = unknown>(
       continue;
     }
 
-    if (isRetryableStatus(response.status, response.headers.get(ERROR_TYPE_HEADER))) {
+    const errorType = response.headers.get(ERROR_TYPE_HEADER);
+    const retryAfter = parseRetryAfter(response.headers);
+
+    // Collect first, and EXCLUSIVELY: a `deadline_exceeded` 504 is a 5xx too,
+    // so both branches would take it — but they are different actions on
+    // different budgets, and the server's own verdict about what it is holding
+    // wins over this module's guess. Which also means a collect that runs out
+    // of `collectBudgetMs` raises rather than falling back into the ordinary
+    // backoff: the class is decided per failure, not retried in both.
+    // `retryAfter !== null` is redundant with `isCollectable`, which refuses a
+    // missing pace — it is written out so the call below needs no cast.
+    if (retryAfter !== null && isCollectable(response.status, errorType, retryAfter)) {
+      const delay = nextCollectDelayMs(retryAfter, attempt, retry, clock());
+      if (delay !== null) {
+        await abortableSleep(delay, options.signal);
+        attempt += 1;
+        continue;
+      }
+      // Out of collect budget (or past the deadline) — fall through to the
+      // 409/504 the server last gave, which carries its own `Retry-After` for
+      // a caller who wants to re-ask by hand.
+    } else if (isRetryableStatus(response.status, errorType)) {
       const delay = nextAttemptDelayMs(attempt, retry, clock());
       if (delay !== null) {
         await abortableSleep(delay, options.signal);
@@ -491,14 +576,19 @@ async function run<TData = unknown>(
       // Out of budget — fall through and raise the last failure the server
       // actually gave, rather than a synthetic "retries exhausted".
     }
-    return finish<TData>(model, response, text);
+    return finish<TData>(model, response, text, idempotencyKey);
   }
 }
 
 /** Turn the attempt that ended the retry loop into a result or an error. */
-function finish<TData>(model: string, response: Response, text: string): RunResult<TData> {
+function finish<TData>(
+  model: string,
+  response: Response,
+  text: string,
+  idempotencyKey: string,
+): RunResult<TData> {
   const requestId = response.headers.get(REQUEST_ID_HEADER);
-  if (!response.ok) throw errorFromResponse(response, text);
+  if (!response.ok) throw errorFromResponse(response, text, idempotencyKey);
 
   // A 202 is a task handle, not a result. This route is the synchronous one,
   // so a 202 here means the response is not the finished generation the
@@ -508,7 +598,7 @@ function finish<TData>(model: string, response: Response, text: string): RunResu
   if (response.status === 202) {
     throw new ComfyError(
       `models.run("${model}") received a 202 (accepted, not finished) where a completed result was expected`,
-      { code: "unexpected_response", httpStatus: 202, requestId },
+      { code: "unexpected_response", httpStatus: 202, requestId, idempotencyKey },
     );
   }
 
@@ -518,7 +608,13 @@ function finish<TData>(model: string, response: Response, text: string): RunResu
   } catch (exc) {
     throw new ComfyError(
       `models.run("${model}") returned a ${String(response.status)} whose body is not JSON`,
-      { code: "unexpected_response", httpStatus: response.status, requestId, cause: exc },
+      {
+        code: "unexpected_response",
+        httpStatus: response.status,
+        requestId,
+        idempotencyKey,
+        cause: exc,
+      },
     );
   }
   return { data: data as TData, requestId };

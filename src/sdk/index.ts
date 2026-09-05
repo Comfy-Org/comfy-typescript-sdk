@@ -26,6 +26,7 @@ export {
   type RunResult,
 } from "./models.js";
 export {
+  DEFAULT_COLLECT_BUDGET_MS,
   DEFAULT_RETRY_BASE_DELAY_MS,
   DEFAULT_RETRY_BUDGET_MS,
   DEFAULT_RETRY_MAX_DELAY_MS,

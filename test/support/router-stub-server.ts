@@ -26,6 +26,11 @@ export interface RouterServerState {
   /** `X-Comfy-Error-Type` to send, or `null` to omit it. */
   errorType: string | null;
   /**
+   * `Retry-After` to send on the ordinary response, or `null` to omit it.
+   * {@link failRetryAfter} is the equivalent for a {@link failTimes} response.
+   */
+  retryAfter: string | null;
+  /**
    * Wait this long before answering — a model that took a while, which is
    * the ordinary case for this route rather than an edge one.
    */
@@ -52,6 +57,22 @@ export interface RouterServerState {
   failStatus: number;
   /** `X-Comfy-Error-Type` sent with a {@link failTimes} response, or `null`. */
   failErrorType: string | null;
+  /**
+   * `Retry-After` sent with a {@link failTimes} response, or `null` to omit
+   * the header entirely. Present-and-absent are different fixture shapes here,
+   * not a detail: the client reads the header's PRESENCE as Router saying it
+   * still holds a generation the same key can collect, so a `504` with one and
+   * a `504` without take different paths.
+   */
+  failRetryAfter: string | null;
+  /**
+   * When true, the response that finally succeeds carries
+   * `Idempotent-Replayed: true` — what a real Router sends when the answer came
+   * off the record held against the `Idempotency-Key` rather than from running
+   * the model again. Nothing in the SDK branches on it; it is here so a collect
+   * test can assert the fixture really is the replay it claims to be.
+   */
+  idempotentReplayed: boolean;
   /**
    * Destroy the socket of the first N requests without answering at all — a
    * transport failure rather than an HTTP one, which the client sees as a
@@ -88,12 +109,15 @@ function defaultState(): RouterServerState {
     contentType: "application/json",
     requestId: "6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21",
     errorType: null,
+    retryAfter: null,
     delayMs: 0,
     hang: false,
     stallBody: false,
     failTimes: 0,
     failStatus: 503,
     failErrorType: null,
+    failRetryAfter: null,
+    idempotentReplayed: false,
     resetTimes: 0,
     requestCount: 0,
     lastMethod: null,
@@ -204,10 +228,13 @@ export class RouterStubServer {
     const headers: Record<string, string> = { "Content-Type": state.contentType };
     if (state.requestId !== null) headers["X-Comfy-Request-Id"] = state.requestId;
     if (state.errorType !== null) headers["X-Comfy-Error-Type"] = state.errorType;
+    if (state.retryAfter !== null) headers["Retry-After"] = state.retryAfter;
+    if (state.idempotentReplayed) headers["Idempotent-Replayed"] = "true";
 
     if (state.failTimes > 0) {
       state.failTimes -= 1;
       if (state.failErrorType !== null) headers["X-Comfy-Error-Type"] = state.failErrorType;
+      if (state.failRetryAfter !== null) headers["Retry-After"] = state.failRetryAfter;
       const failBody = JSON.stringify({ detail: "try again", error_type: state.failErrorType });
       headers["Content-Length"] = String(Buffer.byteLength(failBody));
       res.writeHead(state.failStatus, headers);

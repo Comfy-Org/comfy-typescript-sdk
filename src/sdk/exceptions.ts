@@ -17,6 +17,10 @@ export interface ComfyErrorOptions {
   details?: Record<string, unknown> | null;
   /** See {@link ComfyError.requestId}. */
   requestId?: string | null;
+  /** See {@link ComfyError.retryAfter}. */
+  retryAfter?: number | null;
+  /** See {@link ComfyError.idempotencyKey}. */
+  idempotencyKey?: string | null;
   /** The underlying failure, when this error wraps one (a fetch abort, say). */
   cause?: unknown;
 }
@@ -37,6 +41,34 @@ export class ComfyError extends Error {
    */
   readonly requestId: string | null;
 
+  /**
+   * Seconds the server asked the caller to wait before re-sending this exact
+   * request, off `Retry-After`; `null` when it named none.
+   *
+   * Set on the two answers a same-key re-send can collect from — a `409`
+   * naming `concurrency_limit_exceeded` and a `504` naming `deadline_exceeded`
+   * — where it is the interval Router itself would wait before asking again.
+   * `comfy.models.run` already re-asks for you inside its own collect budget,
+   * so an error carrying one is an answer that OUTLIVED that budget, and this
+   * is what pacing a manual re-ask needs. Pair it with
+   * {@link ComfyError.idempotencyKey}: waiting is only half of the collect,
+   * and re-asking under a fresh key would dispatch — and bill — a second
+   * generation rather than gathering the one already running.
+   */
+  readonly retryAfter: number | null;
+
+  /**
+   * The `Idempotency-Key` the failed call was sent under, or `null` for a
+   * failure raised before any request went out.
+   *
+   * Surfaced for the same reason {@link ComfyError.requestId} is: it is a
+   * value the caller needs and would otherwise have to have captured up front.
+   * A key minted inside `comfy.models.run` is not otherwise visible anywhere,
+   * so without this an interrupted call could not be re-asked for at all — the
+   * generation Router is holding is addressed by that string and nothing else.
+   */
+  readonly idempotencyKey: string | null;
+
   constructor(message: string, options: ComfyErrorOptions = {}) {
     super(message, "cause" in options ? { cause: options.cause } : undefined);
     this.name = new.target.name;
@@ -44,6 +76,8 @@ export class ComfyError extends Error {
     this.httpStatus = options.httpStatus;
     this.details = options.details ?? null;
     this.requestId = options.requestId ?? null;
+    this.retryAfter = options.retryAfter ?? null;
+    this.idempotencyKey = options.idempotencyKey ?? null;
   }
 }
 
@@ -85,13 +119,20 @@ export class InsufficientCredits extends ComfyError {}
  */
 export class MissingCredentials extends ComfyError {}
 
-/** Backpressure: the queue is full. `retryAfter` is seconds to wait when supplied. */
+/**
+ * Backpressure: the queue is full. `retryAfter` is seconds to wait when
+ * supplied.
+ *
+ * It declares `retryAfter` REQUIRED where {@link ComfyError} leaves it
+ * optional, which is the whole difference and why the narrowing stays: on
+ * every other error the field is "the server may have named a pace", while a
+ * `QueueFull` is constructed only where that question has already been
+ * answered, so a caller who caught this one never has to wonder whether the
+ * `null` means "no pace" or "nobody looked".
+ */
 export class QueueFull extends ComfyError {
-  readonly retryAfter: number | null;
-
   constructor(message: string, options: ComfyErrorOptions & { retryAfter: number | null }) {
     super(message, options);
-    this.retryAfter = options.retryAfter;
   }
 }
 

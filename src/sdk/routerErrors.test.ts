@@ -21,6 +21,8 @@ import {
   RateLimited,
   REQUEST_ERROR_TYPES,
   REQUEST_ID_HEADER,
+  parseRetryAfter,
+  RETRY_AFTER_HEADER,
   ROUTER_ERROR_TYPES,
   RouterError,
   ServiceUnavailable,
@@ -544,5 +546,75 @@ describe("InvalidInput and the 422 detail[] shape", () => {
     expect(err).toBeInstanceOf(InvalidInput);
     expect((err as InvalidInput).detail).toEqual([]);
     expect(err.message).toBe("The request was rejected as invalid for this model.");
+  });
+});
+
+describe("Retry-After", () => {
+  const headersOf = (value: string) => new Headers({ [RETRY_AFTER_HEADER]: value });
+
+  it("reads the delay-seconds form the Router contract pins", () => {
+    // `RouterRetryAfterHeader` is `type: integer, minimum: 1`, so this is the
+    // only form Router can send.
+    expect(parseRetryAfter(headersOf("2"))).toBe(2);
+    expect(parseRetryAfter(headersOf("  30 "))).toBe(30);
+  });
+
+  it("keeps a zero rather than flattening it to absent — they say different things", () => {
+    // `null` means "nothing to collect"; `0` means "there is a handle, but the
+    // pace is nonsense". `nextCollectDelayMs` in ./retry.ts acts on that
+    // difference by falling back to its own backoff instead of spinning.
+    expect(parseRetryAfter(headersOf("0"))).toBe(0);
+  });
+
+  it("reads anything that is not a whole number of seconds as absent", () => {
+    // Notably the HTTP-date form, which an intermediary may send and this SDK
+    // cannot pace from. And notably NOT via `parseInt`, which would read
+    // "2 hours" as a two-second pace the response never named.
+    for (const value of ["Wed, 21 Oct 2015 07:28:00 GMT", "2 hours", "-1", "1.5", "", "  "]) {
+      expect(parseRetryAfter(headersOf(value)), value).toBeNull();
+    }
+    expect(parseRetryAfter(new Headers())).toBeNull();
+  });
+
+  it("rides onto every RouterError, not just the two buckets that carry one", () => {
+    // On the base class so a caller who caught a `RouterError` can pace a
+    // manual re-ask without narrowing first — and so an unrecognized bucket
+    // from a newer server keeps a pace it sent.
+    const inFlight = toRouterError(
+      409,
+      stubErrorResponse(
+        409,
+        {},
+        { [ERROR_TYPE_HEADER]: "concurrency_limit_exceeded", [RETRY_AFTER_HEADER]: "2" },
+      ).headers,
+      { detail: "already in progress" },
+    );
+    expect(inFlight).toBeInstanceOf(ConcurrencyLimitExceeded);
+    expect(inFlight.retryAfter).toBe(2);
+
+    const deadline = toRouterError(
+      504,
+      stubErrorResponse(
+        504,
+        {},
+        { [ERROR_TYPE_HEADER]: "deadline_exceeded", [RETRY_AFTER_HEADER]: "5" },
+      ).headers,
+      { detail: "gave up holding" },
+    );
+    expect(deadline).toBeInstanceOf(DeadlineExceeded);
+    expect(deadline.retryAfter).toBe(5);
+  });
+
+  it("is null on the answers that named none, which is the deterministic-refusal shape", () => {
+    // The contract's spent/mismatched-key 409 carries no `Retry-After` at all,
+    // because waiting changes nothing — the answer is a NEW key.
+    const refused = toRouterError(
+      409,
+      stubErrorResponse(409, {}, { [ERROR_TYPE_HEADER]: "invalid_input" }).headers,
+      { detail: "key already used for a different request" },
+    );
+    expect(refused).toBeInstanceOf(InvalidInput);
+    expect(refused.retryAfter).toBeNull();
+    expect(new RouterError("boom").retryAfter).toBeNull();
   });
 });

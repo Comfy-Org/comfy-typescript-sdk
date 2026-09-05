@@ -156,7 +156,9 @@ being ported from a comparable hosted-inference client already expects; it is
 an intentional asymmetry, not a parity gap.
 
 Failures raise a `ComfyError`, and `requestId` is on the error too — an error
-response is exactly when you need one. `code` carries the server's coarse
+response is exactly when you need one, as are `retryAfter` (the pace the server
+named, when it named one) and `idempotencyKey` (the key the failed call went out
+under, including one `run` minted for you). `code` carries the server's coarse
 failure bucket (`model_not_found`, `invalid_input`, `provider_timeout`,
 `content_policy_violation`, ...), and the familiar buckets keep their existing
 classes: `Unauthorized`, `Forbidden`, `InsufficientCredits`, and `NotFound`
@@ -175,17 +177,18 @@ const { data, requestId } = await comfy.models.run(
 
 `run` accepts a third options argument: `signal`, `timeoutMs`, `idempotencyKey`, and `retry`.
 
-The default deadline is **10 minutes** — minutes rather than seconds, because the finished generation is the response and a short default would abort work that had already been paid for. It covers the whole call, retries included, rather than restarting per attempt. Pass `timeoutMs: null` to disable it, and prefer pairing that with a `signal`.
+The default deadline is **20 minutes** — minutes rather than seconds, because the finished generation is the response and a short default would abort work that had already been paid for. It covers the whole call, retries included, rather than restarting per attempt, which is also why it is twenty and not ten: Comfy's own deadline is ten minutes, so a default of ten would leave nothing for the collect described below. Pass `timeoutMs: null` to disable it, and prefer pairing that with a `signal`.
 
 #### Retries
 
-| Setting             | Default           | What it does                                                          |
-| ------------------- | ----------------- | --------------------------------------------------------------------- |
-| `retry.budgetMs`    | `120_000` (2 min) | Total wall clock, from the first attempt, in which retries may happen |
-| `retry.baseDelayMs` | `500`             | Backoff before the first retry; doubles per attempt                   |
-| `retry.maxDelayMs`  | `8_000`           | Ceiling for one backoff, applied before jitter                        |
+| Setting                 | Default              | What it does                                                          |
+| ----------------------- | -------------------- | --------------------------------------------------------------------- |
+| `retry.budgetMs`        | `120_000` (2 min)    | Total wall clock, from the first attempt, in which retries may happen |
+| `retry.baseDelayMs`     | `500`                | Backoff before the first retry; doubles per attempt                   |
+| `retry.maxDelayMs`      | `8_000`              | Ceiling for one backoff, applied before jitter                        |
+| `retry.collectBudgetMs` | `1_200_000` (20 min) | Wall clock for the collect loop below, from the same first attempt    |
 
-**Only a transport failure or a 5xx is retried.** A `404`, `409`, `422`, or a `content_policy_violation` is the server's answer about this request, and sending it again buys the same verdict twice — so those raise immediately. A terminal bucket that arrives under a 5xx (`X-Comfy-Error-Type: content_policy_violation`) is treated the same way.
+**Only a transport failure or a 5xx is retried.** A `404`, `422`, or a `content_policy_violation` is the server's answer about this request, and sending it again buys the same verdict twice — so those raise immediately. A terminal bucket that arrives under a 5xx (`X-Comfy-Error-Type: content_policy_violation`) is treated the same way.
 
 The bound is **elapsed time, not an attempt count**. On a route that holds the connection for the whole generation, "3 retries" says nothing about how long the call can take; a clock does. Each backoff is jittered — half the delay fixed, half random — so clients that failed against the same incident do not re-land on the recovering server as one wave. When the budget runs out, the last failure the server actually gave is what raises.
 
@@ -197,6 +200,50 @@ Pass `retry: false` for a single attempt, or narrow it per call:
 await comfy.models.run("bfl/flux-2-pro", { prompt: "a cat" }, { retry: false });
 await comfy.models.run("bfl/flux-2-pro", { prompt: "a cat" }, { retry: { budgetMs: 30_000 } });
 ```
+
+#### Collecting a generation after a lost response
+
+There is a second, narrower loop underneath the retries, and the server is the one that asks for it. Two answers mean "the generation your `Idempotency-Key` already names has not finished — wait, then ask again for THAT one", and Comfy pairs each with a `Retry-After` saying how long to wait:
+
+- a **`409`** carrying `X-Comfy-Error-Type: concurrency_limit_exceeded` — an earlier attempt of this same call is still in flight. It is what a re-send after a dropped connection meets, and it is not the same thing as the `429` that shares the bucket, where the workspace slot pool is full and nothing is running under your key.
+- a **`504`** carrying `X-Comfy-Error-Type: deadline_exceeded` — Comfy stopped holding the connection at its own ten-minute bound while the provider carried on generating.
+
+`run` collects those for you rather than raising them: it waits the interval the server named, re-sends the same key, and resolves with the generation when it arrives — no second dispatch, and no second charge. Nothing needs enabling.
+
+It gets **its own budget**, `collectBudgetMs`, defaulting to twenty minutes, because a collect has to outlast the deadline that produced it: a `504` arrives AT Comfy's ten-minute bound, so a two-minute budget measured from the first attempt is long spent by then and the collect it exists for could never start. The ordinary `budgetMs` is unchanged by this — a refused connection still gives up after two minutes.
+
+Three things bound it, and the call's own `timeoutMs` is the outermost:
+
+```ts
+// The default deadline (20 min) is what makes room for a 504 collect. A
+// SHORTER one wins over collectBudgetMs and forfeits that collect, since the
+// 504 cannot arrive before a deadline under ten minutes has already fired.
+// The 409 collect still works inside a short deadline: it arrives in
+// milliseconds, not at a ten-minute bound.
+await comfy.models.run("bfl/flux-2-pro", { prompt: "a cat" }, { timeoutMs: 60_000 });
+
+// Switch the collect off and have those answers raised instead, leaving
+// ordinary retries alone. `retry: false` switches off both.
+await comfy.models.run("bfl/flux-2-pro", { prompt: "a cat" }, { retry: { collectBudgetMs: 0 } });
+```
+
+A `409` that carries **no** `Retry-After` is not this: it is the contract's deterministic key refusal — the key names a different request, or its answer can no longer be replayed — and the answer is a new key, not a wait. It raises on the first attempt.
+
+When the collect budget (or the deadline) runs out, the server's own last answer is what raises, never a synthetic "retries exhausted" — and it carries what a manual re-ask needs:
+
+```ts
+try {
+  await comfy.models.run("bfl/flux-2-pro", { prompt: "a cat" }, { idempotencyKey: myKey });
+} catch (err) {
+  if (err instanceof ComfyError && err.retryAfter !== null) {
+    // Still running. Ask again later under err.idempotencyKey — the same key —
+    // and Comfy hands back that generation instead of starting another.
+    console.log(err.code, err.httpStatus, err.retryAfter, err.idempotencyKey);
+  }
+}
+```
+
+This mirrors the Python SDK's collect loop (`is_collectable` / `collect_max_elapsed` in `comfy_sdk/retry.py`), sized the same way; `src/sdk/surface-parity.test.ts` compares the two budgets so they cannot drift apart.
 
 #### Cancelling a call
 
@@ -532,7 +579,7 @@ are only exposed by direct `ComfyLow` calls.
 - `JobFailed` — a job reached a non-`succeeded` terminal state (carries the
   node-level `error` detail when the platform provided one)
 
-All extend a shared `ComfyError` (`code`, `httpStatus`, `details`).
+All extend a shared `ComfyError` (`code`, `httpStatus`, `details`, `requestId`, `retryAfter`, `idempotencyKey`). The last two are `null` unless the failure carried them: `retryAfter` is the pace the server named for re-sending this exact request, and `idempotencyKey` is the key the failed call went out under — the two things a manual re-ask needs, and the pair `comfy.models.run` uses for the collect loop above.
 
 `QueueFull.retryAfter` is nullable when the server omits the header. This is a
 breaking type change from earlier releases: check for `null` before using it in

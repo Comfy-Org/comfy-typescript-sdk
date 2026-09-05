@@ -4,18 +4,26 @@ import { describe, expect, it } from "vitest";
 
 import {
   backoffDelayMs,
+  DEFAULT_COLLECT_BUDGET_MS,
   DEFAULT_RETRY_BASE_DELAY_MS,
   DEFAULT_RETRY_BUDGET_MS,
   DEFAULT_RETRY_MAX_DELAY_MS,
+  isCollectable,
   isRetryableStatus,
   nextAttemptDelayMs,
+  nextCollectDelayMs,
   NO_RETRY,
   resolveRetry,
   TERMINAL_ERROR_TYPES,
   type RetryPolicy,
 } from "./retry.js";
 
-const POLICY: RetryPolicy = { budgetMs: 10_000, baseDelayMs: 100, maxDelayMs: 800 };
+const POLICY: RetryPolicy = {
+  budgetMs: 10_000,
+  baseDelayMs: 100,
+  maxDelayMs: 800,
+  collectBudgetMs: 60_000,
+};
 
 describe("resolveRetry", () => {
   it("fills in the documented defaults when nothing is supplied", () => {
@@ -23,6 +31,7 @@ describe("resolveRetry", () => {
       budgetMs: DEFAULT_RETRY_BUDGET_MS,
       baseDelayMs: DEFAULT_RETRY_BASE_DELAY_MS,
       maxDelayMs: DEFAULT_RETRY_MAX_DELAY_MS,
+      collectBudgetMs: DEFAULT_COLLECT_BUDGET_MS,
     });
   });
 
@@ -38,6 +47,7 @@ describe("resolveRetry", () => {
       budgetMs: 5_000,
       baseDelayMs: DEFAULT_RETRY_BASE_DELAY_MS,
       maxDelayMs: DEFAULT_RETRY_MAX_DELAY_MS,
+      collectBudgetMs: DEFAULT_COLLECT_BUDGET_MS,
     });
   });
 
@@ -47,6 +57,7 @@ describe("resolveRetry", () => {
     expect(() => resolveRetry({ maxDelayMs: "1" as unknown as number })).toThrow(
       /retry\.maxDelayMs/,
     );
+    expect(() => resolveRetry({ collectBudgetMs: -1 })).toThrow(/retry\.collectBudgetMs/);
   });
 });
 
@@ -135,5 +146,109 @@ describe("nextAttemptDelayMs", () => {
     const delay = nextAttemptDelayMs(0, POLICY, { elapsedMs: 0, remainingMs: null });
     expect(delay).toBeGreaterThanOrEqual(50);
     expect(delay).toBeLessThanOrEqual(100);
+  });
+});
+
+describe("isCollectable", () => {
+  it("recognizes the two answers Router pairs with a pace to say the work is still running", () => {
+    // The 409: an earlier attempt of this same call is still in flight, which
+    // is what a re-send after a dropped connection meets.
+    expect(isCollectable(409, "concurrency_limit_exceeded", 2)).toBe(true);
+    // The 504: Comfy stopped holding the connection at its own bound while
+    // the provider carried on.
+    expect(isCollectable(504, "deadline_exceeded", 5)).toBe(true);
+  });
+
+  it("requires the pace — without it the server is holding nothing to collect", () => {
+    // `Retry-After` is sent only when Router holds a handle to a running
+    // generation, so its absence is a statement, not an omission: a resend
+    // would dispatch NEW work rather than gather old.
+    expect(isCollectable(409, "concurrency_limit_exceeded", null)).toBe(false);
+    expect(isCollectable(504, "deadline_exceeded", null)).toBe(false);
+  });
+
+  it("requires the bucket, because both statuses are shared with a refusal", () => {
+    // 409 `invalid_input` is the contract's deterministic key refusal — the
+    // key names a different request, or its answer cannot be replayed — and
+    // the answer is a NEW key, which no amount of waiting produces.
+    expect(isCollectable(409, "invalid_input", 2)).toBe(false);
+    // A header-less 409 (a proxy's conflict) carries no evidence at all.
+    expect(isCollectable(409, null, 2)).toBe(false);
+    // 504 `provider_timeout` is the partner running out of time; nothing
+    // blesses a same-key resend there.
+    expect(isCollectable(504, "provider_timeout", 5)).toBe(false);
+    expect(isCollectable(504, null, 5)).toBe(false);
+  });
+
+  it("leaves the 429 concurrency bucket alone — nothing is running under this key", () => {
+    // Same bucket, different condition: at 429 the workspace slot pool is
+    // full and this request never started. It stays outside `models.run`'s
+    // retry surface entirely.
+    expect(isCollectable(429, "concurrency_limit_exceeded", 2)).toBe(false);
+    expect(isRetryableStatus(429, "concurrency_limit_exceeded")).toBe(false);
+  });
+});
+
+describe("nextCollectDelayMs", () => {
+  const idle = { elapsedMs: 0, remainingMs: null };
+
+  it("honours Retry-After verbatim — the server's pace beats the schedule here", () => {
+    // No jitter, no doubling: 2 seconds means 2 seconds, however many
+    // attempts have already gone out.
+    expect(nextCollectDelayMs(2, 0, POLICY, idle)).toBe(2_000);
+    expect(nextCollectDelayMs(2, 7, POLICY, idle)).toBe(2_000);
+  });
+
+  it("falls back to the backoff for a Retry-After of 0, which names no pace", () => {
+    // The contract pins the header to `minimum: 1`, so a zero can only come
+    // from something confused — and taking it literally would spin full
+    // model-run POSTs at the server for the whole budget.
+    const delay = nextCollectDelayMs(0, 0, POLICY, idle, () => 1);
+    expect(delay).toBe(100);
+    expect(nextCollectDelayMs(0, 3, POLICY, idle, () => 1)).toBe(800);
+  });
+
+  it("clamps to what is left of the collect budget rather than refusing", () => {
+    // One unlucky pace must not end a call that still has budget: the last
+    // attempt may START at the budget, inclusive.
+    expect(nextCollectDelayMs(5, 0, POLICY, { elapsedMs: 58_500, remainingMs: null })).toBe(1_500);
+  });
+
+  it("gives up once the collect budget is spent", () => {
+    expect(nextCollectDelayMs(5, 0, POLICY, { elapsedMs: 60_000, remainingMs: null })).toBeNull();
+    expect(nextCollectDelayMs(5, 0, POLICY, { elapsedMs: 60_001, remainingMs: null })).toBeNull();
+  });
+
+  it("budgets the collect separately from the ordinary retries", () => {
+    // Past `budgetMs` (10s) but well inside `collectBudgetMs` (60s): the
+    // ordinary retry is done and the collect is not. That split is the point
+    // of the second budget — a 504 arrives AT a server-side deadline the
+    // ordinary budget is deliberately too short to survive.
+    const clock = { elapsedMs: 30_000, remainingMs: null };
+    expect(nextAttemptDelayMs(0, POLICY, clock)).toBeNull();
+    expect(nextCollectDelayMs(2, 0, POLICY, clock)).toBe(2_000);
+  });
+
+  it("refuses a collect that cannot start inside the call's own deadline", () => {
+    // The deadline is the hard cap over every attempt and is never clamped
+    // against — a caller who asked for `timeoutMs` gets it.
+    expect(nextCollectDelayMs(2, 0, POLICY, { elapsedMs: 0, remainingMs: 1_500 })).toBeNull();
+    expect(nextCollectDelayMs(2, 0, POLICY, { elapsedMs: 0, remainingMs: 5_000 })).toBe(2_000);
+  });
+
+  it("is off under NO_RETRY, and under any zero budgetMs", () => {
+    // One attempt means one attempt: `retry: false` disables the collect too.
+    expect(nextCollectDelayMs(2, 0, NO_RETRY, idle)).toBeNull();
+    expect(nextCollectDelayMs(2, 0, { ...POLICY, budgetMs: 0 }, idle)).toBeNull();
+    // And the collect can be switched off on its own, leaving retries alone.
+    expect(nextCollectDelayMs(2, 0, { ...POLICY, collectBudgetMs: 0 }, idle)).toBeNull();
+    expect(nextAttemptDelayMs(0, { ...POLICY, collectBudgetMs: 0 }, idle)).not.toBeNull();
+  });
+
+  it("sizes the default collect budget at two Router deadline windows", () => {
+    // Router's own deadline is ten minutes, so one window is already spent by
+    // the time the 504 that starts a collect arrives.
+    expect(DEFAULT_COLLECT_BUDGET_MS).toBe(2 * 600_000);
+    expect(DEFAULT_COLLECT_BUDGET_MS).toBeGreaterThan(DEFAULT_RETRY_BUDGET_MS);
   });
 });
