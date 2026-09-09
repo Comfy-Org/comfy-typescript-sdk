@@ -103,8 +103,8 @@ Two more jobs run on the pull request and have no local `pnpm` script:
   `dist/index.d.ts`. It catches a broken `exports` map or a missing build
   artifact at PR time instead of at release time. Reproduce locally with
   `pnpm build && pnpm pack`.
-- **`public-repo-hygiene`** — see [below](#public-repo-hygiene). Reproduce
-  locally with `node scripts/check-public-repo-hygiene.mjs`.
+- **`hygiene / public-repo-hygiene`** — see [below](#public-repo-hygiene). It
+  runs from its own workflow file, not `ci.yml`.
 
 ## Generated code (do not hand-edit)
 
@@ -162,23 +162,32 @@ latter is codegen output.
 
 ## Public-repo hygiene
 
-`scripts/check-public-repo-hygiene.mjs` runs as its own CI job and scans every
-tracked file for references that only make sense inside Comfy's private
-context. It is a regression guard (this repo leaked such references once), not
-a secrets scanner. It flags three categories:
+`.github/workflows/public-repo-hygiene.yml` calls the shared
+`public-repo-hygiene` reusable workflow in `Comfy-Org/github-workflows`, pinned
+to a commit SHA. It scans every tracked file for references that only make
+sense inside Comfy's private context. It is a regression guard (this repo
+leaked such references once), not a secrets scanner. It flags three
+categories:
 
 1. **Ticket-shaped identifiers** — two to six capital letters, a hyphen, then
    digits. (No literal example here: this file is scanned too.)
 2. **Internal collaboration-tool links** — Notion, Slack, Google Docs/Drive,
    Datadog, PostHog, Linear, and `incident-` references.
 3. **References to `Comfy-Org/<repo>` or `@Comfy-Org/<team>` outside the
-   known-public allowlist** in the script. This is default-deny, so a brand new
-   public repo will be flagged until it is added to the list.
+   known-public allowlist.** This is default-deny, so a brand new public repo
+   will be flagged until it is added to the list.
+
+The checker and its allowlist live upstream and are loaded from the pinned
+commit, never from this repo — so a pull request here cannot widen the
+allowlist or disable the scan through the workflow's inputs. That is
+deliberate.
 
 Most contributor-triggered failures are category 3 or an accidental paste of an
 internal link into a comment or commit body. If you hit a genuine false
-positive, extend the allowlist in the script with a comment explaining why —
-that is the intended fix.
+positive in category 3, open a pull request against `Comfy-Org/github-workflows`
+adding the repo or team to the allowlist under `.github/public-repo-hygiene/`;
+a maintainer then bumps the pinned SHA here. A ticket-shaped acronym can be
+allowlisted with the caller's additive `ticket_allowlist:` input instead.
 
 ## Tests
 
