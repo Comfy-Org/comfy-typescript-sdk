@@ -775,6 +775,85 @@ describe("comfy.models.run collecting a generation under the same key", () => {
     });
   }, 20_000);
 
+  it("collects a Retry-After: 0 on its own backoff rather than spinning", async () => {
+    // `0` is a pace the SDK cannot honour literally — re-asking with no delay
+    // would drain `collectBudgetMs` in a tight loop of full model-run POSTs.
+    // `nextCollectDelayMs` falls back to this module's jittered backoff, so
+    // the collect still happens and still waits.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.failTimes = 1;
+      server.state.failStatus = 409;
+      server.state.failErrorType = "concurrency_limit_exceeded";
+      server.state.failRetryAfter = "0";
+      server.state.idempotentReplayed = true;
+
+      const started = Date.now();
+      const result = await comfy.models.run(MODEL, {}, { retry: COLLECT });
+
+      expect(result.requestId).toBe("6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21");
+      expect(server.state.requestCount).toBe(2);
+      expect(new Set(server.state.idempotencyKeys).size).toBe(1);
+      // Backoff pacing (milliseconds), not the second the header did not name.
+      expect(Date.now() - started).toBeLessThan(500);
+    });
+  }, 20_000);
+
+  it("keeps collecting through a transport failure once Router has said the generation is running", async () => {
+    // A paced 409 says Router holds a generation under this key. The re-ask
+    // that follows loses its socket — and that is a failure to COLLECT, not an
+    // ordinary transport failure: it is re-asked at the server's pace and
+    // budgeted against `collectBudgetMs`. `budgetMs` is 1ms here, so an
+    // ordinary retry would have been refused outright and the generation
+    // Router was still holding abandoned.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.failTimes = 1;
+      server.state.failStatus = 409;
+      server.state.failErrorType = "concurrency_limit_exceeded";
+      server.state.failRetryAfter = "1";
+      server.state.resetTimes = 1;
+      server.state.resetAfterFail = true;
+      server.state.idempotentReplayed = true;
+
+      const result = await comfy.models.run(
+        MODEL,
+        { prompt: "a cat" },
+        { retry: { ...COLLECT, budgetMs: 1 } },
+      );
+
+      expect(result.data).toEqual({ images: [{ url: "https://example.invalid/out.png" }] });
+      expect(server.state.requestCount).toBe(3);
+      expect(new Set(server.state.idempotencyKeys).size).toBe(1);
+    });
+  }, 20_000);
+
+  it("carries the collect's pace on a deadline that fires mid-collect", async () => {
+    // The re-ask is pending when the call's own deadline fires. The
+    // `request_timeout` that raises is the end of a collect, not of a plain
+    // call: it carries the pace of the last collectable answer beside the key,
+    // so a manual re-ask still has both. (Only the first request is asserted
+    // on: whether the re-ask itself reached the stub before the deadline is
+    // undici's timing, not this SDK's.)
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 409;
+      server.state.errorType = "concurrency_limit_exceeded";
+      server.state.retryAfter = "1";
+      server.state.body = { detail: "still running", error_type: "concurrency_limit_exceeded" };
+      server.state.delayMs = 1_000;
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { timeoutMs: 2_800, retry: { ...COLLECT, collectBudgetMs: 60_000 } })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("request_timeout");
+      expect(err.retryAfter).toBe(1);
+      expect(err.idempotencyKey).toBe(server.state.idempotencyKeys[0]);
+    });
+  }, 20_000);
+
   it("leaves a 504 with no Retry-After to the ordinary 5xx backoff", async () => {
     // No header means Router holds no handle to collect from — so this is a
     // plain 5xx, retried on `budgetMs` and this SDK's own jittered backoff

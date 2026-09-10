@@ -45,15 +45,18 @@ export class ComfyError extends Error {
    * Seconds the server asked the caller to wait before re-sending this exact
    * request, off `Retry-After`; `null` when it named none.
    *
-   * Set on the two answers a same-key re-send can collect from — a `409`
-   * naming `concurrency_limit_exceeded` and a `504` naming `deadline_exceeded`
-   * — where it is the interval Router itself would wait before asking again.
-   * `comfy.models.run` already re-asks for you inside its own collect budget,
-   * so an error carrying one is an answer that OUTLIVED that budget, and this
-   * is what pacing a manual re-ask needs. Pair it with
-   * {@link ComfyError.idempotencyKey}: waiting is only half of the collect,
-   * and re-asking under a fresh key would dispatch — and bill — a second
-   * generation rather than gathering the one already running.
+   * Any failure that carried the header has it — a `429` throttle or a proxy's
+   * `503` as much as the two answers a same-key re-send can COLLECT from, a
+   * `409` naming `concurrency_limit_exceeded` and a `504` naming
+   * `deadline_exceeded`. So on its own it says "wait this long", not "your
+   * generation is still running": tell the collectable pair apart by
+   * {@link ComfyError.code}. On those two it is the interval Router itself
+   * would wait before asking again, and `comfy.models.run` already re-asks for
+   * you inside its own collect budget — so one that reaches you OUTLIVED that
+   * budget (or the call's deadline), and this is what pacing a manual re-ask
+   * needs. Pair it with {@link ComfyError.idempotencyKey}: waiting is only
+   * half of the collect, and re-asking under a fresh key would dispatch — and
+   * bill — a second generation rather than gathering the one already running.
    */
   readonly retryAfter: number | null;
 

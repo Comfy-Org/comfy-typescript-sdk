@@ -39,12 +39,15 @@ entry. See CONTRIBUTING.md.
   collect loop off alone, or `retry: false` to switch off both. A `409` carrying
   no `Retry-After` is unchanged and still raises on the first attempt: that is
   the deterministic key refusal, and the answer is a new key.
-- Every `ComfyError` now carries `retryAfter` and `idempotencyKey`, both `null`
-  unless the failure carried them. They are what a manual re-ask needs after the
-  collect budget is spent — the pace, and the key naming the generation Comfy is
-  still holding, including one `models.run` minted for you and that was
-  previously not visible anywhere. `routerErrors.RouterError` gains `retryAfter`
-  for the same reason.
+- Every `ComfyError` now carries `retryAfter` and `idempotencyKey`. `retryAfter`
+  is the server's `Retry-After` in seconds, `null` when the response carried
+  none. `idempotencyKey` is the key the failed call went out under: every
+  `ComfyError` that `comfy.models.run` raises once a request has gone out has
+  one — including a key it minted for you, which was previously not visible
+  anywhere — and it is `null` only on a failure raised before any request was
+  sent. They are what a manual re-ask needs after the collect budget is spent:
+  the pace, and the key naming the generation Comfy is still holding.
+  `routerErrors.RouterError` gains `retryAfter` for the same reason.
 
 ### Changed
 

@@ -200,7 +200,9 @@ export interface RunOptions {
    *   backoff, and bounded by `collectBudgetMs` (twenty minutes by default)
    *   rather than by `budgetMs`, because a collect has to outlast Router's
    *   own deadline. Set `collectBudgetMs: 0` to switch the collect loop off
-   *   and have those answers raised instead.
+   *   and have those answers raised instead. The one thing `budgetMs` still
+   *   says about a collect is zero: `budgetMs: 0` is one attempt, collect
+   *   included, exactly like `retry: false`.
    *
    * A `409` with no `Retry-After` is not collectable and is not retried: that
    * is the contract's deterministic key refusal, and the answer is a new key.
@@ -504,7 +506,30 @@ async function run<TData = unknown>(
     remainingMs: deadlineAt === null ? null : deadlineAt - Date.now(),
   });
 
-  let attempt = 0;
+  let retryAttempt = 0;
+  let collectAttempt = 0;
+  /**
+   * The pace of the last collectable answer, once one has arrived. Set, it
+   * means this call is COLLECTING: Router holds a generation under this key,
+   * so every failure from here — a dropped socket, a proxy's 5xx — is a
+   * failure to collect it, re-asked at that pace and budgeted against
+   * `collectBudgetMs`, not an ordinary retry against a `budgetMs` that a
+   * ten-minute `504` has long since spent. It also rides onto the deadline
+   * error, so a caller whose clock runs out mid-collect still holds the pace
+   * and the key a manual re-ask needs.
+   */
+  let collectingAt: number | null = null;
+  /** The two schedules are counted apart: N paced re-asks must not inflate
+   * the backoff exponent of an ordinary retry that follows them, or vice
+   * versa. */
+  const nextDelayMs = (): number | null =>
+    collectingAt === null
+      ? nextAttemptDelayMs(retryAttempt, retry, clock())
+      : nextCollectDelayMs(collectingAt, collectAttempt, retry, clock());
+  const countAttempt = (): void => {
+    if (collectingAt === null) retryAttempt += 1;
+    else collectAttempt += 1;
+  };
   for (;;) {
     const remainingMs = clock().remainingMs;
     const signal = composeSignal(options.signal, remainingMs);
@@ -531,17 +556,17 @@ async function run<TData = unknown>(
         throw new ComfyError(
           `models.run("${model}") exceeded its ${String(timeoutMs)}ms deadline before the model finished; ` +
             "raise it with timeoutMs, or pass timeoutMs: null and your own signal",
-          { code: "request_timeout", cause: exc, idempotencyKey },
+          { code: "request_timeout", cause: exc, idempotencyKey, retryAfter: collectingAt },
         );
       }
       // A caller's abort is theirs: never retried, never re-dressed.
       if (options.signal?.aborted) throw exc;
-      const delay = nextAttemptDelayMs(attempt, retry, clock());
+      const delay = nextDelayMs();
       if (delay === null) throw exc;
       // Abortable, so an abort during the backoff stops the loop here rather
       // than sleeping out the delay and sending one more attempt.
       await abortableSleep(delay, options.signal);
-      attempt += 1;
+      countAttempt();
       continue;
     }
 
@@ -557,20 +582,24 @@ async function run<TData = unknown>(
     // `retryAfter !== null` is redundant with `isCollectable`, which refuses a
     // missing pace — it is written out so the call below needs no cast.
     if (retryAfter !== null && isCollectable(response.status, errorType, retryAfter)) {
-      const delay = nextCollectDelayMs(retryAfter, attempt, retry, clock());
+      collectingAt = retryAfter;
+      const delay = nextDelayMs();
       if (delay !== null) {
         await abortableSleep(delay, options.signal);
-        attempt += 1;
+        countAttempt();
         continue;
       }
       // Out of collect budget (or past the deadline) — fall through to the
       // 409/504 the server last gave, which carries its own `Retry-After` for
       // a caller who wants to re-ask by hand.
     } else if (isRetryableStatus(response.status, errorType)) {
-      const delay = nextAttemptDelayMs(attempt, retry, clock());
+      // Mid-collect this is still a collect: the 5xx is the re-ask failing to
+      // land, not a verdict on the generation, so it is paced and budgeted as
+      // one (`nextDelayMs` reads `collectingAt`).
+      const delay = nextDelayMs();
       if (delay !== null) {
         await abortableSleep(delay, options.signal);
-        attempt += 1;
+        countAttempt();
         continue;
       }
       // Out of budget — fall through and raise the last failure the server

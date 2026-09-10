@@ -235,7 +235,14 @@ When the collect budget (or the deadline) runs out, the server's own last answer
 try {
   await comfy.models.run("bfl/flux-2-pro", { prompt: "a cat" }, { idempotencyKey: myKey });
 } catch (err) {
-  if (err instanceof ComfyError && err.retryAfter !== null) {
+  // `retryAfter` alone means "wait": a 429 throttle carries one too. These two
+  // codes are the ones where the wait is for a generation still running under
+  // your key.
+  if (
+    err instanceof ComfyError &&
+    err.retryAfter !== null &&
+    (err.code === "concurrency_limit_exceeded" || err.code === "deadline_exceeded")
+  ) {
     // Still running. Ask again later under err.idempotencyKey — the same key —
     // and Comfy hands back that generation instead of starting another.
     console.log(err.code, err.httpStatus, err.retryAfter, err.idempotencyKey);
@@ -579,7 +586,7 @@ are only exposed by direct `ComfyLow` calls.
 - `JobFailed` — a job reached a non-`succeeded` terminal state (carries the
   node-level `error` detail when the platform provided one)
 
-All extend a shared `ComfyError` (`code`, `httpStatus`, `details`, `requestId`, `retryAfter`, `idempotencyKey`). The last two are `null` unless the failure carried them: `retryAfter` is the pace the server named for re-sending this exact request, and `idempotencyKey` is the key the failed call went out under — the two things a manual re-ask needs, and the pair `comfy.models.run` uses for the collect loop above.
+All extend a shared `ComfyError` (`code`, `httpStatus`, `details`, `requestId`, `retryAfter`, `idempotencyKey`). `retryAfter` is the pace the server named for re-sending this exact request, and is `null` whenever the response carried no `Retry-After`. `idempotencyKey` is the key the failed call went out under: every `ComfyError` that `comfy.models.run` raises once a request has gone out carries one — including a key it minted for you — and it is `null` only on a failure raised before any request was sent, or from a surface that stamps no key. Together they are the two things a manual re-ask needs, and the pair `comfy.models.run` uses for the collect loop above.
 
 `QueueFull.retryAfter` is nullable when the server omits the header. This is a
 breaking type change from earlier releases: check for `null` before using it in

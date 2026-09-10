@@ -45,7 +45,8 @@ export interface RetryOptions {
   /**
    * Total wall-clock budget for one logical call, in milliseconds, measured
    * from the first attempt. A further attempt is started only if its backoff
-   * would end inside the budget; `0` disables retries, same as `false`.
+   * would end inside the budget; `0` disables retries, collect included, same
+   * as `false`.
    */
   budgetMs?: number;
   /** Backoff before the first retry, in milliseconds. Doubles per attempt,

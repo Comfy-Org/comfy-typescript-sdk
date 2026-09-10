@@ -550,7 +550,11 @@ describe("InvalidInput and the 422 detail[] shape", () => {
 });
 
 describe("Retry-After", () => {
-  const headersOf = (value: string) => new Headers({ [RETRY_AFTER_HEADER]: value });
+  // Not `new Headers()`: its constructor strips leading and trailing whitespace
+  // from values, which would hide whether the parser trims at all.
+  const headersOf = (value: string) => ({
+    get: (name: string) => (name.toLowerCase() === RETRY_AFTER_HEADER.toLowerCase() ? value : null),
+  });
 
   it("reads the delay-seconds form the Router contract pins", () => {
     // `RouterRetryAfterHeader` is `type: integer, minimum: 1`, so this is the
@@ -570,7 +574,18 @@ describe("Retry-After", () => {
     // Notably the HTTP-date form, which an intermediary may send and this SDK
     // cannot pace from. And notably NOT via `parseInt`, which would read
     // "2 hours" as a two-second pace the response never named.
-    for (const value of ["Wed, 21 Oct 2015 07:28:00 GMT", "2 hours", "-1", "1.5", "", "  "]) {
+    // The last one is all digits and still absent: it is past
+    // `Number.MAX_SAFE_INTEGER`, and pacing from it would schedule a sleep no
+    // process outlives.
+    for (const value of [
+      "Wed, 21 Oct 2015 07:28:00 GMT",
+      "2 hours",
+      "-1",
+      "1.5",
+      "",
+      "  ",
+      "99999999999999999999",
+    ]) {
       expect(parseRetryAfter(headersOf(value)), value).toBeNull();
     }
     expect(parseRetryAfter(new Headers())).toBeNull();

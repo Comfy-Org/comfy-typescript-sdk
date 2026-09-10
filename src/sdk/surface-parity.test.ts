@@ -548,4 +548,25 @@ describe("the collect budget", () => {
       ),
     ).toEqual({ max_elapsed: "60.0", retry_collectable: "True" });
   });
+
+  it("reads past a docstring, a trailing comment and a spaced default", () => {
+    // A field-shaped line INSIDE the docstring is prose and must not count —
+    // stale documentation would otherwise keep a removed field "present". A
+    // trailing comment or a default with spaces in it is still one field.
+    expect(
+      extractRetryPolicyFields(
+        [
+          "class RetryPolicy:",
+          '    """Policy.',
+          "",
+          "    collect_max_elapsed: float = 9999.0",
+          '    """',
+          "",
+          "    max_elapsed: float = 60.0  # seconds",
+          "    hooks: list[str] = field(default_factory=list)",
+          "",
+        ].join("\n"),
+      ),
+    ).toEqual({ max_elapsed: "60.0", hooks: "field(default_factory=list)" });
+  });
 });

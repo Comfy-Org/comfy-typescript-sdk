@@ -163,6 +163,18 @@ export function retryAfterStatuses(doc, pathItem) {
     if (response === null || typeof response !== "object") continue;
     const headers = response.headers ?? {};
     if (Object.keys(headers).some((name) => name.toLowerCase() === "retry-after")) {
+      // OpenAPI also allows `default` and the `4XX`/`5XX` range forms as
+      // response keys. `Number()` turns those into `NaN`, which compares
+      // unequal to everything (itself included) — the "reads as agreement"
+      // failure this script exists to refuse, arriving through the other
+      // door. Refuse loudly instead: the predicate matches exact statuses.
+      if (!/^\d{3}$/.test(status)) {
+        fail(
+          `spec/router-openapi.yaml: ${RUN_OPERATION_ID} declares a \`Retry-After\` header on ` +
+            `response key ${JSON.stringify(status)}, which is not a single numeric status. ` +
+            "The predicate it is compared against (`isCollectable`) matches exact statuses.",
+        );
+      }
       statuses.push(Number(status));
     }
   }

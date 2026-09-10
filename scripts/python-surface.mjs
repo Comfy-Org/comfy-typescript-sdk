@@ -279,8 +279,25 @@ export function extractRetryPolicyFields(source) {
     fail(`${PYTHON_SOURCE_FILES.retry}: no \`class RetryPolicy\` found.`);
   }
   const fields = {};
+  let inDocstring = false;
   for (const line of body) {
-    const match = /^\s{4}([a-z_]\w*)\s*:\s*[\w.|[\] ]+\s*=\s*(\S+)\s*$/.exec(line);
+    // A docstring is prose. A line inside one that happens to look like a
+    // field must not count as a live one, or stale documentation could keep a
+    // removed field "present" and the parity assertion would pass falsely.
+    const quotes = (line.match(/"""/g) ?? []).length;
+    if (inDocstring) {
+      if (quotes % 2 === 1) inDocstring = false;
+      continue;
+    }
+    if (quotes >= 2) continue; // a one-line docstring
+    if (quotes === 1) {
+      inDocstring = true;
+      continue;
+    }
+    // `name: type = default`. The default runs to the end of the line or to a
+    // trailing comment, so `= 15.0  # seconds` and
+    // `= field(default_factory=list)` are each one field rather than none.
+    const match = /^\s{4}([a-z_]\w*)\s*:\s*[\w.|[\] ]+\s*=\s*(.+?)\s*(?:#.*)?$/.exec(line);
     if (match) fields[match[1]] = match[2];
   }
   if (Object.keys(fields).length === 0) {

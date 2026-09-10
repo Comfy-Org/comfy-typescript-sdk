@@ -79,6 +79,13 @@ export interface RouterServerState {
    * fetch rejection and not a status.
    */
   resetTimes: number;
+  /**
+   * Order {@link resetTimes} AFTER {@link failTimes} instead of before: the
+   * fail responses go out first, then the socket resets, then the ordinary
+   * response. That is the shape of a transport failure landing mid-collect —
+   * Router answered a paced `409`/`504`, and the re-ask never got an answer.
+   */
+  resetAfterFail: boolean;
 
   // --- what the last request carried, for tests to assert on ---
   requestCount: number;
@@ -119,6 +126,7 @@ function defaultState(): RouterServerState {
     failRetryAfter: null,
     idempotentReplayed: false,
     resetTimes: 0,
+    resetAfterFail: false,
     requestCount: 0,
     lastMethod: null,
     lastPath: null,
@@ -206,7 +214,7 @@ export class RouterStubServer {
     state.lastUserAgent = header(req, "user-agent");
     if (state.lastIdempotencyKey !== null) state.idempotencyKeys.push(state.lastIdempotencyKey);
 
-    if (state.resetTimes > 0) {
+    if (state.resetTimes > 0 && !(state.resetAfterFail && state.failTimes > 0)) {
       state.resetTimes -= 1;
       req.socket.destroy(); // no status line at all — a transport failure
       return;
@@ -228,8 +236,6 @@ export class RouterStubServer {
     const headers: Record<string, string> = { "Content-Type": state.contentType };
     if (state.requestId !== null) headers["X-Comfy-Request-Id"] = state.requestId;
     if (state.errorType !== null) headers["X-Comfy-Error-Type"] = state.errorType;
-    if (state.retryAfter !== null) headers["Retry-After"] = state.retryAfter;
-    if (state.idempotentReplayed) headers["Idempotent-Replayed"] = "true";
 
     if (state.failTimes > 0) {
       state.failTimes -= 1;
@@ -241,6 +247,13 @@ export class RouterStubServer {
       res.end(failBody);
       return;
     }
+
+    // Below the `failTimes` branch on purpose: these two describe the ordinary
+    // response only. A fail response gets its pace from `failRetryAfter` (so
+    // `null` there really does omit the header), and is not a replay of
+    // anything.
+    if (state.retryAfter !== null) headers["Retry-After"] = state.retryAfter;
+    if (state.idempotentReplayed) headers["Idempotent-Replayed"] = "true";
 
     if (state.stallBody) {
       // A Content-Length the body never reaches, so the client keeps reading.
