@@ -222,8 +222,9 @@ asset and handing the model the asset's download URL:
 ```ts
 import { Comfy, comfy } from "@comfyorg/sdk";
 
-// Both read COMFY_API_KEY from the environment.
-const client = new Comfy();
+// `comfy.models` reads COMFY_API_KEY from the environment; the class client
+// takes its key explicitly, so hand it the same one.
+const client = new Comfy({ apiKey: process.env.COMFY_API_KEY });
 
 // 1. Upload the local image (dedup-aware; a re-run re-uploads nothing) and
 //    resolve a short-lived, self-authorizing signed URL for it.
@@ -240,13 +241,14 @@ const { data } = await comfy.models.run("wan/wan2.5-i2i-preview", {
 `Asset.getDownloadUrl()` commits the asset if needed (hash → dedup probe →
 upload, exactly like submitting it in a workflow) and resolves to the same
 `{ url, expiresAt }` as an output's `getDownloadUrl()`: on Comfy Cloud /
-serverless a signed storage URL any fetcher can read until `expiresAt` —
-which is what lets the provider behind Router pull your image without your
-API key. Mind the two caveats that follow from that: the URL is short-lived,
-so resolve it right before the run rather than storing it; and on a
-_self-hosted_ backend the URL is the auth-guarded content endpoint, which an
-external provider cannot fetch — upload to Comfy Cloud (the default assets
-surface) for Router inputs.
+serverless a signed storage URL any fetcher can read until `expiresAt`
+(`null` when the URL carries no expiry the SDK can read) — which is what
+lets the provider behind Router pull your image without your API key. Mind
+the two caveats that follow from that: the URL is short-lived, so resolve it
+right before the run rather than storing it; and on a _self-hosted_ backend
+the URL is the auth-guarded content endpoint, which an external provider
+cannot fetch — upload to Comfy Cloud (the default assets surface) for Router
+inputs.
 
 Some models take images inline instead of by URL — `bfl/flux-2-pro`'s
 `input_image` is base64, for example — and then there is nothing to upload:
