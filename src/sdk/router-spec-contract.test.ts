@@ -35,6 +35,7 @@ import { withRouterStub } from "../../test/support/router-stub-server.js";
 import { comfy } from "./comfy.js";
 import { COMFY_ROUTER_BASE_URL, config } from "./credentials.js";
 import { RUN_ROUTE_TEMPLATE } from "./models.js";
+import { isCollectable } from "./retry.js";
 
 describe("router route contract (spec/router-openapi.yaml)", () => {
   it("spells RUN_ROUTE_TEMPLATE the path the contract declares for runRouterModel", async () => {
@@ -68,6 +69,30 @@ describe("router route contract (spec/router-openapi.yaml)", () => {
         "`{provider}` then `{model}`",
     ).toEqual(["provider", "model"]);
     expect(templatePlaceholders(RUN_ROUTE_TEMPLATE)).toEqual(parameterNames);
+  });
+
+  it("collects on exactly the statuses the contract paces with a Retry-After", async () => {
+    // `isCollectable` accepts a same-key resend on a 409 and a 504 and on
+    // nothing else. That is not a choice this SDK gets to make: Router sends
+    // `Retry-After` only where it still holds a generation the key can
+    // collect, so the predicate's status set has to BE the contract's. A sync
+    // that moved the header — onto a 429, or off the 409 — would otherwise
+    // leave the SDK resending an answer nothing blesses.
+    const { retryAfterStatuses } = await readRouterRouteContract();
+    expect(
+      retryAfterStatuses,
+      "the vendored Router contract moved `Retry-After` on runRouterModel — update " +
+        "isCollectable in src/sdk/retry.ts to match it",
+    ).toEqual([409, 504]);
+
+    // And the bucket gates, which are what separate the collectable member of
+    // each shared status from the refusal beside it.
+    for (const status of retryAfterStatuses) {
+      const bucket = status === 409 ? "concurrency_limit_exceeded" : "deadline_exceeded";
+      expect(isCollectable(status, bucket, 2), String(status)).toBe(true);
+      expect(isCollectable(status, null, 2), String(status)).toBe(false);
+      expect(isCollectable(status, bucket, null), String(status)).toBe(false);
+    }
   });
 
   it("sends a real request to the path the template fills in", async () => {

@@ -51,13 +51,13 @@ regeneration cannot hide a moved route.
 
 ## 2. Spec-coupled hand-written code
 
-Five hand-written things must be updated in lockstep when a vendored spec
+Six hand-written things must be updated in lockstep when a vendored spec
 changes. Three are coupled to `spec/openapi.yaml` and fail
-`src/low/spec-coverage.test.ts`; the other two are coupled to
+`src/low/spec-coverage.test.ts`; the other three are coupled to
 `spec/router-openapi.yaml` and fail `src/sdk/router-spec-coverage.test.ts` and
-`src/sdk/router-spec-contract.test.ts` respectively. Only the route check
-(fourth below) names the constant to fix; for the rest the failure message will
-not tell you this:
+`src/sdk/router-spec-contract.test.ts` respectively. Only the route check and
+the collect check (fourth and fifth below) name the constant to fix; for the
+rest the failure message will not tell you this:
 
 - **`src/low/transport.ts` — `OPERATION_IDS`.** Must equal, as a set, the
   `operationId` of every non-internal operation in `spec/openapi.yaml`. A spec
@@ -88,6 +88,15 @@ not tell you this:
   sync that moves the route is not done until the constant follows, and until
   it does `comfy.models.run` 404s. The shared spec reader is
   `scripts/router-route-contract.mjs`.
+- **`src/sdk/retry.ts` — `isCollectable`.** The statuses on which
+  `comfy.models.run` re-sends the SAME `Idempotency-Key` to collect a
+  generation already running. That set is not this SDK's to choose: Router
+  sends `Retry-After` only where it holds a handle to collect from, so
+  `src/sdk/router-spec-contract.test.ts` reads which `runRouterModel` responses
+  declare that header and asserts the predicate accepts exactly those. A sync
+  that moved the header — onto a `429`, or off the `409` — would otherwise
+  leave the SDK re-sending an answer nothing blesses, or refusing to collect a
+  generation Comfy is still holding.
 - **`src/low/models.ts`.** Holds four schemas codegen cannot reach, because
   `@hey-api/openapi-ts` only emits types reachable from an operation's
   request/response: `StatusEvent`, `PreviewEvent`, `LogEvent` (reachable only
