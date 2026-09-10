@@ -17,6 +17,18 @@ Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
 entry. See CONTRIBUTING.md.
 -->
 
+### Added
+
+- `Asset.getDownloadUrl()` — a directly-fetchable URL for an _uploaded_
+  asset's bytes, mirroring `Output.getDownloadUrl()` (same
+  `{ url, expiresAt }` shape, commits the asset first if needed). On Comfy
+  Cloud / serverless it is a short-lived signed URL any fetcher can read
+  until `expiresAt`, which is what lets a local image be passed to a
+  URL-taking image-to-image model via `comfy.models.run`: upload the file
+  as an asset, resolve its URL, put the URL in the model's input. The
+  README's "Image to image — upload an asset first" section walks through
+  the flow. Matches `Asset.get_download_url()` in the Python SDK.
+
 ## [0.1.9] - 2026-09-04
 
 ### Fixed
