@@ -34,6 +34,7 @@ import type {
   Asset,
   AssetFromHashData,
   Job,
+  JobLogs,
   JobWorkflowResponse,
   PostJobsData,
 } from "./generated/types.gen.js";
@@ -537,6 +538,36 @@ export class ComfyLow {
   }
 
   /**
+   * `GET /api/v2/jobs/{id}/logs` — what the run printed, or `null` on the
+   * `204` that means this job has no log.
+   *
+   * `null` is the normal answer, not an error, and the contract deliberately
+   * does not say why: the surface captures no logs at all (Comfy Cloud
+   * today), the job has not finished, the run was killed before the worker
+   * could report one, or the log is withheld. Only one of those resolves
+   * itself — a job still running may have a log once it is terminal — so a
+   * `null` read after a terminal status is final. Accepts a job id or the
+   * job's own `urls.logs` link; the link is the form to prefer, since a
+   * surface may mount the operation under a prefix a hand-built path would
+   * miss. The text is whatever the workflow wrote to standard output:
+   * untrusted, to be rendered as plain text and never interpreted.
+   */
+  async getJobLogs(
+    jobIdOrLogsUrl: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<JobLogs | null> {
+    const path = looksLikePath(jobIdOrLogsUrl)
+      ? jobIdOrLogsUrl
+      : `/jobs/${encodeURIComponent(jobIdOrLogsUrl)}/logs`;
+    const response = await this.request("GET", path, { signal: options.signal });
+    if (response.status === 204) {
+      await response.body?.cancel();
+      return null;
+    }
+    return this.parseOrRaise<JobLogs>(response, [200]);
+  }
+
+  /**
    * `GET /api/v2/jobs/{id}/events` — raw live SSE iterator (escape hatch).
    * No reconnection here; a single connection's frames. `../sdk` adds the
    * reconnect loop. No default timeout: an idle stream must not time out
@@ -584,6 +615,7 @@ export const OPERATION_IDS = [
   "postJobs",
   "getJob",
   "getJobWorkflow",
+  "getJobLogs",
   "getJobEvents",
   "cancelJob",
 ] as const;
@@ -599,6 +631,7 @@ export const OPERATION_METHODS: Record<(typeof OPERATION_IDS)[number], keyof Com
   postJobs: "postJobs",
   getJob: "getJob",
   getJobWorkflow: "getJobWorkflow",
+  getJobLogs: "getJobLogs",
   getJobEvents: "getJobEvents",
   cancelJob: "cancelJob",
 };

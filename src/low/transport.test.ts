@@ -232,6 +232,42 @@ describe("ComfyLow transport", () => {
     expect(result).toEqual({ workflow: { nodes: [] }, format: "save" });
   });
 
+  // -- getJobLogs ---------------------------------------------------------
+
+  const LOGS = {
+    text: "loading model\nKSampler: 20 steps\n",
+    truncated: false,
+    captured_at: "2026-07-10T18:21:00Z",
+    complete: true,
+  };
+
+  it("getJobLogs returns the captured log", async () => {
+    server.state.jobLogs = LOGS;
+    const result = await low.getJobLogs("job_01");
+    expect(result).toEqual(LOGS);
+  });
+
+  it("getJobLogs reads the 204 that means 'no log' as null, not as an error", async () => {
+    // The contract's normal answer for a job with nothing captured — Comfy
+    // Cloud's answer for every job today — so it must not surface as a throw.
+    expect(await low.getJobLogs("job_01")).toBeNull();
+    expect(server.state.jobLogsCount).toBe(1);
+  });
+
+  it("getJobLogs 404s -> NotFound for a job that is gone", async () => {
+    server.state.jobLogsGone = true;
+    await expect(low.getJobLogs("job_01")).rejects.toBeInstanceOf(NotFound);
+  });
+
+  it("getJobLogs given the job's own urls.logs link follows it verbatim", async () => {
+    server.state.jobLogs = LOGS;
+    server.state.jobUrlsOrigin = server.baseUrl;
+    const job = await low.getJob("job_01");
+    expect(job.urls.logs).toBe(`${server.baseUrl}/api/v2/jobs/job_01/logs`);
+    const result = await low.getJobLogs(job.urls.logs!);
+    expect(result).toEqual(LOGS);
+  });
+
   // -- deleteAsset --------------------------------------------------------
 
   it("deleteAsset removes the asset; a subsequent getAsset 404s", async () => {

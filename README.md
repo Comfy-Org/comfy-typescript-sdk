@@ -506,6 +506,31 @@ submission has no version-pinning fields yet. It 404s for an unknown ID, a job t
 is not yours, a job past retention, or a job whose workflow the server no
 longer holds.
 
+## What a job printed
+
+`job.getLogs()` fetches the run's captured execution log via
+`GET /api/v2/jobs/{id}/logs` — whatever the workflow's own code and nodes wrote
+to standard output, in order:
+
+```ts
+const job = await client.run(wf);
+const logs = await job.getLogs();
+if (logs !== null) {
+  process.stdout.write(logs.text); // untrusted text: render it, never interpret it
+  if (logs.truncated) console.warn("(beginning of the log was shed; this is the tail)");
+}
+```
+
+`null` is the ordinary answer for a job with no log, not an error, and it does
+not say why: the surface captures no logs at all (Comfy Cloud today — only jobs
+run on the serverless platform have one), the job has not finished, the run was
+killed before the worker could report its output, or the log is withheld. Read
+it after a terminal status; a `null` read after that is final. The SDK follows
+the job's own `urls.logs` link and returns `null` without a request when the
+server offers none, which is a surface saying it captures no logs for any job.
+It 404s under the same conditions `client.jobs.get()` does: unknown, not yours,
+or past retention.
+
 ## Typed errors
 
 Protocol-level failures are raised as one exception class per error code, so

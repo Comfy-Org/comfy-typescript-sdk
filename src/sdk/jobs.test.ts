@@ -74,6 +74,34 @@ describe("Job", () => {
     await expect(job.getWorkflow()).rejects.toBeInstanceOf(NotFound);
   });
 
+  it("getLogs() returns what the run printed", async () => {
+    server.state.jobLogs = {
+      text: "loading model\n",
+      truncated: true,
+      captured_at: "2026-07-10T18:21:00Z",
+      complete: true,
+    };
+    const job = await jobs.get("job_01");
+    const logs = await job.getLogs();
+    expect(logs?.text).toBe("loading model\n");
+    expect(logs?.truncated).toBe(true);
+  });
+
+  it("getLogs() is null, not an error, for a job with no log", async () => {
+    // A 204 is the contract's ordinary answer for a job with nothing captured.
+    const job = await jobs.get("job_01");
+    expect(await job.getLogs()).toBeNull();
+    expect(server.state.jobLogsCount).toBe(1);
+  });
+
+  it("getLogs() spends no request on a surface that offers no urls.logs link", async () => {
+    // An absent link is the surface saying it captures no logs for any job.
+    server.state.jobUrlsIncludeLogs = false;
+    const job = await jobs.get("job_01");
+    expect(await job.getLogs()).toBeNull();
+    expect(server.state.jobLogsCount).toBe(0);
+  });
+
   it("events() consumes the full typed SSE frame sequence to terminal", async () => {
     const job = await jobs.get("job_01");
     const kinds: string[] = [];
