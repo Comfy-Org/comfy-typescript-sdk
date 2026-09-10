@@ -638,10 +638,12 @@ if (logs !== null) {
 ```
 
 `null` is the ordinary answer for a job with no log, not an error, and it does
-not say why: the surface captures no logs at all (Comfy Cloud today — only jobs
-run on the serverless platform have one), the job has not finished, the run was
-killed before the worker could report its output, or the log is withheld. Read
-it after a terminal status; a `null` read after that is final. The SDK follows
+not say why: the surface captures no logs at all, the job has not finished, the
+run was killed before the worker could report its output, or the log is
+withheld. Today only a job run on a serverless deployment (a
+`{deployment}.run.comfy.app` host) has a log; Comfy Cloud captures none and
+answers `null` for every job. Read it after a terminal status; a `null` read
+after that is final. The SDK follows
 the job's own `urls.logs` link and returns `null` without a request when the
 server offers none, which is a surface saying it captures no logs for any job.
 It 404s under the same conditions `client.jobs.get()` does: unknown, not yours,

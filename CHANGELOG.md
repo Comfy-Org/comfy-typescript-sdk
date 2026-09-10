@@ -62,15 +62,18 @@ entry. See CONTRIBUTING.md.
   `GET /api/v2/jobs/{id}/logs` operation (`ComfyLow.getJobLogs()` in the low
   layer; the `JobLogs` type is generated from the spec). Resolves to
   `{ text, truncated, captured_at, complete }`, or `null` for the `204` that
-  means the job has no log — the ordinary answer on Comfy Cloud today, where no
-  logs are captured, and for a job that has not finished or whose run was
-  killed before the worker could report. Follows the job's `urls.logs` link
+  means the job has no log: today only a job run on a serverless deployment (a
+  `{deployment}.run.comfy.app` host) has one, Comfy Cloud captures none and
+  answers `null` for every job, and a job that has not finished or whose run
+  was killed before the worker could report has none either. Follows the job's
+  `urls.logs` link
   and returns `null` without a request when the server offers none. The text
   is untrusted workflow output and should be rendered as plain text.
 - `Job.urls.logs` is now on the generated `JobUrls` type, optional, and
   `PostJobsData["body"]["extra_data"]` accepts `auth_token_comfy_org` beside
   `api_key_comfy_org` (low layer only; `client.submit({ apiKey })` is
   unchanged).
+
 ### Changed
 
 - The default `comfy.models.run` deadline (`DEFAULT_RUN_TIMEOUT_MS`) is now 20

@@ -117,6 +117,9 @@ export interface ServerState {
   jobLogsGone: boolean;
   /** How many times `GET /jobs/{id}/logs` was hit. */
   jobLogsCount: number;
+  /** The exact request path of the last `GET .../jobs/{id}/logs`, so a test
+   * can prove a supplied `urls.logs` link was followed rather than rebuilt. */
+  jobLogsLastPath: string | null;
   /** Asset ids already deleted — GET/DELETE for these 404 asset_not_found,
    * matching the real server treating a repeat delete as "gone". */
   deletedAssets: Set<string>;
@@ -181,6 +184,7 @@ function defaultState(): ServerState {
     jobUrlsIncludeLogs: true,
     jobLogsGone: false,
     jobLogsCount: 0,
+    jobLogsLastPath: null,
     deletedAssets: new Set(),
     deleteInUseAssetId: null,
     uploadCount: 0,
@@ -376,9 +380,11 @@ export class StubServer {
         this.serveJobWorkflow(res);
         return;
       }
-      m = /^\/api\/v2\/jobs\/([^/]+)\/logs$/.exec(path);
+      // Unanchored at the start on purpose: a surface may mount the API under
+      // a prefix that only its own `urls.logs` link carries.
+      m = /\/api\/v2\/jobs\/([^/]+)\/logs$/.exec(path);
       if (m) {
-        this.serveJobLogs(res);
+        this.serveJobLogs(path, res);
         return;
       }
       m = /^\/api\/v2\/jobs\/([^/]+)$/.exec(path);
@@ -489,8 +495,9 @@ export class StubServer {
     );
   }
 
-  private serveJobLogs(res: ServerResponse): void {
+  private serveJobLogs(path: string, res: ServerResponse): void {
     this.state.jobLogsCount += 1;
+    this.state.jobLogsLastPath = path;
     const { jobLogs, jobLogsGone } = this.state;
     if (jobLogsGone) {
       sendError(res, 404, "job_not_found", "job not found");

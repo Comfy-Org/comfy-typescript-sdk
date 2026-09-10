@@ -259,13 +259,15 @@ describe("ComfyLow transport", () => {
     await expect(low.getJobLogs("job_01")).rejects.toBeInstanceOf(NotFound);
   });
 
-  it("getJobLogs given the job's own urls.logs link follows it verbatim", async () => {
+  it("getJobLogs given a urls.logs link follows it verbatim, prefix and all", async () => {
+    // The link is the form to prefer because a surface may mount the operation
+    // under a prefix a hand-built `/jobs/{id}/logs` would miss. A link that
+    // carries one proves the path was followed rather than rebuilt from an id.
     server.state.jobLogs = LOGS;
-    server.state.jobUrlsOrigin = server.baseUrl;
-    const job = await low.getJob("job_01");
-    expect(job.urls.logs).toBe(`${server.baseUrl}/api/v2/jobs/job_01/logs`);
-    const result = await low.getJobLogs(job.urls.logs!);
+    const link = `${server.baseUrl}/mounted/here/api/v2/jobs/job_01/logs`;
+    const result = await low.getJobLogs(link);
     expect(result).toEqual(LOGS);
+    expect(server.state.jobLogsLastPath).toBe("/mounted/here/api/v2/jobs/job_01/logs");
   });
 
   // -- deleteAsset --------------------------------------------------------
