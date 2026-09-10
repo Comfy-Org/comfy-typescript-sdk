@@ -212,12 +212,21 @@ export interface RunOptions {
 }
 
 /**
- * The `comfy.models` surface.
+ * The `comfy.models` surface: discover what is runnable, read one model's
+ * published schemas, then run it.
  *
  * `input` is the model's own native input document, forwarded to the provider
  * unchanged. It is typed as an open object rather than a per-model shape for
  * the reason given on {@link RunResult}: the schemas are the server's to
  * publish, per model, and this package does not carry a copy of them.
+ *
+ * Where it gets them instead is {@link Models.schema}, which fetches the
+ * document Router publishes for one model at
+ * `GET /v2/models/{provider}/{model}/openapi.json`, and {@link Models.list},
+ * which walks the catalog those model IDs come from. Neither bundles a copy
+ * and neither validates against one — the document is handed back as data, so
+ * the choice of validator (and of whether to validate at all) stays the
+ * caller's. See {@link SchemaResult} for why that is not just a scope call.
  */
 export interface Models {
   run<TData = unknown>(
@@ -225,6 +234,11 @@ export interface Models {
     input: Record<string, unknown>,
     options?: RunOptions,
   ): Promise<RunResult<TData>>;
+  schema<TDocument = unknown>(
+    model: string,
+    options?: SchemaOptions,
+  ): Promise<SchemaResult<TDocument>>;
+  list(options?: ListOptions): ModelList;
 }
 
 /**
@@ -257,24 +271,30 @@ type ModelId = {
  * narrower version of that check on the client would turn a helpful round
  * trip into a local rejection, and would go stale the first time the alphabet
  * widens. What is refused here is only what cannot address the route at all.
+ *
+ * `method` only names the caller in the message. The check itself is the same
+ * for every route addressed by a model ID, which is the point: `run` and
+ * `schema` refuse exactly the same IDs, so an ID that resolves for one cannot
+ * fail locally for the other.
  */
-function parseModelId(model: string): ModelId {
+function parseModelId(model: string, method: "run" | "schema" = "run"): ModelId {
   const shape = 'expected a canonical "{provider}/{model}" model ID';
+  const where = `models.${method}(model)`;
   if (typeof model !== "string") {
-    throw new TypeError(`models.run(model): ${shape}, got ${typeof model}`);
+    throw new TypeError(`${where}: ${shape}, got ${typeof model}`);
   }
   const segments = model.split("/");
   if (segments.length !== 2 || segments.some((segment) => segment === "")) {
     const detail =
       segments.length > 2 ? " (a third, variant segment is not addressable on this route yet)" : "";
-    throw new TypeError(`models.run(model): ${shape}, got ${JSON.stringify(model)}${detail}`);
+    throw new TypeError(`${where}: ${shape}, got ${JSON.stringify(model)}${detail}`);
   }
   // `.`/`..` would resolve away when the URL is parsed and address a
   // different route than the one written, so they are refused rather than
   // encoded. Every other character is left to `encodeURIComponent`.
   if (segments.some((segment) => segment === "." || segment === "..")) {
     throw new TypeError(
-      `models.run(model): ${shape}, got ${JSON.stringify(model)} (a "." or ".." segment cannot name a model)`,
+      `${where}: ${shape}, got ${JSON.stringify(model)} (a "." or ".." segment cannot name a model)`,
     );
   }
   return { provider: segments[0], model: segments[1] };
@@ -396,7 +416,7 @@ function describeValidationFailures(detail: readonly unknown[]): string {
 function errorFromResponse(
   response: Response,
   bodyText: string,
-  idempotencyKey: string,
+  idempotencyKey: string | null,
 ): ComfyError {
   const status = response.status;
   const requestId = response.headers.get(REQUEST_ID_HEADER);
@@ -443,6 +463,27 @@ function errorFromResponse(
 }
 
 /**
+ * The credential in force, or the named refusal.
+ *
+ * Every method on this namespace checks it before doing anything else, so a
+ * process with none fails at the call site rather than on a round trip — and
+ * on the two discovery routes, which answer `401` without a credential, that
+ * is the difference between a message naming the two ways to supply one and a
+ * bare HTTP failure.
+ */
+function requireCredentials(): string {
+  const credentials = resolveCredentials();
+  if (credentials === undefined) {
+    throw new MissingCredentials(
+      'no credentials configured — call comfy.config({ credentials: "comfyui-..." }) ' +
+        "or set COMFY_API_KEY in the environment",
+      { code: "missing_credentials" },
+    );
+  }
+  return credentials;
+}
+
+/**
  * Did `signal` abort because this call's own deadline elapsed, rather than
  * because the caller aborted it?
  *
@@ -463,14 +504,7 @@ async function run<TData = unknown>(
 ): Promise<RunResult<TData>> {
   // Credentials first: the whole point of this gate is that a process with
   // none fails at the call site rather than on a round trip.
-  const credentials = resolveCredentials();
-  if (credentials === undefined) {
-    throw new MissingCredentials(
-      'no credentials configured — call comfy.config({ credentials: "comfyui-..." }) ' +
-        "or set COMFY_API_KEY in the environment",
-      { code: "missing_credentials" },
-    );
-  }
+  const credentials = requireCredentials();
   const id = parseModelId(model);
   if (input === null || typeof input !== "object" || Array.isArray(input)) {
     throw new TypeError(
@@ -649,5 +683,421 @@ function finish<TData>(
   return { data: data as TData, requestId };
 }
 
+// -- discovery: the model catalog, and one model's published schemas ---------
+
+/**
+ * Default deadline for one {@link Models.schema} or {@link Models.list}
+ * request, in milliseconds.
+ *
+ * Seconds rather than the minutes {@link DEFAULT_RUN_TIMEOUT_MS} allows,
+ * because these two are ordinary API calls: nothing is generated behind them,
+ * so a server that has not answered in half a minute is not "still working"
+ * the way a `run` legitimately is. A `list()` walk applies this PER PAGE, not
+ * to the whole walk — each page is its own request, and a shared budget would
+ * make a large catalog fail halfway through for no reason but its size.
+ *
+ * Override it per call with `timeoutMs`, or disable it with `null`.
+ */
+export const DEFAULT_DISCOVERY_TIMEOUT_MS = 30_000;
+
+/**
+ * The Router route {@link Models.schema} reads a model's published OpenAPI
+ * document from, as the OpenAPI path template.
+ *
+ * Pinned as a named constant for the same reason as
+ * {@link RUN_ROUTE_TEMPLATE}: `src/sdk/router-spec-contract.test.ts` compares
+ * it character for character against the path the vendored contract declares
+ * for `operationId: getRouterModelInputSchema`, so a sync that moves the route
+ * reddens CI instead of turning `schema()` into a 404 at runtime.
+ */
+export const SCHEMA_ROUTE_TEMPLATE = "/v2/models/{provider}/{model}/openapi.json";
+
+/**
+ * The Router route {@link Models.list} reads the model catalog from. Pinned
+ * against `operationId: listRouterModels` in the vendored contract exactly as
+ * the two templates above are.
+ */
+export const CATALOG_ROUTE_TEMPLATE = "/v2/models";
+
+/** Response header carrying the entity tag of a served schema document. */
+export const ETAG_HEADER = "ETag";
+
+/** Request header carrying the entity tag a caller already holds. */
+export const IF_NONE_MATCH_HEADER = "If-None-Match";
+
+/** Query parameter naming the page to continue a catalog walk from. */
+const CURSOR_PARAM = "cursor";
+
+/** Query parameter asking for a page size. */
+const LIMIT_PARAM = "limit";
+
+/** What every discovery request takes, on top of what it addresses. */
+export interface DiscoveryOptions {
+  /**
+   * Abort the request. On a {@link Models.list} walk it aborts the page in
+   * flight and ends the iteration, rather than only the one request.
+   */
+  signal?: AbortSignal;
+  /**
+   * Per-request deadline in milliseconds — per PAGE on a `list()` walk. Omit
+   * for {@link DEFAULT_DISCOVERY_TIMEOUT_MS}; pass `null` to disable it and
+   * supply your own `signal`.
+   */
+  timeoutMs?: number | null;
+}
+
+export interface SchemaOptions extends DiscoveryOptions {
+  /**
+   * An `ETag` from an earlier {@link SchemaResult}, sent back as
+   * `If-None-Match`.
+   *
+   * This is the whole reason the route ships `ETag` and `Cache-Control`: a
+   * per-model document changes rarely and a client re-reads it often, so a
+   * caller that stores the tag alongside its copy gets a bodyless `304` back
+   * instead of the document. That `304` is NOT an error and NOT an empty
+   * document — it resolves as {@link SchemaUnchanged}, which is why the result
+   * is a union a caller has to narrow.
+   */
+  etag?: string | null;
+}
+
+export interface ListOptions extends DiscoveryOptions {
+  /**
+   * Continue from a cursor a previous {@link ModelPage} handed back, instead
+   * of starting at the first page. Opaque: round-trip it, never parse it.
+   */
+  cursor?: string | null;
+  /**
+   * Page size to ask the server for. The server CLAMPS a value above its own
+   * maximum rather than refusing it, so the size actually served is on
+   * {@link ModelPage.limit} — read it there rather than assuming this one was
+   * honoured. It changes how many requests a full walk takes and nothing
+   * else; the walk still yields every model either way.
+   */
+  limit?: number;
+}
+
+/**
+ * One entry in the Router model catalog.
+ *
+ * Only the identity is typed, which is deliberately the whole of what the
+ * contract calls the minimum needed to invoke a model: `id` is the canonical
+ * `{provider}/{model}` string {@link Models.run} and {@link Models.schema}
+ * take, and the two segments are carried separately so a caller never has to
+ * split it. Everything else an entry carries reaches the caller through the
+ * index signature rather than being restated here — per the same rule that
+ * keeps the schema documents out of this package, the catalog's fields are the
+ * server's to publish and a hand-copied mirror of them is a thing that goes
+ * stale silently.
+ */
+export interface CatalogModel {
+  /** Canonical model ID: `provider` and `model` joined by `/`. */
+  id: string;
+  /** The partner the model belongs to — the first path segment. */
+  provider: string;
+  /** The model within that provider — the second path segment. */
+  model: string;
+  [field: string]: unknown;
+}
+
+/**
+ * One page of the catalog, as {@link ModelList.page} returns it.
+ *
+ * This is the single-page form, for a caller driving its own pagination — a
+ * "load more" button, say. Anything walking the whole catalog should iterate
+ * {@link ModelList} instead, which is what makes the first-page-only bug
+ * impossible rather than merely documented.
+ */
+export interface ModelPage {
+  /** The models on this page. */
+  data: CatalogModel[];
+  /**
+   * Whether another page exists. The end of the catalog is THIS being false —
+   * never a short or empty `data`, which a page legitimately carries mid-walk.
+   */
+  hasMore: boolean;
+  /** Cursor for the next page; `null` when the server named none. */
+  nextCursor: string | null;
+  /**
+   * The page size the server actually served, which can be smaller than the
+   * `limit` asked for — values above the maximum are clamped down rather than
+   * refused. `null` if the response named none.
+   */
+  limit: number | null;
+  /** The `X-Comfy-Request-Id` for the request that fetched this page. */
+  requestId: string | null;
+}
+
+/**
+ * A lazy handle on the catalog: iterate it for every model, or take one page.
+ *
+ * `list()` itself sends nothing — the first request goes out when the
+ * iteration starts or {@link ModelPage} is awaited. Each iteration is a fresh
+ * walk from the configured cursor, so the handle can be iterated more than
+ * once.
+ */
+export interface ModelList extends AsyncIterable<CatalogModel> {
+  /**
+   * Fetch exactly ONE page, without walking. `overrides` are merged over the
+   * options `list()` was given, which is how a caller pages by hand:
+   * `list().page()`, then `list({ cursor: page.nextCursor }).page()`.
+   */
+  page(overrides?: ListOptions): Promise<ModelPage>;
+}
+
+/**
+ * A model's published OpenAPI document, plus the `ETag` to revalidate it with.
+ *
+ * @typeParam TDocument - the document's shape, defaulting to `unknown` for the
+ * same reason {@link RunResult}'s payload does: the schemas are the server's
+ * to publish, per model, and this package carries no copy of them to type
+ * against. Supply your own type — `schema<OpenAPIV3.Document>(...)` — and
+ * `document` is that type.
+ *
+ * It is handed back as DATA and is not validated here, and no validator is a
+ * dependency of this package. That is not only a scope call: these are OpenAPI
+ * 3.0.2 documents, so they are JSON Schema draft-04 plus `nullable`, and stock
+ * Ajv does not cover that combination — a caller validating against one wants
+ * `ajv-draft-04` and its own decisions about it. Making that choice here would
+ * impose a validator (and its bundle weight) on every caller, including the
+ * browser ones.
+ */
+export interface SchemaDocument<TDocument = unknown> {
+  /** `false` — this result carries a document. Narrow on it. */
+  unchanged: false;
+  /** The document, exactly as the server published it. */
+  document: TDocument;
+  /** The document's current `ETag`; pass it back as `options.etag` next time. */
+  etag: string | null;
+  /** The `X-Comfy-Request-Id` for this call. */
+  requestId: string | null;
+}
+
+/**
+ * The answer to a {@link SchemaOptions.etag} that still matches: the caller's
+ * copy is current, and the server sent no body.
+ *
+ * `document` is `undefined` rather than absent so that narrowing on
+ * `unchanged` is the only thing a caller has to do — and so that reading
+ * `.document` on an unnarrowed result is a compile error rather than a silent
+ * `undefined` treated as an empty schema.
+ */
+export interface SchemaUnchanged {
+  /** `true` — the caller's own copy is still current. */
+  unchanged: true;
+  /** Always `undefined`: a `304` carries no body. */
+  document: undefined;
+  /** The `ETag` that still matches — the one sent, echoed by the server. */
+  etag: string | null;
+  /** The `X-Comfy-Request-Id` for this call. */
+  requestId: string | null;
+}
+
+/**
+ * What {@link Models.schema} resolves to: the document, or "unchanged".
+ *
+ * ```ts
+ * const result = await comfy.models.schema("bfl/flux-2-pro", { etag: cached?.etag });
+ * if (!result.unchanged) cached = { document: result.document, etag: result.etag };
+ * ```
+ */
+export type SchemaResult<TDocument = unknown> = SchemaDocument<TDocument> | SchemaUnchanged;
+
+/** The headers every discovery request sends. */
+function discoveryHeaders(credentials: string): Record<string, string> {
+  return {
+    Authorization: `Bearer ${credentials}`,
+    Accept: "application/json",
+    "User-Agent": buildUserAgent(),
+  };
+}
+
+/**
+ * Send one discovery GET and read its body, under this request's deadline.
+ *
+ * Neither discovery method retries. A `run` retries because the connection is
+ * held for a whole generation and losing it can cost a paid result; a catalog
+ * page or a schema document costs nothing to ask for again, carries no
+ * idempotency key, and a caller who wants a policy already has one. What IS
+ * shared with `run` is everything the ticket for these methods is about: the
+ * base URL, the credential, the `X-Comfy-Request-Id` capture and the
+ * `X-Comfy-Error-Type` mapping.
+ */
+async function discoveryFetch(
+  label: string,
+  url: string,
+  headers: Record<string, string>,
+  options: DiscoveryOptions,
+): Promise<{ response: Response; text: string }> {
+  const timeoutMs =
+    options.timeoutMs === undefined ? DEFAULT_DISCOVERY_TIMEOUT_MS : options.timeoutMs;
+  const signal = composeSignal(options.signal, timeoutMs);
+  try {
+    const response = await fetch(
+      url,
+      withInactivityLimits({ method: "GET", headers, signal }, timeoutMs),
+    );
+    // Inside the same `try` as the fetch, for the same reason as in `run`:
+    // the deadline covers reading the body too, and translating the abort in
+    // only one of the two places would leak a bare DOMException out of the
+    // other. A `304` has no body and `.text()` answers "" for it.
+    const text = await response.text();
+    return { response, text };
+  } catch (exc) {
+    if (isTimeout(exc, options.signal)) {
+      throw new ComfyError(
+        `${label} exceeded its ${String(timeoutMs)}ms deadline; raise it with timeoutMs, ` +
+          "or pass timeoutMs: null and your own signal",
+        { code: "request_timeout", cause: exc },
+      );
+    }
+    throw exc;
+  }
+}
+
+/** Parse a discovery response body, or say which call returned what instead. */
+function parseDiscoveryJson(label: string, response: Response, text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch (exc) {
+    throw new ComfyError(`${label} returned a ${String(response.status)} whose body is not JSON`, {
+      code: "unexpected_response",
+      httpStatus: response.status,
+      requestId: response.headers.get(REQUEST_ID_HEADER),
+      cause: exc,
+    });
+  }
+}
+
+async function schema<TDocument = unknown>(
+  model: string,
+  options: SchemaOptions = {},
+): Promise<SchemaResult<TDocument>> {
+  const credentials = requireCredentials();
+  const id = parseModelId(model, "schema");
+  const label = `models.schema("${model}")`;
+  const url = `${resolveBaseUrl()}${fillRoute(SCHEMA_ROUTE_TEMPLATE, id)}`;
+  const headers = discoveryHeaders(credentials);
+  // An empty tag is not a tag: sending `If-None-Match: ` would ask the server
+  // to compare against nothing, and the honest reading of "I hold no copy" is
+  // to send no header at all.
+  if (typeof options.etag === "string" && options.etag !== "") {
+    headers[IF_NONE_MATCH_HEADER] = options.etag;
+  }
+
+  const { response, text } = await discoveryFetch(label, url, headers, options);
+  const requestId = response.headers.get(REQUEST_ID_HEADER);
+  const etag = response.headers.get(ETAG_HEADER);
+
+  // Before the `ok` check, which a 304 fails: it is a successful
+  // revalidation, not a failure, and raising it would defeat the only reason
+  // the caller sent the tag.
+  if (response.status === 304) {
+    return { unchanged: true, document: undefined, etag: etag ?? options.etag ?? null, requestId };
+  }
+  // The same mapping `run` uses, so a `404` here is the `model_not_found`
+  // bucket and the same exception class an unknown ID raises there. No
+  // idempotency key: these are GETs and carry none.
+  if (!response.ok) throw errorFromResponse(response, text, null);
+
+  const document = parseDiscoveryJson(label, response, text);
+  return { unchanged: false, document: document as TDocument, etag, requestId };
+}
+
+/** One page of the catalog, off the wire. */
+async function fetchModelPage(options: ListOptions): Promise<ModelPage> {
+  const credentials = requireCredentials();
+  const label = "models.list()";
+  const url = new URL(`${resolveBaseUrl()}${CATALOG_ROUTE_TEMPLATE}`);
+  if (typeof options.cursor === "string" && options.cursor !== "") {
+    url.searchParams.set(CURSOR_PARAM, options.cursor);
+  }
+  if (options.limit !== undefined) url.searchParams.set(LIMIT_PARAM, String(options.limit));
+
+  const { response, text } = await discoveryFetch(
+    label,
+    url.toString(),
+    discoveryHeaders(credentials),
+    options,
+  );
+  const requestId = response.headers.get(REQUEST_ID_HEADER);
+  if (!response.ok) throw errorFromResponse(response, text, null);
+
+  const body = parseDiscoveryJson(label, response, text) as {
+    data?: unknown;
+    has_more?: unknown;
+    next_cursor?: unknown;
+    limit?: unknown;
+  } | null;
+  const data = Array.isArray(body?.data) ? (body.data as CatalogModel[]) : null;
+  // `has_more` is required by the contract and is the ONLY thing that says
+  // the walk is over, so a response without it is refused rather than read as
+  // a last page. Guessing `false` there is precisely the "first 20 models and
+  // no error" failure these two methods exist to make impossible.
+  const hasMore = typeof body?.has_more === "boolean" ? body.has_more : null;
+  if (data === null || hasMore === null) {
+    throw new ComfyError(
+      `${label} received a catalog page without a \`data\` array and a boolean \`has_more\`, ` +
+        "so there is no way to tell a last page from a truncated walk",
+      { code: "unexpected_response", httpStatus: response.status, requestId },
+    );
+  }
+  return {
+    data,
+    hasMore,
+    nextCursor:
+      typeof body?.next_cursor === "string" && body.next_cursor !== "" ? body.next_cursor : null,
+    limit: typeof body?.limit === "number" ? body.limit : null,
+    requestId,
+  };
+}
+
+/**
+ * Walk the catalog, yielding models rather than pages.
+ *
+ * The page size is a server default (20 at the time of writing) and the
+ * catalog is longer than that, so a method that handed back one page would
+ * make "the first 20 models, with no error to say so" the default outcome for
+ * anyone who did not read the response shape carefully. Iterating models is
+ * what makes the common case correct.
+ */
+async function* walkCatalog(options: ListOptions): AsyncGenerator<CatalogModel> {
+  let cursor = typeof options.cursor === "string" && options.cursor !== "" ? options.cursor : null;
+  // Every cursor this walk has already asked with. A server that answers
+  // `has_more: true` with a cursor it already served would otherwise loop
+  // forever, and an SDK that hangs is worse than one that raises.
+  const asked = new Set<string>();
+  if (cursor !== null) asked.add(cursor);
+  for (;;) {
+    const page = await fetchModelPage({ ...options, cursor });
+    for (const entry of page.data) yield entry;
+    if (!page.hasMore) return;
+    const next = page.nextCursor;
+    if (next === null) {
+      throw new ComfyError(
+        "models.list() reached a page reporting `has_more: true` with no `next_cursor`, " +
+          "so the rest of the catalog is unreachable",
+        { code: "unexpected_response", requestId: page.requestId },
+      );
+    }
+    if (asked.has(next)) {
+      throw new ComfyError(
+        "models.list() was handed a `next_cursor` it had already followed, which would " +
+          "walk the same pages forever",
+        { code: "unexpected_response", requestId: page.requestId },
+      );
+    }
+    asked.add(next);
+    cursor = next;
+  }
+}
+
+function list(options: ListOptions = {}): ModelList {
+  return {
+    page: (overrides: ListOptions = {}) => fetchModelPage({ ...options, ...overrides }),
+    [Symbol.asyncIterator]: () => walkCatalog(options),
+  };
+}
+
 /** The `comfy.models` namespace. Frozen — it is shared process-wide. */
-export const models: Models = Object.freeze({ run });
+export const models: Models = Object.freeze({ run, schema, list });

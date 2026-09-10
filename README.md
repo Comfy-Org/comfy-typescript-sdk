@@ -317,9 +317,83 @@ const { data } = await comfy.models.run("bfl/flux-2-pro", {
 });
 ```
 
-Which form a model takes is in its input schema —
-`GET /v2/models/{provider}/{model}/openapi.json`, or the model's page in the
-[Router model catalog](https://docs.comfy.org/development/comfy-router/models).
+Which form a model takes is in its input schema, which
+`comfy.models.schema(model)` fetches for you (below), or the model's page in
+the [Router model catalog](https://docs.comfy.org/development/comfy-router/models).
+
+### Discovering models — `comfy.models.list()` and `comfy.models.schema()`
+
+You do not have to know a model ID (or its arguments) up front. `list()` walks
+the catalog `run()` accepts IDs from, and `schema()` returns the OpenAPI
+document Router publishes for one model — so listing the catalog, reading one
+model's schema and running it are three calls on the same namespace, with the
+same credential, base URL, error mapping and `requestId` capture:
+
+```ts
+import { comfy } from "@comfyorg/sdk";
+
+comfy.config({ credentials: "comfyui-..." });
+
+// Every model, across every page — `list()` follows the cursor for you.
+for await (const model of comfy.models.list()) {
+  console.log(model.id, model.provider, model.model);
+}
+
+// One model's published input AND output schemas, as an OpenAPI document.
+const result = await comfy.models.schema("bfl/flux-2-pro");
+if (!result.unchanged) {
+  console.log(Object.keys(result.document as Record<string, unknown>));
+}
+
+const { data } = await comfy.models.run("bfl/flux-2-pro", { prompt: "a cat" });
+```
+
+**`list()` iterates models, not pages.** The catalog is cursor-paginated with
+a server-chosen page size (20 at the time of writing), so a method that handed
+back one page would make "the first twenty models, with no error to say so"
+the default outcome. Nothing is sent until the iteration starts, and each
+iteration is a fresh walk.
+
+If you are driving your own pagination — a "load more" button, say — take one
+page instead. Paginate by what came back, never by the `limit` you asked for:
+a value above the server's maximum is clamped rather than refused.
+
+```ts
+const page = await comfy.models.list({ limit: 50 }).page();
+page.data; // CatalogModel[]
+page.hasMore; // the ONLY thing that says the walk is over
+page.nextCursor; // opaque — round-trip it, never parse it
+page.limit; // the size actually served, which may be smaller than 50
+
+const next = await comfy.models.list({ cursor: page.nextCursor }).page();
+```
+
+**`schema()` revalidates with `ETag`.** The route ships `ETag` and
+`Cache-Control` precisely so a client can cache a document and re-check it
+cheaply, and a per-model schema changes rarely. Store the tag next to your
+copy and pass it back; a `304` resolves as an explicit `unchanged: true`
+rather than throwing or handing you an empty document:
+
+```ts
+let cached: { document: unknown; etag: string | null } | undefined;
+
+const fresh = await comfy.models.schema("bfl/flux-2-pro", { etag: cached?.etag });
+if (!fresh.unchanged) cached = { document: fresh.document, etag: fresh.etag };
+// else: `cached` is still current, and no document crossed the wire.
+```
+
+The document is returned as **data** and is not validated here — no validator
+is a dependency of this package. That is deliberate: these are OpenAPI 3.0.2
+documents, so JSON Schema draft-04 plus `nullable`, which stock Ajv does not
+cover; a consumer that validates against one wants `ajv-draft-04` and its own
+decisions about it. Type the document yourself if you have a type for it —
+`schema<OpenAPIV3.Document>(...)` — exactly as `run<TData>` takes one.
+
+Both routes are pinned to the vendored contract the same way `run`'s is: the
+route-coverage check in `src/sdk/router-spec-contract.test.ts` maps every
+operation `spec/router-openapi.yaml` declares to the `comfy.models` method
+that calls it, so the next route a sync adds fails CI rather than sitting
+unreachable.
 
 ### Pointing `comfy.models` somewhere else
 

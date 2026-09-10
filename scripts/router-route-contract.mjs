@@ -39,12 +39,17 @@ export const MODELS_SOURCE_PATH = fileURLToPath(new URL("src/sdk/models.ts", ROO
 /** Source of `COMFY_ROUTER_BASE_URL`. */
 export const CREDENTIALS_SOURCE_PATH = fileURLToPath(new URL("src/sdk/credentials.ts", ROOT));
 
-/**
- * The operation whose path this SDK hard-codes. `comfy.models.run` posts to
- * exactly this one; the catalog and per-model-schema routes beside it in the
- * contract are not called from here and are not pinned.
- */
+/** The operation `comfy.models.run` posts to. */
 export const RUN_OPERATION_ID = "runRouterModel";
+
+/** The operation `comfy.models.list` reads the model catalog from. */
+export const CATALOG_OPERATION_ID = "listRouterModels";
+
+/** The operation `comfy.models.schema` reads a model's OpenAPI document from. */
+export const SCHEMA_OPERATION_ID = "getRouterModelInputSchema";
+
+/** The HTTP methods an OpenAPI path item can carry an operation under. */
+const HTTP_METHODS = ["get", "put", "post", "delete", "options", "head", "patch", "trace"];
 
 function fail(message) {
   throw new Error(
@@ -231,4 +236,61 @@ export async function readRouterBaseUrl(sourcePath = CREDENTIALS_SOURCE_PATH) {
  */
 export function templatePlaceholders(template) {
   return [...template.matchAll(/\{(\w+)\}/g)].map((match) => match[1]);
+}
+
+/**
+ * Every operation the vendored contract declares, as
+ * `{ operationId, method, path }`, sorted by path then method.
+ *
+ * This is the acquisition half of the ROUTE-COVERAGE check in
+ * `src/sdk/router-spec-contract.test.ts`: that test maps each declared
+ * operation to the `comfy.models` method that calls it, so the next route a
+ * Router sync adds fails CI instead of sitting unreachable from the SDK — the
+ * way `listRouterModels` and `getRouterModelInputSchema` both did from the day
+ * the contract was first vendored here.
+ *
+ * An operation with no `operationId` is refused rather than skipped: the
+ * coverage map is keyed by that id, and a silently dropped operation is
+ * exactly the un-noticed route this exists to catch.
+ */
+export function routerOperations(doc) {
+  const paths = doc?.paths;
+  if (paths === null || typeof paths !== "object") {
+    fail("spec/router-openapi.yaml declares no `paths`");
+  }
+  const operations = [];
+  for (const [path, item] of Object.entries(paths)) {
+    if (item === null || typeof item !== "object") continue;
+    for (const method of HTTP_METHODS) {
+      const operation = item[method];
+      if (operation === undefined) continue;
+      if (operation === null || typeof operation !== "object") {
+        fail(`spec/router-openapi.yaml: malformed \`${method}\` operation on ${path}`);
+      }
+      if (typeof operation.operationId !== "string" || operation.operationId === "") {
+        fail(`spec/router-openapi.yaml: \`${method} ${path}\` declares no operationId`);
+      }
+      operations.push({ operationId: operation.operationId, method, path });
+    }
+  }
+  if (operations.length === 0) {
+    fail("spec/router-openapi.yaml declares no operations — an empty set reads as agreement");
+  }
+  return operations.sort(
+    (a, b) => a.path.localeCompare(b.path) || a.method.localeCompare(b.method),
+  );
+}
+
+/** {@link routerOperations} for the vendored contract on disk. */
+export async function readRouterOperations(specPath = ROUTER_SPEC_PATH) {
+  return routerOperations(parse(await readFile(specPath, "utf-8")));
+}
+
+/**
+ * Read one `export const <NAME> = "<path template>";` out of
+ * `src/sdk/models.ts` — the same acquisition `readRunRouteTemplate` does, for
+ * the two discovery routes that now have constants of their own.
+ */
+export async function readRouteTemplate(name, sourcePath = MODELS_SOURCE_PATH) {
+  return readStringConstant(await readFile(sourcePath, "utf-8"), name, "src/sdk/models.ts");
 }

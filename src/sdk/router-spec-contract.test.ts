@@ -1,6 +1,15 @@
 /**
- * Drift check for the Router route `comfy.models.run` posts to, against the
- * vendored Router contract.
+ * Drift check for the Router routes this SDK calls, against the vendored
+ * Router contract — and, since the discovery methods landed, for the ones it
+ * does NOT call.
+ *
+ * Two halves. The first pins each route's path template. The second, at the
+ * bottom of the file, is ROUTE COVERAGE: every operation the contract declares
+ * maps to a `comfy.models` method or to a written-down reason there is none,
+ * so the next route a sync adds fails CI rather than sitting unreachable. That
+ * second half exists because its failure mode already happened — the catalog
+ * and per-model-schema routes were in this contract from the day it was
+ * vendored, with no SDK method for either and no check that could see it.
  *
  * `src/sdk/router-spec-coverage.test.ts` beside this one pins the `error_type`
  * table to the same file. This pins the other hand-written thing coupled to
@@ -28,13 +37,19 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  readRouterOperations,
   readRouterRouteContract,
   templatePlaceholders,
 } from "../../scripts/router-route-contract.mjs";
 import { withRouterStub } from "../../test/support/router-stub-server.js";
 import { comfy } from "./comfy.js";
 import { COMFY_ROUTER_BASE_URL, config } from "./credentials.js";
-import { RUN_ROUTE_TEMPLATE } from "./models.js";
+import {
+  CATALOG_ROUTE_TEMPLATE,
+  models,
+  RUN_ROUTE_TEMPLATE,
+  SCHEMA_ROUTE_TEMPLATE,
+} from "./models.js";
 import { isCollectable } from "./retry.js";
 
 describe("router route contract (spec/router-openapi.yaml)", () => {
@@ -127,5 +142,104 @@ describe("router route contract (spec/router-openapi.yaml)", () => {
       }
       expect(server.state.lastPath).toBe("/v2/models/fal%20ai/flux%23pro");
     });
+  });
+});
+
+/**
+ * Every operation the vendored contract declares, mapped to the
+ * `comfy.models` method that calls it — or to `null` with the reason it is
+ * deliberately not exposed.
+ *
+ * This is the ROUTE-COVERAGE half of the drift gate, and it exists because
+ * the omission it catches already happened once: `spec/router-openapi.yaml`
+ * has declared the catalog and per-model-schema routes since the day it was
+ * vendored, and nothing in this repo called either of them or noticed. The
+ * error-bucket check beside this one covers `x-comfy-error-types` and says so
+ * in its own header; no check looked at `paths` at all.
+ *
+ * Every entry is a decision, so a `null` is as deliberate as a method name:
+ * adding a route to the contract fails this test until somebody either writes
+ * the method or writes down why there is none.
+ */
+const ROUTE_COVERAGE: Record<string, { method: keyof typeof models | null; why: string }> = {
+  runRouterModel: { method: "run", why: "the synchronous invocation route." },
+  listRouterModels: {
+    method: "list",
+    why: "the model catalog, walked page by page by `comfy.models.list`.",
+  },
+  getRouterModelInputSchema: {
+    method: "schema",
+    why: "the per-model OpenAPI document `comfy.models.schema` returns.",
+  },
+  getRouterModel: {
+    method: null,
+    why:
+      "per-model catalog DETAIL (`RouterModelDetail`), which no `comfy.models` method reaches " +
+      "today. It is not the schema document — that is `getRouterModelInputSchema` above — and " +
+      "it is not needed to invoke a model, since `list()` already yields the identity fields " +
+      "`run()` and `schema()` take. Exposing it is additive and unblocked; it is left out here " +
+      "only because nothing has asked for it yet.",
+  },
+};
+
+describe("router route coverage (spec/router-openapi.yaml)", () => {
+  it("accounts for every operation the contract declares", async () => {
+    const declared = await readRouterOperations();
+    const unaccounted = declared
+      .map((operation) => operation.operationId)
+      .filter((operationId) => !Object.hasOwn(ROUTE_COVERAGE, operationId));
+    expect(
+      unaccounted,
+      "the vendored Router contract declares operations this SDK neither calls nor has " +
+        "declared a reason for — add each to ROUTE_COVERAGE in this file, with the " +
+        "`comfy.models` method that calls it or the reason there is none",
+    ).toEqual([]);
+  });
+
+  it("declares no operation the contract does not", async () => {
+    // The other direction: an entry left behind by a sync that REMOVED a route
+    // would otherwise go on excusing coverage of something nobody serves.
+    const declared = new Set((await readRouterOperations()).map((o) => o.operationId));
+    const stale = Object.keys(ROUTE_COVERAGE).filter((operationId) => !declared.has(operationId));
+    expect(
+      stale,
+      "ROUTE_COVERAGE names operations the vendored contract no longer declares",
+    ).toEqual([]);
+  });
+
+  it("resolves every mapped operation to a real method on comfy.models", () => {
+    for (const [operationId, { method }] of Object.entries(ROUTE_COVERAGE)) {
+      if (method === null) continue;
+      expect(models[method], `${operationId} maps to comfy.models.${method}`).toBeTypeOf(
+        "function",
+      );
+    }
+  });
+
+  it("gives every unexposed operation a stated reason", () => {
+    for (const [operationId, { method, why }] of Object.entries(ROUTE_COVERAGE)) {
+      if (method !== null) continue;
+      expect(why.length, `${operationId} is unexposed with no reason stated`).toBeGreaterThan(80);
+    }
+  });
+
+  it("spells each discovery route the path the contract declares for it", async () => {
+    // The same pinning `RUN_ROUTE_TEMPLATE` gets above, for the two routes
+    // this SDK newly calls: a sync that moves either one reddens here rather
+    // than turning the method into a 404 at runtime.
+    const byId = new Map((await readRouterOperations()).map((o) => [o.operationId, o]));
+    expect(byId.get("listRouterModels")?.path).toBe(CATALOG_ROUTE_TEMPLATE);
+    expect(byId.get("listRouterModels")?.method).toBe("get");
+    expect(byId.get("getRouterModelInputSchema")?.path).toBe(SCHEMA_ROUTE_TEMPLATE);
+    expect(byId.get("getRouterModelInputSchema")?.method).toBe("get");
+  });
+
+  it("addresses the schema route with the same two segments the run route takes", async () => {
+    // `parseModelId` is shared, so the two templates must fill the same
+    // placeholders in the same order or one of the two callers is wrong.
+    expect(templatePlaceholders(SCHEMA_ROUTE_TEMPLATE)).toEqual(
+      templatePlaceholders(RUN_ROUTE_TEMPLATE),
+    );
+    expect(templatePlaceholders(CATALOG_ROUTE_TEMPLATE)).toEqual([]);
   });
 });

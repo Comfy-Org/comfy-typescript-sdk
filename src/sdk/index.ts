@@ -17,13 +17,25 @@ export {
   type ComfyConfig,
 } from "./credentials.js";
 export {
+  DEFAULT_DISCOVERY_TIMEOUT_MS,
   DEFAULT_RUN_TIMEOUT_MS,
   ERROR_TYPE_HEADER,
+  ETAG_HEADER,
+  IF_NONE_MATCH_HEADER,
   models,
   REQUEST_ID_HEADER,
+  type CatalogModel,
+  type DiscoveryOptions,
+  type ListOptions,
+  type ModelList,
+  type ModelPage,
   type Models,
   type RunOptions,
   type RunResult,
+  type SchemaDocument,
+  type SchemaOptions,
+  type SchemaResult,
+  type SchemaUnchanged,
 } from "./models.js";
 export {
   DEFAULT_COLLECT_BUDGET_MS,

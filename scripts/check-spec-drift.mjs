@@ -11,11 +11,12 @@
  *    the result against what's committed, so a spec edit without a regen (or a
  *    hand-edit of a generated file) is caught. Mirrors
  *    `scripts/check_drift.py` in the Python SDK.
- * 2. The Router route `comfy.models.run` posts to, against
+ * 2. The Router routes `comfy.models` calls, against
  *    `spec/router-openapi.yaml`. Nothing is generated from that contract, so
  *    there is nothing to regenerate and diff — the check is a comparison of
- *    two constants (`RUN_ROUTE_TEMPLATE`, `COMFY_ROUTER_BASE_URL`) against the
- *    path and host the contract declares. `src/sdk/router-spec-contract.test.ts`
+ *    the route constants (`RUN_ROUTE_TEMPLATE`, `CATALOG_ROUTE_TEMPLATE`,
+ *    `SCHEMA_ROUTE_TEMPLATE`, `COMFY_ROUTER_BASE_URL`) against the paths and
+ *    host the contract declares. `src/sdk/router-spec-contract.test.ts`
  *    asserts the same agreement in the unit suite; this runs it in the drift
  *    job too, so a Router sync that moves the route reddens the job whose name
  *    says why rather than only `pnpm test`.
@@ -28,10 +29,14 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  CATALOG_OPERATION_ID,
   readRouterBaseUrl,
+  readRouterOperations,
   readRouterRouteContract,
+  readRouteTemplate,
   readRunRouteTemplate,
   RUN_OPERATION_ID,
+  SCHEMA_OPERATION_ID,
   templatePlaceholders,
 } from "./router-route-contract.mjs";
 
@@ -95,11 +100,17 @@ async function checkRouterRoute() {
   let contract;
   let template;
   let baseUrl;
+  let operations;
+  let catalogTemplate;
+  let schemaTemplate;
   try {
-    [contract, template, baseUrl] = await Promise.all([
+    [contract, template, baseUrl, operations, catalogTemplate, schemaTemplate] = await Promise.all([
       readRouterRouteContract(),
       readRunRouteTemplate(),
       readRouterBaseUrl(),
+      readRouterOperations(),
+      readRouteTemplate("CATALOG_ROUTE_TEMPLATE"),
+      readRouteTemplate("SCHEMA_ROUTE_TEMPLATE"),
     ]);
   } catch (error) {
     console.error(`ERROR: could not compare the Router route against spec/router-openapi.yaml.\n`);
@@ -122,6 +133,27 @@ async function checkRouterRoute() {
         `spec/router-openapi.yaml declares "${contract.serverUrl}" as \`servers[0].url\`.`,
     );
   }
+  // The two discovery routes, pinned the same way. `comfy.models.list` and
+  // `comfy.models.schema` build their URLs from these constants, so a sync
+  // that moves either path turns the method into a 404 until it follows.
+  for (const [operationId, constant, value] of [
+    [CATALOG_OPERATION_ID, "CATALOG_ROUTE_TEMPLATE", catalogTemplate],
+    [SCHEMA_OPERATION_ID, "SCHEMA_ROUTE_TEMPLATE", schemaTemplate],
+  ]) {
+    const declared = operations.find((operation) => operation.operationId === operationId);
+    if (declared === undefined) {
+      problems.push(
+        `spec/router-openapi.yaml no longer declares \`${operationId}\`, which ` +
+          `${constant} (src/sdk/models.ts) still spells as "${value}".`,
+      );
+    } else if (declared.path !== value) {
+      problems.push(
+        `${constant} (src/sdk/models.ts) is "${value}", but spec/router-openapi.yaml ` +
+          `declares "${declared.path}" for \`${declared.method}.operationId: ${operationId}\`.`,
+      );
+    }
+  }
+
   const placeholders = templatePlaceholders(template);
   if (placeholders.join(",") !== contract.parameterNames.join(",")) {
     problems.push(
