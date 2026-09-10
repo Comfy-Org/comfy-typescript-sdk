@@ -95,6 +95,31 @@ describe("AssetFactory / Asset", () => {
     expect(ref.info.id).toBe(asset.id);
   });
 
+  it("getDownloadUrl() commits first, then resolves the signed URL on a redirecting (Cloud) backend", async () => {
+    // The flow that feeds an uploaded image to a URL-taking model: upload
+    // must happen as a side effect, then the content URL is resolved.
+    const signedUrl =
+      "https://storage.googleapis.com/bucket/object?X-Goog-Date=20260722T120000Z&X-Goog-Expires=3600&X-Goog-Signature=deadbeef";
+    server.state.contentRedirectLocation = signedUrl;
+    const asset = assets.fromBytes(new Uint8Array([7, 7, 7]), { filename: "photo.png" });
+
+    const download = await asset.getDownloadUrl();
+
+    expect(asset.id).toBe("asset_uploaded_01"); // committed as a side effect
+    expect(server.state.uploadCount).toBe(1);
+    expect(download.url).toBe(signedUrl);
+    expect(download.expiresAt).toEqual(new Date("2026-07-22T13:00:00.000Z"));
+  });
+
+  it("getDownloadUrl() returns the content endpoint with null expiresAt on an inline-serving (self-hosted) backend", async () => {
+    const asset = assets.fromBytes(new Uint8Array([7, 7, 7]), { filename: "photo.png" });
+
+    const download = await asset.getDownloadUrl();
+
+    expect(download.url).toBe(`${server.baseUrl}/api/v2/assets/${asset.id}/content`);
+    expect(download.expiresAt).toBeNull();
+  });
+
   it("get() rehydrates an already-committed asset without an opener", async () => {
     const asset = await assets.get("asset_existing");
     expect(asset.id).toBe("asset_existing");

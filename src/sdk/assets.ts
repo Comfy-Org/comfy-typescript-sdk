@@ -86,8 +86,21 @@ function bytesSource(data: Uint8Array, filename?: string, contentType?: string):
     contentType: contentType ?? guessContentType(filename),
     filePath: name,
     hasher: () => hashBytes(data),
-    opener: async () => new Blob([data]),
+    opener: async () => new Blob([blobPart(data)]),
   };
+}
+
+/**
+ * A `Uint8Array` as a `BlobPart`. `Uint8Array` is typed over `ArrayBufferLike`
+ * while `BlobPart` wants a view over a plain `ArrayBuffer`, so narrow rather
+ * than cast: the common case (a `Buffer`, a fresh array) already is one and
+ * passes through untouched; a view over a `SharedArrayBuffer` is copied, which
+ * `Blob` would have to do anyway.
+ */
+function blobPart(data: Uint8Array): Uint8Array<ArrayBuffer> {
+  return data.buffer instanceof ArrayBuffer
+    ? (data as Uint8Array<ArrayBuffer>)
+    : new Uint8Array(data);
 }
 
 /**
@@ -183,6 +196,32 @@ export class Asset {
   async asReference(signal?: AbortSignal) {
     await this.commit(signal);
     return assetReference(this.idValue!, { hash: this.hashValue, filePath: this.source.filePath });
+  }
+
+  /**
+   * A directly-fetchable URL for this asset's bytes (commits first if
+   * needed).
+   *
+   * The counterpart of {@link Output.getDownloadUrl} for an *uploaded*
+   * asset: hand the URL to anything that fetches by URL instead of
+   * streaming the bytes through your process — e.g. a Comfy Router model
+   * whose input takes an image URL. On a Cloud/serverless backend it is a
+   * short-lived, self-authorizing signed URL readable with no further auth;
+   * on a self-hosted backend it is the content endpoint itself, where normal
+   * auth still applies, so an external service cannot fetch it.
+   *
+   * The returned `expiresAt` is the signed URL's own expiry, read from the
+   * URL when the SDK recognizes the signature format (today: GCS-style
+   * `X-Goog-Date`/`X-Goog-Expires` query parameters). It is `null` whenever
+   * there is no expiry to read — always on a self-hosted backend, and also
+   * for a signed URL in a format this SDK does not parse — so treat `null`
+   * as "unknown", not "never expires". It is unrelated to this handle's
+   * {@link Asset.expiresAt} getter, which is the asset's *retention*
+   * deadline as an ISO string.
+   */
+  async getDownloadUrl(signal?: AbortSignal): Promise<{ url: string; expiresAt: Date | null }> {
+    const assetId = await this.commit(signal);
+    return translate(() => this.low.getAssetContentUrl(assetId, { signal }));
   }
 
   /**
