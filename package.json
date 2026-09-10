@@ -57,7 +57,7 @@
     "sync:python-surface": "node scripts/sync-python-surface.mjs --write"
   },
   "dependencies": {
-    "eventsource-parser": "^3.0.0",
+    "eventsource-parser": "^4.1.0",
     "hash-wasm": "^4.11.0",
     "zod": "^4.4.3"
   },
