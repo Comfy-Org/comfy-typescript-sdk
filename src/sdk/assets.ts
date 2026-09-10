@@ -186,6 +186,24 @@ export class Asset {
   }
 
   /**
+   * A directly-fetchable URL for this asset's bytes (commits first if
+   * needed).
+   *
+   * The counterpart of {@link Output.getDownloadUrl} for an *uploaded*
+   * asset: hand the URL to anything that fetches by URL instead of
+   * streaming the bytes through your process — e.g. a Comfy Router model
+   * whose input takes an image URL. On a Cloud/serverless backend it is a
+   * short-lived, self-authorizing signed URL readable until `expiresAt`
+   * with no further auth; on a self-hosted backend it is the content
+   * endpoint itself (normal auth still applies, so an external service
+   * cannot fetch it) and `expiresAt` is `null`.
+   */
+  async getDownloadUrl(signal?: AbortSignal): Promise<{ url: string; expiresAt: Date | null }> {
+    await this.commit(signal);
+    return translate(() => this.low.getAssetContentUrl(this.idValue!, { signal }));
+  }
+
+  /**
    * Delete this asset from storage. The handle has no id afterward, so a
    * further `commit()` would re-hash/re-upload as if this were a fresh
    * handle rather than raise. Throws if this handle was never committed —

@@ -211,6 +211,60 @@ await comfy.models.run("bfl/flux-2-pro", { prompt: "a cat" }, { signal: controll
 
 The abort aborts the underlying connection, so the server observes a disconnect rather than a client that merely stopped listening, and it stops the retry loop between attempts as well as during one. It rejects with the standard `AbortError` — your own abort, re-thrown untouched rather than dressed up as an SDK error, so `err.name === "AbortError"` tells "I cancelled this" apart from a transport failure (a `TypeError`) and from this SDK's own deadline (a `ComfyError` with `code: "request_timeout"`).
 
+### Image to image — upload an asset first
+
+An image-to-image model takes an image _as input_, and Router forwards the
+model's native body unchanged — so the image goes in whatever form the
+provider documents. Most URL-taking models want a URL the provider can fetch,
+and your local file doesn't have one yet. Give it one by uploading it as an
+asset and handing the model the asset's download URL:
+
+```ts
+import { Comfy, comfy } from "@comfyorg/sdk";
+
+// Both read COMFY_API_KEY from the environment.
+const client = new Comfy();
+
+// 1. Upload the local image (dedup-aware; a re-run re-uploads nothing) and
+//    resolve a short-lived, self-authorizing signed URL for it.
+const asset = client.assets.fromFile("photo.png");
+const { url } = await asset.getDownloadUrl();
+
+// 2. Pass that URL wherever the model's own input schema takes an image.
+const { data } = await comfy.models.run("wan/wan2.5-i2i-preview", {
+  input: { images: [url], prompt: "Make it golden." },
+  parameters: { size: "768*768" },
+});
+```
+
+`Asset.getDownloadUrl()` commits the asset if needed (hash → dedup probe →
+upload, exactly like submitting it in a workflow) and resolves to the same
+`{ url, expiresAt }` as an output's `getDownloadUrl()`: on Comfy Cloud /
+serverless a signed storage URL any fetcher can read until `expiresAt` —
+which is what lets the provider behind Router pull your image without your
+API key. Mind the two caveats that follow from that: the URL is short-lived,
+so resolve it right before the run rather than storing it; and on a
+_self-hosted_ backend the URL is the auth-guarded content endpoint, which an
+external provider cannot fetch — upload to Comfy Cloud (the default assets
+surface) for Router inputs.
+
+Some models take images inline instead of by URL — `bfl/flux-2-pro`'s
+`input_image` is base64, for example — and then there is nothing to upload:
+
+```ts
+import { readFileSync } from "node:fs";
+
+const imageB64 = readFileSync("photo.png").toString("base64");
+const { data } = await comfy.models.run("bfl/flux-2-pro", {
+  prompt: "make it watercolor",
+  input_image: imageB64,
+});
+```
+
+Which form a model takes is in its input schema —
+`GET /v2/models/{provider}/{model}/openapi.json`, or the model's page in the
+[Router model catalog](https://docs.comfy.org/development/comfy-router/models).
+
 ### Pointing `comfy.models` somewhere else
 
 `comfy.models` talks to the Comfy API host that fronts the model router
@@ -365,6 +419,12 @@ nothing.
 `client.assets` also has `fromStream`, `fromUrl`, and `get(assetId)` (to
 rehydrate a handle for an asset that is already committed) for less common
 cases — see the type definitions for details.
+
+An uploaded asset can also hand out a directly-fetchable URL for its bytes —
+`asset.getDownloadUrl()`, the same `{ url, expiresAt }` an output resolves to
+(it commits first if needed). That is how a local image reaches a service
+that fetches by URL, e.g. an image-to-image model behind Comfy Router — see
+[Image to image — upload an asset first](#image-to-image--upload-an-asset-first).
 
 A committed asset also exposes `jobId` — the ID of the job that produced it,
 `undefined` for an asset you uploaded yourself (which has no producing job)
