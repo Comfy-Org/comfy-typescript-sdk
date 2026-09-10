@@ -541,3 +541,54 @@ export function toRouterError(status: number, headers: HeadersLike, body: unknow
   const message = typeof envelope.detail === "string" ? envelope.detail : `HTTP ${status}`;
   return new (cls ?? RouterError)(message, options);
 }
+
+/**
+ * The typed exception a COMPLETED queued request reports, or `null`.
+ *
+ * The queue (`comfy.models.submit` and friends) expresses a failure — and a
+ * cancellation — the same way it expresses a success: the request reaches
+ * `COMPLETED`, and the failure rides in the body as an `error_type`. There is
+ * no error STATUS to read, since the poll that discovered it was a `200`, so a
+ * client that only mapped HTTP status codes would hand a caller a failed
+ * generation back as a successful result. This maps that body through the same
+ * `error_type` table {@link toRouterError} uses, so one bucket is one class
+ * however it arrived.
+ *
+ * Returns `null` when the payload names no `error_type`, which is the ordinary
+ * success path; every caller has to read that as "no error found" rather than
+ * as "no error possible".
+ *
+ * `httpStatus` is left `null` on what this builds, deliberately: there was no
+ * failing status, and reporting one would invite a caller to branch on a code
+ * the server never sent. That also keeps `./retry.ts` out of it — a completion
+ * carrying an `error_type` is the server's final answer about a request that
+ * already ran, not a transport condition another attempt could survive.
+ *
+ * Like {@link toRouterError} it never throws: a malformed body degrades to the
+ * least specific exception the payload still supports. Mirrors the Python
+ * SDK's `error_from_completion`.
+ */
+export function errorFromCompletion(body: unknown, requestId: string | null): RouterError | null {
+  if (!isRecord(body)) return null;
+  const raw = body.error_type;
+  if (typeof raw !== "string" || raw.trim() === "") return null;
+  // Routed through the shared builder so the `detail[]` handling, the
+  // unknown-bucket fallback and the prototype-pollution guard are the ones
+  // already tested there. The stand-in headers name no bucket, so the body's
+  // `error_type` is what decides the class, and the status argument is `0` —
+  // outside `ERROR_TYPE_BY_STATUS` — so nothing is inferred from it. They DO
+  // carry the request id, because a completion arrives on a `200` whose own
+  // `X-Comfy-Request-Id` identifies the poll rather than the queued request,
+  // and the queued request's id is the one worth quoting.
+  const headers: HeadersLike = {
+    get: (name) => (name === REQUEST_ID_HEADER ? requestId : null),
+  };
+  const error = toRouterError(0, headers, { ...body, error_type: raw.trim() });
+  // `httpStatus` is `readonly`, and `0` is not a status any server sent.
+  return Object.defineProperty(error, "httpStatus", {
+    value: null,
+    writable: false,
+    enumerable: true,
+    configurable: true,
+  });
+}

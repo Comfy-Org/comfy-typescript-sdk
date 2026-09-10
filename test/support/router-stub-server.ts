@@ -12,6 +12,28 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
+/** One request the stub saw, in the order it saw them. */
+export interface RecordedRequest {
+  method: string;
+  path: string;
+  body: string;
+  idempotencyKey: string | null;
+}
+
+/** A scripted answer from {@link RouterServerState.respond}. */
+export interface ScriptedResponse {
+  status: number;
+  /** A string is sent verbatim (for non-JSON fixtures); anything else is
+   * JSON-encoded. Omitted sends an empty body. */
+  body?: unknown;
+  /** `X-Comfy-Request-Id`; omitted keeps {@link RouterServerState.requestId}. */
+  requestId?: string | null;
+  /** `X-Comfy-Error-Type`; omitted keeps {@link RouterServerState.errorType}. */
+  errorType?: string | null;
+  /** Extra response headers — `Retry-After` is the one the queue needs. */
+  headers?: Record<string, string>;
+}
+
 export interface RouterServerState {
   /** HTTP status to answer with. */
   status: number;
@@ -58,6 +80,16 @@ export interface RouterServerState {
    * fetch rejection and not a status.
    */
   resetTimes: number;
+  /**
+   * Answer per request, for a surface whose routes differ — the queued
+   * model-request family, where one call sequence hits submit, status, result
+   * and cancel in turn and a single `body` cannot describe all four.
+   *
+   * Consulted LAST, after `resetTimes`, `hang`, `delayMs`, `failTimes` and
+   * `stallBody`, so every one of those scenarios still composes with it.
+   * Returning `null` falls through to the plain `status`/`body` answer.
+   */
+  respond: ((request: RecordedRequest, index: number) => ScriptedResponse | null) | null;
 
   // --- what the last request carried, for tests to assert on ---
   requestCount: number;
@@ -79,6 +111,8 @@ export interface RouterServerState {
    * merely abandoning a promise.
    */
   clientDisconnects: number;
+  /** Every request, in order — what a multi-route call sequence is asserted on. */
+  requests: RecordedRequest[];
 }
 
 function defaultState(): RouterServerState {
@@ -95,6 +129,7 @@ function defaultState(): RouterServerState {
     failStatus: 503,
     failErrorType: null,
     resetTimes: 0,
+    respond: null,
     requestCount: 0,
     lastMethod: null,
     lastPath: null,
@@ -106,6 +141,7 @@ function defaultState(): RouterServerState {
     lastUserAgent: null,
     idempotencyKeys: [],
     clientDisconnects: 0,
+    requests: [],
   };
 }
 
@@ -181,6 +217,13 @@ export class RouterStubServer {
     state.lastAccept = header(req, "accept");
     state.lastUserAgent = header(req, "user-agent");
     if (state.lastIdempotencyKey !== null) state.idempotencyKeys.push(state.lastIdempotencyKey);
+    const recorded: RecordedRequest = {
+      method: state.lastMethod ?? "",
+      path: state.lastPath ?? "",
+      body: raw,
+      idempotencyKey: state.lastIdempotencyKey,
+    };
+    state.requests.push(recorded);
 
     if (state.resetTimes > 0) {
       state.resetTimes -= 1;
@@ -219,6 +262,30 @@ export class RouterStubServer {
       // A Content-Length the body never reaches, so the client keeps reading.
       res.writeHead(state.status, { ...headers, "Content-Length": "4096" });
       res.write('{"images":');
+      return;
+    }
+
+    const scripted = state.respond?.(recorded, state.requests.length - 1) ?? null;
+    if (scripted !== null) {
+      const scriptedHeaders = { ...headers, ...scripted.headers };
+      if (scripted.requestId !== undefined) {
+        if (scripted.requestId === null) delete scriptedHeaders["X-Comfy-Request-Id"];
+        else scriptedHeaders["X-Comfy-Request-Id"] = scripted.requestId;
+      }
+      if (scripted.errorType !== undefined) {
+        if (scripted.errorType === null) delete scriptedHeaders["X-Comfy-Error-Type"];
+        else scriptedHeaders["X-Comfy-Error-Type"] = scripted.errorType;
+      }
+      if (scripted.body === undefined) {
+        res.writeHead(scripted.status, scriptedHeaders);
+        res.end();
+        return;
+      }
+      const scriptedBody =
+        typeof scripted.body === "string" ? scripted.body : JSON.stringify(scripted.body);
+      scriptedHeaders["Content-Length"] = String(Buffer.byteLength(scriptedBody));
+      res.writeHead(scripted.status, scriptedHeaders);
+      res.end(scriptedBody);
       return;
     }
 

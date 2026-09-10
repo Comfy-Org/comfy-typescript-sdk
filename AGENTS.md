@@ -87,7 +87,22 @@ not tell you this:
   constant to update. The vendored spec is the side that is right — a Router
   sync that moves the route is not done until the constant follows, and until
   it does `comfy.models.run` 404s. The shared spec reader is
-  `scripts/router-route-contract.mjs`.
+  `scripts/router-route-contract.mjs`. The ID parsing those routes depend on
+  (`parseModelId`, `parseRequestId`, `fillRoute`) lives in
+  `src/sdk/modelRoutes.ts`, a leaf both `models.ts` and `modelRequests.ts`
+  import so that neither has to import the other for it.
+- **`src/sdk/modelRequests.ts` — the four `MODEL_REQUEST*` route templates.**
+  The queued surface (`comfy.models.submit` / `subscribe` / `handle`) addresses
+  a `requests` collection under the run route. Those four operations are **not
+  in `spec/router-openapi.yaml` yet** — they are authored upstream but held,
+  and the one-way sync strips a held operation — so there is nothing to compare
+  them against and the pin is a RELATION instead: `router-spec-contract.test.ts`
+  asserts each template is the run route plus its fixed suffix, which is what
+  makes a sync that moves the run route move these too. That block ends with a
+  rot guard that fails the day the vendored contract DOES declare the
+  collection; when it fires, read those paths out of the spec the way
+  `readRouterRouteContract` reads `runRouterModel`'s and compare against them
+  instead. The Python SDK binds the same four the same way.
 - **`src/low/models.ts`.** Holds four schemas codegen cannot reach, because
   `@hey-api/openapi-ts` only emits types reachable from an operation's
   request/response: `StatusEvent`, `PreviewEvent`, `LogEvent` (reachable only
@@ -209,10 +224,15 @@ Two things to know before you touch it:
   fails. Adding an entry is a design decision — the test also fails on an entry
   that no longer applies, so the list cannot rot into a blanket exemption.
 - **A LEAD is not an asymmetry, and has its own field.** The two SDKs ship on
-  separate pull requests, so one of them carries a new Router bucket first.
-  `routerErrorClassesAheadOfPython` tolerates that in ONE direction —
-  TypeScript may lead, never lag — and the rot guard fails the moment the
-  Python snapshot grows the same name, which is the signal to delete the entry
-  rather than to grow it. Do not reach for it to excuse a class this SDK
+  separate pull requests, so one of them carries a new Router bucket — or a new
+  `models` method — first. `routerErrorClassesAheadOfPython` and
+  `modelsMethodsAheadOfPython` tolerate that in ONE direction — TypeScript may
+  lead, never lag — and each has a rot guard that fails the moment the Python
+  snapshot grows the same name, which is the signal to delete the entry rather
+  than to grow it. `modelsMethodsAheadOfPython` carries `submit`, `subscribe`
+  and `handle` today, because the queued surface landed here while the Python
+  twin was still on an open pull request; run `pnpm sync:python-surface` once
+  that change is on the Python default branch and delete the entry the rot
+  guard then names. Do not reach for either field to excuse something this SDK
   invented: `router-spec-coverage.test.ts` only passes for a bucket the
   vendored Router contract actually declares.

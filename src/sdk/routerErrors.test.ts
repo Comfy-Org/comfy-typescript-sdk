@@ -10,6 +10,7 @@ import {
   ContentPolicyViolation,
   DeadlineExceeded,
   ERROR_TYPE_HEADER,
+  errorFromCompletion,
   Forbidden,
   InsufficientCredits,
   InternalError,
@@ -544,5 +545,74 @@ describe("InvalidInput and the 422 detail[] shape", () => {
     expect(err).toBeInstanceOf(InvalidInput);
     expect((err as InvalidInput).detail).toEqual([]);
     expect(err.message).toBe("The request was rejected as invalid for this model.");
+  });
+});
+
+describe("errorFromCompletion", () => {
+  it("returns null for a completion that names no error_type", () => {
+    // The ordinary success path. Every caller has to read `null` as "no error
+    // found", never as "no error possible".
+    expect(errorFromCompletion({ status: "COMPLETED" }, "req-1")).toBeNull();
+    expect(errorFromCompletion({ status: "COMPLETED", error_type: "" }, "req-1")).toBeNull();
+    expect(errorFromCompletion({ status: "COMPLETED", error_type: "   " }, "req-1")).toBeNull();
+    expect(errorFromCompletion({ error_type: 7 }, "req-1")).toBeNull();
+    // A body that is not an object at all is a provider payload, not an
+    // envelope, so there is nothing in it the queue could have reported.
+    expect(errorFromCompletion([1, 2, 3], "req-1")).toBeNull();
+    expect(errorFromCompletion(null, "req-1")).toBeNull();
+  });
+
+  it("maps a completion's bucket through the same table a response goes through", () => {
+    for (const errorType of ROUTER_ERROR_TYPES) {
+      const err = errorFromCompletion({ status: "COMPLETED", error_type: errorType }, "req-1");
+      expect(err, errorType).toBeInstanceOf(RouterError);
+      expect(err?.errorType).toBe(errorType);
+      expect(err?.constructor.name, errorType).toBe(
+        toRouterError(0, new Headers({ [ERROR_TYPE_HEADER]: errorType }), {}).constructor.name,
+      );
+    }
+  });
+
+  it("leaves httpStatus null — the poll that found it was a 200", () => {
+    // Reporting a status here would invite a caller to branch on a code the
+    // server never sent, and would read as a transport condition a retry
+    // could survive. A completion is the server's final answer.
+    const err = errorFromCompletion({ status: "COMPLETED", error_type: "provider_error" }, "r");
+    expect(err?.httpStatus).toBeNull();
+  });
+
+  it("carries the QUEUED request's id, not the poll's", () => {
+    const err = errorFromCompletion({ status: "COMPLETED", error_type: "internal_error" }, "req-9");
+    expect(err?.requestId).toBe("req-9");
+    expect(errorFromCompletion({ error_type: "internal_error" }, null)?.requestId).toBeNull();
+  });
+
+  it("keeps a bucket this release does not recognize, as the base class", () => {
+    const err = errorFromCompletion({ status: "COMPLETED", error_type: "from_the_future" }, "r");
+    expect(err).toBeInstanceOf(RouterError);
+    expect(err?.constructor).toBe(RouterError);
+    expect(err?.errorType).toBe("from_the_future");
+  });
+
+  it("keeps the per-field detail[] of an invalid_input completion", () => {
+    const err = errorFromCompletion(
+      {
+        status: "COMPLETED",
+        error_type: "invalid_input",
+        detail: [{ loc: ["body", "seed"], msg: "must be >= 0", type: "greater_than" }],
+      },
+      "req-1",
+    );
+    expect(err).toBeInstanceOf(InvalidInput);
+    expect((err as InvalidInput).detail).toHaveLength(1);
+    expect(err?.message).toBe("body.seed: must be >= 0");
+  });
+
+  it("cannot be talked into an untyped throw by a prototype-shaped bucket", () => {
+    for (const errorType of ["constructor", "toString", "__proto__"]) {
+      const err = errorFromCompletion({ status: "COMPLETED", error_type: errorType }, "r");
+      expect(err, errorType).toBeInstanceOf(RouterError);
+      expect(err?.errorType).toBe(errorType);
+    }
   });
 });

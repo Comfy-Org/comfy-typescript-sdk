@@ -55,16 +55,24 @@ import { clampTimerMs, withInactivityLimits } from "../low/dispatcher.js";
 import { buildUserAgent } from "../low/index.js";
 import { abortableSleep } from "./abortable-sleep.js";
 import { newIdempotencyKey } from "./core.js";
-import { resolveBaseUrl, resolveCredentials } from "./credentials.js";
+import { requireCredentials, resolveBaseUrl } from "./credentials.js";
 import {
   ComfyError,
   type ComfyErrorOptions,
   Forbidden,
   InsufficientCredits,
-  MissingCredentials,
   NotFound,
   Unauthorized,
 } from "./exceptions.js";
+import {
+  handle,
+  type RequestHandle,
+  submit,
+  subscribe,
+  type SubmitOptions,
+  type SubscribeOptions,
+} from "./modelRequests.js";
+import { fillRoute, type ModelId, parseModelId } from "./modelRoutes.js";
 import { isRetryableStatus, nextAttemptDelayMs, resolveRetry, type RetryOptions } from "./retry.js";
 
 /**
@@ -170,59 +178,102 @@ export interface Models {
     input: Record<string, unknown>,
     options?: RunOptions,
   ): Promise<RunResult<TData>>;
-}
 
-/**
- * A canonical model ID split into the two path segments that address it.
- *
- * A `type` rather than an `interface` so it carries an implicit index
- * signature and can be passed to {@link fillRoute}, which looks its values up
- * by the placeholder name it read out of the template. The two field names
- * ARE the two path parameters `RUN_ROUTE_TEMPLATE` names, and the contract
- * test asserts that agreement against the vendored spec.
- */
-type ModelId = {
-  provider: string;
-  model: string;
-};
+  /**
+   * Queue `model` with `input` and resolve to a {@link RequestHandle} on the
+   * request — the QUEUED counterpart of {@link Models.run}.
+   *
+   * The same request either way: the same canonical `{provider}/{model}` id
+   * and the same native JSON input, forwarded unchanged. The difference is
+   * when the server answers — here, as soon as the request is ACCEPTED, with
+   * the generation collected later through the returned handle.
+   *
+   * Reach for it over `run` when the caller cannot hold a connection for the
+   * length of a generation: a web request that has to return now, a worker
+   * that submits in one process and collects in another, or a batch whose
+   * submits should all be in flight at once.
+   *
+   * ```ts
+   * const handle = await comfy.models.submit("bfl/flux-2-pro", { prompt: "a cat" });
+   * const { data } = await handle.get();
+   * ```
+   *
+   * A FRESH `Idempotency-Key` is minted per call, which is what makes two
+   * deliberate submits of the same input two requests rather than one
+   * deduplicated request, while every retry inside this one call reuses the one
+   * key and so replays the original acceptance rather than queueing a second
+   * generation. `options.idempotencyKey` overrides it — the case that earns
+   * that is a lost response, where the request may have been accepted and its
+   * id lost with the reply.
+   *
+   * The surface is gated SERVER SIDE: a caller the queue is not switched on for
+   * is answered `403 not_enabled`, which arrives here as
+   * `routerErrors.NotEnabled`. Nothing about the request is wrong in that case,
+   * and it is terminal — it is not retried.
+   */
+  submit<TData = unknown>(
+    model: string,
+    input: Record<string, unknown>,
+    options?: SubmitOptions,
+  ): Promise<RequestHandle<TData>>;
 
-/**
- * Split `{provider}/{model}` into its segments.
- *
- * Exactly two, both non-empty: that is the shape of the route this calls, and
- * of every ID the model catalog lists. A third `variant` segment is a real
- * part of the wider model-ID grammar but is NOT addressable on this route —
- * how it is spelled over HTTP is not settled — so it is refused here, with a
- * message that says which part is missing rather than letting the call go out
- * as an unresolvable path.
- *
- * Beyond the segment count this is deliberately NOT a full validation of the
- * ID alphabet. The server resolves IDs against the catalog and answers a
- * miss with `model_not_found` plus close-match suggestions; re-implementing a
- * narrower version of that check on the client would turn a helpful round
- * trip into a local rejection, and would go stale the first time the alphabet
- * widens. What is refused here is only what cannot address the route at all.
- */
-function parseModelId(model: string): ModelId {
-  const shape = 'expected a canonical "{provider}/{model}" model ID';
-  if (typeof model !== "string") {
-    throw new TypeError(`models.run(model): ${shape}, got ${typeof model}`);
-  }
-  const segments = model.split("/");
-  if (segments.length !== 2 || segments.some((segment) => segment === "")) {
-    const detail =
-      segments.length > 2 ? " (a third, variant segment is not addressable on this route yet)" : "";
-    throw new TypeError(`models.run(model): ${shape}, got ${JSON.stringify(model)}${detail}`);
-  }
-  // `.`/`..` would resolve away when the URL is parsed and address a
-  // different route than the one written, so they are refused rather than
-  // encoded. Every other character is left to `encodeURIComponent`.
-  if (segments.some((segment) => segment === "." || segment === "..")) {
-    throw new TypeError(
-      `models.run(model): ${shape}, got ${JSON.stringify(model)} (a "." or ".." segment cannot name a model)`,
-    );
-  }
-  return { provider: segments[0], model: segments[1] };
+  /**
+   * Queue a request, follow it to completion, and resolve to its result —
+   * {@link Models.submit} plus polling plus {@link RequestHandle.get}, in one
+   * call.
+   *
+   * The ergonomic form for a caller who does want to wait but also wants to
+   * show progress while waiting. It resolves to `RunResult<TData>`, identical
+   * to what {@link Models.run} would have returned for the same model and
+   * input.
+   *
+   * ```ts
+   * const { data } = await comfy.models.subscribe(
+   *   "bfl/flux-2-pro",
+   *   { prompt: "a cat" },
+   *   { onQueueUpdate: (u) => console.log(u.status, u.queuePosition), timeoutMs: 300_000 },
+   * );
+   * ```
+   *
+   * `timeoutMs` is a CLIENT-SIDE bound on the whole call with no server-side
+   * meaning — the queue's own timeouts are the server's. When it runs out, or
+   * when `signal` aborts, this makes one best-effort
+   * {@link RequestHandle.cancel} — so a caller who has stopped waiting is not
+   * also still paying for a generation nobody will collect — and then rejects.
+   * Use {@link Models.submit} when the request should outlive the caller's
+   * patience.
+   *
+   * A completion carrying an `error_type` — which is how the server reports a
+   * failure AND a cancellation — rejects with the typed exception from
+   * `routerErrors` rather than resolving, so a `200` never comes back as a
+   * successful result.
+   */
+  subscribe<TData = unknown>(
+    model: string,
+    input: Record<string, unknown>,
+    options?: SubscribeOptions,
+  ): Promise<RunResult<TData>>;
+
+  /**
+   * Rebuild the handle for a request submitted anywhere. Makes NO request.
+   *
+   * Takes no state beyond the two ids that address the request, so a process
+   * that never made the submit — a worker draining a queue of ids, a retry
+   * after a restart — reaches the same {@link RequestHandle} the submitting
+   * process held. An id that names nothing surfaces on the first
+   * {@link RequestHandle.status} or {@link RequestHandle.get}, as the server's
+   * own answer rather than as a guess made here.
+   *
+   * ```ts
+   * const handle = comfy.models.handle("bfl/flux-2-pro", requestId);
+   * const { data } = await handle.get();
+   * ```
+   *
+   * Both ids are validated LOCALLY rather than pasted into a URL: a malformed
+   * `{provider}/{model}` id, or a `requestId` that is not one printable path
+   * segment of at most 256 characters, throws a `TypeError`.
+   */
+  handle<TData = unknown>(model: string, requestId: string): RequestHandle<TData>;
 }
 
 /**
@@ -246,27 +297,6 @@ function parseModelId(model: string): ModelId {
  * relevant and would add a TypeScript-only name to the cross-SDK surface.
  */
 export const RUN_ROUTE_TEMPLATE = "/v2/models/{provider}/{model}";
-
-/**
- * Substitute `{placeholder}` segments in an OpenAPI path template, percent-
- * encoding each value.
- *
- * `encodeURIComponent` per segment, not on the assembled path: a `/` inside a
- * value has to stay encoded, or a value could add a path segment of its own.
- * An unknown placeholder throws rather than being left in the path — a URL
- * with a literal `{...}` in it is a request that goes out and fails
- * confusingly at the server, and the only way to get one here is for
- * {@link RUN_ROUTE_TEMPLATE} and this call site to have drifted apart.
- */
-function fillRoute(template: string, values: Readonly<Record<string, string>>): string {
-  return template.replaceAll(/\{(\w+)\}/g, (_match, name: string) => {
-    const value = values[name];
-    if (typeof value !== "string") {
-      throw new Error(`route template "${template}" has no value for {${name}}`);
-    }
-    return encodeURIComponent(value);
-  });
-}
 
 function runUrl(baseUrl: string, id: ModelId): string {
   return `${baseUrl}${fillRoute(RUN_ROUTE_TEMPLATE, id)}`;
@@ -397,14 +427,7 @@ async function run<TData = unknown>(
 ): Promise<RunResult<TData>> {
   // Credentials first: the whole point of this gate is that a process with
   // none fails at the call site rather than on a round trip.
-  const credentials = resolveCredentials();
-  if (credentials === undefined) {
-    throw new MissingCredentials(
-      'no credentials configured — call comfy.config({ credentials: "comfyui-..." }) ' +
-        "or set COMFY_API_KEY in the environment",
-      { code: "missing_credentials" },
-    );
-  }
+  const credentials = requireCredentials();
   const id = parseModelId(model);
   if (input === null || typeof input !== "object" || Array.isArray(input)) {
     throw new TypeError(
@@ -524,5 +547,14 @@ function finish<TData>(model: string, response: Response, text: string): RunResu
   return { data: data as TData, requestId };
 }
 
-/** The `comfy.models` namespace. Frozen — it is shared process-wide. */
-export const models: Models = Object.freeze({ run });
+/**
+ * The `comfy.models` namespace. Frozen — it is shared process-wide.
+ *
+ * `submit`, `subscribe` and `handle` are imported from `./modelRequests.ts`
+ * rather than declared here: the queued surface is a file's worth of polling,
+ * pacing and completion handling, and folding it into this module would bury
+ * `run` in it. The dependency runs ONE WAY — that module imports nothing from
+ * this one at run time, only `RunResult` as an erased type — which is what
+ * keeps reading these three at module-evaluation time safe.
+ */
+export const models: Models = Object.freeze({ run, submit, subscribe, handle });
