@@ -40,6 +40,7 @@ export {
 } from "./modelRequests.js";
 export { MAX_REQUEST_ID_LENGTH } from "./modelRoutes.js";
 export {
+  DEFAULT_COLLECT_BUDGET_MS,
   DEFAULT_RETRY_BASE_DELAY_MS,
   DEFAULT_RETRY_BUDGET_MS,
   DEFAULT_RETRY_MAX_DELAY_MS,
