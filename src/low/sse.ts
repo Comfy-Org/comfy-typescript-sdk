@@ -43,19 +43,21 @@ function parseData(raw: string): Record<string, unknown> {
 export const SSE_IDLE_TIMEOUT_MS = 45_000;
 
 /** A pass-through stream that errors if no chunk arrives within `ms`. */
-function idleTimeout(ms: number): TransformStream<Uint8Array, Uint8Array> {
+function idleTimeout(
+  ms: number,
+): TransformStream<Uint8Array<ArrayBuffer>, Uint8Array<ArrayBuffer>> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const clear = () => {
     if (timer !== undefined) clearTimeout(timer);
   };
-  const arm = (controller: TransformStreamDefaultController<Uint8Array>) => {
+  const arm = (controller: TransformStreamDefaultController<Uint8Array<ArrayBuffer>>) => {
     clear();
     timer = setTimeout(
       () => controller.error(new Error(`SSE idle timeout: no data for ${ms}ms`)),
       ms,
     );
   };
-  return new TransformStream<Uint8Array, Uint8Array>({
+  return new TransformStream<Uint8Array<ArrayBuffer>, Uint8Array<ArrayBuffer>>({
     start: arm,
     transform(chunk, controller) {
       arm(controller);
@@ -75,7 +77,10 @@ function idleTimeout(ms: number): TransformStream<Uint8Array, Uint8Array> {
  * errors a silently-stalled connection instead of blocking forever.
  */
 export async function* iterateSse(
-  body: ReadableStream<Uint8Array>,
+  // Over a plain `ArrayBuffer`, not `ArrayBufferLike`: that is what a fetch
+  // body is, and what `TextDecoderStream` accepts once the two are told apart
+  // (`@types/node` >= 26).
+  body: ReadableStream<Uint8Array<ArrayBuffer>>,
   options: { idleTimeoutMs?: number } = {},
 ): AsyncGenerator<RawEvent, void, void> {
   const stream = body

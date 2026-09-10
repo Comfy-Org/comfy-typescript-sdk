@@ -63,16 +63,16 @@
   },
   "devDependencies": {
     "@hey-api/openapi-ts": "0.99.0",
-    "@types/node": "^22.10.0",
+    "@types/node": "^26.5.0",
     "@vitest/coverage-v8": "^4.1.0",
-    "oxfmt": "^0.66.0",
+    "oxfmt": "^0.67.0",
     "oxlint": "^1.62.0",
-    "typescript": "^5.8.3",
+    "typescript": "^6.0.3",
     "vitest": "^4.1.0",
     "yaml": "^2.9.0"
   },
   "engines": {
     "node": ">=22"
   },
-  "packageManager": "pnpm@11.13.0"
+  "packageManager": "pnpm@11.26.0"
 }

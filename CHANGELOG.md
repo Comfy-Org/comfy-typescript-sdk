@@ -17,6 +17,8 @@ Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
 entry. See CONTRIBUTING.md.
 -->
 
+## [0.2.0] - 2026-09-10
+
 ### Added
 
 - **Queued model delivery — `comfy.models.submit`, `comfy.models.subscribe`
@@ -81,6 +83,22 @@ entry. See CONTRIBUTING.md.
   sent. They are what a manual re-ask needs after the collect budget is spent:
   the pace, and the key naming the generation Comfy is still holding.
   `routerErrors.RouterError` gains `retryAfter` for the same reason.
+
+- `Job.getLogs()` — the run's captured execution log via the new
+  `GET /api/v2/jobs/{id}/logs` operation (`ComfyLow.getJobLogs()` in the low
+  layer; the `JobLogs` type is generated from the spec). Resolves to
+  `{ text, truncated, captured_at, complete }`, or `null` for the `204` that
+  means the job has no log: today only a job run on a serverless deployment (a
+  `{deployment}.run.comfy.app` host) has one, Comfy Cloud captures none and
+  answers `null` for every job, and a job that has not finished or whose run
+  was killed before the worker could report has none either. Follows the job's
+  `urls.logs` link
+  and returns `null` without a request when the server offers none. The text
+  is untrusted workflow output and should be rendered as plain text.
+- `Job.urls.logs` is now on the generated `JobUrls` type, optional, and
+  `PostJobsData["body"]["extra_data"]` accepts `auth_token_comfy_org` beside
+  `api_key_comfy_org` (low layer only; `client.submit({ apiKey })` is
+  unchanged).
 
 ### Changed
 
@@ -348,7 +366,8 @@ First public release of the Comfy API v2 TypeScript SDK (`@comfyorg/sdk`).
   Cloud, and serverless: upload and dedup inputs, submit a workflow, follow it
   (poll or SSE), and download outputs. Requires Node >= 22.
 
-[Unreleased]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.9...v0.2.0
 [0.1.9]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.6...v0.1.7

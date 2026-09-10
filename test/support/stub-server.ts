@@ -103,6 +103,23 @@ export interface ServerState {
    * record.
    */
   jobWorkflow: { workflow: Record<string, unknown>; format: "save" | "api" } | null;
+  /**
+   * `GET /jobs/{id}/logs` response body. `null` (the default) makes the stub
+   * answer `204`, the contract's "this job has no log", which is what Comfy
+   * Cloud answers for every job today.
+   */
+  jobLogs: { text: string; truncated: boolean; captured_at: string; complete: boolean } | null;
+  /** When false, jobs are served without a `urls.logs` link — a surface that
+   * captures no logs at all, so a client should not spend a request. */
+  jobUrlsIncludeLogs: boolean;
+  /** When true, `GET /jobs/{id}/logs` 404s with `job_not_found` — the job
+   * itself is unknown, not yours, or past retention. */
+  jobLogsGone: boolean;
+  /** How many times `GET /jobs/{id}/logs` was hit. */
+  jobLogsCount: number;
+  /** The exact request path of the last `GET .../jobs/{id}/logs`, so a test
+   * can prove a supplied `urls.logs` link was followed rather than rebuilt. */
+  jobLogsLastPath: string | null;
   /** Asset ids already deleted — GET/DELETE for these 404 asset_not_found,
    * matching the real server treating a repeat delete as "gone". */
   deletedAssets: Set<string>;
@@ -163,6 +180,11 @@ function defaultState(): ServerState {
     getAssetHashOverride: undefined,
     hangJobPoll: false,
     jobWorkflow: null,
+    jobLogs: null,
+    jobUrlsIncludeLogs: true,
+    jobLogsGone: false,
+    jobLogsCount: 0,
+    jobLogsLastPath: null,
     deletedAssets: new Set(),
     deleteInUseAssetId: null,
     uploadCount: 0,
@@ -201,6 +223,7 @@ function jobJson(
   status: string,
   outputs: unknown[] = [],
   urlsOrigin: string | null = null,
+  includeLogsUrl = true,
 ) {
   const prefix = urlsOrigin ?? "";
   return {
@@ -219,6 +242,9 @@ function jobJson(
       self: `${prefix}/api/v2/jobs/${id}`,
       events: `${prefix}/api/v2/jobs/${id}/events`,
       cancel: `${prefix}/api/v2/jobs/${id}/cancel`,
+      // Optional in the contract: present on any surface that captures logs,
+      // absent on one that never does.
+      ...(includeLogsUrl ? { logs: `${prefix}/api/v2/jobs/${id}/logs` } : {}),
     },
   };
 }
@@ -354,6 +380,13 @@ export class StubServer {
         this.serveJobWorkflow(res);
         return;
       }
+      // Unanchored at the start on purpose: a surface may mount the API under
+      // a prefix that only its own `urls.logs` link carries.
+      m = /\/api\/v2\/jobs\/([^/]+)\/logs$/.exec(path);
+      if (m) {
+        this.serveJobLogs(path, res);
+        return;
+      }
       m = /^\/api\/v2\/jobs\/([^/]+)$/.exec(path);
       if (m) {
         this.serveJob(m[1], res);
@@ -455,7 +488,27 @@ export class StubServer {
     // Stamp the polled job's own id as job_id, matching a real server: an
     // output belongs to the job that produced it.
     const outputs = status === "succeeded" ? [{ ...OUTPUT, job_id: jobId }] : [];
-    sendJson(res, 200, jobJson(jobId, status, outputs, state.jobUrlsOrigin));
+    sendJson(
+      res,
+      200,
+      jobJson(jobId, status, outputs, state.jobUrlsOrigin, state.jobUrlsIncludeLogs),
+    );
+  }
+
+  private serveJobLogs(path: string, res: ServerResponse): void {
+    this.state.jobLogsCount += 1;
+    this.state.jobLogsLastPath = path;
+    const { jobLogs, jobLogsGone } = this.state;
+    if (jobLogsGone) {
+      sendError(res, 404, "job_not_found", "job not found");
+      return;
+    }
+    if (jobLogs === null) {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    sendJson(res, 200, jobLogs);
   }
 
   private serveJobWorkflow(res: ServerResponse): void {

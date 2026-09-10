@@ -232,6 +232,44 @@ describe("ComfyLow transport", () => {
     expect(result).toEqual({ workflow: { nodes: [] }, format: "save" });
   });
 
+  // -- getJobLogs ---------------------------------------------------------
+
+  const LOGS = {
+    text: "loading model\nKSampler: 20 steps\n",
+    truncated: false,
+    captured_at: "2026-07-10T18:21:00Z",
+    complete: true,
+  };
+
+  it("getJobLogs returns the captured log", async () => {
+    server.state.jobLogs = LOGS;
+    const result = await low.getJobLogs("job_01");
+    expect(result).toEqual(LOGS);
+  });
+
+  it("getJobLogs reads the 204 that means 'no log' as null, not as an error", async () => {
+    // The contract's normal answer for a job with nothing captured — Comfy
+    // Cloud's answer for every job today — so it must not surface as a throw.
+    expect(await low.getJobLogs("job_01")).toBeNull();
+    expect(server.state.jobLogsCount).toBe(1);
+  });
+
+  it("getJobLogs 404s -> NotFound for a job that is gone", async () => {
+    server.state.jobLogsGone = true;
+    await expect(low.getJobLogs("job_01")).rejects.toBeInstanceOf(NotFound);
+  });
+
+  it("getJobLogs given a urls.logs link follows it verbatim, prefix and all", async () => {
+    // The link is the form to prefer because a surface may mount the operation
+    // under a prefix a hand-built `/jobs/{id}/logs` would miss. A link that
+    // carries one proves the path was followed rather than rebuilt from an id.
+    server.state.jobLogs = LOGS;
+    const link = `${server.baseUrl}/mounted/here/api/v2/jobs/job_01/logs`;
+    const result = await low.getJobLogs(link);
+    expect(result).toEqual(LOGS);
+    expect(server.state.jobLogsLastPath).toBe("/mounted/here/api/v2/jobs/job_01/logs");
+  });
+
   // -- deleteAsset --------------------------------------------------------
 
   it("deleteAsset removes the asset; a subsequent getAsset 404s", async () => {

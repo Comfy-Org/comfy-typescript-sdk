@@ -86,8 +86,21 @@ function bytesSource(data: Uint8Array, filename?: string, contentType?: string):
     contentType: contentType ?? guessContentType(filename),
     filePath: name,
     hasher: () => hashBytes(data),
-    opener: async () => new Blob([data]),
+    opener: async () => new Blob([blobPart(data)]),
   };
+}
+
+/**
+ * A `Uint8Array` as a `BlobPart`. `Uint8Array` is typed over `ArrayBufferLike`
+ * while `BlobPart` wants a view over a plain `ArrayBuffer`, so narrow rather
+ * than cast: the common case (a `Buffer`, a fresh array) already is one and
+ * passes through untouched; a view over a `SharedArrayBuffer` is copied, which
+ * `Blob` would have to do anyway.
+ */
+function blobPart(data: Uint8Array): Uint8Array<ArrayBuffer> {
+  return data.buffer instanceof ArrayBuffer
+    ? (data as Uint8Array<ArrayBuffer>)
+    : new Uint8Array(data);
 }
 
 /**
