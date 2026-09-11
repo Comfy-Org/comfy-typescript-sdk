@@ -103,7 +103,7 @@ describe("comfy.models.run on success", () => {
 
       const result = await comfy.models.run(MODEL, { prompt: "a cat" });
 
-      expect(result).toEqual({ data: payload, requestId: "req-abc-123" });
+      expect(result).toEqual({ kind: "json", data: payload, requestId: "req-abc-123" });
     });
   });
 
@@ -112,11 +112,13 @@ describe("comfy.models.run on success", () => {
       useStub(server);
       server.state.body = { images: [{ url: "https://example.invalid/a.png" }] };
 
-      const { data } = await comfy.models.run<{ images: { url: string }[] }>(MODEL, {});
+      const result = await comfy.models.run<{ images: { url: string }[] }>(MODEL, {});
 
-      // No cast and no `any`: this compiles only because `data` is the
-      // supplied type, and the default is `unknown` rather than `any`.
-      expect(data.images[0].url).toBe("https://example.invalid/a.png");
+      // No cast and no `any`: this compiles only because `kind` narrows the
+      // union to the JSON member and `data` is then the supplied type, whose
+      // default is `unknown` rather than `any`.
+      if (result.kind !== "json") throw new Error(`expected a JSON result, got ${result.kind}`);
+      expect(result.data.images[0].url).toBe("https://example.invalid/a.png");
     });
   });
 
@@ -138,13 +140,15 @@ describe("comfy.models.run on success", () => {
     });
   });
 
-  it("sends the credential as a bearer token, and JSON content negotiation", async () => {
+  it("sends the credential as a bearer token, and JSON-first content negotiation", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
       await comfy.models.run(MODEL, {});
       expect(server.state.lastAuthorization).toBe(`Bearer ${CREDENTIAL}`);
       expect(server.state.lastContentType).toBe("application/json");
-      expect(server.state.lastAccept).toBe("application/json");
+      // JSON preferred, but not exclusive: the run route's 200 has a `*/*`
+      // binary branch too, and a client that handles it must say so.
+      expect(server.state.lastAccept).toBe("application/json, */*;q=0.9");
       expect(server.state.lastUserAgent).toContain("comfy-sdk-typescript/");
     });
   });
@@ -497,10 +501,10 @@ describe("comfy.models.run failures", () => {
     });
   });
 
-  it("refuses a 200 whose body is not JSON", async () => {
+  it("refuses a 200 that says it is JSON and then is not", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
-      server.state.contentType = "text/plain";
+      server.state.contentType = "application/json";
       server.state.body = "not json at all";
 
       const err = (await comfy.models.run(MODEL, {}).catch((e: unknown) => e)) as ComfyError;
@@ -508,6 +512,212 @@ describe("comfy.models.run failures", () => {
       expect(err.code).toBe("unexpected_response");
       expect(err.httpStatus).toBe(200);
       expect(err.requestId).toBe("6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21");
+    });
+  });
+});
+
+/**
+ * The run route's `200` has two documented shapes, not one: an
+ * `application/json` document and a `*\/*` `format: binary` body, which is how
+ * a partner whose generation IS the response answers. The ElevenLabs audio
+ * models (`elevenlabs/eleven_v3`, `elevenlabs/eleven_sfx_v2`) are the first of
+ * those in the catalog, and before this the SDK read every 200 as text and
+ * `JSON.parse`d it — so the call threw AFTER the server had run and billed the
+ * generation, with the bytes already destroyed by the lossy UTF-8 decode.
+ */
+describe("comfy.models.run on a binary result", () => {
+  const AUDIO_MODEL = "elevenlabs/eleven_v3";
+
+  /** An ID3v2.4 header followed by the first MPEG frame's sync word — the
+   * head of a real `audio/mpeg` body, including bytes that are not valid
+   * UTF-8 and would not survive a text decode. */
+  const MP3_BYTES = new Uint8Array([
+    0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xfb, 0x90, 0x64, 0x00, 0x0d,
+  ]);
+
+  it("resolves audio/mpeg bytes verbatim rather than throwing on the JSON parse", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "audio/mpeg";
+      server.state.body = MP3_BYTES;
+      server.state.requestId = "req-audio-1";
+
+      const result = await comfy.models.run(AUDIO_MODEL, { text: "hello there" });
+
+      expect(result.kind).toBe("binary");
+      if (result.kind !== "binary") throw new Error("unreachable");
+      expect(result.contentType).toBe("audio/mpeg");
+      expect(result.requestId).toBe("req-audio-1");
+      expect(result.data).toBeInstanceOf(Uint8Array);
+      // Byte for byte, and the exact length — a `Uint8Array` view onto a
+      // larger buffer would compare equal on content but hand a caller
+      // trailing garbage the moment they wrote `.buffer` to a file.
+      expect(Array.from(result.data)).toEqual(Array.from(MP3_BYTES));
+      expect(result.data.byteLength).toBe(MP3_BYTES.byteLength);
+    });
+  });
+
+  it("keeps the media type's parameters on contentType, for a Blob to use", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "audio/mpeg; rate=44100";
+      server.state.body = MP3_BYTES;
+
+      const result = await comfy.models.run(AUDIO_MODEL, {});
+
+      expect(result.kind).toBe("binary");
+      if (result.kind !== "binary") throw new Error("unreachable");
+      expect(result.contentType).toBe("audio/mpeg; rate=44100");
+    });
+  });
+
+  it("treats any other non-JSON media type the same way", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "image/png";
+      server.state.body = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+      const result = await comfy.models.run("some/image-model", {});
+
+      expect(result.kind).toBe("binary");
+      if (result.kind !== "binary") throw new Error("unreachable");
+      expect(result.contentType).toBe("image/png");
+      expect(Array.from(result.data)).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    });
+  });
+
+  it("reads a +json suffix as JSON, not as bytes", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "application/vnd.partner.result+json; charset=utf-8";
+      server.state.body = { audio_url: "https://example.invalid/out.mp3" };
+
+      const result = await comfy.models.run(AUDIO_MODEL, {});
+
+      expect(result).toEqual({
+        kind: "json",
+        data: { audio_url: "https://example.invalid/out.mp3" },
+        requestId: "6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21",
+      });
+    });
+  });
+
+  it("falls back to JSON when the 200 declared no Content-Type at all", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = null;
+      server.state.body = { images: [{ url: "https://example.invalid/a.png" }] };
+
+      const result = await comfy.models.run(MODEL, {});
+
+      expect(result.kind).toBe("json");
+      if (result.kind !== "json") throw new Error("unreachable");
+      expect(result.data).toEqual({ images: [{ url: "https://example.invalid/a.png" }] });
+    });
+  });
+
+  it("is binary with an empty contentType when there is no Content-Type and no JSON", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = null;
+      server.state.body = MP3_BYTES;
+
+      const result = await comfy.models.run(AUDIO_MODEL, {});
+
+      expect(result.kind).toBe("binary");
+      if (result.kind !== "binary") throw new Error("unreachable");
+      expect(result.contentType).toBe("");
+      expect(Array.from(result.data)).toEqual(Array.from(MP3_BYTES));
+    });
+  });
+
+  it("still refuses a 202, whatever the body's media type says", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 202;
+      server.state.contentType = "audio/mpeg";
+      server.state.body = MP3_BYTES;
+
+      const err = (await comfy.models.run(AUDIO_MODEL, {}).catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("unexpected_response");
+      expect(err.httpStatus).toBe(202);
+    });
+  });
+
+  it("still reports a non-2xx as the error it is, never as bytes", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 422;
+      server.state.errorType = "invalid_input";
+      server.state.contentType = "application/json";
+      server.state.body = { detail: [{ loc: ["body", "text"], msg: "field required" }] };
+
+      const err = (await comfy.models
+        .run(AUDIO_MODEL, {}, { retry: false })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("invalid_input");
+      expect(err.httpStatus).toBe(422);
+    });
+  });
+
+  it("collects a binary 200 across a paced 409, replay header and all", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "audio/mpeg";
+      server.state.body = MP3_BYTES;
+      server.state.failTimes = 1;
+      server.state.failStatus = 409;
+      server.state.failErrorType = "concurrency_limit_exceeded";
+      server.state.failRetryAfter = "0";
+      server.state.idempotentReplayed = true;
+
+      const result = await comfy.models.run(AUDIO_MODEL, {}, { retry: { collectBudgetMs: 5_000 } });
+
+      expect(server.state.requestCount).toBe(2);
+      // Both attempts under the one key: the collect is a re-ask for the
+      // generation the first attempt already started, not a second run.
+      expect(new Set(server.state.idempotencyKeys).size).toBe(1);
+      expect(result.kind).toBe("binary");
+      if (result.kind !== "binary") throw new Error("unreachable");
+      expect(result.contentType).toBe("audio/mpeg");
+      expect(Array.from(result.data)).toEqual(Array.from(MP3_BYTES));
+    });
+  });
+
+  it("honours the deadline on a binary body just as on a JSON one", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "audio/mpeg";
+      server.state.body = MP3_BYTES;
+      server.state.delayMs = 1_000;
+
+      const err = (await comfy.models
+        .run(AUDIO_MODEL, {}, { timeoutMs: 50, retry: false })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("request_timeout");
+    });
+  });
+
+  it("stops a binary run on the caller's signal", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "audio/mpeg";
+      server.state.body = MP3_BYTES;
+      server.state.hang = true;
+      const controller = new AbortController();
+
+      const pending = comfy.models.run(AUDIO_MODEL, {}, { signal: controller.signal });
+      await waitFor(() => server.state.requestCount === 1);
+      controller.abort();
+
+      await expect(pending).rejects.toThrow();
+      await waitFor(() => server.state.clientDisconnects === 1);
     });
   });
 });

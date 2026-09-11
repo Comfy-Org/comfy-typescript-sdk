@@ -17,11 +17,14 @@ export {
   type ComfyConfig,
 } from "./credentials.js";
 export {
+  CONTENT_TYPE_HEADER,
   DEFAULT_RUN_TIMEOUT_MS,
   ERROR_TYPE_HEADER,
   models,
   REQUEST_ID_HEADER,
   type Models,
+  type RunBinaryResult,
+  type RunJsonResult,
   type RunOptions,
   type RunResult,
 } from "./models.js";

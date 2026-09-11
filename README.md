@@ -96,7 +96,7 @@ import { comfy } from "@comfyorg/sdk";
 // or: import * as comfy from "@comfyorg/sdk";
 
 comfy.config({ credentials: "comfyui-..." });
-const { data, requestId } = await comfy.models.run("bfl/flux-2-pro", {
+const { kind, data, requestId } = await comfy.models.run("bfl/flux-2-pro", {
   prompt: "a cat",
 });
 ```
@@ -136,14 +136,19 @@ does that polling inside the call rather than handing back a task handle, so
 there is nothing to poll and no job to track. M1 returns the final result
 only — no progress and no streaming.
 
-It resolves to a `{ data, requestId }` result:
+It resolves to a `{ kind, data, requestId }` result, where `kind` tells you which of the route's two documented `200` shapes came back:
+
+- **`kind: "json"`** — the partner answered with a JSON document, which is what most of the catalog does. `data` is that document.
+- **`kind: "binary"`** — the partner's generation _is_ the response body, returned under the partner's own media type. `data` is a `Uint8Array` of the exact bytes and `contentType` carries that media type.
+
+Common to both:
 
 - **`data`** is the provider's native payload, exactly as it came off the
-  wire. It is typed `unknown` by default — deliberately not `any`, which would
-  silently switch type-checking off for every field you touch. Per-model
-  schemas are published by the server (each model serves its own OpenAPI
-  document), not baked into this package, so supply the type you have:
-  `await comfy.models.run<FluxOutput>("bfl/flux-2-pro", { prompt })`.
+  wire. On the JSON branch it is typed `unknown` by default — deliberately not
+  `any`, which would silently switch type-checking off for every field you
+  touch. Per-model schemas are published by the server (each model serves its
+  own OpenAPI document), not baked into this package, so supply the type you
+  have: `await comfy.models.run<FluxOutput>("bfl/flux-2-pro", { prompt })`.
 - **`requestId`** is the server's `X-Comfy-Request-Id` for the call — the value
   to quote in a support request, surfaced so you never have to go reading
   response headers to find one. It is `null` only when the response carried no
@@ -154,6 +159,37 @@ Note this wrapper is a **deliberate difference from the Python SDK**, which
 returns the payload directly. It matches the shape a TypeScript integration
 being ported from a comparable hosted-inference client already expects; it is
 an intentional asymmetry, not a parity gap.
+
+#### Binary results — a model that returns audio, image or video bytes
+
+The run route's `200` has two branches in the contract: `application/json`, and `*/*` with `format: binary` for a partner whose generated file is the whole response. The ElevenLabs audio models (`elevenlabs/eleven_v3`, `elevenlabs/eleven_sfx_v2`) are the first of those in the catalog, and they answer with `audio/mpeg` bytes. `run` reads the response `Content-Type` before it touches the body and hands those bytes back untouched — not base64, not wrapped in an object:
+
+```ts
+import { writeFile } from "node:fs/promises";
+
+const result = await comfy.models.run("elevenlabs/eleven_v3", {
+  text: "[excited] Ship it!",
+  output_format: "mp3_44100_128",
+});
+
+if (result.kind === "binary") {
+  // Node — straight to disk; `data` is a Uint8Array of the exact bytes.
+  await writeFile("dialogue.mp3", result.data);
+
+  // Browser — hand it to an <audio> element, or download it.
+  const blob = new Blob([result.data], { type: result.contentType }); // "audio/mpeg"
+  const url = URL.createObjectURL(blob);
+} else {
+  // A JSON-answering model (most of the catalog) lands here.
+  console.log(result.data);
+}
+```
+
+Checking `result.kind` is also what narrows the type: TypeScript will not let you pass `result.data` to `writeFile` until it knows the result is the binary one. If you know a given model's branch, assert it — `if (result.kind !== "binary") throw new Error("expected audio")` — rather than casting.
+
+A media type is JSON if it is `application/json` or carries the structured `+json` suffix; anything else is bytes. The response carries `X-Content-Type-Options: nosniff`, so the partner's declared type is taken at its word and never guessed at from the body. The one exception is a `2xx` that declares **no** `Content-Type` at all: that body is parsed as JSON if it parses, and is otherwise a binary result with `contentType: ""`. A response that says `application/json` and then isn't still raises `ComfyError` with `code: "unexpected_response"`.
+
+The whole body is buffered in memory; there is no streaming surface yet.
 
 Failures raise a `ComfyError`, and `requestId` is on the error too — an error
 response is exactly when you need one, as are `retryAfter` (the pace the server
