@@ -266,7 +266,12 @@ export function routerOperations(doc) {
   const declaredAt = new Map();
   for (const [path, rawItem] of Object.entries(paths)) {
     const item = deref(doc, rawItem);
-    if (item === null || typeof item !== "object") {
+    // `Array.isArray` as well as the `typeof` test: `typeof []` is `"object"`,
+    // so an array-shaped path item would pass, carry no method keys, and drop
+    // every operation under that path while the non-empty guard below stayed
+    // satisfied by some OTHER path's operations — a silent omission, which is
+    // the one failure mode this contract check exists to prevent.
+    if (item === null || typeof item !== "object" || Array.isArray(item)) {
       fail(`spec/router-openapi.yaml: malformed path item ${path}`);
     }
     for (const method of HTTP_METHODS) {

@@ -467,7 +467,10 @@ page.hasMore; // the ONLY thing that says the walk is over
 page.nextCursor; // opaque — round-trip it, never parse it
 page.limit; // the size actually served, which may be smaller than 50
 
-const next = await comfy.models.list({ cursor: page.nextCursor }).page();
+// `hasMore` is the guard, not a formality: at the end of the walk
+// `nextCursor` is `null`, and `list` ignores a null cursor — so following it
+// unguarded silently re-serves page one.
+const next = page.hasMore ? await comfy.models.list({ cursor: page.nextCursor }).page() : null;
 ```
 
 **`schema()` revalidates with `ETag`.** The route ships `ETag` and

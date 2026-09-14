@@ -279,6 +279,12 @@ describe("the operation extractor the coverage check reads through", () => {
     expect(() => routerOperations({ paths: { "/v2/models": "get" } })).toThrow(
       "malformed path item /v2/models",
     );
+    // An ARRAY is the shape a `typeof item !== "object"` test alone lets
+    // through: it carries no method keys, so every operation under that path
+    // vanishes while another path keeps the non-empty guard satisfied.
+    expect(() => routerOperations({ paths: { "/v2/models": [] } })).toThrow(
+      "malformed path item /v2/models",
+    );
   });
 
   it("refuses an operationId declared twice, as it refuses one declared nowhere", () => {

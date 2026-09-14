@@ -145,18 +145,6 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
     modelsMethodsAheadOfPython: ["schema", "list"],
   },
   {
-    id: "models-queue-lead",
-    why:
-      "The queued surface — `submit`, `subscribe` and `handle`, plus the `RequestHandle` they " +
-      "hand back — landed in this SDK while the Python twin was still on an open pull request, " +
-      "so TypeScript LEADS on those three method names. This is not a divergence anybody wants " +
-      "to keep: the two surfaces are the same shape, method for method, and the rot guard below " +
-      "fails the moment `parity/python-surface.json` grows any of them, which is the signal to " +
-      "delete this entry and let the two tables be compared again. Refresh the snapshot with " +
-      "`pnpm sync:python-surface` once the Python change is on its default branch.",
-    modelsMethodsAheadOfPython: ["handle", "submit", "subscribe"],
-  },
-  {
     id: "collect-switched-off-by-budget",
     why:
       "Python switches the collect loop off with a BOOLEAN (`RetryPolicy.retry_collectable=False`) " +

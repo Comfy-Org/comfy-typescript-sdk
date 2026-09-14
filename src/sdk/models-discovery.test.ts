@@ -90,20 +90,26 @@ describe("the comfy.models discovery surface", () => {
     expect(DEFAULT_DISCOVERY_TIMEOUT_MS).toBeGreaterThan(0);
   });
 
-  it("adds no validator to the package's runtime dependencies", async () => {
+  it("picks no JSON Schema validator on the caller's behalf", async () => {
     // The documents are OpenAPI 3.0.2 — draft-04 plus `nullable` — and every
     // consumer that validates one needs `ajv-draft-04` rather than stock Ajv.
     // Making that choice here would impose it (and its bundle weight) on every
     // caller, including the browser ones, so `schema()` returns the document
     // and the caller validates.
+    //
+    // Named packages, not a snapshot of the whole `dependencies` map: the
+    // behaviour is "this package does not choose a schema validator for you",
+    // and an exact list would also fail on an unrelated dependency that has
+    // nothing to do with it. `zod` is deliberately not on this list — it is a
+    // runtime dependency of the generated low-layer request schemas and
+    // validates nothing a caller hands to `schema()`.
     const manifest = JSON.parse(
       await readFile(fileURLToPath(new URL("../../package.json", import.meta.url)), "utf-8"),
     ) as { dependencies: Record<string, string> };
-    expect(Object.keys(manifest.dependencies).sort()).toEqual([
-      "eventsource-parser",
-      "hash-wasm",
-      "zod",
-    ]);
+    const declared = Object.keys(manifest.dependencies);
+    for (const validator of ["ajv", "ajv-draft-04", "@apidevtools/json-schema-ref-parser"]) {
+      expect(declared).not.toContain(validator);
+    }
   });
 });
 

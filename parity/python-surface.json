@@ -12,10 +12,16 @@
   },
   "modelsMethods": {
     "Models": [
-      "run"
+      "handle",
+      "run",
+      "submit",
+      "subscribe"
     ],
     "AsyncModels": [
-      "run"
+      "handle",
+      "run",
+      "submit",
+      "subscribe"
     ]
   },
   "routerErrorClasses": [
