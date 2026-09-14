@@ -96,7 +96,7 @@ import { comfy } from "@comfyorg/sdk";
 // or: import * as comfy from "@comfyorg/sdk";
 
 comfy.config({ credentials: "comfyui-..." });
-const { data, requestId } = await comfy.models.run("bfl/flux-2-pro", {
+const { kind, data, requestId } = await comfy.models.run("bfl/flux-2-pro", {
   prompt: "a cat",
 });
 ```
@@ -121,6 +121,9 @@ and any error this SDK throws are all safe to paste into a bug report. The
 same now holds for the class client: `console.log(client)` no longer prints
 the `apiKey` you constructed it with.
 
+There are two ways to run a model on this namespace — `run`, which waits, and
+`submit`, which queues — and they send the same request.
+
 ### `comfy.models.run(model, input)`
 
 `model` is a canonical `{provider}/{model}` ID (`"bfl/flux-2-pro"`). `input`
@@ -136,14 +139,19 @@ does that polling inside the call rather than handing back a task handle, so
 there is nothing to poll and no job to track. M1 returns the final result
 only — no progress and no streaming.
 
-It resolves to a `{ data, requestId }` result:
+It resolves to a `{ kind, data, requestId }` result, where `kind` tells you which of the route's two documented `200` shapes came back:
+
+- **`kind: "json"`** — the partner answered with a JSON document, which is what most of the catalog does. `data` is that document.
+- **`kind: "binary"`** — the partner's generation _is_ the response body, returned under the partner's own media type. `data` is a `Uint8Array` of the exact bytes and `contentType` carries that media type.
+
+Common to both:
 
 - **`data`** is the provider's native payload, exactly as it came off the
-  wire. It is typed `unknown` by default — deliberately not `any`, which would
-  silently switch type-checking off for every field you touch. Per-model
-  schemas are published by the server (each model serves its own OpenAPI
-  document), not baked into this package, so supply the type you have:
-  `await comfy.models.run<FluxOutput>("bfl/flux-2-pro", { prompt })`.
+  wire. On the JSON branch it is typed `unknown` by default — deliberately not
+  `any`, which would silently switch type-checking off for every field you
+  touch. Per-model schemas are published by the server (each model serves its
+  own OpenAPI document), not baked into this package, so supply the type you
+  have: `await comfy.models.run<FluxOutput>("bfl/flux-2-pro", { prompt })`.
 - **`requestId`** is the server's `X-Comfy-Request-Id` for the call — the value
   to quote in a support request, surfaced so you never have to go reading
   response headers to find one. It is `null` only when the response carried no
@@ -154,6 +162,39 @@ Note this wrapper is a **deliberate difference from the Python SDK**, which
 returns the payload directly. It matches the shape a TypeScript integration
 being ported from a comparable hosted-inference client already expects; it is
 an intentional asymmetry, not a parity gap.
+
+#### Binary results — a model that returns audio, image or video bytes
+
+The run route's `200` has two branches in the contract: `application/json`, and `*/*` with `format: binary` for a partner whose generated file is the whole response. The ElevenLabs audio models (`elevenlabs/eleven_v3`, `elevenlabs/eleven_sfx_v2`) are the first of those in the catalog, and they answer with `audio/mpeg` bytes. `run` reads the response `Content-Type` before it touches the body and hands those bytes back untouched — not base64, not wrapped in an object:
+
+```ts
+import { writeFile } from "node:fs/promises";
+
+const result = await comfy.models.run("elevenlabs/eleven_v3", {
+  text: "[excited] Ship it!",
+  output_format: "mp3_44100_128",
+});
+
+if (result.kind === "binary") {
+  // Node — straight to disk; `data` is a Uint8Array of the exact bytes.
+  await writeFile("dialogue.mp3", result.data);
+
+  // Browser — hand it to an <audio> element, or download it.
+  const blob = new Blob([result.data], { type: result.contentType }); // "audio/mpeg"
+  const url = URL.createObjectURL(blob);
+} else {
+  // A JSON-answering model (most of the catalog) lands here.
+  console.log(result.data);
+}
+```
+
+`contentType` is the partner's own media type forwarded verbatim — remote input, not a value this SDK vouches for. A blob typed `text/html` or `image/svg+xml` and handed to `URL.createObjectURL` runs script in your origin the moment it is opened, so pin the type you expect — `new Blob([result.data], { type: "audio/mpeg" })` — anywhere the result might be navigated to rather than played.
+
+Checking `result.kind` is also what narrows the type: TypeScript will not let you pass `result.data` to `writeFile` until it knows the result is the binary one. If you know a given model's branch, assert it — `if (result.kind !== "binary") throw new Error("expected audio")` — rather than casting.
+
+A media type is JSON if its subtype is `json` (`application/json`, and the `text/json` some providers still send) or carries the structured `+json` suffix; anything else is bytes. The response carries `X-Content-Type-Options: nosniff`, so the partner's declared type is taken at its word and never guessed at from the body. The one exception is a `2xx` that declares **no** `Content-Type` at all: that body is parsed as JSON if it parses, and is otherwise a binary result with `contentType: ""`. A response that says `application/json` and then isn't still raises `ComfyError` with `code: "unexpected_response"`.
+
+The whole body is buffered in memory; there is no streaming surface yet.
 
 Failures raise a `ComfyError`, and `requestId` is on the error too — an error
 response is exactly when you need one, as are `retryAfter` (the pace the server
@@ -193,7 +234,9 @@ await comfy.models.run("some/video-model", { prompt }, { maxBytes: null });
 
 It is checked twice, because the two checks catch different responses. A `Content-Length` over the cap is refused **before the body is read** and the connection is dropped, so the oversized response is never downloaded rather than downloaded and discarded. The bytes actually read are then counted against the same cap, since a chunked response declares no length at all and a declared one is a claim by the sender rather than a bound on it.
 
-A body over the cap raises a `ComfyError` with `code: "response_too_large"`, carrying `maxBytes` and the offending size on `details`. It is **not retried** — it is a verdict about the response rather than a transport failure, and re-asking would re-download the same oversized body on every attempt. The cap covers an error response's body too, which only matters where something ahead of the route is answering with something that is not the contract at all.
+A result over the cap raises a `ComfyError` with `code: "response_too_large"`, carrying `maxBytes` and the offending size on `details`. It is **not retried** — it is a verdict about the response rather than a transport failure, and re-asking would re-download the same oversized body on every attempt. Check `details.maxBytes` rather than the code alone if you branch on it: `code` on an error derived from a response is whatever the server's `X-Comfy-Error-Type` said, so an upstream can answer with the same string, and only a cap breach raised here carries `maxBytes`.
+
+The cap never changes what a response _means_. A response `run` is going to retry or collect is classified from its status and headers, and its body is dropped unread — so an intermediary answering a `503` with a huge error page does not turn a retryable failure into a fatal one, and does not abandon a generation the server is still holding behind a `409`/`504`. An error response `run` does hand back is truncated at the cap instead of refused, so an oversized error body still arrives as `Unauthorized`, `InsufficientCredits`, or whatever bucket its status and header name.
 
 #### Retries
 
@@ -281,6 +324,67 @@ await comfy.models.run("bfl/flux-2-pro", { prompt: "a cat" }, { signal: controll
 
 The abort aborts the underlying connection, so the server observes a disconnect rather than a client that merely stopped listening, and it stops the retry loop between attempts as well as during one. It rejects with the standard `AbortError` — your own abort, re-thrown untouched rather than dressed up as an SDK error, so `err.name === "AbortError"` tells "I cancelled this" apart from a transport failure (a `TypeError`) and from this SDK's own deadline (a `ComfyError` with `code: "request_timeout"`).
 
+### `comfy.models.submit(model, input)` — queue it, collect it later
+
+`run` holds one connection open until the generation is finished. When the caller cannot wait that long — a web request that has to return now, a worker that submits in one process and collects in another, a batch that should be in flight all at once — submit it to the queue instead:
+
+```ts
+const handle = await comfy.models.submit("bfl/flux-2-pro", { prompt: "a cat" });
+
+handle.requestId; // with the model id, all another process needs
+(await handle.status()).status; // 'IN_QUEUE' / 'IN_PROGRESS' / 'COMPLETED'
+const { data } = await handle.get(); // waits, then returns the provider payload
+```
+
+`submit` sends the same request `run` does — the same model id, the same native body, the same `/v2/models/{provider}/{model}` prefix with a `requests` collection under it — and resolves as soon as the server has **accepted** it. The queue is the server's: ordering, admission, retries, timeouts, billing and expiry are all decided there, and this SDK adds polling and ergonomics on top of it and nothing else.
+
+The handle carries four operations:
+
+| Operation                 | What it does                                                                                                                                                |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `handle.status()`         | one authoritative poll, resolved as a `QueueUpdate` (`status`, `completed`, `queuePosition`, `errorType`, `retryAfterMs`, `raw`)                            |
+| `handle.get(options?)`    | poll to completion, then resolve to `{ data, requestId }` — the same `RunResult` shape `run` returns, with the provider's own payload in `data`             |
+| `handle.cancel()`         | ask the server to cancel, as a `PUT`. A request, not a guarantee: a request that already completed stays completed, and the next `status()` is what is true |
+| `handle.events(options?)` | the poll loop with its updates exposed — an async iterable yielding the first observation, every change of status or queue position, and the completion     |
+
+Polling is **poll-authoritative**: there is no stream to reconcile against on this surface, and `events()` is the poll loop rather than SSE. It backs off adaptively, and a `Retry-After` the server names on a poll beats that schedule — the server knows its own pace — capped at 60 seconds so one header cannot park a caller behind it.
+
+**A `200` is not the same thing as a success here.** The server reports a failed _and_ a cancelled request as `COMPLETED` carrying an `error_type`, so `get()` rejects with the matching typed exception from [`routerErrors`](#router-errors-comfymodelsrun) rather than handing the failure back as a result. `events()` deliberately does not reject **for that case** — a completion carrying an `error_type` is yielded as an observation, because `events()` is a view of the queue's progress and `get()` is the one that collects. It can still reject for reasons that are not the request's own outcome: a transport failure, an exhausted `timeoutMs`, or an aborted `signal`. So keep those handlers; it is only the completion error that arrives as data rather than a throw.
+
+Rebuild a handle in another process from the two ids that address the request, with no call made:
+
+```ts
+const handle = comfy.models.handle("bfl/flux-2-pro", requestId);
+const { data } = await handle.get();
+```
+
+Both ids are needed because both address the route (`/v2/models/{provider}/{model}/requests/{request_id}`), and both are validated locally before anything is sent — a malformed model id, or a `requestId` that is not one printable path segment of at most 256 characters, throws a `TypeError` rather than being pasted into a URL.
+
+### `comfy.models.subscribe(model, input, options)` — submit, follow, collect
+
+```ts
+const { data } = await comfy.models.subscribe(
+  "bfl/flux-2-pro",
+  { prompt: "a cat" },
+  {
+    onQueueUpdate: (update) => console.log(update.status, update.queuePosition),
+    timeoutMs: 300_000,
+  },
+);
+```
+
+`submit` + poll + `get`, in one call, for a caller who does want to wait but also wants to show progress. It resolves to the same `{ data, requestId }` `run` would have returned. `onQueueUpdate` is awaited if it returns a promise, so an `async` callback finishes before the next poll; an exception it raises propagates and abandons the wait, and the request keeps running server-side.
+
+`timeoutMs` is a **client-side** bound with no server-side meaning — the queue's own timeouts are the server's. It covers the submit, every poll, every retry of one, the pauses between them, and the result fetch. It does **not** cover time spent inside your own `onQueueUpdate` callback: the deadline and `signal` are checked by the poll loop, and a callback is awaited between polls, so a callback that returns a promise which never settles parks `subscribe` indefinitely and neither the timeout nor an abort will fire. That is deliberate and matches how a callback that _throws_ is treated — it is your code, and tearing down a healthy request because of it would be destructive — but it means an `async` `onQueueUpdate` should carry its own bound. When it runs out — or when `signal` aborts — `subscribe` makes one best-effort `cancel()`, so a caller who has stopped waiting is not also still paying for a generation nobody will collect, and then rejects. **That applies only once the submit has returned a handle**: `subscribe` submits before it has anything to cancel, so a deadline that expires during the submit itself — or a submit the server accepted whose response was lost — leaves a request running with no handle to address it. That window is what `idempotencyKey` below is for: re-submitting under the same key replays the original acceptance and returns the same request rather than queueing a second one, which is the only way back to an id that was lost with its reply. Best-effort is literal: a cancel that itself fails is swallowed, because the timeout is the failure worth reporting and a masked one sends you looking in the wrong place. Use `submit` when the request should outlive the caller's patience.
+
+The same bound is available on `handle.get()` and `handle.events()`, where it rejects **without** cancelling: the queue is the server's, and a local clock running out says nothing about it. The first poll is always made, so `timeoutMs: 0` reads "look once".
+
+Each `submit` **call** mints one fresh `Idempotency-Key`: two deliberate submits of the same input are two requests, while a transport-level retry inside one call keeps the one key and replays the original acceptance rather than queueing a second generation. Pass `idempotencyKey` to choose it yourself — the case that earns it is a lost response, where the request may have been accepted and its id lost with the reply.
+
+This surface is **gated server side**. A caller the queue is not switched on for is answered `403 not_enabled`, which arrives as `routerErrors.NotEnabled` — nothing about the request is wrong, and it is terminal, so it is not retried.
+
+> The queued methods raise `routerErrors.*` rather than the `ComfyError` family `run` maps its failures into. That difference is deliberate and matches the Python SDK: a queue failure is reported as an `error_type` inside a `200` body, where there is no HTTP status to classify and the bucket is the only thing there is.
+
 ### Image to image — upload an asset first
 
 An image-to-image model takes an image _as input_, and Router forwards the
@@ -333,9 +437,86 @@ const { data } = await comfy.models.run("bfl/flux-2-pro", {
 });
 ```
 
-Which form a model takes is in its input schema —
-`GET /v2/models/{provider}/{model}/openapi.json`, or the model's page in the
-[Router model catalog](https://docs.comfy.org/development/comfy-router/models).
+Which form a model takes is in its input schema, which
+`comfy.models.schema(model)` fetches for you (below), or the model's page in
+the [Router model catalog](https://docs.comfy.org/development/comfy-router/models).
+
+### Discovering models — `comfy.models.list()` and `comfy.models.schema()`
+
+You do not have to know a model ID (or its arguments) up front. `list()` walks
+the catalog `run()` accepts IDs from, and `schema()` returns the OpenAPI
+document Router publishes for one model — so listing the catalog, reading one
+model's schema and running it are three calls on the same namespace, with the
+same credential, base URL, error mapping and `requestId` capture:
+
+```ts
+import { comfy } from "@comfyorg/sdk";
+
+comfy.config({ credentials: "comfyui-..." });
+
+// Every model, across every page — `list()` follows the cursor for you.
+for await (const model of comfy.models.list()) {
+  console.log(model.id, model.provider, model.model);
+}
+
+// One model's published input AND output schemas, as an OpenAPI document.
+const result = await comfy.models.schema("bfl/flux-2-pro");
+if (!result.unchanged) {
+  console.log(Object.keys(result.document as Record<string, unknown>));
+}
+
+const { data } = await comfy.models.run("bfl/flux-2-pro", { prompt: "a cat" });
+```
+
+**`list()` iterates models, not pages.** The catalog is cursor-paginated with
+a server-chosen page size (20 at the time of writing), so a method that handed
+back one page would make "the first twenty models, with no error to say so"
+the default outcome. Nothing is sent until the iteration starts, and each
+iteration is a fresh walk.
+
+If you are driving your own pagination — a "load more" button, say — take one
+page instead. Paginate by what came back, never by the `limit` you asked for:
+a value above the server's maximum is clamped rather than refused.
+
+```ts
+const page = await comfy.models.list({ limit: 50 }).page();
+page.data; // CatalogModel[]
+page.hasMore; // the ONLY thing that says the walk is over
+page.nextCursor; // opaque — round-trip it, never parse it
+page.limit; // the size actually served, which may be smaller than 50
+
+// `hasMore` is the guard, not a formality: at the end of the walk
+// `nextCursor` is `null`, and `list` ignores a null cursor — so following it
+// unguarded silently re-serves page one.
+const next = page.hasMore ? await comfy.models.list({ cursor: page.nextCursor }).page() : null;
+```
+
+**`schema()` revalidates with `ETag`.** The route ships `ETag` and
+`Cache-Control` precisely so a client can cache a document and re-check it
+cheaply, and a per-model schema changes rarely. Store the tag next to your
+copy and pass it back; a `304` resolves as an explicit `unchanged: true`
+rather than throwing or handing you an empty document:
+
+```ts
+let cached: { document: unknown; etag: string | null } | undefined;
+
+const fresh = await comfy.models.schema("bfl/flux-2-pro", { etag: cached?.etag });
+if (!fresh.unchanged) cached = { document: fresh.document, etag: fresh.etag };
+// else: `cached` is still current, and no document crossed the wire.
+```
+
+The document is returned as **data** and is not validated here — no validator
+is a dependency of this package. That is deliberate: these are OpenAPI 3.0.2
+documents, so JSON Schema draft-04 plus `nullable`, which stock Ajv does not
+cover; a consumer that validates against one wants `ajv-draft-04` and its own
+decisions about it. Type the document yourself if you have a type for it —
+`schema<OpenAPIV3.Document>(...)` — exactly as `run<TData>` takes one.
+
+Both routes are pinned to the vendored contract the same way `run`'s is: the
+route-coverage check in `src/sdk/router-spec-contract.test.ts` maps every
+operation `spec/router-openapi.yaml` declares to the `comfy.models` method
+that calls it, so the next route a sync adds fails CI rather than sitting
+unreachable.
 
 ### Pointing `comfy.models` somewhere else
 
@@ -716,7 +897,10 @@ try {
 ### Router errors (`comfy.models.run`)
 
 Model execution has its own error contract, and its own exception hierarchy to
-match. Every failure carries a coarse, machine-readable `error_type` on the
+match. The queued surface (`comfy.models.submit` / `subscribe` and the handle
+they return) raises from this same hierarchy for every failure it reports,
+including the ones that arrive inside a `COMPLETED` body rather than on a
+status. Every failure carries a coarse, machine-readable `error_type` on the
 `X-Comfy-Error-Type` response header; this SDK turns that value into one class
 per bucket, all descending from `RouterError`. The Python SDK spells every one
 of these names identically, so a snippet transfers between the two languages

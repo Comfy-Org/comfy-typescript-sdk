@@ -82,6 +82,21 @@ interface Asymmetry {
    * next bucket will land on one side first too.
    */
   readonly routerErrorClassesAheadOfPython?: readonly (readonly [string, string])[];
+  /**
+   * Public `models` method names this SDK has landed AHEAD of the Python one.
+   *
+   * The same LEAD mechanism as `routerErrorClassesAheadOfPython`, applied to
+   * the other surface the two SDKs ship on separate pull requests: one of them
+   * necessarily carries a new method first. Tolerated in one direction only —
+   * TypeScript may lead, never lag — and only until the twin lands, because
+   * the rot guard below fails the moment the Python snapshot grows the same
+   * name, which is the signal to delete the entry rather than to grow it.
+   *
+   * It is a LEAD, not an asymmetry: nothing here says the two surfaces differ
+   * on purpose, only that one of them arrived first. An entry that is really a
+   * deliberate divergence belongs in `why` with no field at all.
+   */
+  readonly modelsMethodsAheadOfPython?: readonly string[];
 }
 
 const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
@@ -118,6 +133,18 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
     pythonAsyncModelsClasses: ["AsyncModels"],
   },
   {
+    id: "discovery-methods-land-first-in-typescript",
+    why:
+      "`comfy.models.schema` and `comfy.models.list` reach Router's two discovery routes — the " +
+      "per-model OpenAPI document and the paginated model catalog — which the contract has " +
+      "declared all along and neither SDK called. The shape is settled here first, on purpose: " +
+      "the same two methods belong on `comfy_sdk.models.Models`/`AsyncModels` and are a " +
+      "follow-up on the Python SDK, so the naming is negotiated once rather than twice. This " +
+      "is a LAG, not a divergence — the entry fails the moment the Python snapshot grows " +
+      "either name, which is when it should be deleted rather than kept.",
+    modelsMethodsAheadOfPython: ["schema", "list"],
+  },
+  {
     id: "collect-switched-off-by-budget",
     why:
       "Python switches the collect loop off with a BOOLEAN (`RetryPolicy.retry_collectable=False`) " +
@@ -140,6 +167,9 @@ const AHEAD_OF_PYTHON: readonly (readonly [string, string])[] = INTENTIONAL_ASYM
   (a) => a.routerErrorClassesAheadOfPython ?? [],
 );
 const AHEAD_CLASS_NAMES = new Set(AHEAD_OF_PYTHON.map(([className]) => className));
+const AHEAD_MODELS_METHODS = new Set(
+  INTENTIONAL_ASYMMETRIES.flatMap((a) => a.modelsMethodsAheadOfPython ?? []),
+);
 const AHEAD_ERROR_TYPES = new Set(AHEAD_OF_PYTHON.map(([, errorType]) => errorType));
 
 interface PythonSurface {
@@ -295,7 +325,43 @@ describe("cross-SDK surface parity", () => {
     );
     expect(pythonSync.length, "no synchronous Python `models` class in the snapshot").toBe(1);
 
-    expect(nameDivergences("comfy.models", pythonSync[0][1], methodNames(models))).toEqual([]);
+    // Filtered on BOTH sides, so the day the Python SDK catches up produces
+    // exactly ONE failure — the rot guard below, whose message says to delete
+    // the entry — rather than a divergence line per method.
+    expect(
+      nameDivergences(
+        "comfy.models",
+        pythonSync[0][1].filter((name) => !AHEAD_MODELS_METHODS.has(name)),
+        methodNames(models).filter((name) => !AHEAD_MODELS_METHODS.has(name)),
+      ),
+    ).toEqual([]);
+  });
+
+  it("keeps every declared `models` lead live, and only in the leading direction", async () => {
+    // Same rot rule as the router-class lead: an entry has to name a method
+    // this SDK really has, and it has to STOP naming one the Python SDK has
+    // caught up on — otherwise the allowlist goes on excusing a divergence
+    // that no longer exists and hides the next real one.
+    const python = await loadPythonSurface();
+    const pythonMethods = new Set(
+      Object.entries(python.modelsMethods)
+        .filter(([className]) => !ASYNC_MODELS_CLASSES.has(className))
+        .flatMap(([, methods]) => methods),
+    );
+    const typescriptMethods = new Set(methodNames(models));
+
+    for (const name of AHEAD_MODELS_METHODS) {
+      expect(
+        typescriptMethods.has(name),
+        `the allowlist says \`comfy.models.${name}\` leads the Python SDK, but this SDK does ` +
+          "not expose it",
+      ).toBe(true);
+      expect(
+        pythonMethods.has(name),
+        `the Python SDK now carries \`models.${name}\` — delete its entry from ` +
+          "INTENTIONAL_ASYMMETRIES so the two surfaces are compared again",
+      ).toBe(false);
+    }
   });
 
   it("declares no async-only method name on the Python side", async () => {
@@ -310,7 +376,7 @@ describe("cross-SDK surface parity", () => {
     );
     for (const className of ASYNC_MODELS_CLASSES) {
       const methods = python.modelsMethods[className] ?? [];
-      const extra = methods.filter((name) => !sync.has(name));
+      const extra = methods.filter((name) => !sync.has(name) && !AHEAD_MODELS_METHODS.has(name));
       expect(extra, `${className} declares methods the synchronous class does not`).toEqual([]);
     }
   });

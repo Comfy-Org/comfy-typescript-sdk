@@ -104,7 +104,7 @@ describe("comfy.models.run on success", () => {
 
       const result = await comfy.models.run(MODEL, { prompt: "a cat" });
 
-      expect(result).toEqual({ data: payload, requestId: "req-abc-123" });
+      expect(result).toEqual({ kind: "json", data: payload, requestId: "req-abc-123" });
     });
   });
 
@@ -113,11 +113,13 @@ describe("comfy.models.run on success", () => {
       useStub(server);
       server.state.body = { images: [{ url: "https://example.invalid/a.png" }] };
 
-      const { data } = await comfy.models.run<{ images: { url: string }[] }>(MODEL, {});
+      const result = await comfy.models.run<{ images: { url: string }[] }>(MODEL, {});
 
-      // No cast and no `any`: this compiles only because `data` is the
-      // supplied type, and the default is `unknown` rather than `any`.
-      expect(data.images[0].url).toBe("https://example.invalid/a.png");
+      // No cast and no `any`: this compiles only because `kind` narrows the
+      // union to the JSON member and `data` is then the supplied type, whose
+      // default is `unknown` rather than `any`.
+      if (result.kind !== "json") throw new Error(`expected a JSON result, got ${result.kind}`);
+      expect(result.data.images[0].url).toBe("https://example.invalid/a.png");
     });
   });
 
@@ -139,13 +141,15 @@ describe("comfy.models.run on success", () => {
     });
   });
 
-  it("sends the credential as a bearer token, and JSON content negotiation", async () => {
+  it("sends the credential as a bearer token, and JSON-first content negotiation", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
       await comfy.models.run(MODEL, {});
       expect(server.state.lastAuthorization).toBe(`Bearer ${CREDENTIAL}`);
       expect(server.state.lastContentType).toBe("application/json");
-      expect(server.state.lastAccept).toBe("application/json");
+      // JSON preferred, but not exclusive: the run route's 200 has a `*/*`
+      // binary branch too, and a client that handles it must say so.
+      expect(server.state.lastAccept).toBe("application/json, */*;q=0.9");
       expect(server.state.lastUserAgent).toContain("comfy-sdk-typescript/");
     });
   });
@@ -498,10 +502,10 @@ describe("comfy.models.run failures", () => {
     });
   });
 
-  it("refuses a 200 whose body is not JSON", async () => {
+  it("refuses a 200 that says it is JSON and then is not", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
-      server.state.contentType = "text/plain";
+      server.state.contentType = "application/json";
       server.state.body = "not json at all";
 
       const err = (await comfy.models.run(MODEL, {}).catch((e: unknown) => e)) as ComfyError;
@@ -514,6 +518,307 @@ describe("comfy.models.run failures", () => {
 });
 
 /**
+ * The run route's `200` has two documented shapes, not one: an
+ * `application/json` document and a `*\/*` `format: binary` body, which is how
+ * a partner whose generation IS the response answers. The ElevenLabs audio
+ * models (`elevenlabs/eleven_v3`, `elevenlabs/eleven_sfx_v2`) are the first of
+ * those in the catalog, and before this the SDK read every 200 as text and
+ * `JSON.parse`d it — so the call threw AFTER the server had run and billed the
+ * generation, with the bytes already destroyed by the lossy UTF-8 decode.
+ */
+describe("comfy.models.run on a binary result", () => {
+  const AUDIO_MODEL = "elevenlabs/eleven_v3";
+
+  /** An ID3v2.4 header followed by the first MPEG frame's sync word — the
+   * head of a real `audio/mpeg` body, including bytes that are not valid
+   * UTF-8 and would not survive a text decode. */
+  const MP3_BYTES = new Uint8Array([
+    0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xfb, 0x90, 0x64, 0x00, 0x0d,
+  ]);
+
+  it("resolves audio/mpeg bytes verbatim rather than throwing on the JSON parse", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "audio/mpeg";
+      server.state.body = MP3_BYTES;
+      server.state.requestId = "req-audio-1";
+
+      const result = await comfy.models.run(AUDIO_MODEL, { text: "hello there" });
+
+      expect(result.kind).toBe("binary");
+      if (result.kind !== "binary") throw new Error("unreachable");
+      expect(result.contentType).toBe("audio/mpeg");
+      expect(result.requestId).toBe("req-audio-1");
+      expect(result.data).toBeInstanceOf(Uint8Array);
+      // Byte for byte, and the exact length — a `Uint8Array` view onto a
+      // larger buffer would compare equal on content but hand a caller
+      // trailing garbage the moment they wrote `.buffer` to a file.
+      expect(Array.from(result.data)).toEqual(Array.from(MP3_BYTES));
+      expect(result.data.byteLength).toBe(MP3_BYTES.byteLength);
+    });
+  });
+
+  it("keeps the media type's parameters on contentType, for a Blob to use", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "audio/mpeg; rate=44100";
+      server.state.body = MP3_BYTES;
+
+      const result = await comfy.models.run(AUDIO_MODEL, {});
+
+      expect(result.kind).toBe("binary");
+      if (result.kind !== "binary") throw new Error("unreachable");
+      expect(result.contentType).toBe("audio/mpeg; rate=44100");
+    });
+  });
+
+  it("treats any other non-JSON media type the same way", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "image/png";
+      server.state.body = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+      const result = await comfy.models.run("some/image-model", {});
+
+      expect(result.kind).toBe("binary");
+      if (result.kind !== "binary") throw new Error("unreachable");
+      expect(result.contentType).toBe("image/png");
+      expect(Array.from(result.data)).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    });
+  });
+
+  it("reads a +json suffix as JSON, not as bytes", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "application/vnd.partner.result+json; charset=utf-8";
+      server.state.body = { audio_url: "https://example.invalid/out.mp3" };
+
+      const result = await comfy.models.run(AUDIO_MODEL, {});
+
+      expect(result).toEqual({
+        kind: "json",
+        data: { audio_url: "https://example.invalid/out.mp3" },
+        requestId: "6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21",
+      });
+    });
+  });
+
+  it("falls back to JSON when the 200 declared no Content-Type at all", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = null;
+      server.state.body = { images: [{ url: "https://example.invalid/a.png" }] };
+
+      const result = await comfy.models.run(MODEL, {});
+
+      expect(result.kind).toBe("json");
+      if (result.kind !== "json") throw new Error("unreachable");
+      expect(result.data).toEqual({ images: [{ url: "https://example.invalid/a.png" }] });
+    });
+  });
+
+  it("is binary with an empty contentType when there is no Content-Type and no JSON", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = null;
+      server.state.body = MP3_BYTES;
+
+      const result = await comfy.models.run(AUDIO_MODEL, {});
+
+      expect(result.kind).toBe("binary");
+      if (result.kind !== "binary") throw new Error("unreachable");
+      expect(result.contentType).toBe("");
+      expect(Array.from(result.data)).toEqual(Array.from(MP3_BYTES));
+    });
+  });
+
+  it("refuses a 2xx that is not the contract's 200, rather than calling it a result", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 204;
+      server.state.contentType = null;
+      server.state.body = null;
+
+      const err = (await comfy.models
+        .run(AUDIO_MODEL, {}, { retry: false })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("unexpected_response");
+      expect(err.httpStatus).toBe(204);
+    });
+  });
+
+  it("refuses an empty 200 body rather than handing back zero bytes as the generation", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "audio/mpeg";
+      server.state.body = null;
+
+      const err = (await comfy.models
+        .run(AUDIO_MODEL, {}, { retry: false })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("unexpected_response");
+      expect(err.httpStatus).toBe(200);
+    });
+  });
+
+  it("reads a Content-Type sent twice as the one media type it is", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      // What `Headers.get` hands back for a header the response carried twice:
+      // the values joined with ", ". Parsed naively it matches neither
+      // `application/json` nor `+json`, and an ordinary result comes back as
+      // bytes.
+      server.state.contentType = "application/json, application/json";
+      server.state.body = { images: [{ url: "https://example.invalid/a.png" }] };
+
+      const result = await comfy.models.run(MODEL, {});
+
+      expect(result.kind).toBe("json");
+      if (result.kind !== "json") throw new Error("unreachable");
+      expect(result.data).toEqual({ images: [{ url: "https://example.invalid/a.png" }] });
+    });
+  });
+
+  it("treats a json subtype as JSON whatever the type, and a suffix with no type as not", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "text/json";
+      server.state.body = { ok: true };
+
+      const json = await comfy.models.run(MODEL, {});
+
+      expect(json.kind).toBe("json");
+
+      // No `type/subtype` at all: the trailing `+json` is not a structured
+      // suffix, so this is the contract's byte branch rather than a document.
+      server.state.contentType = "garbage+json";
+      server.state.body = MP3_BYTES;
+
+      const bytes = await comfy.models.run(AUDIO_MODEL, {});
+
+      expect(bytes.kind).toBe("binary");
+    });
+  });
+
+  it("does not let a lossy decode turn headerless bytes into a JSON string", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = null;
+      // `22 FF 22`: not valid UTF-8, but a non-fatal decode replaces the FF
+      // with U+FFFD and leaves `"\uFFFD"` — a JSON document. These are the
+      // partner's bytes, and they have to come back as bytes.
+      const bytes = new Uint8Array([0x22, 0xff, 0x22]);
+      server.state.body = bytes;
+
+      const result = await comfy.models.run(AUDIO_MODEL, {});
+
+      expect(result.kind).toBe("binary");
+      if (result.kind !== "binary") throw new Error("unreachable");
+      expect(Array.from(result.data)).toEqual(Array.from(bytes));
+    });
+  });
+
+  it("still refuses a 202, whatever the body's media type says", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 202;
+      server.state.contentType = "audio/mpeg";
+      server.state.body = MP3_BYTES;
+
+      const err = (await comfy.models.run(AUDIO_MODEL, {}).catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("unexpected_response");
+      expect(err.httpStatus).toBe(202);
+    });
+  });
+
+  it("still reports a non-2xx as the error it is, never as bytes", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 422;
+      server.state.errorType = "invalid_input";
+      server.state.contentType = "application/json";
+      server.state.body = { detail: [{ loc: ["body", "text"], msg: "field required" }] };
+
+      const err = (await comfy.models
+        .run(AUDIO_MODEL, {}, { retry: false })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("invalid_input");
+      expect(err.httpStatus).toBe(422);
+    });
+  });
+
+  it("collects a binary 200 across a paced 409, replay header and all", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "audio/mpeg";
+      server.state.body = MP3_BYTES;
+      server.state.failTimes = 1;
+      server.state.failStatus = 409;
+      server.state.failErrorType = "concurrency_limit_exceeded";
+      server.state.failRetryAfter = "0";
+      server.state.idempotentReplayed = true;
+
+      const result = await comfy.models.run(AUDIO_MODEL, {}, { retry: { collectBudgetMs: 5_000 } });
+
+      expect(server.state.requestCount).toBe(2);
+      // Both attempts under the one key: the collect is a re-ask for the
+      // generation the first attempt already started, not a second run.
+      expect(new Set(server.state.idempotencyKeys).size).toBe(1);
+      expect(result.kind).toBe("binary");
+      if (result.kind !== "binary") throw new Error("unreachable");
+      expect(result.contentType).toBe("audio/mpeg");
+      expect(Array.from(result.data)).toEqual(Array.from(MP3_BYTES));
+    });
+  });
+
+  it("honours the deadline on a binary body just as on a JSON one", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "audio/mpeg";
+      // `stallBody` rather than `delayMs`: the delay sleeps BEFORE the status
+      // line, so the deadline would fire while waiting for headers and never
+      // reach `response.arrayBuffer()` — which is the call this change moved
+      // the body read to. Stalling after the headers puts the deadline where
+      // the new code actually runs.
+      server.state.stallBody = true;
+
+      const err = (await comfy.models
+        .run(AUDIO_MODEL, {}, { timeoutMs: 50, retry: false })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("request_timeout");
+    });
+  });
+
+  it("stops a binary run on the caller's signal", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "audio/mpeg";
+      // As above: `hang` never sends a status line, so the abort would land on
+      // a pending `fetch()` instead of on the pending binary body read.
+      server.state.stallBody = true;
+      const controller = new AbortController();
+
+      const pending = comfy.models.run(AUDIO_MODEL, {}, { signal: controller.signal });
+      await waitFor(() => server.state.requestCount === 1);
+      controller.abort();
+
+      await expect(pending).rejects.toThrow();
+      await waitFor(() => server.state.clientDisconnects === 1);
+    });
+  });
+});
+
+/**
  * The body is buffered whole — one call resolves with one finished result, so
  * there is nothing to stream it into — and `maxBytes` is the ceiling on that.
  * Two checks, because they catch different responses: `Content-Length` before
@@ -521,6 +826,11 @@ describe("comfy.models.run failures", () => {
  * allocation), and the bytes as they are read (the only check a chunked
  * response has). A breach is deliberately kept out of the retry loop, since
  * retrying it re-downloads the same oversized body on every attempt.
+ *
+ * What the cap does NOT do is decide what a response means: the class is read
+ * off the status and the headers first, a body this call will retry or
+ * collect is never read at all, and an error body it does surface is
+ * truncated rather than refused. Those are the last four tests here.
  */
 describe("comfy.models.run response size cap", () => {
   /** A retry policy that WOULD retry, and fast — so a test asserting one
@@ -597,22 +907,41 @@ describe("comfy.models.run response size cap", () => {
     });
   });
 
-  it("does not retry a cap breach, however retryable the status looks", async () => {
+  it("holds a body delivered as many small chunks without breaching on overhead", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
-      // A 503 is the most retryable answer there is, and its body is still
-      // buffered — so this is the case where retrying would re-download the
-      // oversized body on every attempt until the budget ran out.
-      server.state.status = 503;
-      server.state.errorType = "service_unavailable";
-      server.state.body = { detail: "x".repeat(20_000), error_type: "service_unavailable" };
+      // Ten thousand chunks for a body of a few hundred KiB: the payload is
+      // far under the cap, and a reader that kept one view per chunk would
+      // cost the heap orders of magnitude more than the payload. The cap is
+      // on the bytes, and the bytes are what this stays under.
+      server.state.chunkedBody = { chunkBytes: 32, chunks: 10_000 };
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { maxBytes: 1_000_000, timeoutMs: 30_000 })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      // The whole body arrives — 320_000 bytes of `a`, which is not JSON, so
+      // the read succeeds and the PARSE is what fails. That is the assertion:
+      // the cap let it through.
+      expect(server.state.chunkedBodyCompleted).toBe(true);
+      expect(err.code).not.toBe("response_too_large");
+    });
+  });
+
+  it("does not retry a result past the cap, however much budget is left", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      // A 200 whose body is the result: nothing about it is worth re-asking
+      // for, and retrying would re-download the same oversized body on every
+      // attempt until the budget ran out.
+      server.state.body = { caption: "x".repeat(20_000) };
 
       const err = (await comfy.models
         .run(MODEL, {}, { maxBytes: 512, retry: WOULD_RETRY })
         .catch((e: unknown) => e)) as ComfyError;
 
       expect(err.code).toBe("response_too_large");
-      expect(err.httpStatus).toBe(503);
+      expect(err.httpStatus).toBe(200);
       expect(server.state.requestCount).toBe(1);
     });
   });
@@ -667,6 +996,28 @@ describe("comfy.models.run response size cap", () => {
     });
   });
 
+  it("carries the response's Retry-After on the breach", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      // `retryAfter` is documented as "any failure that carried the header
+      // has it", and a cap breach is a failure like any other: it hands back
+      // an `idempotencyKey`, so it owes the pace to use it at.
+      server.state.respond = () => ({
+        status: 200,
+        body: { caption: "x".repeat(20_000) },
+        headers: { "Retry-After": "3" },
+      });
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { maxBytes: 512 })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err.code).toBe("response_too_large");
+      expect(err.retryAfter).toBe(3);
+      expect(err.idempotencyKey).toEqual(expect.any(String));
+    });
+  });
+
   it("rejects a maxBytes that is not a size, before any request goes out", async () => {
     const fetchSpy = forbidNetwork();
     config({ credentials: CREDENTIAL, baseUrl: "http://127.0.0.1:1" });
@@ -678,6 +1029,108 @@ describe("comfy.models.run response size cap", () => {
     );
     await expect(comfy.models.run(MODEL, {}, { maxBytes: -1 })).rejects.toBeInstanceOf(TypeError);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("names NaN as NaN when it rejects it", async () => {
+    config({ credentials: CREDENTIAL, baseUrl: "http://127.0.0.1:1" });
+    // `JSON.stringify(NaN)` is `"null"`, and `null` is the one value the same
+    // sentence calls valid — the message would name what it accepts.
+    const err = (await comfy.models
+      .run(MODEL, {}, { maxBytes: Number.NaN })
+      .catch((e: unknown) => e)) as TypeError;
+    expect(err.message).toContain("got NaN");
+  });
+
+  it("keeps a retryable status retryable behind an oversized error body", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      // The README's own case: an intermediary answering a 503 with an HTML
+      // error page far past the cap. The status is what says "ask again", and
+      // the body has nothing to add — so it is dropped unread and the retry
+      // budget is spent on retries rather than on one fatal cap breach.
+      server.state.status = 503;
+      server.state.errorType = "service_unavailable";
+      server.state.body = { detail: "x".repeat(20_000), error_type: "service_unavailable" };
+
+      const err = (await comfy.models
+        // A budget short enough to exhaust inside one test, so what is
+        // asserted is that the retries happened at all.
+        .run(MODEL, {}, { maxBytes: 512, retry: { budgetMs: 300, baseDelayMs: 5, maxDelayMs: 20 } })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err.code).toBe("service_unavailable");
+      expect(err.httpStatus).toBe(503);
+      expect(server.state.requestCount).toBeGreaterThan(1);
+    });
+  });
+
+  it("collects a generation behind an oversized 409 body", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      const payload = { caption: "done" };
+      // A collectable 409 is Router saying it still holds the generation —
+      // already billed — and asking to be re-asked. A cap breach on its body
+      // would abandon it, so the body is never read.
+      server.state.respond = (_request, index) =>
+        index === 0
+          ? {
+              status: 409,
+              errorType: "concurrency_limit_exceeded",
+              body: { detail: "y".repeat(20_000), error_type: "concurrency_limit_exceeded" },
+              headers: { "Retry-After": "1" },
+            }
+          : { status: 200, body: payload };
+
+      const result = await comfy.models.run(
+        MODEL,
+        {},
+        {
+          maxBytes: 1_024,
+          retry: { budgetMs: 60_000, baseDelayMs: 5, maxDelayMs: 10, collectBudgetMs: 5_000 },
+        },
+      );
+
+      expect(result.kind).toBe("json");
+      expect(result.data).toEqual(payload);
+      expect(server.state.requestCount).toBe(2);
+    });
+  });
+
+  it("truncates an oversized error body rather than losing its class", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      // 402 with an error page past the cap. The bucket lives in the status
+      // and `X-Comfy-Error-Type`, not in the body, and refusing the body
+      // would trade `InsufficientCredits` for a bare `ComfyError` — the one
+      // thing the response was actually carrying.
+      server.state.status = 402;
+      server.state.errorType = "insufficient_credits";
+      server.state.body = { detail: "z".repeat(20_000), error_type: "insufficient_credits" };
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { maxBytes: 512 })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(InsufficientCredits);
+      expect(err.code).toBe("insufficient_credits");
+      expect(err.httpStatus).toBe(402);
+    });
+  });
+
+  it("still refuses a RESULT past the cap when the status is a 200", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      // The mirror of the test above: nothing about a 200 is worth keeping
+      // once the result itself will not fit, so this one does raise.
+      server.state.body = { caption: "x".repeat(20_000) };
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { maxBytes: 512 })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err.code).toBe("response_too_large");
+      expect(err.details?.maxBytes).toBe(512);
+    });
   });
 });
 
