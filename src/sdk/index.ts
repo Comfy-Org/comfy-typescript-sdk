@@ -17,6 +17,7 @@ export {
   type ComfyConfig,
 } from "./credentials.js";
 export {
+  DEFAULT_MAX_RESPONSE_BYTES,
   DEFAULT_RUN_TIMEOUT_MS,
   ERROR_TYPE_HEADER,
   models,

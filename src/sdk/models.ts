@@ -61,6 +61,18 @@
  * aborts the socket — the server sees a disconnect, which is also the exit
  * that is not billed — and stops the retry loop between attempts as well as
  * during one.
+ *
+ * # The response body is buffered, and the buffer is capped
+ *
+ * One call resolves with one finished result, so the whole body is held in
+ * memory; there is no streaming surface to hand a caller instead. `maxBytes`
+ * is the ceiling on that — {@link DEFAULT_MAX_RESPONSE_BYTES} unless the
+ * caller says otherwise, `null` to disable — checked against `Content-Length`
+ * before the body is read and against the bytes as they are read, since a
+ * chunked response declares no length and a declared one is a claim rather
+ * than a bound. A breach is the one failure here that is deliberately kept out
+ * of the retry loop: re-asking would re-download the same oversized body on
+ * every attempt.
  */
 
 import { clampTimerMs, withInactivityLimits } from "../low/dispatcher.js";
@@ -110,6 +122,38 @@ import {
  * at all can hang until the process exits.
  */
 export const DEFAULT_RUN_TIMEOUT_MS = 1_200_000;
+
+/**
+ * Default ceiling on the response body one {@link Models.run} call will
+ * buffer, in bytes.
+ *
+ * The whole body is held in memory — the call resolves with a finished result,
+ * so there is no streaming surface to hand a caller instead — and without a
+ * ceiling a pathological or mis-routed response allocates without bound in the
+ * caller's process. Sixty-four MiB is comfortably above what the catalog
+ * actually returns today (a JSON document is kilobytes; an ElevenLabs mp3 is
+ * about a megabyte a minute) and far below the size at which buffering is the
+ * process's problem rather than the response's.
+ *
+ * It is a per-call knob rather than a guess this package has to get right for
+ * everyone: a model whose generation is genuinely larger — video, once the
+ * catalog has it — raises it with `maxBytes`, and `maxBytes: null` disables
+ * the cap entirely for a caller who would rather have the allocation than the
+ * error.
+ */
+export const DEFAULT_MAX_RESPONSE_BYTES = 67_108_864;
+
+/**
+ * `code` on the {@link ComfyError} a body over the cap raises. Its own bucket
+ * rather than `unexpected_response`, because it is the one failure here a
+ * caller can act on mechanically — raise `maxBytes`, or stop asking this model
+ * for something this big.
+ *
+ * Not exported: the string is the contract (it is documented in the README and
+ * on {@link RunOptions.maxBytes}), and every other code this module raises is
+ * a string literal too.
+ */
+const RESPONSE_TOO_LARGE = "response_too_large";
 
 /** Response header carrying the server-generated id for a call. */
 export const REQUEST_ID_HEADER = "X-Comfy-Request-Id";
@@ -180,6 +224,31 @@ export interface RunOptions {
    * same key, whichever way it was obtained.
    */
   idempotencyKey?: string;
+  /**
+   * Largest response body this call will buffer, in bytes. Omit for
+   * {@link DEFAULT_MAX_RESPONSE_BYTES} (64 MiB); pass `null` to disable the
+   * cap entirely.
+   *
+   * Enforced twice, because the two checks catch different responses. A
+   * `Content-Length` over the cap is refused **before the body is read at
+   * all** and the connection is dropped — the cheap exit, and the one that
+   * avoids the download rather than merely the allocation. The bytes actually
+   * read are then counted against the same cap, since `Content-Length` is
+   * absent on a chunked response and is not a promise on any of them.
+   *
+   * A breach raises a {@link ComfyError} with `code: "response_too_large"`,
+   * carrying `maxBytes` and the offending size on `details`. It is NOT
+   * retried: it is a verdict about this response rather than a transport
+   * failure, and re-asking would re-download the same oversized body on every
+   * attempt until the budget ran out — multiplying the cost of the one thing
+   * that already went wrong.
+   *
+   * The cap covers an error response's body as well as a result's. An error
+   * body is kilobytes in every ordinary case, so this only bites where
+   * something ahead of the route is answering with something that is not the
+   * contract at all.
+   */
+  maxBytes?: number | null;
   /**
    * Retry policy for this call. Omit for the defaults in `./retry.ts`
    * (`DEFAULT_RETRY_BUDGET_MS` of wall clock, jittered exponential backoff
@@ -443,6 +512,147 @@ function errorFromResponse(
 }
 
 /**
+ * Resolve `options.maxBytes` to a cap, or to `null` for "no cap".
+ *
+ * Validated at the call site rather than in the read, for the reason the
+ * credentials check is: a process that asked for a cap it cannot have should
+ * find out before a model runs and is billed. `NaN` is the case worth the
+ * explicit check — every comparison against it is false, so it would read as
+ * "no cap" and silently undo the ceiling the caller thought they set.
+ */
+function resolveMaxBytes(maxBytes: number | null | undefined): number | null {
+  if (maxBytes === undefined) return DEFAULT_MAX_RESPONSE_BYTES;
+  if (maxBytes === null) return null;
+  if (typeof maxBytes !== "number" || !Number.isFinite(maxBytes) || maxBytes < 0) {
+    throw new TypeError(
+      "models.run(options.maxBytes): expected a non-negative number of bytes, " +
+        `or null to disable the cap, got ${JSON.stringify(maxBytes)}`,
+    );
+  }
+  return maxBytes;
+}
+
+/**
+ * The response's declared body length, or `null` when it declared none this
+ * can act on.
+ *
+ * A header the response carried twice reaches `Headers.get` as `"n, n"`, and a
+ * proxy can send something that is not a number at all. Neither is a length to
+ * refuse a response over, and neither needs to be: an undeclared length is
+ * exactly what the read-side count below exists for.
+ */
+function declaredLength(response: Response): number | null {
+  const raw = response.headers.get("Content-Length");
+  if (raw === null) return null;
+  const value = raw.trim();
+  if (!/^\d+$/.test(value)) return null;
+  return Number(value);
+}
+
+function tooLarge(
+  model: string,
+  response: Response,
+  idempotencyKey: string,
+  maxBytes: number,
+  measured: { readonly contentLength: number } | { readonly bytesRead: number },
+): ComfyError {
+  const how =
+    "contentLength" in measured
+      ? `declares a Content-Length of ${String(measured.contentLength)} bytes`
+      : `is over ${String(measured.bytesRead)} bytes`;
+  return new ComfyError(
+    `models.run("${model}") response body ${how}, past the ${String(maxBytes)}-byte maxBytes cap; ` +
+      "raise maxBytes for this call, or pass maxBytes: null to disable the cap",
+    {
+      code: RESPONSE_TOO_LARGE,
+      httpStatus: response.status,
+      details: { maxBytes, ...measured },
+      requestId: response.headers.get(REQUEST_ID_HEADER),
+      idempotencyKey,
+    },
+  );
+}
+
+/** Is `exc` this module's own cap breach, as opposed to anything else the
+ * fetch-and-read can throw? Only this module raises that code, and only from
+ * {@link readBodyWithin}, which is what makes the check exact. */
+function isTooLarge(exc: unknown): boolean {
+  return exc instanceof ComfyError && exc.code === RESPONSE_TOO_LARGE;
+}
+
+/**
+ * Buffer the response body as text, refusing one over `maxBytes`.
+ *
+ * Two checks rather than one, because they catch different responses and the
+ * cheap one cannot stand alone:
+ *
+ * - **`Content-Length`**, before a byte is read. This is the exit worth
+ *   having: it costs one header read, and cancelling the body here means the
+ *   oversized response is never downloaded rather than downloaded and thrown
+ *   away.
+ * - **the bytes actually read**, chunk by chunk. `Content-Length` is absent on
+ *   a chunked response, is the *encoded* length when a body arrives
+ *   compressed, and is in any case a claim by the sender rather than a bound
+ *   on it — so the read is where the cap is actually enforced.
+ *
+ * With no cap the runtime's own `text()` does the buffering, which is what
+ * this route did before the cap existed.
+ */
+async function readBodyWithin(
+  response: Response,
+  maxBytes: number | null,
+  model: string,
+  idempotencyKey: string,
+): Promise<string> {
+  if (maxBytes === null) return response.text();
+
+  const declared = declaredLength(response);
+  if (declared !== null && declared > maxBytes) {
+    // Drop the connection rather than leave a body nothing will ever read
+    // streaming into the buffer — not downloading it is the whole point of
+    // checking the header first.
+    await response.body?.cancel().catch(() => undefined);
+    throw tooLarge(model, response, idempotencyKey, maxBytes, { contentLength: declared });
+  }
+
+  const body = response.body;
+  // No stream to read — a body-less status, or a runtime that exposes none.
+  // `text()` is the empty string there and cannot breach a cap.
+  if (body === null) return response.text();
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        throw tooLarge(model, response, idempotencyKey, maxBytes, { bytesRead: total });
+      }
+      chunks.push(value);
+    }
+  } catch (exc) {
+    // Stop the transfer on the way out, for the breach and for an abort
+    // alike: without this the rest of an oversized body keeps arriving on a
+    // socket nothing is reading from.
+    await reader.cancel().catch(() => undefined);
+    throw exc;
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  // The same decode `Response.text()` does: UTF-8, BOM stripped, invalid
+  // sequences replaced rather than thrown on.
+  return new TextDecoder().decode(bytes);
+}
+
+/**
  * Did `signal` abort because this call's own deadline elapsed, rather than
  * because the caller aborted it?
  *
@@ -497,6 +707,7 @@ async function run<TData = unknown>(
   const body = JSON.stringify(input);
 
   const retry = resolveRetry(options.retry);
+  const maxBytes = resolveMaxBytes(options.maxBytes);
   const timeoutMs = options.timeoutMs === undefined ? DEFAULT_RUN_TIMEOUT_MS : options.timeoutMs;
   const startedAt = Date.now();
   const deadlineAt = timeoutMs === null ? null : startedAt + timeoutMs;
@@ -550,8 +761,14 @@ async function run<TData = unknown>(
       // body consumption too, so a signal that fires while the result is
       // still streaming rejects HERE, and translating it in only one of the
       // two places would leak a bare DOMException out of the other.
-      text = await response.text();
+      text = await readBodyWithin(response, maxBytes, model, idempotencyKey);
     } catch (exc) {
+      // A body past the cap leaves the loop immediately. It is a verdict about
+      // THIS response, not a transport failure, and the retry loop sitting
+      // around the read is exactly what would make it expensive: every attempt
+      // would re-download the same oversized body until the budget expired,
+      // multiplying the cost of the one thing that already failed.
+      if (isTooLarge(exc)) throw exc;
       if (isTimeout(exc, options.signal)) {
         throw new ComfyError(
           `models.run("${model}") exceeded its ${String(timeoutMs)}ms deadline before the model finished; ` +

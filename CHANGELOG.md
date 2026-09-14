@@ -17,6 +17,30 @@ Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
 entry. See CONTRIBUTING.md.
 -->
 
+### Added
+
+- `comfy.models.run` now caps the response body it will buffer, and takes a
+  `maxBytes` option to size that cap per call. The whole body is held in memory
+  — the call resolves with a finished result, so there is no streaming surface
+  to hand one to a caller through — and until now nothing bounded it, so a
+  pathological or mis-routed response could allocate without bound in the
+  caller's process. The default ceiling is 64 MiB
+  (`DEFAULT_MAX_RESPONSE_BYTES`, exported), comfortably above what the catalog
+  returns today; pass a larger `maxBytes` for a model whose generation is
+  genuinely bigger, or `maxBytes: null` to disable the cap entirely. A
+  `Content-Length` over the cap is refused before the body is read at all and
+  the connection is dropped, so the oversized response is never downloaded; the
+  bytes actually read are counted against the same cap, since a chunked
+  response declares no length and a declared one is a claim rather than a
+  bound. A breach raises a `ComfyError` with the new
+  `code: "response_too_large"` — its own bucket rather than
+  `unexpected_response`, so it can be branched on — carrying `maxBytes` and the
+  offending size on `details`. It is deliberately **not** retried: it is a
+  verdict about the response rather than a transport failure, and the retry
+  loop would otherwise re-download the same oversized body on every attempt
+  until the budget expired. The cap applies to an error response's body as
+  well.
+
 ## [0.2.0] - 2026-09-10
 
 ### Added

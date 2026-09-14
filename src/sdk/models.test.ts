@@ -9,6 +9,7 @@ import {
   ComfyError,
   config,
   CREDENTIALS_ENV_VAR,
+  DEFAULT_MAX_RESPONSE_BYTES,
   DEFAULT_RUN_TIMEOUT_MS,
   Forbidden,
   InsufficientCredits,
@@ -509,6 +510,174 @@ describe("comfy.models.run failures", () => {
       expect(err.httpStatus).toBe(200);
       expect(err.requestId).toBe("6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21");
     });
+  });
+});
+
+/**
+ * The body is buffered whole — one call resolves with one finished result, so
+ * there is nothing to stream it into — and `maxBytes` is the ceiling on that.
+ * Two checks, because they catch different responses: `Content-Length` before
+ * the body is touched (the exit that avoids the download rather than just the
+ * allocation), and the bytes as they are read (the only check a chunked
+ * response has). A breach is deliberately kept out of the retry loop, since
+ * retrying it re-downloads the same oversized body on every attempt.
+ */
+describe("comfy.models.run response size cap", () => {
+  /** A retry policy that WOULD retry, and fast — so a test asserting one
+   * attempt is asserting the classification rather than a slow clock. */
+  const WOULD_RETRY = { budgetMs: 5_000, baseDelayMs: 5, maxDelayMs: 20 };
+
+  it("refuses a Content-Length over the cap without reading the body", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      // The stall is the proof: this response declares 4096 bytes and sends
+      // ten, so a client that waited for the body would wait until its
+      // deadline. Returning at all means the header alone decided it.
+      server.state.stallBody = true;
+      server.state.stallBodyContentLength = 4096;
+
+      const startedAt = Date.now();
+      const err = (await comfy.models
+        .run(MODEL, {}, { maxBytes: 512, timeoutMs: 30_000 })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("response_too_large");
+      expect(err.httpStatus).toBe(200);
+      expect(err.requestId).toBe("6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21");
+      expect(err.details).toEqual({ maxBytes: 512, contentLength: 4096 });
+      expect(Date.now() - startedAt).toBeLessThan(5_000);
+      expect(server.state.requestCount).toBe(1);
+      // The connection is dropped rather than left draining a body nothing
+      // will read.
+      await waitFor(() => server.state.clientDisconnects === 1);
+    });
+  });
+
+  it("caps at DEFAULT_MAX_RESPONSE_BYTES when the call names no maxBytes", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.stallBody = true;
+      server.state.stallBodyContentLength = DEFAULT_MAX_RESPONSE_BYTES + 1;
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { timeoutMs: 30_000 })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err.code).toBe("response_too_large");
+      expect(err.details).toEqual({
+        maxBytes: DEFAULT_MAX_RESPONSE_BYTES,
+        contentLength: DEFAULT_MAX_RESPONSE_BYTES + 1,
+      });
+    });
+  });
+
+  it("stops a chunked response that declares no length mid-read", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      // 8 MiB with no Content-Length at all: the only thing that can refuse
+      // this is counting the bytes as they arrive.
+      server.state.chunkedBody = { chunkBytes: 64 * 1024, chunks: 128 };
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { maxBytes: 8_192, timeoutMs: 30_000, retry: WOULD_RETRY })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("response_too_large");
+      expect(err.details?.maxBytes).toBe(8_192);
+      expect(err.details?.bytesRead).toBeGreaterThan(8_192);
+      // Mid-read, not after: the server never got to write the whole body.
+      expect(server.state.chunkedBodyCompleted).toBe(false);
+      expect(server.state.chunkedChunksSent).toBeLessThan(128);
+      // And it is a verdict, not a transport failure — one attempt, however
+      // much retry budget was left.
+      expect(server.state.requestCount).toBe(1);
+      await waitFor(() => server.state.clientDisconnects === 1);
+    });
+  });
+
+  it("does not retry a cap breach, however retryable the status looks", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      // A 503 is the most retryable answer there is, and its body is still
+      // buffered — so this is the case where retrying would re-download the
+      // oversized body on every attempt until the budget ran out.
+      server.state.status = 503;
+      server.state.errorType = "service_unavailable";
+      server.state.body = { detail: "x".repeat(20_000), error_type: "service_unavailable" };
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { maxBytes: 512, retry: WOULD_RETRY })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err.code).toBe("response_too_large");
+      expect(err.httpStatus).toBe(503);
+      expect(server.state.requestCount).toBe(1);
+    });
+  });
+
+  it("disables the cap entirely on maxBytes: null", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      const payload = { caption: "x".repeat(20_000) };
+      server.state.body = payload;
+
+      const refused = (await comfy.models
+        .run(MODEL, {}, { maxBytes: 64 })
+        .catch((e: unknown) => e)) as ComfyError;
+      expect(refused.code).toBe("response_too_large");
+
+      const result = await comfy.models.run(MODEL, {}, { maxBytes: null });
+
+      expect(result.data).toEqual(payload);
+    });
+  });
+
+  it("admits a body of exactly maxBytes and refuses one byte more", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      const payload = { caption: "x".repeat(1_000) };
+      const exact = Buffer.byteLength(JSON.stringify(payload));
+      server.state.body = payload;
+
+      const result = await comfy.models.run(MODEL, {}, { maxBytes: exact });
+      expect(result.data).toEqual(payload);
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { maxBytes: exact - 1 })
+        .catch((e: unknown) => e)) as ComfyError;
+      expect(err.code).toBe("response_too_large");
+    });
+  });
+
+  it("decodes a multi-byte body the same as the runtime's own text()", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      // Big enough to arrive as several chunks, and non-ASCII throughout, so
+      // a character straddles a chunk boundary. Counting bytes chunk by chunk
+      // is only safe because the decode happens once, over the whole buffer —
+      // decoding per chunk would replace every split character with U+FFFD.
+      const payload = { caption: "é🎧".repeat(20_000) };
+      server.state.body = payload;
+
+      const result = await comfy.models.run(MODEL, {});
+
+      expect(result.data).toEqual(payload);
+    });
+  });
+
+  it("rejects a maxBytes that is not a size, before any request goes out", async () => {
+    const fetchSpy = forbidNetwork();
+    config({ credentials: CREDENTIAL, baseUrl: "http://127.0.0.1:1" });
+
+    // NaN is the one worth pinning: every comparison against it is false, so
+    // an unchecked NaN reads as "no cap" and silently undoes the ceiling.
+    await expect(comfy.models.run(MODEL, {}, { maxBytes: Number.NaN })).rejects.toBeInstanceOf(
+      TypeError,
+    );
+    await expect(comfy.models.run(MODEL, {}, { maxBytes: -1 })).rejects.toBeInstanceOf(TypeError);
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });
 
