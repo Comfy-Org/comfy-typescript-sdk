@@ -133,16 +133,16 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
     pythonAsyncModelsClasses: ["AsyncModels"],
   },
   {
-    id: "models-queue-lead",
+    id: "discovery-methods-land-first-in-typescript",
     why:
-      "The queued surface — `submit`, `subscribe` and `handle`, plus the `RequestHandle` they " +
-      "hand back — landed in this SDK while the Python twin was still on an open pull request, " +
-      "so TypeScript LEADS on those three method names. This is not a divergence anybody wants " +
-      "to keep: the two surfaces are the same shape, method for method, and the rot guard below " +
-      "fails the moment `parity/python-surface.json` grows any of them, which is the signal to " +
-      "delete this entry and let the two tables be compared again. Refresh the snapshot with " +
-      "`pnpm sync:python-surface` once the Python change is on its default branch.",
-    modelsMethodsAheadOfPython: ["handle", "submit", "subscribe"],
+      "`comfy.models.schema` and `comfy.models.list` reach Router's two discovery routes — the " +
+      "per-model OpenAPI document and the paginated model catalog — which the contract has " +
+      "declared all along and neither SDK called. The shape is settled here first, on purpose: " +
+      "the same two methods belong on `comfy_sdk.models.Models`/`AsyncModels` and are a " +
+      "follow-up on the Python SDK, so the naming is negotiated once rather than twice. This " +
+      "is a LAG, not a divergence — the entry fails the moment the Python snapshot grows " +
+      "either name, which is when it should be deleted rather than kept.",
+    modelsMethodsAheadOfPython: ["schema", "list"],
   },
   {
     id: "collect-switched-off-by-budget",

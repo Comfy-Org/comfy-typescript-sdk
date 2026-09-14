@@ -877,7 +877,18 @@ export class RequestHandle<TData = unknown> {
     // A body that is not a JSON object is returned UNCHANGED: the payload is
     // the partner's, and a model whose native output is an array or a bare
     // value is not a malformed response.
-    return { data: body as TData, requestId: response.headers.get(REQUEST_ID_HEADER) };
+    //
+    // Always `"json"`: the result route is read through `decode`, which parses
+    // the body as a document, so the queued path has no binary branch to reach
+    // — `RunResult`'s other arm is produced only by the SYNCHRONOUS route
+    // (`finish` in models.ts), which reads `Content-Type` off the generation
+    // itself. The discriminant is still written rather than inferred so a
+    // caller can narrow one union across both paths.
+    return {
+      kind: "json",
+      data: body as TData,
+      requestId: response.headers.get(REQUEST_ID_HEADER),
+    };
   }
 
   /**

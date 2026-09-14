@@ -456,6 +456,11 @@ describe("RequestHandle.get", () => {
       const handle = comfy.models.handle<typeof PAYLOAD>(MODEL, REQUEST_ID);
       const result = await handle.get();
 
+      // The DISCRIMINANT, so a caller can narrow one `RunResult` across both
+      // paths. The queued result route is read as a document, so this arm is
+      // the only one it produces — `"binary"` is the synchronous route's,
+      // decided off the generation's own `Content-Type`.
+      expect(result.kind).toBe("json");
       // No cast: `data` is the supplied type, exactly as `run<T>` gives it.
       expect(result.data.images[0].url).toBe("https://example.invalid/out.png");
       expect(result.requestId).toBe("http-req-9");
