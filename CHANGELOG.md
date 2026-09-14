@@ -17,8 +17,36 @@ Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
 entry. See CONTRIBUTING.md.
 -->
 
+## [0.3.0] - 2026-09-14
+
 ### Added
 
+- **Queued model delivery — `comfy.models.submit`, `comfy.models.subscribe`
+  and `comfy.models.handle`.** `comfy.models.run` holds one connection open
+  until the generation is finished; `submit` returns a `RequestHandle` as soon
+  as the server accepts the request, so a caller who cannot hold a connection
+  for the length of a generation — a web request that has to return now, a
+  worker that submits in one process and collects in another — can collect it
+  later. The handle carries `requestId`, `model`, `status()`, `get()`,
+  `cancel()` and an async-iterable `events()`; `get()` resolves to the same
+  `{ data, requestId }` `run` does. `subscribe` is submit + poll + collect in
+  one call with an `onQueueUpdate` callback, and `handle(model, requestId)`
+  rebuilds a handle from the two ids with no request made. Polling is
+  poll-authoritative with adaptive backoff, a server `Retry-After` beats the
+  schedule (capped at 60 s), and `timeoutMs`/`signal` bound the whole wait
+  rather than only the pauses in it. A `COMPLETED` status carrying an
+  `error_type` — which is how the server reports a failed _and_ a cancelled
+  request — rejects with the matching `routerErrors` class, so a `200` is
+  never handed back as a successful result. Intended to mirror `models.submit` /
+  `subscribe` / `handle` in the Python SDK, which have not shipped yet
+  (comfy-python-sdk#137) — the TypeScript SDK leads on this surface until they
+  do, so do not read the names as a parity guarantee today. The surface is gated server side:
+  outside the preview it answers `403 not_enabled`, which arrives as
+  `routerErrors.NotEnabled`.
+- `routerErrors.errorFromCompletion(body, requestId)` — the typed exception a
+  completed queued request reports, or `null`. Maps a `COMPLETED` body's
+  `error_type` through the same table `toRouterError` uses, with `httpStatus`
+  left `null` because the poll that found it was a `200`.
 - `comfy.models.run` now caps the response body it will buffer, and takes a
   `maxBytes` option to size that cap per call. The whole body is held in memory
   — the call resolves with a finished result, so there is no streaming surface
@@ -51,6 +79,29 @@ entry. See CONTRIBUTING.md.
   `X-Comfy-Error-Type` name. Only a result past the cap raises
   `response_too_large`, and `details.maxBytes` is what distinguishes that local
   breach from an upstream that declared the same `code` itself.
+- **Model discovery — `comfy.models.schema()` and `comfy.models.list()`.**
+  Comfy Router publishes both which models it runs and what arguments each one
+  takes, and neither was reachable from this SDK: you could only `run()` a
+  model whose ID and input shape you already knew.
+  `comfy.models.schema(model, options?)` fetches one model's published OpenAPI
+  document and resolves to `{ unchanged: false, document, etag, requestId }`;
+  pass an `etag` you already hold and it goes out as `If-None-Match`, and a
+  `304` resolves as an explicit `{ unchanged: true, document: undefined, etag,
+requestId }` rather than throwing or handing back an empty document. The
+  result is a discriminated union on `unchanged`, so reading `.document`
+  without narrowing is a compile error. `comfy.models.list(options?)` returns a
+  lazy handle that is async-iterable over models, following `next_cursor` until
+  the catalog is exhausted, with `list().page()` as the single-page form for a
+  caller driving its own pagination. Both go through `run()`'s credential gate,
+  base-URL resolution, request-id capture and error table. The document is
+  returned as data and is not validated here — these are OpenAPI 3.0.2
+  documents, and a browser-loadable package should not carry a validator.
+  Exported alongside them: `DEFAULT_DISCOVERY_TIMEOUT_MS`, `ETAG_HEADER`,
+  `IF_NONE_MATCH_HEADER`, and the `CatalogModel`, `DiscoveryOptions`,
+  `ListOptions`, `ModelList`, `ModelPage`, `SchemaDocument`, `SchemaOptions`,
+  `SchemaResult` and `SchemaUnchanged` types. Neither method exists in the
+  Python SDK yet, so the TypeScript SDK leads on this surface — declared in
+  `surface-parity.test.ts` with a rot guard rather than assumed.
 
 ### Fixed
 
@@ -94,32 +145,6 @@ entry. See CONTRIBUTING.md.
 
 ### Added
 
-- **Queued model delivery — `comfy.models.submit`, `comfy.models.subscribe`
-  and `comfy.models.handle`.** `comfy.models.run` holds one connection open
-  until the generation is finished; `submit` returns a `RequestHandle` as soon
-  as the server accepts the request, so a caller who cannot hold a connection
-  for the length of a generation — a web request that has to return now, a
-  worker that submits in one process and collects in another — can collect it
-  later. The handle carries `requestId`, `model`, `status()`, `get()`,
-  `cancel()` and an async-iterable `events()`; `get()` resolves to the same
-  `{ data, requestId }` `run` does. `subscribe` is submit + poll + collect in
-  one call with an `onQueueUpdate` callback, and `handle(model, requestId)`
-  rebuilds a handle from the two ids with no request made. Polling is
-  poll-authoritative with adaptive backoff, a server `Retry-After` beats the
-  schedule (capped at 60 s), and `timeoutMs`/`signal` bound the whole wait
-  rather than only the pauses in it. A `COMPLETED` status carrying an
-  `error_type` — which is how the server reports a failed _and_ a cancelled
-  request — rejects with the matching `routerErrors` class, so a `200` is
-  never handed back as a successful result. Intended to mirror `models.submit` /
-  `subscribe` / `handle` in the Python SDK, which have not shipped yet
-  (comfy-python-sdk#137) — the TypeScript SDK leads on this surface until they
-  do, so do not read the names as a parity guarantee today. The surface is gated server side:
-  outside the preview it answers `403 not_enabled`, which arrives as
-  `routerErrors.NotEnabled`.
-- `routerErrors.errorFromCompletion(body, requestId)` — the typed exception a
-  completed queued request reports, or `null`. Maps a `COMPLETED` body's
-  `error_type` through the same table `toRouterError` uses, with `httpStatus`
-  left `null` because the poll that found it was a `200`.
 - `Asset.getDownloadUrl()` — a directly-fetchable URL for an _uploaded_
   asset's bytes, mirroring `Output.getDownloadUrl()` (same
   `{ url, expiresAt }` shape, commits the asset first if needed). On Comfy
