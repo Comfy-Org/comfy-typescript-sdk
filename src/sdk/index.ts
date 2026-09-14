@@ -26,6 +26,20 @@ export {
   type RunResult,
 } from "./models.js";
 export {
+  CANCEL_TIMEOUT_MS,
+  COMPLETED,
+  DEFAULT_SUBMIT_TIMEOUT_MS,
+  MAX_RETRY_AFTER_MS,
+  MIN_REQUEST_TIMEOUT_MS,
+  nextPollDelayMs,
+  RequestHandle,
+  type QueueUpdate,
+  type SubmitOptions,
+  type SubscribeOptions,
+  type WaitOptions,
+} from "./modelRequests.js";
+export { MAX_REQUEST_ID_LENGTH } from "./modelRoutes.js";
+export {
   DEFAULT_COLLECT_BUDGET_MS,
   DEFAULT_RETRY_BASE_DELAY_MS,
   DEFAULT_RETRY_BUDGET_MS,

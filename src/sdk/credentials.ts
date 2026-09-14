@@ -23,6 +23,8 @@
  * `console.log(comfy)` cannot print it. `credentials.test.ts` asserts that.
  */
 
+import { MissingCredentials } from "./exceptions.js";
+
 /** Environment variable read when {@link config} set no credentials. */
 export const CREDENTIALS_ENV_VAR = "COMFY_API_KEY";
 
@@ -162,6 +164,28 @@ export function resolveCredentials(): string | undefined {
   if (configuredCredentials !== undefined) return configuredCredentials;
   const fromEnv = globalThis.process?.env?.[CREDENTIALS_ENV_VAR]?.trim();
   return fromEnv ? fromEnv : undefined;
+}
+
+/**
+ * {@link resolveCredentials}, or a {@link MissingCredentials} naming both ways
+ * to supply one.
+ *
+ * The whole point of this gate is that a process with no credential fails at
+ * the call site rather than on a round trip, so every `comfy.models.*` call
+ * runs it before it builds a request. It lives here, beside the resolution it
+ * guards, so the awaited and the queued surfaces cannot drift into two
+ * different messages for the same misconfiguration.
+ */
+export function requireCredentials(): string {
+  const credentials = resolveCredentials();
+  if (credentials === undefined) {
+    throw new MissingCredentials(
+      'no credentials configured — call comfy.config({ credentials: "comfyui-..." }) ' +
+        `or set ${CREDENTIALS_ENV_VAR} in the environment`,
+      { code: "missing_credentials" },
+    );
+  }
+  return credentials;
 }
 
 /**

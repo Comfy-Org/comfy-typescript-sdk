@@ -21,6 +21,32 @@ entry. See CONTRIBUTING.md.
 
 ### Added
 
+- **Queued model delivery — `comfy.models.submit`, `comfy.models.subscribe`
+  and `comfy.models.handle`.** `comfy.models.run` holds one connection open
+  until the generation is finished; `submit` returns a `RequestHandle` as soon
+  as the server accepts the request, so a caller who cannot hold a connection
+  for the length of a generation — a web request that has to return now, a
+  worker that submits in one process and collects in another — can collect it
+  later. The handle carries `requestId`, `model`, `status()`, `get()`,
+  `cancel()` and an async-iterable `events()`; `get()` resolves to the same
+  `{ data, requestId }` `run` does. `subscribe` is submit + poll + collect in
+  one call with an `onQueueUpdate` callback, and `handle(model, requestId)`
+  rebuilds a handle from the two ids with no request made. Polling is
+  poll-authoritative with adaptive backoff, a server `Retry-After` beats the
+  schedule (capped at 60 s), and `timeoutMs`/`signal` bound the whole wait
+  rather than only the pauses in it. A `COMPLETED` status carrying an
+  `error_type` — which is how the server reports a failed _and_ a cancelled
+  request — rejects with the matching `routerErrors` class, so a `200` is
+  never handed back as a successful result. Intended to mirror `models.submit` /
+  `subscribe` / `handle` in the Python SDK, which have not shipped yet
+  (comfy-python-sdk#137) — the TypeScript SDK leads on this surface until they
+  do, so do not read the names as a parity guarantee today. The surface is gated server side:
+  outside the preview it answers `403 not_enabled`, which arrives as
+  `routerErrors.NotEnabled`.
+- `routerErrors.errorFromCompletion(body, requestId)` — the typed exception a
+  completed queued request reports, or `null`. Maps a `COMPLETED` body's
+  `error_type` through the same table `toRouterError` uses, with `httpStatus`
+  left `null` because the poll that found it was a `200`.
 - `Asset.getDownloadUrl()` — a directly-fetchable URL for an _uploaded_
   asset's bytes, mirroring `Output.getDownloadUrl()` (same
   `{ url, expiresAt }` shape, commits the asset first if needed). On Comfy
