@@ -17,6 +17,41 @@ Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
 entry. See CONTRIBUTING.md.
 -->
 
+### Added
+
+- `comfy.models.run` now caps the response body it will buffer, and takes a
+  `maxBytes` option to size that cap per call. The whole body is held in memory
+  — the call resolves with a finished result, so there is no streaming surface
+  to hand one to a caller through — and until now nothing bounded it, so a
+  pathological or mis-routed response could allocate without bound in the
+  caller's process. The default ceiling is 64 MiB
+  (`DEFAULT_MAX_RESPONSE_BYTES`, exported), comfortably above what the catalog
+  returns today; pass a larger `maxBytes` for a model whose generation is
+  genuinely bigger, or `maxBytes: null` to disable the cap entirely. A
+  `Content-Length` over the cap is refused before the body is read at all and
+  the connection is dropped, so the oversized response is never downloaded; the
+  bytes actually read are counted against the same cap, since a chunked
+  response declares no length and a declared one is a claim rather than a
+  bound. The read accumulates into one growable buffer rather than a list of
+  chunks, so the cap bounds the heap and not merely the payload. A breach
+  raises a `ComfyError` with the new `code: "response_too_large"` — its own
+  bucket rather than `unexpected_response`, so it can be branched on —
+  carrying `maxBytes` and the offending size on `details`, and the
+  `Retry-After` the response carried. It is deliberately **not** retried: it
+  is a verdict about the response rather than a transport failure, and the
+  retry loop would otherwise re-download the same oversized body on every
+  attempt until the budget expired.
+- The cap never changes what a response means. A response `run` is going to
+  retry or collect is classified from its status and headers, and its body is
+  dropped unread — so an oversized upstream error page cannot make a retryable
+  `502` fatal, or abandon a generation the server is still holding behind a
+  collectable `409`/`504`. An error response `run` does hand back is truncated
+  at the cap rather than refused, so an oversized error body still arrives as
+  `Unauthorized`, `InsufficientCredits` or whatever bucket its status and
+  `X-Comfy-Error-Type` name. Only a result past the cap raises
+  `response_too_large`, and `details.maxBytes` is what distinguishes that local
+  breach from an upstream that declared the same `code` itself.
+
 ### Fixed
 
 - `comfy.models.run` no longer throws `unexpected_response` ("body is not

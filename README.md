@@ -216,9 +216,27 @@ const { data, requestId } = await comfy.models.run(
 );
 ```
 
-`run` accepts a third options argument: `signal`, `timeoutMs`, `idempotencyKey`, and `retry`.
+`run` accepts a third options argument: `signal`, `timeoutMs`, `maxBytes`, `idempotencyKey`, and `retry`.
 
 The default deadline is **20 minutes** — minutes rather than seconds, because the finished generation is the response and a short default would abort work that had already been paid for. It covers the whole call, retries included, rather than restarting per attempt, which is also why it is twenty and not ten: Comfy's own deadline is ten minutes, so a default of ten would leave nothing for the collect described below. Pass `timeoutMs: null` to disable it, and prefer pairing that with a `signal`.
+
+#### How much of a response it will buffer
+
+The whole body is held in memory: one call resolves with one finished result, so there is no streaming surface to hand it to you through. `maxBytes` is the ceiling on that, defaulting to **64 MiB** (`DEFAULT_MAX_RESPONSE_BYTES`, exported) — comfortably above what the catalog returns today, and short of letting a pathological or mis-routed response allocate without bound in your process.
+
+```ts
+// A larger generation than the default allows for.
+await comfy.models.run("some/video-model", { prompt }, { maxBytes: 512 * 1024 * 1024 });
+
+// No cap at all — you would rather have the allocation than the error.
+await comfy.models.run("some/video-model", { prompt }, { maxBytes: null });
+```
+
+It is checked twice, because the two checks catch different responses. A `Content-Length` over the cap is refused **before the body is read** and the connection is dropped, so the oversized response is never downloaded rather than downloaded and discarded. The bytes actually read are then counted against the same cap, since a chunked response declares no length at all and a declared one is a claim by the sender rather than a bound on it.
+
+A result over the cap raises a `ComfyError` with `code: "response_too_large"`, carrying `maxBytes` and the offending size on `details`. It is **not retried** — it is a verdict about the response rather than a transport failure, and re-asking would re-download the same oversized body on every attempt. Check `details.maxBytes` rather than the code alone if you branch on it: `code` on an error derived from a response is whatever the server's `X-Comfy-Error-Type` said, so an upstream can answer with the same string, and only a cap breach raised here carries `maxBytes`.
+
+The cap never changes what a response _means_. A response `run` is going to retry or collect is classified from its status and headers, and its body is dropped unread — so an intermediary answering a `503` with a huge error page does not turn a retryable failure into a fatal one, and does not abandon a generation the server is still holding behind a `409`/`504`. An error response `run` does hand back is truncated at the cap instead of refused, so an oversized error body still arrives as `Unauthorized`, `InsufficientCredits`, or whatever bucket its status and header name.
 
 #### Retries
 

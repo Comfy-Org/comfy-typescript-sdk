@@ -95,6 +95,25 @@ export interface RouterServerState {
    */
   stallBody: boolean;
   /**
+   * `Content-Length` a {@link stallBody} response declares. The body never
+   * reaches it, which is what makes it the fixture for a client that acts on
+   * the DECLARED length: a client that waits for the bytes instead waits
+   * forever.
+   */
+  stallBodyContentLength: number;
+  /**
+   * Send the body as N chunks of `chunkBytes` each with NO `Content-Length`,
+   * so the response is chunked and its size cannot be known before it is
+   * read. Writes respect backpressure, so a client that stops reading part
+   * way stops the transfer — {@link chunkedChunksSent} and
+   * {@link chunkedBodyCompleted} are how a test proves that happened.
+   */
+  chunkedBody: { chunkBytes: number; chunks: number } | null;
+  /** Chunks of a {@link chunkedBody} response actually flushed to the socket. */
+  chunkedChunksSent: number;
+  /** Whether a {@link chunkedBody} response wrote every chunk and ended. */
+  chunkedBodyCompleted: boolean;
+  /**
    * Answer the first N requests with {@link failStatus} (and
    * {@link failErrorType}) before falling through to the normal response —
    * the shape a client retry has to climb out of.
@@ -131,8 +150,9 @@ export interface RouterServerState {
    * model-request family, where one call sequence hits submit, status, result
    * and cancel in turn and a single `body` cannot describe all four.
    *
-   * Consulted LAST, after `resetTimes`, `hang`, `delayMs`, `failTimes` and
-   * `stallBody`, so every one of those scenarios still composes with it.
+   * Consulted LAST, after `resetTimes`, `hang`, `delayMs`, `failTimes`,
+   * `stallBody` and `chunkedBody`, so every one of those scenarios still
+   * composes with it.
    * Returning `null` falls through to the plain `status`/`body` answer.
    */
   respond: ((request: RecordedRequest, index: number) => ScriptedResponse | null) | null;
@@ -202,6 +222,10 @@ function defaultState(): RouterServerState {
     delayMs: 0,
     hang: false,
     stallBody: false,
+    stallBodyContentLength: 4096,
+    chunkedBody: null,
+    chunkedChunksSent: 0,
+    chunkedBodyCompleted: false,
     failTimes: 0,
     failStatus: 503,
     failErrorType: null,
@@ -237,6 +261,29 @@ function readBody(req: IncomingMessage): Promise<string> {
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
     req.on("error", reject);
+  });
+}
+
+/**
+ * Write one chunk and wait for it to reach the socket, resolving `false` if
+ * the connection went away first.
+ *
+ * Waiting for the flush rather than firing writes into Node's buffer is what
+ * makes a large chunked body actually stall against a client that stopped
+ * reading — which is the scenario a size cap has to be proven against.
+ */
+function writeChunk(res: ServerResponse, chunk: Buffer): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (res.destroyed || res.writableEnded) {
+      resolve(false);
+      return;
+    }
+    const onClose = () => resolve(false);
+    res.once("close", onClose);
+    res.write(chunk, () => {
+      res.off("close", onClose);
+      resolve(!res.destroyed);
+    });
   });
 }
 
@@ -402,8 +449,25 @@ export class RouterStubServer {
 
     if (state.stallBody) {
       // A Content-Length the body never reaches, so the client keeps reading.
-      res.writeHead(state.status, { ...headers, "Content-Length": "4096" });
+      res.writeHead(state.status, {
+        ...headers,
+        "Content-Length": String(state.stallBodyContentLength),
+      });
       res.write('{"images":');
+      return;
+    }
+
+    if (state.chunkedBody !== null) {
+      // No Content-Length: Node falls back to chunked transfer-encoding, so
+      // the client learns the size only by reading it.
+      res.writeHead(state.status, headers);
+      const chunk = Buffer.alloc(state.chunkedBody.chunkBytes, 0x61);
+      for (let i = 0; i < state.chunkedBody.chunks; i += 1) {
+        if (!(await writeChunk(res, chunk))) return;
+        state.chunkedChunksSent += 1;
+      }
+      res.end();
+      state.chunkedBodyCompleted = true;
       return;
     }
 
