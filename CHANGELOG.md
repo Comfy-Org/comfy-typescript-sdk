@@ -17,6 +17,44 @@ Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
 entry. See CONTRIBUTING.md.
 -->
 
+### Fixed
+
+- `comfy.models.run` no longer throws `unexpected_response` ("body is not
+  JSON") on a model whose `200` is the generated file itself. The run route's
+  `200` has two branches in the contract — `application/json` and `*/*` with
+  `format: binary` — and the ElevenLabs audio models (`elevenlabs/eleven_v3`,
+  `elevenlabs/eleven_sfx_v2`) are the first of the second kind in the catalog;
+  every one of them was unusable from this SDK, and the failure landed _after_
+  the server had run and billed the generation, with the bytes already
+  destroyed by the lossy text decode on the way to the parse. `run` now reads
+  the response `Content-Type` before it touches the body and returns the bytes
+  untouched.
+
+### Changed
+
+- **Breaking (types).** `RunResult` is now a discriminated union of the two
+  documented `200` shapes: `RunJsonResult` (`kind: "json"`, `data` the parsed
+  document — unchanged from before) and the new `RunBinaryResult`
+  (`kind: "binary"`, `data` a `Uint8Array` of the exact bytes, `contentType`
+  the partner's own media type, `""` when the response declared none). The
+  runtime shape of a JSON result gains only `kind`, so existing code keeps
+  working; existing _types_ need a `if (result.kind === "json")` narrowing
+  before `data` is the supplied `TData` again. Both members are exported, as
+  is `CONTENT_TYPE_HEADER`.
+- A `200` that declares a non-JSON `Content-Type` is now a binary result
+  rather than an `unexpected_response` error. A `200` declaring no
+  `Content-Type` at all is parsed as JSON if it decodes as UTF-8 and parses,
+  and is a binary result with `contentType: ""` otherwise. A media type counts
+  as JSON when its subtype is `json` (so `text/json` too) or carries the
+  structured `+json` suffix. A `200` that says `application/json` and then does
+  not parse still raises `unexpected_response` — as does any other `2xx`, since
+  a `204`/`205`/`206` is not a completed result, and as does a `200` with an
+  empty body rather than returning zero bytes as the generation. The `202`
+  guard is unchanged.
+- `comfy.models.run` now sends `Accept: application/json, */*;q=0.9` rather
+  than `Accept: application/json`. JSON is still ranked first; the client just
+  no longer claims to reject the binary branch its own contract declares.
+
 ## [0.2.0] - 2026-09-10
 
 ### Added

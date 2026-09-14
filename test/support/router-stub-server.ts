@@ -37,11 +37,15 @@ export interface ScriptedResponse {
 export interface RouterServerState {
   /** HTTP status to answer with. */
   status: number;
-  /** Response body. A string is sent verbatim (for non-JSON fixtures);
-   * anything else is JSON-encoded. `null` sends an empty body. */
+  /** Response body. A `Buffer`/`Uint8Array` is sent byte for byte (for a
+   * binary fixture — a partner's own audio or image bytes), a string verbatim
+   * (for non-JSON text fixtures); anything else is JSON-encoded. `null` sends
+   * an empty body. */
   body: unknown;
-  /** `Content-Type` of the response. */
-  contentType: string;
+  /** `Content-Type` of the response, or `null` to omit the header entirely —
+   * which a partner's response forwarded without one genuinely does, and
+   * which the client has to treat as its own case. */
+  contentType: string | null;
   /** `X-Comfy-Request-Id` to send, or `null` to omit the header — which a
    * proxy error page ahead of the router genuinely does. */
   requestId: string | null;
@@ -276,7 +280,8 @@ export class RouterStubServer {
       if (res.writableEnded || res.destroyed) return;
     }
 
-    const headers: Record<string, string> = { "Content-Type": state.contentType };
+    const headers: Record<string, string> = {};
+    if (state.contentType !== null) headers["Content-Type"] = state.contentType;
     if (state.requestId !== null) headers["X-Comfy-Request-Id"] = state.requestId;
     if (state.errorType !== null) headers["X-Comfy-Error-Type"] = state.errorType;
 
@@ -334,7 +339,14 @@ export class RouterStubServer {
       res.end();
       return;
     }
-    const payload = typeof state.body === "string" ? state.body : JSON.stringify(state.body);
+    // A `Uint8Array` (which a `Buffer` is) goes out byte for byte: a binary
+    // fixture only proves anything if nothing re-encodes it on the way.
+    const payload =
+      state.body instanceof Uint8Array
+        ? Buffer.from(state.body.buffer, state.body.byteOffset, state.body.byteLength)
+        : typeof state.body === "string"
+          ? state.body
+          : JSON.stringify(state.body);
     headers["Content-Length"] = String(Buffer.byteLength(payload));
     res.writeHead(state.status, headers);
     res.end(payload);
