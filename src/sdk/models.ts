@@ -687,6 +687,15 @@ async function run<TData = unknown>(
 /** UTF-8, non-fatal, BOM-stripping — the same decode `Response.text()` does. */
 const UTF8 = new TextDecoder();
 
+/**
+ * The same decode, but refusing invalid UTF-8 instead of papering over it
+ * with U+FFFD. Only the headerless probe below wants this: a body that the
+ * lenient decoder mangles into replacement characters can go on to parse as
+ * JSON (`22 FF 22` becomes the document `"\uFFFD"`), which would hand a
+ * caller a corrupted string where the bytes of their generation should be.
+ */
+const UTF8_STRICT = new TextDecoder("utf-8", { fatal: true });
+
 function decodeUtf8(bytes: Uint8Array): string {
   return UTF8.decode(bytes);
 }
@@ -695,23 +704,37 @@ function decodeUtf8(bytes: Uint8Array): string {
  * The media type from a `Content-Type`, lowercased and without its
  * parameters: `audio/mpeg; charset=binary` -> `audio/mpeg`. `""` when the
  * header was absent or blank.
+ *
+ * The comma matters as much as the semicolon: `Headers.get` joins a header
+ * sent twice into one `", "`-separated value, so a response carrying
+ * `Content-Type` twice arrives here as `application/json, application/json`
+ * — which matches neither the exact type nor the `+json` suffix, and would
+ * send an ordinary JSON result down the binary branch.
  */
 function mediaTypeOf(contentType: string): string {
-  return contentType.split(";")[0].trim().toLowerCase();
+  return contentType.split(";")[0].split(",")[0].trim().toLowerCase();
 }
 
 /**
  * Does this media type name a JSON document?
  *
- * `application/json` and the structured `+json` suffix (`application/
+ * A `json` subtype (`application/json`, and the `text/json` some providers
+ * still send) or the structured `+json` suffix (`application/
  * vnd.something+json`), which is the set the run route's `200` declares
  * against `RouterModelOutput`. Everything else is the contract's `*\/*`
  * branch — bytes — and is not sniffed any further: the response carries
  * `X-Content-Type-Options: nosniff`, so the partner's media type is taken at
  * its word rather than guessed at from the body.
+ *
+ * The test is on the subtype rather than the whole string, so a malformed
+ * value with no `type/subtype` at all (`garbage+json`) is not read as a
+ * document on the strength of its last five characters.
  */
 function isJsonMediaType(mediaType: string): boolean {
-  return mediaType === "application/json" || mediaType.endsWith("+json");
+  const slash = mediaType.indexOf("/");
+  if (slash === -1) return false;
+  const subtype = mediaType.slice(slash + 1);
+  return subtype === "json" || subtype.endsWith("+json");
 }
 
 /** Turn the attempt that ended the retry loop into a result or an error. */
@@ -736,6 +759,26 @@ function finish<TData>(
     );
   }
 
+  // Every other 2xx is not a finished result either, and used to say so: a
+  // 204/205 has no content to be one, a 206 is a fragment of one, and before
+  // this route grew a binary branch all three reached `JSON.parse("")` and
+  // raised. An empty body is the same case arriving under a 200 — a
+  // `Content-Length: 0` or a truncated response — and silently handing back
+  // `Uint8Array(0)` writes a caller a zero-byte file for a generation the
+  // server already billed them for.
+  if (response.status !== 200) {
+    throw new ComfyError(
+      `models.run("${model}") returned a ${String(response.status)} where the contract's completed result is a 200`,
+      { code: "unexpected_response", httpStatus: response.status, requestId, idempotencyKey },
+    );
+  }
+  if (responseBody.byteLength === 0) {
+    throw new ComfyError(
+      `models.run("${model}") returned a 200 with an empty body where a completed result was expected`,
+      { code: "unexpected_response", httpStatus: 200, requestId, idempotencyKey },
+    );
+  }
+
   // The `Content-Type` decides which of the two documented 200 shapes this
   // is, and it is read BEFORE anything interprets the body. A partner whose
   // generation is the response — ElevenLabs audio is the first in the catalog
@@ -750,7 +793,13 @@ function finish<TData>(
 
   let data: unknown;
   try {
-    data = JSON.parse(decodeUtf8(responseBody));
+    // Strictly when nothing declared a type: invalid UTF-8 is then a fact
+    // about the body rather than a field of U+FFFDs, and JSON has to be
+    // valid UTF-8 anyway, so refusing it costs no document that would have
+    // parsed.
+    data = JSON.parse(
+      mediaType === "" ? UTF8_STRICT.decode(responseBody) : decodeUtf8(responseBody),
+    );
   } catch (exc) {
     // No `Content-Type` at all and a body that is not JSON: nothing claimed
     // this was a document, so it is the binary branch with no media type to

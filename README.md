@@ -185,9 +185,11 @@ if (result.kind === "binary") {
 }
 ```
 
+`contentType` is the partner's own media type forwarded verbatim — remote input, not a value this SDK vouches for. A blob typed `text/html` or `image/svg+xml` and handed to `URL.createObjectURL` runs script in your origin the moment it is opened, so pin the type you expect — `new Blob([result.data], { type: "audio/mpeg" })` — anywhere the result might be navigated to rather than played.
+
 Checking `result.kind` is also what narrows the type: TypeScript will not let you pass `result.data` to `writeFile` until it knows the result is the binary one. If you know a given model's branch, assert it — `if (result.kind !== "binary") throw new Error("expected audio")` — rather than casting.
 
-A media type is JSON if it is `application/json` or carries the structured `+json` suffix; anything else is bytes. The response carries `X-Content-Type-Options: nosniff`, so the partner's declared type is taken at its word and never guessed at from the body. The one exception is a `2xx` that declares **no** `Content-Type` at all: that body is parsed as JSON if it parses, and is otherwise a binary result with `contentType: ""`. A response that says `application/json` and then isn't still raises `ComfyError` with `code: "unexpected_response"`.
+A media type is JSON if its subtype is `json` (`application/json`, and the `text/json` some providers still send) or carries the structured `+json` suffix; anything else is bytes. The response carries `X-Content-Type-Options: nosniff`, so the partner's declared type is taken at its word and never guessed at from the body. The one exception is a `2xx` that declares **no** `Content-Type` at all: that body is parsed as JSON if it parses, and is otherwise a binary result with `contentType: ""`. A response that says `application/json` and then isn't still raises `ComfyError` with `code: "unexpected_response"`.
 
 The whole body is buffered in memory; there is no streaming surface yet.
 

@@ -631,6 +631,96 @@ describe("comfy.models.run on a binary result", () => {
     });
   });
 
+  it("refuses a 2xx that is not the contract's 200, rather than calling it a result", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 204;
+      server.state.contentType = null;
+      server.state.body = null;
+
+      const err = (await comfy.models
+        .run(AUDIO_MODEL, {}, { retry: false })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("unexpected_response");
+      expect(err.httpStatus).toBe(204);
+    });
+  });
+
+  it("refuses an empty 200 body rather than handing back zero bytes as the generation", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "audio/mpeg";
+      server.state.body = null;
+
+      const err = (await comfy.models
+        .run(AUDIO_MODEL, {}, { retry: false })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("unexpected_response");
+      expect(err.httpStatus).toBe(200);
+    });
+  });
+
+  it("reads a Content-Type sent twice as the one media type it is", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      // What `Headers.get` hands back for a header the response carried twice:
+      // the values joined with ", ". Parsed naively it matches neither
+      // `application/json` nor `+json`, and an ordinary result comes back as
+      // bytes.
+      server.state.contentType = "application/json, application/json";
+      server.state.body = { images: [{ url: "https://example.invalid/a.png" }] };
+
+      const result = await comfy.models.run(MODEL, {});
+
+      expect(result.kind).toBe("json");
+      if (result.kind !== "json") throw new Error("unreachable");
+      expect(result.data).toEqual({ images: [{ url: "https://example.invalid/a.png" }] });
+    });
+  });
+
+  it("treats a json subtype as JSON whatever the type, and a suffix with no type as not", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "text/json";
+      server.state.body = { ok: true };
+
+      const json = await comfy.models.run(MODEL, {});
+
+      expect(json.kind).toBe("json");
+
+      // No `type/subtype` at all: the trailing `+json` is not a structured
+      // suffix, so this is the contract's byte branch rather than a document.
+      server.state.contentType = "garbage+json";
+      server.state.body = MP3_BYTES;
+
+      const bytes = await comfy.models.run(AUDIO_MODEL, {});
+
+      expect(bytes.kind).toBe("binary");
+    });
+  });
+
+  it("does not let a lossy decode turn headerless bytes into a JSON string", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = null;
+      // `22 FF 22`: not valid UTF-8, but a non-fatal decode replaces the FF
+      // with U+FFFD and leaves `"\uFFFD"` — a JSON document. These are the
+      // partner's bytes, and they have to come back as bytes.
+      const bytes = new Uint8Array([0x22, 0xff, 0x22]);
+      server.state.body = bytes;
+
+      const result = await comfy.models.run(AUDIO_MODEL, {});
+
+      expect(result.kind).toBe("binary");
+      if (result.kind !== "binary") throw new Error("unreachable");
+      expect(Array.from(result.data)).toEqual(Array.from(bytes));
+    });
+  });
+
   it("still refuses a 202, whatever the body's media type says", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
@@ -692,8 +782,12 @@ describe("comfy.models.run on a binary result", () => {
     await withRouterStub(async (server) => {
       useStub(server);
       server.state.contentType = "audio/mpeg";
-      server.state.body = MP3_BYTES;
-      server.state.delayMs = 1_000;
+      // `stallBody` rather than `delayMs`: the delay sleeps BEFORE the status
+      // line, so the deadline would fire while waiting for headers and never
+      // reach `response.arrayBuffer()` — which is the call this change moved
+      // the body read to. Stalling after the headers puts the deadline where
+      // the new code actually runs.
+      server.state.stallBody = true;
 
       const err = (await comfy.models
         .run(AUDIO_MODEL, {}, { timeoutMs: 50, retry: false })
@@ -708,8 +802,9 @@ describe("comfy.models.run on a binary result", () => {
     await withRouterStub(async (server) => {
       useStub(server);
       server.state.contentType = "audio/mpeg";
-      server.state.body = MP3_BYTES;
-      server.state.hang = true;
+      // As above: `hang` never sends a status line, so the abort would land on
+      // a pending `fetch()` instead of on the pending binary body read.
+      server.state.stallBody = true;
       const controller = new AbortController();
 
       const pending = comfy.models.run(AUDIO_MODEL, {}, { signal: controller.signal });

@@ -41,12 +41,16 @@ entry. See CONTRIBUTING.md.
   working; existing _types_ need a `if (result.kind === "json")` narrowing
   before `data` is the supplied `TData` again. Both members are exported, as
   is `CONTENT_TYPE_HEADER`.
-- A `2xx` that declares a non-JSON `Content-Type` is now a binary result
-  rather than an `unexpected_response` error. A `2xx` declaring no
-  `Content-Type` at all is parsed as JSON if it parses and is a binary result
-  with `contentType: ""` otherwise. A `2xx` that says `application/json` and
-  then does not parse still raises `unexpected_response`, and the `202` guard
-  is unchanged.
+- A `200` that declares a non-JSON `Content-Type` is now a binary result
+  rather than an `unexpected_response` error. A `200` declaring no
+  `Content-Type` at all is parsed as JSON if it decodes as UTF-8 and parses,
+  and is a binary result with `contentType: ""` otherwise. A media type counts
+  as JSON when its subtype is `json` (so `text/json` too) or carries the
+  structured `+json` suffix. A `200` that says `application/json` and then does
+  not parse still raises `unexpected_response` — as does any other `2xx`, since
+  a `204`/`205`/`206` is not a completed result, and as does a `200` with an
+  empty body rather than returning zero bytes as the generation. The `202`
+  guard is unchanged.
 - `comfy.models.run` now sends `Accept: application/json, */*;q=0.9` rather
   than `Accept: application/json`. JSON is still ranked first; the client just
   no longer claims to reject the binary branch its own contract declares.
