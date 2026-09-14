@@ -249,9 +249,13 @@ export function templatePlaceholders(template) {
  * way `listRouterModels` and `getRouterModelInputSchema` both did from the day
  * the contract was first vendored here.
  *
- * An operation with no `operationId` is refused rather than skipped: the
- * coverage map is keyed by that id, and a silently dropped operation is
- * exactly the un-noticed route this exists to catch.
+ * An operation with no `operationId`, or one sharing its id with another, is
+ * refused rather than skipped: the coverage map is keyed by that id, so a
+ * dropped operation is exactly the un-noticed route this exists to catch, and
+ * a duplicated one lets a single entry excuse two routes. A path item that is
+ * a local `$ref` (legal in OpenAPI 3.x) is resolved rather than skipped for
+ * the same reason — unresolved it carries no method keys, and every operation
+ * under it would vanish with the non-empty guard below still satisfied.
  */
 export function routerOperations(doc) {
   const paths = doc?.paths;
@@ -259,18 +263,31 @@ export function routerOperations(doc) {
     fail("spec/router-openapi.yaml declares no `paths`");
   }
   const operations = [];
-  for (const [path, item] of Object.entries(paths)) {
-    if (item === null || typeof item !== "object") continue;
+  const declaredAt = new Map();
+  for (const [path, rawItem] of Object.entries(paths)) {
+    const item = deref(doc, rawItem);
+    if (item === null || typeof item !== "object") {
+      fail(`spec/router-openapi.yaml: malformed path item ${path}`);
+    }
     for (const method of HTTP_METHODS) {
       const operation = item[method];
       if (operation === undefined) continue;
       if (operation === null || typeof operation !== "object") {
         fail(`spec/router-openapi.yaml: malformed \`${method}\` operation on ${path}`);
       }
-      if (typeof operation.operationId !== "string" || operation.operationId === "") {
+      const { operationId } = operation;
+      if (typeof operationId !== "string" || operationId === "") {
         fail(`spec/router-openapi.yaml: \`${method} ${path}\` declares no operationId`);
       }
-      operations.push({ operationId: operation.operationId, method, path });
+      const earlier = declaredAt.get(operationId);
+      if (earlier !== undefined) {
+        fail(
+          `spec/router-openapi.yaml: operationId ${JSON.stringify(operationId)} is declared by ` +
+            `both \`${earlier}\` and \`${method} ${path}\``,
+        );
+      }
+      declaredAt.set(operationId, `${method} ${path}`);
+      operations.push({ operationId, method, path });
     }
   }
   if (operations.length === 0) {

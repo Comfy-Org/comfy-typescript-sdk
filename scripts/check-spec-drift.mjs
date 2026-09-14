@@ -41,6 +41,9 @@ import {
 } from "./router-route-contract.mjs";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
+
+/** The verb both discovery methods send; the contract has to declare the same. */
+const DISCOVERY_METHOD = "get";
 const COMMITTED_DIR = join(ROOT, "src", "low", "generated");
 const GENERATED_FILES = ["types.gen.ts", "zod.gen.ts", "index.ts"];
 
@@ -134,11 +137,14 @@ async function checkRouterRoute() {
     );
   }
   // The two discovery routes, pinned the same way. `comfy.models.list` and
-  // `comfy.models.schema` build their URLs from these constants, so a sync
-  // that moves either path turns the method into a 404 until it follows.
-  for (const [operationId, constant, value] of [
-    [CATALOG_OPERATION_ID, "CATALOG_ROUTE_TEMPLATE", catalogTemplate],
-    [SCHEMA_OPERATION_ID, "SCHEMA_ROUTE_TEMPLATE", schemaTemplate],
+  // `comfy.models.schema` build their URLs from these constants and send GET,
+  // so a sync that moves either path turns the method into a 404, and one
+  // that moves the verb turns it into a 405, until the SDK follows. Both are
+  // compared — the unit test beside this asserts the method too, and the
+  // drift job named for this purpose must not be the weaker gate.
+  for (const [operationId, constant, value, caller] of [
+    [CATALOG_OPERATION_ID, "CATALOG_ROUTE_TEMPLATE", catalogTemplate, "comfy.models.list"],
+    [SCHEMA_OPERATION_ID, "SCHEMA_ROUTE_TEMPLATE", schemaTemplate, "comfy.models.schema"],
   ]) {
     const declared = operations.find((operation) => operation.operationId === operationId);
     if (declared === undefined) {
@@ -150,6 +156,11 @@ async function checkRouterRoute() {
       problems.push(
         `${constant} (src/sdk/models.ts) is "${value}", but spec/router-openapi.yaml ` +
           `declares "${declared.path}" for \`${declared.method}.operationId: ${operationId}\`.`,
+      );
+    } else if (declared.method !== DISCOVERY_METHOD) {
+      problems.push(
+        `${caller} sends ${DISCOVERY_METHOD.toUpperCase()} ${value}, but spec/router-openapi.yaml ` +
+          `declares \`${operationId}\` as \`${declared.method} ${declared.path}\`.`,
       );
     }
   }

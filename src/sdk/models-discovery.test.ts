@@ -242,6 +242,30 @@ describe("comfy.models.schema", () => {
     expect(result.etag).toBe(ETAG);
   });
 
+  it("refuses a 304 to a request that sent no If-None-Match", async () => {
+    // An unsolicited 304 — a proxy, a buggy origin — confirms a copy the
+    // caller does not hold. Read as "unchanged" it would resolve with neither
+    // a document nor an error, and a cache keyed on `!result.unchanged` would
+    // never fill. The empty tag deliberately sends no header, so it is the
+    // same case.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 304;
+      server.state.body = null;
+      for (const options of [{}, { etag: "" }]) {
+        const err = (await comfy.models
+          .schema(MODEL, options)
+          .catch((e: unknown) => e)) as ComfyError;
+        expect(err).toBeInstanceOf(ComfyError);
+        expect(err.code).toBe("unexpected_response");
+        expect(err.httpStatus).toBe(304);
+        expect(err.requestId).toBe(REQUEST_ID);
+        expect(err.message).toContain("If-None-Match");
+      }
+      expect(server.state.lastIfNoneMatch).toBeNull();
+    });
+  });
+
   it("raises the same model_not_found class an unknown ID raises on run", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
@@ -500,6 +524,66 @@ describe("comfy.models.list", () => {
     });
   });
 
+  it("refuses has_more with no cursor on a single page() too, not only mid-walk", async () => {
+    // The README's hand-pagination recipe is `list({ cursor: page.nextCursor
+    // }).page()`; handed a `null` cursor it would omit the parameter and
+    // re-serve page one, and a `while (page.hasMore)` loop over it would never
+    // end. So the refusal lives where both consumers read a page.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.catalogPages = [{ cursor: null, data: [entry("bfl/flux-1")], has_more: true }];
+      const err = (await comfy.models
+        .list()
+        .page()
+        .catch((e: unknown) => e)) as ComfyError;
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("unexpected_response");
+      expect(err.httpStatus).toBe(200);
+      expect(err.requestId).toBe(REQUEST_ID);
+      expect(err.message).toContain("next_cursor");
+      expect(server.state.requestCount).toBe(1);
+    });
+  });
+
+  it("refuses an entry that is not the identity the contract promises", async () => {
+    // `CatalogModel` promises string `id`, `provider` and `model`; a `null`
+    // or a bare object handed on under that type would crash a consumer at
+    // `model.id`, far from the response that caused it.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      for (const bad of [null, { id: "bfl/flux-1" }, "bfl/flux-1"]) {
+        server.state.catalogPages = [
+          { cursor: null, data: [entry("bfl/flux-2"), bad], has_more: false },
+        ];
+        const err = (await comfy.models
+          .list()
+          .page()
+          .catch((e: unknown) => e)) as ComfyError;
+        expect(err).toBeInstanceOf(ComfyError);
+        expect(err.code).toBe("unexpected_response");
+        expect(err.message).toContain("data[1]");
+      }
+      const walked = (await (async () => {
+        for await (const _ of comfy.models.list()) void _;
+      })().catch((e: unknown) => e)) as ComfyError;
+      expect(walked.code).toBe("unexpected_response");
+    });
+  });
+
+  it("names the field a page lacked, rather than both", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.body = { has_more: false };
+      const err = (await comfy.models
+        .list()
+        .page()
+        .catch((e: unknown) => e)) as ComfyError;
+      expect(err.code).toBe("unexpected_response");
+      expect(err.message).toContain("`data` array");
+      expect(err.message).not.toContain("has_more");
+    });
+  });
+
   it("refuses a page with no boolean has_more rather than reading it as the last", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
@@ -568,6 +652,49 @@ describe("comfy.models.list", () => {
         .page()
         .catch((e: unknown) => e)) as ComfyError;
       expect(err.code).toBe("request_timeout");
+    });
+  });
+
+  it("resolves the credential and base URL once per walk, not once per page", async () => {
+    // `comfy.config()` is reconfigurable mid-run. A cursor is minted by one
+    // host; re-resolving per page would present it to another host, under
+    // another credential, because the consumer happened to reconfigure
+    // between two yielded models. `run` resolves both once per call — so does
+    // a walk.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.catalogPages = PAGES;
+      const seen: string[] = [];
+      for await (const model of comfy.models.list()) {
+        seen.push(model.id);
+        if (seen.length === 1) {
+          config({ credentials: "comfyui-someone-else", baseUrl: "http://127.0.0.1:9/" });
+        }
+      }
+      expect(seen).toHaveLength(5);
+      expect(server.state.requestCount).toBe(3);
+      expect(server.state.lastAuthorization).toBe(`Bearer ${CREDENTIAL}`);
+    });
+  });
+
+  it("ends the iteration at an abort between yields, without draining the page", async () => {
+    // `DiscoveryOptions.signal` says an abort "ends the iteration". Observed
+    // only by the fetches, an abort after a yield would still hand over every
+    // remaining model on the current page before the next fetch noticed.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.catalogPages = PAGES;
+      const controller = new AbortController();
+      const seen: string[] = [];
+      const err = (await (async () => {
+        for await (const model of comfy.models.list({ signal: controller.signal })) {
+          seen.push(model.id);
+          controller.abort();
+        }
+      })().catch((e: unknown) => e)) as Error;
+      expect(err.name).toBe("AbortError");
+      expect(seen).toEqual(["bfl/flux-2-pro"]);
+      expect(server.state.requestCount).toBe(1);
     });
   });
 

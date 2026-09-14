@@ -991,8 +991,18 @@ async function schema<TDocument = unknown>(
 
   // Before the `ok` check, which a 304 fails: it is a successful
   // revalidation, not a failure, and raising it would defeat the only reason
-  // the caller sent the tag.
+  // the caller sent the tag. Only when a tag WAS sent, though: a 304 to a
+  // request that carried no `If-None-Match` confirms a copy the caller does
+  // not hold, and reading it as "unchanged" would hand back neither a document
+  // nor an error — a cache that never fills.
   if (response.status === 304) {
+    if (!(IF_NONE_MATCH_HEADER in headers)) {
+      throw new ComfyError(
+        `${label} received a 304 without having sent If-None-Match, so there is no held copy ` +
+          "for it to confirm",
+        { code: "unexpected_response", httpStatus: response.status, requestId },
+      );
+    }
     return { unchanged: true, document: undefined, etag: etag ?? options.etag ?? null, requestId };
   }
   // The same mapping `run` uses, so a `404` here is the `model_not_found`
@@ -1004,11 +1014,52 @@ async function schema<TDocument = unknown>(
   return { unchanged: false, document: document as TDocument, etag, requestId };
 }
 
-/** One page of the catalog, off the wire. */
-async function fetchModelPage(options: ListOptions): Promise<ModelPage> {
+/** Where a discovery call goes and what it carries, resolved once per call. */
+interface DiscoveryEndpoint {
+  baseUrl: string;
+  credentials: string;
+}
+
+/**
+ * Resolve the credential and base URL together. `run` resolves both once per
+ * call; a `list()` walk resolves them once per WALK (not per page), so a
+ * `config()` change while the consumer is between yielded models cannot send
+ * a cursor minted by one host to another under a different credential.
+ */
+function resolveDiscoveryEndpoint(): DiscoveryEndpoint {
   const credentials = requireCredentials();
+  return { credentials, baseUrl: resolveBaseUrl() };
+}
+
+/** Whether a catalog entry carries the identity the contract promises. */
+function isCatalogModel(value: unknown): value is CatalogModel {
+  if (value === null || typeof value !== "object") return false;
+  const { id, provider, model } = value as Record<string, unknown>;
+  return typeof id === "string" && typeof provider === "string" && typeof model === "string";
+}
+
+/** The one refusal both consumers of a page need for `has_more` with no cursor. */
+const HAS_MORE_WITHOUT_CURSOR =
+  "reporting `has_more: true` with no `next_cursor`, so the rest of the catalog is unreachable";
+
+/** A catalog page that cannot be read safely, saying which part could not. */
+function catalogPageError(
+  what: string,
+  details: { httpStatus?: number; requestId: string | null },
+): ComfyError {
+  return new ComfyError(`models.list() received a catalog page ${what}`, {
+    code: "unexpected_response",
+    ...details,
+  });
+}
+
+/** One page of the catalog, off the wire. */
+async function fetchModelPage(
+  options: ListOptions,
+  endpoint: DiscoveryEndpoint = resolveDiscoveryEndpoint(),
+): Promise<ModelPage> {
   const label = "models.list()";
-  const url = new URL(`${resolveBaseUrl()}${CATALOG_ROUTE_TEMPLATE}`);
+  const url = new URL(`${endpoint.baseUrl}${CATALOG_ROUTE_TEMPLATE}`);
   if (typeof options.cursor === "string" && options.cursor !== "") {
     url.searchParams.set(CURSOR_PARAM, options.cursor);
   }
@@ -1017,7 +1068,7 @@ async function fetchModelPage(options: ListOptions): Promise<ModelPage> {
   const { response, text } = await discoveryFetch(
     label,
     url.toString(),
-    discoveryHeaders(credentials),
+    discoveryHeaders(endpoint.credentials),
     options,
   );
   const requestId = response.headers.get(REQUEST_ID_HEADER);
@@ -1029,24 +1080,43 @@ async function fetchModelPage(options: ListOptions): Promise<ModelPage> {
     next_cursor?: unknown;
     limit?: unknown;
   } | null;
-  const data = Array.isArray(body?.data) ? (body.data as CatalogModel[]) : null;
+  const details = { httpStatus: response.status, requestId };
+  const entries = Array.isArray(body?.data) ? (body.data as unknown[]) : null;
+  if (entries === null) throw catalogPageError("without a `data` array", details);
   // `has_more` is required by the contract and is the ONLY thing that says
   // the walk is over, so a response without it is refused rather than read as
   // a last page. Guessing `false` there is precisely the "first 20 models and
   // no error" failure these two methods exist to make impossible.
   const hasMore = typeof body?.has_more === "boolean" ? body.has_more : null;
-  if (data === null || hasMore === null) {
-    throw new ComfyError(
-      `${label} received a catalog page without a \`data\` array and a boolean \`has_more\`, ` +
-        "so there is no way to tell a last page from a truncated walk",
-      { code: "unexpected_response", httpStatus: response.status, requestId },
+  if (hasMore === null) {
+    throw catalogPageError(
+      "without a boolean `has_more`, so there is no way to tell a last page from a truncated walk",
+      details,
     );
   }
+  // Each entry has to be at least the identity the contract promises. A page
+  // of `[null]` handed on as `CatalogModel[]` would crash a consumer at
+  // `model.id`, far from the response that caused it.
+  const data: CatalogModel[] = [];
+  for (const [index, item] of entries.entries()) {
+    if (!isCatalogModel(item)) {
+      throw catalogPageError(
+        `whose \`data[${String(index)}]\` lacks the string \`id\`, \`provider\` and \`model\` fields`,
+        details,
+      );
+    }
+    data.push(item);
+  }
+  const nextCursor =
+    typeof body?.next_cursor === "string" && body.next_cursor !== "" ? body.next_cursor : null;
+  // Refused HERE, not only in the walk, so a caller paging by hand —
+  // `list({ cursor: page.nextCursor }).page()` — is never handed a `null`
+  // cursor that silently re-serves page one to a `while (page.hasMore)` loop.
+  if (hasMore && nextCursor === null) throw catalogPageError(HAS_MORE_WITHOUT_CURSOR, details);
   return {
     data,
     hasMore,
-    nextCursor:
-      typeof body?.next_cursor === "string" && body.next_cursor !== "" ? body.next_cursor : null,
+    nextCursor,
     limit: typeof body?.limit === "number" ? body.limit : null,
     requestId,
   };
@@ -1062,6 +1132,7 @@ async function fetchModelPage(options: ListOptions): Promise<ModelPage> {
  * what makes the common case correct.
  */
 async function* walkCatalog(options: ListOptions): AsyncGenerator<CatalogModel> {
+  const endpoint = resolveDiscoveryEndpoint();
   let cursor = typeof options.cursor === "string" && options.cursor !== "" ? options.cursor : null;
   // Every cursor this walk has already asked with. A server that answers
   // `has_more: true` with a cursor it already served would otherwise loop
@@ -1069,16 +1140,22 @@ async function* walkCatalog(options: ListOptions): AsyncGenerator<CatalogModel> 
   const asked = new Set<string>();
   if (cursor !== null) asked.add(cursor);
   for (;;) {
-    const page = await fetchModelPage({ ...options, cursor });
-    for (const entry of page.data) yield entry;
+    const page = await fetchModelPage({ ...options, cursor }, endpoint);
+    for (const entry of page.data) {
+      // Observed between yields as well as by the page fetches, so an abort
+      // after a model was yielded ends the iteration — as
+      // `DiscoveryOptions.signal` says — instead of draining the rest of the
+      // page first. Raised raw, as the fetch raises it: a caller's own abort
+      // is theirs to recognise.
+      options.signal?.throwIfAborted();
+      yield entry;
+    }
     if (!page.hasMore) return;
     const next = page.nextCursor;
     if (next === null) {
-      throw new ComfyError(
-        "models.list() reached a page reporting `has_more: true` with no `next_cursor`, " +
-          "so the rest of the catalog is unreachable",
-        { code: "unexpected_response", requestId: page.requestId },
-      );
+      // `fetchModelPage` already refuses this shape, so this cannot fire; it
+      // narrows `next` and refuses the same way should that ever change.
+      throw catalogPageError(HAS_MORE_WITHOUT_CURSOR, { requestId: page.requestId });
     }
     if (asked.has(next)) {
       throw new ComfyError(

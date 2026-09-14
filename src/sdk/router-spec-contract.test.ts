@@ -39,6 +39,7 @@ import { describe, expect, it } from "vitest";
 import {
   readRouterOperations,
   readRouterRouteContract,
+  routerOperations,
   templatePlaceholders,
 } from "../../scripts/router-route-contract.mjs";
 import { withRouterStub } from "../../test/support/router-stub-server.js";
@@ -241,5 +242,46 @@ describe("router route coverage (spec/router-openapi.yaml)", () => {
       templatePlaceholders(RUN_ROUTE_TEMPLATE),
     );
     expect(templatePlaceholders(CATALOG_ROUTE_TEMPLATE)).toEqual([]);
+  });
+});
+
+describe("the operation extractor the coverage check reads through", () => {
+  // Every shape below would otherwise drop an operation out of the coverage
+  // set with the non-empty guard still satisfied — the silent miss ROUTE
+  // COVERAGE exists to make impossible.
+  const operation = (operationId: string) => ({ operationId, responses: {} });
+
+  it("resolves a path item expressed as a local $ref rather than skipping it", () => {
+    const doc = {
+      paths: { "/v2/models": { $ref: "#/components/pathItems/catalog" } },
+      components: { pathItems: { catalog: { get: operation("listRouterModels") } } },
+    };
+    expect(routerOperations(doc)).toEqual([
+      { operationId: "listRouterModels", method: "get", path: "/v2/models" },
+    ]);
+  });
+
+  it("refuses a path item that is not an object", () => {
+    expect(() => routerOperations({ paths: { "/v2/models": null } })).toThrow(
+      "malformed path item /v2/models",
+    );
+    expect(() => routerOperations({ paths: { "/v2/models": "get" } })).toThrow(
+      "malformed path item /v2/models",
+    );
+  });
+
+  it("refuses an operationId declared twice, as it refuses one declared nowhere", () => {
+    // Two operations under one id are both excused by a single ROUTE_COVERAGE
+    // entry — and `find()` and `new Map()` consumers would disagree on which.
+    const doc = {
+      paths: {
+        "/v2/models": { get: operation("listRouterModels") },
+        "/v2/catalog": { get: operation("listRouterModels") },
+      },
+    };
+    expect(() => routerOperations(doc)).toThrow(/"listRouterModels" is declared by both/);
+    expect(() => routerOperations({ paths: { "/v2/models": { get: { responses: {} } } } })).toThrow(
+      "declares no operationId",
+    );
   });
 });
