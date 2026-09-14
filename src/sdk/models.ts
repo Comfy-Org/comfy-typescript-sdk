@@ -295,6 +295,15 @@ export interface Models {
    * when `signal` aborts, this makes one best-effort
    * {@link RequestHandle.cancel} — so a caller who has stopped waiting is not
    * also still paying for a generation nobody will collect — and then rejects.
+   *
+   * That cancel is only possible ONCE THE SUBMIT HAS RETURNED A HANDLE. This
+   * submits before it has anything to cancel, so a deadline that expires
+   * during the submit — or a submit the server accepted whose response was
+   * lost — leaves a queued request running with no handle to address it. Pass
+   * `idempotencyKey` to cover that window: re-submitting under the same key
+   * replays the original acceptance and yields the same request, which is the
+   * only route back to an id lost with its reply.
+   *
    * Use {@link Models.submit} when the request should outlive the caller's
    * patience.
    *

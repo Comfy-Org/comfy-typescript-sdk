@@ -37,8 +37,10 @@ entry. See CONTRIBUTING.md.
   rather than only the pauses in it. A `COMPLETED` status carrying an
   `error_type` — which is how the server reports a failed _and_ a cancelled
   request — rejects with the matching `routerErrors` class, so a `200` is
-  never handed back as a successful result. Mirrors `models.submit` /
-  `subscribe` / `handle` in the Python SDK. The surface is gated server side:
+  never handed back as a successful result. Intended to mirror `models.submit` /
+  `subscribe` / `handle` in the Python SDK, which have not shipped yet
+  (comfy-python-sdk#137) — the TypeScript SDK leads on this surface until they
+  do, so do not read the names as a parity guarantee today. The surface is gated server side:
   outside the preview it answers `403 not_enabled`, which arrives as
   `routerErrors.NotEnabled`.
 - `routerErrors.errorFromCompletion(body, requestId)` — the typed exception a

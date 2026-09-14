@@ -637,7 +637,19 @@ export function toRouterError(status: number, headers: HeadersLike, body: unknow
     return new InvalidInput(message, { ...options, detail: entries });
   }
 
-  const message = typeof envelope.detail === "string" ? envelope.detail : `HTTP ${status}`;
+  // `status` is `0` only when `errorFromCompletion` built this from a
+  // COMPLETED payload, where there was no failing HTTP status to name. Saying
+  // `HTTP 0` there reports a status no server ever sent — the same thing the
+  // `httpStatus: null` override in that function exists to prevent, and the
+  // message is the half a caller actually reads and logs. Fall back to the
+  // bucket instead, matching the Python SDK's `error_from_completion`, which
+  // the doc on that function claims parity with.
+  const message =
+    typeof envelope.detail === "string"
+      ? envelope.detail
+      : status > 0
+        ? `HTTP ${status}`
+        : `the request completed with error_type '${errorType ?? ""}'`;
   return new (cls ?? RouterError)(message, options);
 }
 

@@ -187,10 +187,15 @@ describe("queued model-request routes (not yet in spec/router-openapi.yaml)", ()
     // vendored spec: read their paths out of it the way `readRouterRouteContract`
     // reads `runRouterModel`'s, and compare the four constants against THOSE
     // instead of against the relation above.
-    const doc = parse(await readFile(ROUTER_SPEC_PATH, "utf-8")) as {
-      paths?: Record<string, unknown>;
-    };
-    const queuePaths = Object.keys(doc.paths ?? {}).filter((path) => path.includes("/requests"));
+    // Narrowed at runtime rather than asserted: `src/**` forbids unsafe type
+    // assertions, and a spec that parsed to something other than a mapping
+    // would otherwise reach `Object.keys` as a lie about its own shape.
+    const doc: unknown = parse(await readFile(ROUTER_SPEC_PATH, "utf-8"));
+    const paths = typeof doc === "object" && doc !== null && "paths" in doc ? doc.paths : undefined;
+    const queuePaths =
+      typeof paths === "object" && paths !== null
+        ? Object.keys(paths).filter((path) => path.includes("/requests"))
+        : [];
     expect(
       queuePaths,
       "spec/router-openapi.yaml now declares the queued model-request routes — pin the four " +

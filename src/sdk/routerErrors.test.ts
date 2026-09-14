@@ -551,6 +551,28 @@ describe("InvalidInput and the 422 detail[] shape", () => {
 });
 
 describe("errorFromCompletion", () => {
+  it("names the bucket, not `HTTP 0`, when the completion carries no detail", () => {
+    // Regression: the message fell through to `HTTP ${status}` with the
+    // sentinel status `0` this path passes, so an ordinary cancelled or
+    // failed completion read `HTTP 0` — a status no server sent, and the one
+    // string a caller actually logs. The `httpStatus: null` override already
+    // guarded the FIELD; the message was missed.
+    const err = errorFromCompletion({ status: "COMPLETED", error_type: "provider_error" }, "req-1");
+    expect(err).not.toBeNull();
+    expect(err?.message).not.toContain("HTTP 0");
+    expect(err?.message).toBe("the request completed with error_type 'provider_error'");
+    // The field guard still holds.
+    expect(err?.httpStatus).toBeNull();
+  });
+
+  it("prefers the server's detail over the bucket fallback", () => {
+    const err = errorFromCompletion(
+      { status: "COMPLETED", error_type: "provider_error", detail: "upstream said no" },
+      "req-1",
+    );
+    expect(err?.message).toBe("upstream said no");
+  });
+
   it("returns null for a completion that names no error_type", () => {
     // The ordinary success path. Every caller has to read `null` as "no error
     // found", never as "no error possible".
