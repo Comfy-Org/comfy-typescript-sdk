@@ -290,8 +290,14 @@ export interface Models {
    * );
    * ```
    *
-   * `timeoutMs` is a CLIENT-SIDE bound on the whole call with no server-side
-   * meaning — the queue's own timeouts are the server's. When it runs out, or
+   * `timeoutMs` is a CLIENT-SIDE bound with no server-side meaning — the
+   * queue's own timeouts are the server's. It bounds the submit, the polls
+   * and the result fetch, but NOT time spent inside `onQueueUpdate`: the
+   * deadline and `signal` are enforced by the poll loop, and the callback is
+   * awaited between polls, so one that never settles parks this call and
+   * neither the timeout nor an abort fires. Deliberate — it is the caller's
+   * own code, the same reason a callback that throws does not cancel the
+   * request — but an `async` callback should carry its own bound. When it runs out, or
    * when `signal` aborts, this makes one best-effort
    * {@link RequestHandle.cancel} — so a caller who has stopped waiting is not
    * also still paying for a generation nobody will collect — and then rejects.
