@@ -456,7 +456,10 @@ describe("RequestHandle.get", () => {
       const handle = comfy.models.handle<typeof PAYLOAD>(MODEL, REQUEST_ID);
       const result = await handle.get();
 
-      // No cast: `data` is the supplied type, exactly as `run<T>` gives it.
+      // No cast: `data` is the supplied type, exactly as `run<T>` gives it —
+      // and on the same `json` arm of `RunResult`, so a caller narrowing on
+      // `kind` the way `run`'s docs say to reads a queued result the same way.
+      expect(result.kind).toBe("json");
       expect(result.data.images[0].url).toBe("https://example.invalid/out.png");
       expect(result.requestId).toBe("http-req-9");
       expect(server.state.requests.map((r) => `${r.method} ${r.path}`)).toEqual([

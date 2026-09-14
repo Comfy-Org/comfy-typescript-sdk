@@ -876,8 +876,14 @@ export class RequestHandle<TData = unknown> {
     raiseForCompletion(body, this.requestId, true);
     // A body that is not a JSON object is returned UNCHANGED: the payload is
     // the partner's, and a model whose native output is an array or a bare
-    // value is not a malformed response.
-    return { data: body as TData, requestId: response.headers.get(REQUEST_ID_HEADER) };
+    // value is not a malformed response. Always the `json` arm of `RunResult`:
+    // this route is decoded as JSON above, so there is no binary case here the
+    // way there is on `run`.
+    return {
+      kind: "json",
+      data: body as TData,
+      requestId: response.headers.get(REQUEST_ID_HEADER),
+    };
   }
 
   /**
