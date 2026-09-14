@@ -17,8 +17,74 @@ Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
 entry. See CONTRIBUTING.md.
 -->
 
+### Fixed
+
+- `comfy.models.run` no longer throws `unexpected_response` ("body is not
+  JSON") on a model whose `200` is the generated file itself. The run route's
+  `200` has two branches in the contract — `application/json` and `*/*` with
+  `format: binary` — and the ElevenLabs audio models (`elevenlabs/eleven_v3`,
+  `elevenlabs/eleven_sfx_v2`) are the first of the second kind in the catalog;
+  every one of them was unusable from this SDK, and the failure landed _after_
+  the server had run and billed the generation, with the bytes already
+  destroyed by the lossy text decode on the way to the parse. `run` now reads
+  the response `Content-Type` before it touches the body and returns the bytes
+  untouched.
+
+### Changed
+
+- **Breaking (types).** `RunResult` is now a discriminated union of the two
+  documented `200` shapes: `RunJsonResult` (`kind: "json"`, `data` the parsed
+  document — unchanged from before) and the new `RunBinaryResult`
+  (`kind: "binary"`, `data` a `Uint8Array` of the exact bytes, `contentType`
+  the partner's own media type, `""` when the response declared none). The
+  runtime shape of a JSON result gains only `kind`, so existing code keeps
+  working; existing _types_ need a `if (result.kind === "json")` narrowing
+  before `data` is the supplied `TData` again. Both members are exported, as
+  is `CONTENT_TYPE_HEADER`.
+- A `200` that declares a non-JSON `Content-Type` is now a binary result
+  rather than an `unexpected_response` error. A `200` declaring no
+  `Content-Type` at all is parsed as JSON if it decodes as UTF-8 and parses,
+  and is a binary result with `contentType: ""` otherwise. A media type counts
+  as JSON when its subtype is `json` (so `text/json` too) or carries the
+  structured `+json` suffix. A `200` that says `application/json` and then does
+  not parse still raises `unexpected_response` — as does any other `2xx`, since
+  a `204`/`205`/`206` is not a completed result, and as does a `200` with an
+  empty body rather than returning zero bytes as the generation. The `202`
+  guard is unchanged.
+- `comfy.models.run` now sends `Accept: application/json, */*;q=0.9` rather
+  than `Accept: application/json`. JSON is still ranked first; the client just
+  no longer claims to reject the binary branch its own contract declares.
+
+## [0.2.0] - 2026-09-10
+
 ### Added
 
+- **Queued model delivery — `comfy.models.submit`, `comfy.models.subscribe`
+  and `comfy.models.handle`.** `comfy.models.run` holds one connection open
+  until the generation is finished; `submit` returns a `RequestHandle` as soon
+  as the server accepts the request, so a caller who cannot hold a connection
+  for the length of a generation — a web request that has to return now, a
+  worker that submits in one process and collects in another — can collect it
+  later. The handle carries `requestId`, `model`, `status()`, `get()`,
+  `cancel()` and an async-iterable `events()`; `get()` resolves to the same
+  `{ data, requestId }` `run` does. `subscribe` is submit + poll + collect in
+  one call with an `onQueueUpdate` callback, and `handle(model, requestId)`
+  rebuilds a handle from the two ids with no request made. Polling is
+  poll-authoritative with adaptive backoff, a server `Retry-After` beats the
+  schedule (capped at 60 s), and `timeoutMs`/`signal` bound the whole wait
+  rather than only the pauses in it. A `COMPLETED` status carrying an
+  `error_type` — which is how the server reports a failed _and_ a cancelled
+  request — rejects with the matching `routerErrors` class, so a `200` is
+  never handed back as a successful result. Intended to mirror `models.submit` /
+  `subscribe` / `handle` in the Python SDK, which have not shipped yet
+  (comfy-python-sdk#137) — the TypeScript SDK leads on this surface until they
+  do, so do not read the names as a parity guarantee today. The surface is gated server side:
+  outside the preview it answers `403 not_enabled`, which arrives as
+  `routerErrors.NotEnabled`.
+- `routerErrors.errorFromCompletion(body, requestId)` — the typed exception a
+  completed queued request reports, or `null`. Maps a `COMPLETED` body's
+  `error_type` through the same table `toRouterError` uses, with `httpStatus`
+  left `null` because the poll that found it was a `200`.
 - `Asset.getDownloadUrl()` — a directly-fetchable URL for an _uploaded_
   asset's bytes, mirroring `Output.getDownloadUrl()` (same
   `{ url, expiresAt }` shape, commits the asset first if needed). On Comfy
@@ -340,7 +406,8 @@ First public release of the Comfy API v2 TypeScript SDK (`@comfyorg/sdk`).
   Cloud, and serverless: upload and dedup inputs, submit a workflow, follow it
   (poll or SSE), and download outputs. Requires Node >= 22.
 
-[Unreleased]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.9...v0.2.0
 [0.1.9]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.6...v0.1.7
