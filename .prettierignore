@@ -10,3 +10,9 @@ src/low/generated/
 # job). Same reason as above: oxfmt collapses its short arrays, which would put
 # `pnpm format:check` and the parity freshness check permanently at odds.
 parity/python-surface.json
+
+# `CLAUDE.md` is a fixed Claude Code shim whose two-line content is the org-wide
+# canonical form (byte-identical across every repo). oxfmt would insert a blank
+# line before the `@AGENTS.md` import, diverging this repo's shim from that
+# standard; exclude it so the canonical bytes stay put. Edit AGENTS.md, not this.
+CLAUDE.md
