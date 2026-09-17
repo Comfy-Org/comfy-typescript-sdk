@@ -132,6 +132,35 @@ describe("comfy.models.run on success", () => {
     });
   });
 
+  it("appends no query for the alt-provider controls unless the caller set one", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      await comfy.models.run(MODEL, { prompt: "a cat" });
+      // Byte-for-byte the path this route has always used — no trailing `?`.
+      expect(server.state.lastPath).toBe("/v2/models/bfl/flux-2-pro");
+    });
+  });
+
+  it("sends the alt-provider controls as query params, in a fixed order, only when set", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      await comfy.models.run(MODEL, { prompt: "a cat" }, { modelProvider: "fal" });
+      expect(server.state.lastPath).toBe("/v2/models/bfl/flux-2-pro?model_provider=fal");
+
+      await comfy.models.run(MODEL, { prompt: "a cat" }, { strictMode: true });
+      expect(server.state.lastPath).toBe("/v2/models/bfl/flux-2-pro?strict_mode=true");
+
+      await comfy.models.run(
+        MODEL,
+        { prompt: "a cat" },
+        { modelProvider: "fal", strictMode: false, fallbackProvider: "false" },
+      );
+      expect(server.state.lastPath).toBe(
+        "/v2/models/bfl/flux-2-pro?model_provider=fal&strict_mode=false&fallback_provider=false",
+      );
+    });
+  });
+
   it("sends the input as the body, with no Comfy envelope around it", async () => {
     await withRouterStub(async (server) => {
       useStub(server);

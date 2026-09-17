@@ -17,6 +17,25 @@ Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
 entry. See CONTRIBUTING.md.
 -->
 
+### Added
+
+- **Comfy Router alt-provider controls on `comfy.models.run` —
+  `modelProvider`, `strictMode` and `fallbackProvider`.** Three optional
+  `RunOptions` fields, sent as the `model_provider`, `strict_mode` and
+  `fallback_provider` query params on the synchronous run route.
+  `modelProvider` selects an alternate serving provider (e.g. `"fal"`);
+  `strictMode` (default `false`) toggles native ↔ provider translation, and
+  `true` passes the provider's own raw shape both ways; `fallbackProvider`
+  accepts `"false"` to opt out of provider-fallback. Each is sent ONLY when
+  set, so a run that names none of the three is byte-for-byte the request it
+  always was. These are run-route only — the queued `submit`/`subscribe`
+  surface does not accept them.
+- **Three queue-tier `routerErrors` classes — `Cancelled`, `QueueTimeout`
+  and `RequestNotFound`** — for the `cancelled`, `queue_timeout` and
+  `request_not_found` buckets the vendored Router contract now declares, so a
+  queued failure carrying one of them is a typed `catch` rather than a bare
+  `RouterError`.
+
 ## [0.3.0] - 2026-09-14
 
 ### Added

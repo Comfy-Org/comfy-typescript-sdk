@@ -5,6 +5,7 @@ import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 import {
+  Cancelled,
   ClientDisconnected,
   ConcurrencyLimitExceeded,
   ContentPolicyViolation,
@@ -19,10 +20,12 @@ import {
   NotEnabled,
   ProviderError,
   ProviderTimeout,
+  QueueTimeout,
   RateLimited,
   REQUEST_ERROR_TYPES,
   REQUEST_ID_HEADER,
   parseRetryAfter,
+  RequestNotFound,
   RETRY_AFTER_HEADER,
   ROUTER_ERROR_TYPES,
   RouterError,
@@ -51,6 +54,9 @@ const CLASSES: Array<[RouterErrorType, typeof RouterError]> = [
   ["not_enabled", NotEnabled],
   ["service_unavailable", ServiceUnavailable],
   ["rate_limited", RateLimited],
+  ["cancelled", Cancelled],
+  ["queue_timeout", QueueTimeout],
+  ["request_not_found", RequestNotFound],
 ];
 
 /**
@@ -74,11 +80,11 @@ async function raise(response: Response): Promise<never> {
 }
 
 describe("the closed error-type set", () => {
-  it("is the six request-level buckets plus the nine transport-level ones", () => {
+  it("is the six request-level buckets plus the twelve transport-level ones", () => {
     expect(REQUEST_ERROR_TYPES).toHaveLength(6);
-    expect(TRANSPORT_ERROR_TYPES).toHaveLength(9);
+    expect(TRANSPORT_ERROR_TYPES).toHaveLength(12);
     expect(ROUTER_ERROR_TYPES).toEqual([...REQUEST_ERROR_TYPES, ...TRANSPORT_ERROR_TYPES]);
-    expect(new Set(ROUTER_ERROR_TYPES).size).toBe(15);
+    expect(new Set(ROUTER_ERROR_TYPES).size).toBe(18);
   });
 
   it("has exactly one class per bucket, and no class outside it", () => {
@@ -95,8 +101,11 @@ describe("the closed error-type set", () => {
   it("omits the buckets deferred past this release", () => {
     // Adding one of these is a decision someone makes on purpose, in lockstep
     // with the server and the sibling SDK — not a constant that quietly widens
-    // a set two SDKs build their exception hierarchies from.
-    for (const deferred of ["file_download_error", "cancelled", "queue_timeout"]) {
+    // a set two SDKs build their exception hierarchies from. `cancelled` and
+    // `queue_timeout` used to sit here too; the vendored contract now declares
+    // them (with `request_not_found`), so they are typed above rather than
+    // deferred, and only `file_download_error` remains out of the spec.
+    for (const deferred of ["file_download_error"]) {
       expect(ROUTER_ERROR_TYPES).not.toContain(deferred);
     }
   });
@@ -125,7 +134,9 @@ describe("the class hierarchy", () => {
     // Python SDK's base declares `error_type = ""` for the same reason and
     // `surface-parity.test.ts` compares the two.
     expect(new RouterError("boom").errorType).toBe("");
-    expect(new RouterError("boom", { errorType: "queue_timeout" }).errorType).toBe("queue_timeout");
+    expect(new RouterError("boom", { errorType: "file_download_error" }).errorType).toBe(
+      "file_download_error",
+    );
     // Every subclass still reports its own bucket — the base default is not
     // inherited by anything that declares one.
     for (const [type, cls] of CLASSES) {
@@ -380,7 +391,7 @@ describe("an error_type from a newer server", () => {
   // must degrade to the base class rather than throw something untyped —
   // "treat an unknown value as internal_error" is advice for the caller, not
   // licence for the SDK to rewrite what the server actually said.
-  it.each(["file_download_error", "cancelled", "queue_timeout", "something_invented_next_year"])(
+  it.each(["file_download_error", "something_invented_next_year"])(
     "produces the base RouterError carrying %s verbatim",
     (unknownType) => {
       const err = toRouterError(
@@ -416,8 +427,8 @@ describe("an error_type from a newer server", () => {
   it("is catchable as a RouterError", async () => {
     const response = stubErrorResponse(
       500,
-      { detail: "nope", error_type: "queue_timeout" },
-      { [ERROR_TYPE_HEADER]: "queue_timeout" },
+      { detail: "nope", error_type: "file_download_error" },
+      { [ERROR_TYPE_HEADER]: "file_download_error" },
     );
     await expect(raise(response)).rejects.toBeInstanceOf(RouterError);
   });

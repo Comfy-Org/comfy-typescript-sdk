@@ -109,7 +109,7 @@ import {
   type SubmitOptions,
   type SubscribeOptions,
 } from "./modelRequests.js";
-import { fillRoute, type ModelId, parseModelId } from "./modelRoutes.js";
+import { fillRoute, type ModelId, parseModelId, routerRunQuery } from "./modelRoutes.js";
 import { parseRetryAfter } from "./routerErrors.js";
 import {
   isCollectable,
@@ -379,6 +379,34 @@ export interface RunOptions {
    * `retry: false` is one attempt, collect included.
    */
   retry?: RetryOptions | false;
+  /**
+   * Select an alternate serving provider for this model — Comfy Router's
+   * `model_provider` query param (e.g. `"fal"`). Omitted, the model runs on its
+   * default provider and the request is byte-for-byte what it always was.
+   *
+   * Under the default `strictMode` (`false`) the `input` you pass stays this
+   * model's own native shape and Router translates it to the alternate
+   * provider's schema on the way in and the response back to native on the way
+   * out. See {@link strictMode} and {@link fallbackProvider} for the two knobs
+   * that ride with it — all three are sent ONLY when set, so a call that names
+   * none of them is unchanged.
+   */
+  modelProvider?: string;
+  /**
+   * `strict_mode` — only meaningful alongside {@link modelProvider}. `false`
+   * (the default) has Router translate between this model's native shape and the
+   * alternate provider's own schema in both directions; `true` sends and returns
+   * that provider's raw shape unchanged, so `input` must already BE that
+   * provider's schema and no translation happens either way. Rendered on the
+   * wire as `true`/`false`.
+   */
+  strictMode?: boolean;
+  /**
+   * `fallback_provider` — pass `"false"` to opt out of Router retrying a failed
+   * call against the model's other registered provider. Any other value, or
+   * omitting it, leaves provider-fallback on (the default).
+   */
+  fallbackProvider?: string;
 }
 
 /**
@@ -544,8 +572,11 @@ export interface Models {
  */
 export const RUN_ROUTE_TEMPLATE = "/v2/models/{provider}/{model}";
 
-function runUrl(baseUrl: string, id: ModelId): string {
-  return `${baseUrl}${fillRoute(RUN_ROUTE_TEMPLATE, id)}`;
+function runUrl(baseUrl: string, id: ModelId, query: string): string {
+  // `query` is already percent-encoded (`routerRunQuery`) and empty for a call
+  // that named no alt-provider control, so nothing is appended and the URL is
+  // byte-for-byte the one this route has always built.
+  return `${baseUrl}${fillRoute(RUN_ROUTE_TEMPLATE, id)}${query === "" ? "" : `?${query}`}`;
 }
 
 /**
@@ -955,7 +986,16 @@ async function run<TData = unknown>(
     );
   }
 
-  const url = runUrl(resolveBaseUrl(), id);
+  // The alt-provider controls, as a query string that is empty unless the
+  // caller set one — so the URL, and the whole request, is unchanged for a run
+  // that names none of them. Built once, outside the retry loop, since every
+  // attempt of this one logical call goes to the same URL.
+  const query = routerRunQuery({
+    modelProvider: options.modelProvider,
+    strictMode: options.strictMode,
+    fallbackProvider: options.fallbackProvider,
+  });
+  const url = runUrl(resolveBaseUrl(), id, query);
   // Minted once, outside the retry loop: every attempt of this one logical
   // call sends the SAME key. The server records the first response against
   // it and replays that for a repeat, so a retry after a lost or 5xx-ed

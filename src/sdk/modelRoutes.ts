@@ -171,3 +171,57 @@ export function fillRoute(template: string, values: Readonly<Record<string, stri
     return encodeURIComponent(value);
   });
 }
+
+/**
+ * Comfy Router's alt-provider controls for one model RUN, in the shape a caller
+ * passes them. Every field is optional; see {@link routerRunQuery} for how each
+ * reaches the wire.
+ *
+ * These ride ONLY on the synchronous run route. The queued routes
+ * (`submit`/`subscribe`) do not accept them — the backend refuses them on the
+ * `requests` collection — so nothing in `./modelRequests.ts` builds this.
+ */
+export interface RouterRunParams {
+  /**
+   * `model_provider` — an alternate serving provider for this model (e.g.
+   * `"fal"`), instead of its current default. Omitted, the model runs on its
+   * default provider and the request is byte-for-byte what it always was.
+   */
+  modelProvider?: string;
+  /**
+   * `strict_mode` — only meaningful alongside {@link modelProvider}. `false`
+   * (the default) keeps `input` this model's own native shape and lets Router
+   * translate it to the alternate provider both ways; `true` sends and returns
+   * that provider's own raw shape unchanged, with no translation either way.
+   */
+  strictMode?: boolean;
+  /**
+   * `fallback_provider` — pass `"false"` to opt out of Router retrying a failed
+   * call against the model's other registered provider. Any other value, or
+   * omitting it, leaves fallback on (the default).
+   */
+  fallbackProvider?: string;
+}
+
+/**
+ * The Comfy Router alt-provider query string for a model run, or `""`.
+ *
+ * Each field is emitted ONLY when the caller set it (`undefined` means "send
+ * nothing"), so a run that names none of the three appends no query at all and
+ * is byte-for-byte the request this route has always made — the server applies
+ * its own defaults rather than being handed `model_provider=default` /
+ * `strict_mode=false` spelled out on the wire. The order is fixed
+ * (`model_provider`, then `strict_mode`, then `fallback_provider`) so the
+ * encoded string is stable and testable, and `strict_mode` renders as the
+ * spec's `true`/`false` query form. Values are percent-encoded by
+ * `URLSearchParams`. Mirrors the Python SDK's `_router_run_query`.
+ */
+export function routerRunQuery(params: RouterRunParams): string {
+  const query = new URLSearchParams();
+  if (params.modelProvider !== undefined) query.set("model_provider", params.modelProvider);
+  if (params.strictMode !== undefined)
+    query.set("strict_mode", params.strictMode ? "true" : "false");
+  if (params.fallbackProvider !== undefined)
+    query.set("fallback_provider", params.fallbackProvider);
+  return query.toString();
+}
