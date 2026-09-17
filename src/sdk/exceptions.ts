@@ -69,6 +69,13 @@ export class ComfyError extends Error {
    * A key minted inside `comfy.models.run` is not otherwise visible anywhere,
    * so without this an interrupted call could not be re-asked for at all — the
    * generation Router is holding is addressed by that string and nothing else.
+   *
+   * A raw transport failure or abort thrown by `comfy.models.run` /
+   * `comfy.models.submit` carries it too — not as a `ComfyError` but as an own
+   * `idempotencyKey` property stamped onto the underlying throwable (undici's
+   * `TypeError` "fetch failed", a `DOMException` `AbortError`), which is the
+   * only value that ties such a failure to the server-side record, since none
+   * of them ever collected an `X-Comfy-Request-Id`. See {@link stampIdempotencyKey}.
    */
   readonly idempotencyKey: string | null;
 
@@ -201,5 +208,61 @@ export async function translate<T>(fn: () => Promise<T>): Promise<T> {
       throw toSdkError(exc);
     }
     throw exc;
+  }
+}
+
+/**
+ * The readable {@link ComfyError} attributes a stamped error is guaranteed to
+ * answer to. Mirrors Python's `_STAMPED_ATTRIBUTES`.
+ */
+const STAMPED_ATTRIBUTES = ["requestId", "retryAfter"] as const;
+
+/**
+ * Attach `idempotencyKey` to `exc` in place and hand it back.
+ *
+ * The transport failures `comfy.models.run` / `comfy.models.submit` re-throw
+ * are undici's own `TypeError` ("fetch failed") and `DOMException`
+ * (`AbortError`) — throwables this SDK does not construct, so there is no
+ * constructor argument to thread the key through and no subclass to catch by.
+ * Stamping the own property in place is how those raw errors carry the
+ * `Idempotency-Key` all the same: on a transport failure comfy-api never
+ * minted an `X-Comfy-Request-Id`, so the key is the only value that correlates
+ * the failure to the server-side record. Mirrors Python's `_stamp()`.
+ *
+ * Never overwrites a value already set — so a {@link ComfyError} built WITH a
+ * key keeps it (the field is `readonly` at the type level only; the write goes
+ * through a `Record` cast deliberately, and the guard makes it a no-op there).
+ * A `null` key writes nothing; a non-object or non-extensible throwable (a
+ * string, a frozen object) passes through untouched. `requestId` and
+ * `retryAfter` are defaulted to `null` when absent, so a stamped transport
+ * error reads every attribute the way a caller who caught a ComfyError expects,
+ * without clobbering a value the error already carried.
+ */
+export function stampIdempotencyKey<E>(exc: E, idempotencyKey: string | null): E {
+  if (
+    idempotencyKey === null ||
+    exc === null ||
+    typeof exc !== "object" ||
+    !Object.isExtensible(exc)
+  )
+    return exc;
+  const target = exc as unknown as Record<string, unknown>;
+  if (target.idempotencyKey === undefined || target.idempotencyKey === null)
+    target.idempotencyKey = idempotencyKey;
+  for (const name of STAMPED_ATTRIBUTES) if (!(name in target)) target[name] = null;
+  return exc;
+}
+
+/**
+ * Run `fn`; anything it throws leaves stamped with `idempotencyKey`, the same
+ * object with the same stack. Mirrors the second arm of Python's
+ * `translating(idempotency_key=…)` — the arm that stamps a raw transport
+ * failure rather than translating a protocol error.
+ */
+export async function stamping<T>(idempotencyKey: string | null, fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (exc) {
+    throw stampIdempotencyKey(exc, idempotencyKey);
   }
 }

@@ -236,6 +236,76 @@ describe("comfy.models.submit", () => {
   });
 });
 
+describe("comfy.models.submit stamps the Idempotency-Key onto every failure", () => {
+  it("stamps a raw transport failure, preserving its TypeError identity", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.resetTimes = 1; // socket destroyed mid-request — no status at all
+
+      const err = (await comfy.models
+        .submit(MODEL, {}, { retry: false, idempotencyKey: "k-transport" })
+        .catch((e: unknown) => e)) as TypeError & Record<string, unknown>;
+
+      expect(err).toBeInstanceOf(TypeError);
+      expect(err.message).toBe("fetch failed"); // identity + message untouched
+      expect(err.idempotencyKey).toBe("k-transport");
+      expect(err.requestId).toBeNull();
+      expect(err.retryAfter).toBeNull();
+    });
+  });
+
+  it("stamps an already-aborted signal's AbortError", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      const controller = new AbortController();
+      controller.abort();
+
+      const err = (await comfy.models
+        .submit(MODEL, {}, { signal: controller.signal, idempotencyKey: "k-abort" })
+        .catch((e: unknown) => e)) as Error & Record<string, unknown>;
+
+      expect(err).not.toBeInstanceOf(ComfyError);
+      expect(err.name).toBe("AbortError");
+      expect(err.idempotencyKey).toBe("k-abort");
+    });
+  });
+
+  it("stamps the RouterError a bare 502 decodes to", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = () => ({
+        status: 502,
+        errorType: "provider_error",
+        body: { detail: "bad gateway", error_type: "provider_error" },
+      });
+
+      const err = (await comfy.models
+        .submit(MODEL, {}, { retry: false, idempotencyKey: "k-502" })
+        .catch((e: unknown) => e)) as routerErrors.RouterError;
+
+      expect(err).toBeInstanceOf(routerErrors.ProviderError);
+      expect(err).toBeInstanceOf(routerErrors.RouterError);
+      expect(err.httpStatus).toBe(502);
+      expect(err.idempotencyKey).toBe("k-502");
+    });
+  });
+
+  it("stamps the request_timeout ComfyError a spent deadline raises", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.hang = true; // never answers, so the deadline is what ends the call
+
+      const err = (await comfy.models
+        .submit(MODEL, {}, { timeoutMs: 50, retry: false, idempotencyKey: "k-timeout" })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("request_timeout");
+      expect(err.idempotencyKey).toBe("k-timeout");
+    });
+  });
+});
+
 describe("RequestHandle.status", () => {
   it("GETs the status route once and reports what the queue said", async () => {
     await withRouterStub(async (server) => {

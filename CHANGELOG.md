@@ -17,6 +17,10 @@ Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
 entry. See CONTRIBUTING.md.
 -->
 
+### Fixed
+
+- **`idempotencyKey` is now stamped onto _every_ error `comfy.models.run` and `comfy.models.submit` throw, including raw transport failures and aborts.** Previously only the `run` response-path `ComfyError` carried it; undici's transport-failure `TypeError` ("fetch failed"), an already-aborted signal's `AbortError`, and the queue path's `RouterError` (e.g. a bare `502` `ProviderError`) all escaped without it. On a transport failure the server never minted an `X-Comfy-Request-Id`, so the key is the only value that correlates the failure to the server-side record. It is now attached as an own `idempotencyKey` property on the raw throwable (its identity, message and stack are otherwise untouched), and `routerErrors.RouterError` gained a typed `idempotencyKey` field. Mirrors the Python SDK's `exceptions.translating(idempotency_key=…)`.
+
 ## [0.3.0] - 2026-09-14
 
 ### Added
