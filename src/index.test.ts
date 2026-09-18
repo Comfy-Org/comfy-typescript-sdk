@@ -39,7 +39,14 @@ describe("public surface", () => {
 
   it("re-exports the Router error namespace from the package root", () => {
     expect(routerErrors.RouterError).toBeTypeOf("function");
-    expect(routerErrors.ROUTER_ERROR_TYPES).toHaveLength(15);
+    expect(routerErrors.ROUTER_ERROR_TYPES).toHaveLength(18);
+    // The length assertion above counts the closed set but cannot say the new
+    // members reached the package ROOT — a class added to the set and missed by
+    // the re-export would keep that count at 18 and still be unreachable to a
+    // caller writing `import { routerErrors }`. Name the three this sync added.
+    expect(routerErrors.Cancelled).toBeTypeOf("function");
+    expect(routerErrors.QueueTimeout).toBeTypeOf("function");
+    expect(routerErrors.RequestNotFound).toBeTypeOf("function");
     expect(new routerErrors.ContentPolicyViolation("boom")).toBeInstanceOf(
       routerErrors.RouterError,
     );

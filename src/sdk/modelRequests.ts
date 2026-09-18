@@ -65,7 +65,12 @@ import { backoffSchedule, newIdempotencyKey } from "./core.js";
 import { requireCredentials, resolveBaseUrl } from "./credentials.js";
 import { ComfyError } from "./exceptions.js";
 import { fillRoute, parseModelId, parseRequestId } from "./modelRoutes.js";
-import type { RunResult } from "./models.js";
+import {
+  DROPPED_PARAMS_HEADER,
+  FALLBACK_PROVIDER_HEADER,
+  parseDroppedParams,
+  type RunResult,
+} from "./models.js";
 import {
   ERROR_TYPE_HEADER,
   errorFromCompletion,
@@ -884,10 +889,20 @@ export class RequestHandle<TData = unknown> {
     // (`finish` in models.ts), which reads `Content-Type` off the generation
     // itself. The discriminant is still written rather than inferred so a
     // caller can narrow one union across both paths.
+    //
+    // The two alt-provider disclosure headers are read here for the same
+    // reason the discriminant is written rather than inferred: one union, both
+    // paths, narrowed the same way. They are expected to be absent on this
+    // route — the queued `/requests` path takes no `model_provider` parameter,
+    // so a queued run cannot address an alternate provider and has nothing to
+    // disclose — but reading them keeps the two result shapes identical and
+    // means this path needs no edit on the day that route does gain them.
     return {
       kind: "json",
       data: body as TData,
       requestId: response.headers.get(REQUEST_ID_HEADER),
+      servingProvider: response.headers.get(FALLBACK_PROVIDER_HEADER),
+      droppedParams: parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER)),
     };
   }
 
