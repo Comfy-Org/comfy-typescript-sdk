@@ -381,6 +381,15 @@ export interface RunOptions {
    *
    * Every attempt within one call — the first and each retry — sends the
    * same key, whichever way it was obtained.
+   *
+   * **Resend the alt-provider controls with it.** A key's identity covers the
+   * QUERY as well as the method and body, and {@link modelProvider},
+   * {@link strictMode} and {@link fallbackProvider} are query parameters — so a
+   * recovery call that supplies the key but drops them presents the same key
+   * under a different query, is refused, and leaves the very generation it was
+   * meant to collect uncollectable. This bites at the server default too:
+   * `strictMode: false` is sent as `strict_mode=false`, which is a different
+   * query from omitting it. Replay the call exactly as it was made.
    */
   idempotencyKey?: string;
   /**
