@@ -113,6 +113,9 @@ describe("comfy.models.run on success", () => {
         // `null` here is "the provider asked for served it", not "unknown".
         servingProvider: null,
         droppedParams: null,
+        // The stub stamped no `X-Comfy-Credits-Used`: `null` is "not
+        // reported", which is a different answer from a reported `"0"`.
+        creditsUsed: null,
       });
     });
   });
@@ -207,6 +210,79 @@ describe("comfy.models.run on success", () => {
       server.state.requestId = null;
       const result = await comfy.models.run(MODEL, {});
       expect(result.requestId).toBeNull();
+    });
+  });
+});
+
+describe("comfy.models.run and X-Comfy-Credits-Used", () => {
+  /** A model whose partner answers with bytes, for the binary arm below. */
+  const AUDIO_MODEL = "elevenlabs/eleven_v3";
+
+  it("surfaces the header verbatim on a stamped JSON run", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.creditsUsed = "0.42";
+
+      const result = await comfy.models.run(MODEL, {});
+
+      // Verbatim, and a STRING: the wire value is decimal and a caller
+      // reconciling money parses it deliberately rather than receiving a
+      // float this SDK chose the rounding of.
+      expect(result.creditsUsed).toBe("0.42");
+      expect(typeof result.creditsUsed).toBe("string");
+    });
+  });
+
+  it("surfaces it on a binary run too — the arms mirror each other", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "audio/mpeg";
+      server.state.body = new Uint8Array([0x49, 0x44, 0x33, 0x04]);
+      server.state.creditsUsed = "1.50";
+
+      const result = await comfy.models.run(AUDIO_MODEL, {});
+
+      expect(result.kind).toBe("binary");
+      expect(result.creditsUsed).toBe("1.50");
+    });
+  });
+
+  it("is null when the response carried no such header", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.creditsUsed = null;
+
+      const result = await comfy.models.run(MODEL, {});
+
+      // "Not reported", NOT "free" — a sizeable share of real Router runs
+      // carry no header today even where the cost is known, so a caller that
+      // sums this as zero understates spend.
+      expect(result.creditsUsed).toBeNull();
+    });
+  });
+
+  it('keeps a reported "0" distinguishable from an absent header', async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.creditsUsed = "0";
+      const reportedZero = await comfy.models.run(MODEL, {});
+
+      server.state.creditsUsed = null;
+      const notReported = await comfy.models.run(MODEL, {});
+
+      // The whole reason the field is `string | null` rather than a number:
+      // `"0"` is a real reported cost and absence is silence, so the two must
+      // not collapse. Both readings of a numeric field would collapse them —
+      // `Number(null)` is `0`, and `"0"` is falsy once parsed.
+      expect(reportedZero.creditsUsed).toBe("0");
+      expect(notReported.creditsUsed).toBeNull();
+      expect(reportedZero.creditsUsed).not.toBe(notReported.creditsUsed);
+      // Branch on PRESENCE — the first pair below. The second pair is the
+      // bug this test encodes against: a value-based check reads the free
+      // call and the unreported one identically.
+      expect(reportedZero.creditsUsed !== null).toBe(true);
+      expect(notReported.creditsUsed !== null).toBe(false);
+      expect(Number(reportedZero.creditsUsed) !== 0).toBe(Number(notReported.creditsUsed) !== 0);
     });
   });
 });
@@ -639,6 +715,9 @@ describe("comfy.models.run on a binary result", () => {
         requestId: "6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21",
         servingProvider: null,
         droppedParams: null,
+        // The stub stamped no `X-Comfy-Credits-Used`: `null` is "not
+        // reported", which is a different answer from a reported `"0"`.
+        creditsUsed: null,
       });
     });
   });

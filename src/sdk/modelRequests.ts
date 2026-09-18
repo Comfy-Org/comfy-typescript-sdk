@@ -66,6 +66,7 @@ import { requireCredentials, resolveBaseUrl } from "./credentials.js";
 import { ComfyError } from "./exceptions.js";
 import { fillRoute, parseModelId, parseRequestId } from "./modelRoutes.js";
 import {
+  CREDITS_USED_HEADER,
   DROPPED_PARAMS_HEADER,
   FALLBACK_PROVIDER_HEADER,
   parseDroppedParams,
@@ -897,12 +898,18 @@ export class RequestHandle<TData = unknown> {
     // so a queued run cannot address an alternate provider and has nothing to
     // disclose — but reading them keeps the two result shapes identical and
     // means this path needs no edit on the day that route does gain them.
+    //
+    // `X-Comfy-Credits-Used` is NOT in that category: a queued run costs
+    // exactly what a synchronous one does, so Router has every reason to
+    // stamp it here. Absent stays `null`, which reads as "not reported"
+    // rather than as free either way.
     return {
       kind: "json",
       data: body as TData,
       requestId: response.headers.get(REQUEST_ID_HEADER),
       servingProvider: response.headers.get(FALLBACK_PROVIDER_HEADER),
       droppedParams: parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER)),
+      creditsUsed: response.headers.get(CREDITS_USED_HEADER),
     };
   }
 

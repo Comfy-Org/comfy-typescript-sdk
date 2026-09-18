@@ -471,6 +471,29 @@ describe("RequestHandle.get", () => {
     });
   });
 
+  it("lifts X-Comfy-Credits-Used off the result response, and reads absence as null", async () => {
+    // The queued route costs what the synchronous one does, so Router has
+    // every reason to stamp a price here too — and this path builds its
+    // `RunResult` by hand rather than through `finish`, so it is its own
+    // chance to drop the header on the floor.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = queueScript({ statuses: [DONE], result: PAYLOAD });
+      server.state.creditsUsed = "2.75";
+
+      expect((await comfy.models.handle(MODEL, REQUEST_ID).get()).creditsUsed).toBe("2.75");
+    });
+
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = queueScript({ statuses: [DONE], result: PAYLOAD });
+      server.state.creditsUsed = null;
+
+      // "Not reported", not "free".
+      expect((await comfy.models.handle(MODEL, REQUEST_ID).get()).creditsUsed).toBeNull();
+    });
+  });
+
   it("rejects with the typed router error a completion reports, and fetches no result", async () => {
     const cases: [string, new (...args: never[]) => Error][] = [
       ["content_policy_violation", routerErrors.ContentPolicyViolation],

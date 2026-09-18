@@ -217,6 +217,18 @@ export const FALLBACK_PROVIDER_HEADER = "X-Comfy-Router-Fallback-Provider";
 export const DROPPED_PARAMS_HEADER = "X-Comfy-Router-Dropped-Params";
 
 /**
+ * `X-Comfy-Credits-Used` — what Router priced this call at, in credits. See
+ * {@link RunJsonResult.creditsUsed}.
+ *
+ * Not in `spec/router-openapi.yaml` yet: the header ships on Router's run
+ * responses, but the vendored contract's `runRouterModel` `200` does not
+ * declare it, so there is nothing here to pin the name against the way
+ * `router-spec-contract.test.ts` pins the route. The next Router sync that
+ * brings a `RouterCreditsUsedHeader` is the point to add that pin.
+ */
+export const CREDITS_USED_HEADER = "X-Comfy-Credits-Used";
+
+/**
  * Parse the `X-Comfy-Router-Dropped-Params` header value.
  *
  * The spec describes this header as "a JSON array of strings" in prose while
@@ -289,6 +301,35 @@ export interface RunJsonResult<TData = unknown> {
    * `null` when no translation ran, or it ran and dropped nothing.
    */
   droppedParams: readonly string[] | null;
+  /**
+   * `X-Comfy-Credits-Used`: what Router priced this call at, verbatim — a
+   * decimal string carrying up to two decimal places (`"0.42"`).
+   *
+   * Three things it is not, and each of them changes what you may do with it:
+   *
+   * - **It is a price, not a settled ledger entry.** It is what Router
+   *   computed as it answered this call, not a posted balance movement. The
+   *   workspace's ledger is reconciled server-side and can disagree — a
+   *   refund, a correction, a replay that is not charged a second time. Show
+   *   it and reconcile against it; do not treat it as the authoritative
+   *   charge.
+   * - **`null` means "not reported", never "free".** A response carrying no
+   *   header says nothing at all about the cost, and a substantial share of
+   *   real Router runs carry none today even where the cost is known. Summing
+   *   `null` as zero understates spend.
+   * - **`"0"` is a real reported cost.** A genuinely free call and an
+   *   unreported one are different answers, so branch on PRESENCE
+   *   (`creditsUsed !== null`) and never on the value being non-zero — the
+   *   falsiness of `"0"`'s numeric reading is exactly the bug.
+   *
+   * `string | null` rather than `number | null` on purpose, the same way
+   * {@link droppedParams} keeps the server's own shape: the wire value is
+   * decimal, `Number("")` and `Number(null)` are both `0`, and a caller
+   * reconciling money should not silently receive a float nothing asked it to
+   * parse. Parse it deliberately, and let a value that will not parse fail
+   * where you can see it.
+   */
+  creditsUsed: string | null;
 }
 
 /**
@@ -319,6 +360,8 @@ export interface RunBinaryResult {
   servingProvider: string | null;
   /** As {@link RunJsonResult.droppedParams}. */
   droppedParams: readonly string[] | null;
+  /** As {@link RunJsonResult.creditsUsed}. */
+  creditsUsed: string | null;
 }
 
 /**
@@ -1310,6 +1353,10 @@ function finish<TData>(
   // cannot tell an alt-provider run from a native one.
   const servingProvider = response.headers.get(FALLBACK_PROVIDER_HEADER);
   const droppedParams = parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER));
+  // Read here for the same reason, and kept as the raw header string: what the
+  // call COST is not recoverable from the body either, and `null` has to stay
+  // distinguishable from a reported `"0"`.
+  const creditsUsed = response.headers.get(CREDITS_USED_HEADER);
   if (!response.ok) throw errorFromResponse(response, decodeUtf8(responseBody), idempotencyKey);
 
   // A 202 is a task handle, not a result. This route is the synchronous one,
@@ -1360,6 +1407,7 @@ function finish<TData>(
       requestId,
       servingProvider,
       droppedParams,
+      creditsUsed,
     };
   }
 
@@ -1387,6 +1435,7 @@ function finish<TData>(
         requestId,
         servingProvider,
         droppedParams,
+        creditsUsed,
       };
     }
     throw new ComfyError(
@@ -1400,7 +1449,14 @@ function finish<TData>(
       },
     );
   }
-  return { kind: "json", data: data as TData, requestId, servingProvider, droppedParams };
+  return {
+    kind: "json",
+    data: data as TData,
+    requestId,
+    servingProvider,
+    droppedParams,
+    creditsUsed,
+  };
 }
 
 // -- discovery: the model catalog, and one model's published schemas ---------

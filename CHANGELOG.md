@@ -30,6 +30,16 @@ entry. See CONTRIBUTING.md.
   set, so a run that names none of the three is byte-for-byte the request it
   always was. These are run-route only — the queued `submit`/`subscribe`
   surface does not accept them.
+- **`creditsUsed` on a run result — what Router priced the call at.** Both
+  arms of `RunResult` (`RunJsonResult` and `RunBinaryResult`) now carry the
+  `X-Comfy-Credits-Used` response header, and so does the queued
+  `RequestHandle.get()` result. Typed `string | null`, verbatim off the wire:
+  the value is decimal and a caller reconciling money should parse it
+  deliberately rather than receive a float this SDK chose the rounding of.
+  Three caveats it is worth reading the TSDoc for — it is a price rather than
+  a settled ledger entry, `null` means "not reported" and never "free", and a
+  reported `"0"` is a real cost, so branch on presence (`creditsUsed !== null`)
+  rather than on the value being non-zero.
 - **Three queue-tier `routerErrors` classes — `Cancelled`, `QueueTimeout`
   and `RequestNotFound`** — for the `cancelled`, `queue_timeout` and
   `request_not_found` buckets the vendored Router contract now declares, so a
