@@ -5,11 +5,13 @@
  *
  * Skipped unless pointed at a live Router deployment:
  *
+ *     export COMFY_ROUTER_E2E=1            # required: these calls BILL
  *     export COMFY_ROUTER_BASE_URL="https://stagingapi.comfy.org"
  *     export COMFY_API_KEY="comfyui-..."
  *     pnpm test test/integration/router-models-e2e.test.ts
  *
- * Gated on COMFY_ROUTER_BASE_URL being set explicitly (not just COMFY_API_KEY):
+ * Gated on COMFY_ROUTER_E2E=1 as well as the credentials, so an ordinary
+ * `pnpm test` with staging credentials exported cannot bill:
  * these calls dispatch real partner generations and cost credits, so they run
  * only against a deployment the caller deliberately named, never accidentally
  * against the default prod host. The provider under test defaults to `fal` and
@@ -57,7 +59,16 @@ const VIDEO_TIMEOUT_MS = 600_000; // submit-poll video, polled server-side insid
 // as an assertion rather than as a Vitest timeout that hides the real result.
 const TEST_MARGIN_MS = 30_000;
 
-const shouldRun = Boolean(ROUTER_BASE_URL && API_KEY);
+// These calls BILL. The opt-in is a dedicated variable, deliberately not the
+// SDK's own documented credentials: `COMFY_ROUTER_BASE_URL` + `COMFY_API_KEY`
+// are exactly what a developer pointed at staging has exported already, and
+// `vitest.config.ts` sets no `test.include`, so vitest's default glob reaches
+// this file on a plain `pnpm test`. Gating on credentials alone therefore means
+// an ordinary local test run silently spends money on an image AND a video
+// generation. `COMFY_ROUTER_E2E=1` is the same opt-in the cloud repo's Router
+// e2e suite uses, so the two agree on what "yes, bill me" looks like.
+const E2E_OPT_IN = process.env.COMFY_ROUTER_E2E === "1";
+const shouldRun = Boolean(E2E_OPT_IN && ROUTER_BASE_URL && API_KEY);
 
 /** The image URL/data-URI from a native OpenAI-image response, or "". */
 function imageUrl(data: unknown): string {
