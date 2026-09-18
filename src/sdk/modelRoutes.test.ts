@@ -46,4 +46,29 @@ describe("routerRunQuery", () => {
   it("percent-encodes a provider value rather than letting it break the query", () => {
     expect(routerRunQuery({ modelProvider: "a b&c" })).toBe("model_provider=a+b%26c");
   });
+
+  it("renders a boolean fallbackProvider as the spec spelling, not JS's", () => {
+    // The spec reads this parameter as "omitted, or ANY value other than
+    // `false`, turns fallback on". A boolean is the only spelling a caller
+    // cannot get wrong, so it must render as the exact literal the server
+    // looks for — `String(false)` happens to be right here, but pinning it
+    // stops a future refactor reaching for something that isn't.
+    expect(routerRunQuery({ fallbackProvider: false })).toBe("fallback_provider=false");
+    expect(routerRunQuery({ fallbackProvider: true })).toBe("fallback_provider=true");
+    // A string still passes through verbatim: "false" keeps working, and a
+    // future non-boolean vocabulary needs no change here.
+    expect(routerRunQuery({ fallbackProvider: "false" })).toBe("fallback_provider=false");
+  });
+
+  it("does not let a truthy string invert strict_mode", () => {
+    // The regression this guards: `strictMode ? "true" : "false"` maps the
+    // STRING "false" — which is truthy in JS, and is the exact spelling the
+    // sibling fallbackProvider option asks for — to `strict_mode=true`,
+    // inverting the one flag that decides whether the body is translated or
+    // passed through raw. Typed `boolean`, but this SDK is consumed from plain
+    // JS and from config files, where that value arrives as a string.
+    expect(routerRunQuery({ strictMode: "false" as unknown as boolean })).toBe("strict_mode=false");
+    expect(routerRunQuery({ strictMode: "true" as unknown as boolean })).toBe("strict_mode=false");
+    expect(routerRunQuery({ strictMode: 1 as unknown as boolean })).toBe("strict_mode=false");
+  });
 });

@@ -205,6 +205,48 @@ export const ERROR_TYPE_HEADER = "X-Comfy-Error-Type";
 export const CONTENT_TYPE_HEADER = "Content-Type";
 
 /**
+ * `X-Comfy-Router-Fallback-Provider` — the provider that actually served a call
+ * that fell back. See {@link RunJsonResult.servingProvider}.
+ */
+export const FALLBACK_PROVIDER_HEADER = "X-Comfy-Router-Fallback-Provider";
+
+/**
+ * `X-Comfy-Router-Dropped-Params` — native fields an alt-provider translation
+ * could not carry. See {@link RunJsonResult.droppedParams}.
+ */
+export const DROPPED_PARAMS_HEADER = "X-Comfy-Router-Dropped-Params";
+
+/**
+ * Parse the `X-Comfy-Router-Dropped-Params` header value.
+ *
+ * The spec describes this header as "a JSON array of strings" in prose while
+ * declaring `schema: {type: array, items: {type: string}}`, which in OpenAPI
+ * means the SIMPLE comma-delimited form instead. The two disagree, and the
+ * spec's own example settles it: its single entry reads `moderation (fal
+ * applies its own, non-configurable safety filtering)` — which contains a
+ * comma, so a comma split would tear one entry into two meaningless fragments.
+ * The prose is right and the declared schema is the part that is wrong.
+ *
+ * So: parse JSON, and on anything else keep the raw value as ONE entry rather
+ * than guessing at delimiters — a single entry a human can read beats two
+ * confident fragments. (The spec defect is filed against the server's own
+ * openapi.yml; this vendored copy is synced from it, so fixing it here would be
+ * reverted by the next sync.)
+ */
+export function parseDroppedParams(raw: string | null): readonly string[] | null {
+  if (raw === null) return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (Array.isArray(parsed) && parsed.every((x): x is string => typeof x === "string")) {
+      return parsed;
+    }
+  } catch {
+    // Not JSON — fall through to the single-entry reading below.
+  }
+  return [raw];
+}
+
+/**
  * A completed {@link Models.run} whose result was a JSON document.
  *
  * @typeParam TData - the provider's payload shape. It defaults to `unknown`,
@@ -227,6 +269,26 @@ export interface RunJsonResult<TData = unknown> {
    * Comfy genuinely does not.
    */
   requestId: string | null;
+  /**
+   * `X-Comfy-Router-Fallback-Provider`: the provider that ultimately served this
+   * call, when `fallbackProvider` retried against a second one and that retry
+   * succeeded — never a provider that was attempted and also failed.
+   *
+   * `null` means the provider that was asked for served it, which is the common
+   * case; it does not mean "unknown". This is the ONLY disclosure of the
+   * difference: an alt-provider response is translated back to the model's own
+   * native contract, so `data` alone is identical either way.
+   */
+  servingProvider: string | null;
+  /**
+   * `X-Comfy-Router-Dropped-Params`: native fields the translation could not carry.
+   *
+   * Present only when `modelProvider` translated the body (`strictMode: false`,
+   * the default) and one or more native fields could not be expressed exactly
+   * on the alternate provider's schema; each entry names the field and why.
+   * `null` when no translation ran, or it ran and dropped nothing.
+   */
+  droppedParams: readonly string[] | null;
 }
 
 /**
@@ -253,6 +315,10 @@ export interface RunBinaryResult {
   contentType: string;
   /** As {@link RunJsonResult.requestId}. */
   requestId: string | null;
+  /** As {@link RunJsonResult.servingProvider}. */
+  servingProvider: string | null;
+  /** As {@link RunJsonResult.droppedParams}. */
+  droppedParams: readonly string[] | null;
 }
 
 /**
@@ -402,11 +468,16 @@ export interface RunOptions {
    */
   strictMode?: boolean;
   /**
-   * `fallback_provider` — pass `"false"` to opt out of Router retrying a failed
+   * `fallback_provider` — pass `false` to opt out of Router retrying a failed
    * call against the model's other registered provider. Any other value, or
    * omitting it, leaves provider-fallback on (the default).
+   *
+   * Prefer the boolean. The spec turns fallback on for ANY value that is not
+   * exactly `false`, so `"False"`, `"0"`, `"no"` and `"off"` all type-check and
+   * then do the opposite of what they read as — a `boolean` cannot be spelled
+   * wrong, and is normalised to the wire spelling for you.
    */
-  fallbackProvider?: string;
+  fallbackProvider?: boolean | string;
 }
 
 /**
@@ -1224,6 +1295,12 @@ function finish<TData>(
   idempotencyKey: string,
 ): RunResult<TData> {
   const requestId = response.headers.get(REQUEST_ID_HEADER);
+  // Read before any branch returns: these disclose HOW the call ran (which
+  // provider served it, what a translation dropped), and an alt-provider
+  // response is translated back to the native contract, so the body alone
+  // cannot tell an alt-provider run from a native one.
+  const servingProvider = response.headers.get(FALLBACK_PROVIDER_HEADER);
+  const droppedParams = parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER));
   if (!response.ok) throw errorFromResponse(response, decodeUtf8(responseBody), idempotencyKey);
 
   // A 202 is a task handle, not a result. This route is the synchronous one,
@@ -1267,7 +1344,14 @@ function finish<TData>(
   const contentType = response.headers.get(CONTENT_TYPE_HEADER)?.trim() ?? "";
   const mediaType = mediaTypeOf(contentType);
   if (mediaType !== "" && !isJsonMediaType(mediaType)) {
-    return { kind: "binary", data: responseBody, contentType, requestId };
+    return {
+      kind: "binary",
+      data: responseBody,
+      contentType,
+      requestId,
+      servingProvider,
+      droppedParams,
+    };
   }
 
   let data: unknown;
@@ -1287,7 +1371,14 @@ function finish<TData>(
     // contradicting its own header, which no caller can do anything useful
     // with a `Uint8Array` of.
     if (mediaType === "") {
-      return { kind: "binary", data: responseBody, contentType: "", requestId };
+      return {
+        kind: "binary",
+        data: responseBody,
+        contentType: "",
+        requestId,
+        servingProvider,
+        droppedParams,
+      };
     }
     throw new ComfyError(
       `models.run("${model}") returned a ${String(response.status)} whose body is not JSON`,
@@ -1300,7 +1391,7 @@ function finish<TData>(
       },
     );
   }
-  return { kind: "json", data: data as TData, requestId };
+  return { kind: "json", data: data as TData, requestId, servingProvider, droppedParams };
 }
 
 // -- discovery: the model catalog, and one model's published schemas ---------

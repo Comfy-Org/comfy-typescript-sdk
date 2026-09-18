@@ -199,8 +199,15 @@ export interface RouterRunParams {
    * `fallback_provider` — pass `"false"` to opt out of Router retrying a failed
    * call against the model's other registered provider. Any other value, or
    * omitting it, leaves fallback on (the default).
+   *
+   * A `boolean` is normalised to that spelling, and it is the safer thing to
+   * pass. The spec reads this parameter as "omitted, or ANY value other than
+   * `false`, turns fallback on", so the near-misses a `string` invites —
+   * `"False"`, `"0"`, `"no"`, `"off"` — all type-check and then do the exact
+   * OPPOSITE of what the caller asked, silently, behind a 200 that looks like
+   * the intended one. `false` cannot be spelled wrong.
    */
-  fallbackProvider?: string;
+  fallbackProvider?: boolean | string;
 }
 
 /**
@@ -219,9 +226,28 @@ export interface RouterRunParams {
 export function routerRunQuery(params: RouterRunParams): string {
   const query = new URLSearchParams();
   if (params.modelProvider !== undefined) query.set("model_provider", params.modelProvider);
-  if (params.strictMode !== undefined)
-    query.set("strict_mode", params.strictMode ? "true" : "false");
+  if (params.strictMode !== undefined) query.set("strict_mode", boolParam(params.strictMode));
   if (params.fallbackProvider !== undefined)
-    query.set("fallback_provider", params.fallbackProvider);
+    query.set(
+      "fallback_provider",
+      typeof params.fallbackProvider === "boolean"
+        ? boolParam(params.fallbackProvider)
+        : params.fallbackProvider,
+    );
   return query.toString();
+}
+
+/**
+ * Render a boolean query parameter as the spec's `true`/`false`.
+ *
+ * Deliberately `=== true` rather than a truthiness test. `strictMode` is typed
+ * `boolean`, but this SDK is consumed from plain JavaScript and from config
+ * files too, and the string `"false"` — the exact spelling the sibling
+ * `fallbackProvider` option asks for — is TRUTHY. A `? :` on the raw value
+ * therefore maps `"false"` to `strict_mode=true` and inverts the mode, which is
+ * the one failure mode this parameter cannot afford: it decides whether the
+ * body is translated or passed through raw.
+ */
+function boolParam(value: boolean): string {
+  return value === true ? "true" : "false";
 }
