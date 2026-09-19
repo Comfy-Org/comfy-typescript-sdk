@@ -659,6 +659,22 @@ const asset = client.assets.fromFile("photo.png");
 wf.setInput("10", "image", asset);
 ```
 
+An asset handle resolves to a **filename** on the server, not to decoded
+media. Bind it only to an input that takes a filename: the file widget of a
+loader node (`LoadImage.image`, `LoadVideo.file`, `LoadAudio.audio`,
+`Load3D.model_file`, or a custom node's own filename widget), then link that
+loader's output into the node that needs the tensor. Binding a handle directly
+to an `IMAGE`, `VIDEO`, `AUDIO` or `MASK` socket, including grouped
+partner-node inputs such as `model.reference_images.image_1`, is accepted at
+submit but fails at execution because the node receives a string.
+
+```ts
+// "10" is a LoadImage node: its `image` widget takes a filename, so bind the handle there.
+wf.setInput("10", "image", asset);
+// "11" is the consumer: link LoadImage's decoded IMAGE output ([nodeId, outputIndex]) into it.
+wf.setInput("11", "image", ["10", 0]);
+```
+
 On submit, the SDK walks the workflow graph, finds every embedded handle,
 and for each one: hashes the bytes locally (blake3, via
 [`hash-wasm`](https://www.npmjs.com/package/hash-wasm) — pure WebAssembly,

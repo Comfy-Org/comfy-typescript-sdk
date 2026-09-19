@@ -17,6 +17,18 @@ Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
 entry. See CONTRIBUTING.md.
 -->
 
+### Docs
+
+- **Asset handles bind only to a filename input, never to an
+  IMAGE/VIDEO/AUDIO/MASK socket.** Documented that an asset handle resolves to
+  a filename on the server, so it must be set on a loader node's file widget
+  (`LoadImage.image`, `LoadVideo.file`, `LoadAudio.audio`, `Load3D.model_file`,
+  …) whose output is then linked into the consuming node. Binding a handle
+  straight onto an `IMAGE`/`VIDEO`/`AUDIO`/`MASK` socket — including grouped
+  partner-node inputs such as `model.reference_images.image_1` — is accepted at
+  submit but fails at execution because the node receives a string. Covers the
+  README "Assets" section plus the `setInput` and `Asset` doc comments.
+
 ### Added
 
 - **Comfy Router alt-provider controls on `comfy.models.run` —
