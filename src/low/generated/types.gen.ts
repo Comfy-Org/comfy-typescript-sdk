@@ -105,7 +105,8 @@ export type JobWorkflowResponse = {
 
 /**
  * Lifecycle: queued → running → succeeded | failed | expired;
- * a cancel request moves running → canceling → canceled.
+ * a cancel request, or the deletion of the deployment the job is running
+ * on, moves running → canceling → canceled.
  * Terminal states: succeeded, canceled, failed, expired.
  *
  */
@@ -194,7 +195,9 @@ export type JobError = {
  * `queue_full` (429 + Retry-After), `insufficient_credits` (402),
  * `not_found` (404), `unauthorized` (401), `forbidden` (403).
  * Deployment-scoped surfaces add: `deployment_not_ready` (429 +
- * Retry-After — the deployment can still reach ready; retry) and
+ * Retry-After — the deployment can still reach ready; retry),
+ * `deployment_unavailable` (429 + Retry-After: the deployment is ready
+ * but its GPU provider is not taking work on it yet; retry) and
  * `deployment_stopped` (422 — terminal deployment state; a retry
  * cannot succeed without operator action). A 429 is disambiguated
  * by `error.code` alone; clients should treat any 429 + Retry-After
@@ -571,7 +574,7 @@ export type PostJobsErrors = {
      */
     422: ErrorEnvelope;
     /**
-     * `queue_full` (bounded queue depth reached) or, on deployment-scoped surfaces, `deployment_not_ready` (deployment still provisioning/starting). Disambiguate by `error.code`; both mean back off and retry after `Retry-After`.
+     * `queue_full` (bounded queue depth reached) or, on deployment-scoped surfaces, `deployment_not_ready` (deployment still provisioning/starting) or `deployment_unavailable` (the deployment is ready but its GPU provider is not taking work on it yet). Disambiguate by `error.code`; all three mean back off and retry after `Retry-After`.
      */
     429: ErrorEnvelope;
     /**
