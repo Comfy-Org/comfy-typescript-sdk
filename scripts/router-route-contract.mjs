@@ -39,12 +39,17 @@ export const MODELS_SOURCE_PATH = fileURLToPath(new URL("src/sdk/models.ts", ROO
 /** Source of `COMFY_ROUTER_BASE_URL`. */
 export const CREDENTIALS_SOURCE_PATH = fileURLToPath(new URL("src/sdk/credentials.ts", ROOT));
 
-/**
- * The operation whose path this SDK hard-codes. `comfy.models.run` posts to
- * exactly this one; the catalog and per-model-schema routes beside it in the
- * contract are not called from here and are not pinned.
- */
+/** The operation `comfy.models.run` posts to. */
 export const RUN_OPERATION_ID = "runRouterModel";
+
+/** The operation `comfy.models.list` reads the model catalog from. */
+export const CATALOG_OPERATION_ID = "listRouterModels";
+
+/** The operation `comfy.models.schema` reads a model's OpenAPI document from. */
+export const SCHEMA_OPERATION_ID = "getRouterModelInputSchema";
+
+/** The HTTP methods an OpenAPI path item can carry an operation under. */
+const HTTP_METHODS = ["get", "put", "post", "delete", "options", "head", "patch", "trace"];
 
 function fail(message) {
   throw new Error(
@@ -139,7 +144,52 @@ export async function readRouterRouteContract(specPath = ROUTER_SPEC_PATH) {
     runPath,
     serverUrl,
     parameterNames: pathParameterNames(doc, pathItem, pathItem.post),
+    retryAfterStatuses: retryAfterStatuses(doc, pathItem),
   };
+}
+
+/**
+ * The run route's error responses that declare a `Retry-After` header, as
+ * sorted numeric statuses.
+ *
+ * This is the contract half of `isCollectable` in `src/sdk/retry.ts`: that
+ * predicate accepts a same-key resend on exactly the statuses Router pairs
+ * with a pace, and it would be silently wrong — resending a deterministic
+ * refusal, or refusing to collect a generation Comfy is still holding — if the
+ * contract moved the header and nothing compared the two. Read off the run
+ * route rather than off the shared `components/responses`, because it is what
+ * THIS operation can answer with that the predicate is about.
+ */
+export function retryAfterStatuses(doc, pathItem) {
+  const responses = deref(doc, pathItem.post.responses ?? {});
+  const statuses = [];
+  for (const [status, rawResponse] of Object.entries(responses)) {
+    const response = deref(doc, rawResponse);
+    if (response === null || typeof response !== "object") continue;
+    const headers = response.headers ?? {};
+    if (Object.keys(headers).some((name) => name.toLowerCase() === "retry-after")) {
+      // OpenAPI also allows `default` and the `4XX`/`5XX` range forms as
+      // response keys. `Number()` turns those into `NaN`, which compares
+      // unequal to everything (itself included) — the "reads as agreement"
+      // failure this script exists to refuse, arriving through the other
+      // door. Refuse loudly instead: the predicate matches exact statuses.
+      if (!/^\d{3}$/.test(status)) {
+        fail(
+          `spec/router-openapi.yaml: ${RUN_OPERATION_ID} declares a \`Retry-After\` header on ` +
+            `response key ${JSON.stringify(status)}, which is not a single numeric status. ` +
+            "The predicate it is compared against (`isCollectable`) matches exact statuses.",
+        );
+      }
+      statuses.push(Number(status));
+    }
+  }
+  if (statuses.length === 0) {
+    fail(
+      `spec/router-openapi.yaml: ${RUN_OPERATION_ID} declares no response carrying a ` +
+        "`Retry-After` header. An empty list would read as agreement with any predicate.",
+    );
+  }
+  return statuses.sort((a, b) => a - b);
 }
 
 /**
@@ -186,4 +236,83 @@ export async function readRouterBaseUrl(sourcePath = CREDENTIALS_SOURCE_PATH) {
  */
 export function templatePlaceholders(template) {
   return [...template.matchAll(/\{(\w+)\}/g)].map((match) => match[1]);
+}
+
+/**
+ * Every operation the vendored contract declares, as
+ * `{ operationId, method, path }`, sorted by path then method.
+ *
+ * This is the acquisition half of the ROUTE-COVERAGE check in
+ * `src/sdk/router-spec-contract.test.ts`: that test maps each declared
+ * operation to the `comfy.models` method that calls it, so the next route a
+ * Router sync adds fails CI instead of sitting unreachable from the SDK — the
+ * way `listRouterModels` and `getRouterModelInputSchema` both did from the day
+ * the contract was first vendored here.
+ *
+ * An operation with no `operationId`, or one sharing its id with another, is
+ * refused rather than skipped: the coverage map is keyed by that id, so a
+ * dropped operation is exactly the un-noticed route this exists to catch, and
+ * a duplicated one lets a single entry excuse two routes. A path item that is
+ * a local `$ref` (legal in OpenAPI 3.x) is resolved rather than skipped for
+ * the same reason — unresolved it carries no method keys, and every operation
+ * under it would vanish with the non-empty guard below still satisfied.
+ */
+export function routerOperations(doc) {
+  const paths = doc?.paths;
+  if (paths === null || typeof paths !== "object") {
+    fail("spec/router-openapi.yaml declares no `paths`");
+  }
+  const operations = [];
+  const declaredAt = new Map();
+  for (const [path, rawItem] of Object.entries(paths)) {
+    const item = deref(doc, rawItem);
+    // `Array.isArray` as well as the `typeof` test: `typeof []` is `"object"`,
+    // so an array-shaped path item would pass, carry no method keys, and drop
+    // every operation under that path while the non-empty guard below stayed
+    // satisfied by some OTHER path's operations — a silent omission, which is
+    // the one failure mode this contract check exists to prevent.
+    if (item === null || typeof item !== "object" || Array.isArray(item)) {
+      fail(`spec/router-openapi.yaml: malformed path item ${path}`);
+    }
+    for (const method of HTTP_METHODS) {
+      const operation = item[method];
+      if (operation === undefined) continue;
+      if (operation === null || typeof operation !== "object") {
+        fail(`spec/router-openapi.yaml: malformed \`${method}\` operation on ${path}`);
+      }
+      const { operationId } = operation;
+      if (typeof operationId !== "string" || operationId === "") {
+        fail(`spec/router-openapi.yaml: \`${method} ${path}\` declares no operationId`);
+      }
+      const earlier = declaredAt.get(operationId);
+      if (earlier !== undefined) {
+        fail(
+          `spec/router-openapi.yaml: operationId ${JSON.stringify(operationId)} is declared by ` +
+            `both \`${earlier}\` and \`${method} ${path}\``,
+        );
+      }
+      declaredAt.set(operationId, `${method} ${path}`);
+      operations.push({ operationId, method, path });
+    }
+  }
+  if (operations.length === 0) {
+    fail("spec/router-openapi.yaml declares no operations — an empty set reads as agreement");
+  }
+  return operations.sort(
+    (a, b) => a.path.localeCompare(b.path) || a.method.localeCompare(b.method),
+  );
+}
+
+/** {@link routerOperations} for the vendored contract on disk. */
+export async function readRouterOperations(specPath = ROUTER_SPEC_PATH) {
+  return routerOperations(parse(await readFile(specPath, "utf-8")));
+}
+
+/**
+ * Read one `export const <NAME> = "<path template>";` out of
+ * `src/sdk/models.ts` — the same acquisition `readRunRouteTemplate` does, for
+ * the two discovery routes that now have constants of their own.
+ */
+export async function readRouteTemplate(name, sourcePath = MODELS_SOURCE_PATH) {
+  return readStringConstant(await readFile(sourcePath, "utf-8"), name, "src/sdk/models.ts");
 }

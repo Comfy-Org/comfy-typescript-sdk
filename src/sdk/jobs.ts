@@ -14,6 +14,7 @@ import { ApiError } from "../low/index.js";
 import type {
   ComfyLow,
   Job as LowJob,
+  JobLogs,
   JobWorkflowResult,
   Output as LowOutput,
 } from "../low/index.js";
@@ -147,6 +148,27 @@ export class Job {
    */
   async getWorkflow(signal?: AbortSignal): Promise<JobWorkflowResult> {
     return translate(() => this.low.getJobWorkflow(this.model.id, { signal }));
+  }
+
+  /**
+   * What the run printed, via `GET /api/v2/jobs/{id}/logs` — or `null` when
+   * this job has no log.
+   *
+   * `null` is the ordinary answer, not a failure, and it does not say why:
+   * the surface captures no logs (Comfy Cloud today), the job has not
+   * finished, the run was killed before the worker could report one, or the
+   * log is withheld. Read it after a terminal status: a job still running may
+   * have one once it finishes, and a `null` read after that is final. Follows
+   * the job's own `urls.logs` link, and returns `null` without a request when
+   * the server offers none — that is the surface saying it captures no logs
+   * for any job. The text is untrusted workflow output: render it as plain
+   * text, never interpret it. `truncated` means the beginning was shed and
+   * `text` is the tail of a longer run.
+   */
+  async getLogs(signal?: AbortSignal): Promise<JobLogs | null> {
+    const link = this.model.urls.logs;
+    if (link === undefined) return null;
+    return translate(() => this.low.getJobLogs(link, { signal }));
   }
 
   /**

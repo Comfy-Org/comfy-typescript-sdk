@@ -31,9 +31,14 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
-import { extractErrorTypeByStatus, extractRouterErrors } from "../../scripts/python-surface.mjs";
+import {
+  extractErrorTypeByStatus,
+  extractRetryPolicyFields,
+  extractRouterErrors,
+} from "../../scripts/python-surface.mjs";
 import * as sdk from "../index.js";
 import { models } from "./models.js";
+import { DEFAULT_COLLECT_BUDGET_MS, DEFAULT_RETRY_BUDGET_MS, resolveRetry } from "./retry.js";
 import * as routerErrors from "./routerErrors.js";
 
 const MANIFEST_PATH = fileURLToPath(new URL("../../parity/python-surface.json", import.meta.url));
@@ -77,6 +82,21 @@ interface Asymmetry {
    * next bucket will land on one side first too.
    */
   readonly routerErrorClassesAheadOfPython?: readonly (readonly [string, string])[];
+  /**
+   * Public `models` method names this SDK has landed AHEAD of the Python one.
+   *
+   * The same LEAD mechanism as `routerErrorClassesAheadOfPython`, applied to
+   * the other surface the two SDKs ship on separate pull requests: one of them
+   * necessarily carries a new method first. Tolerated in one direction only —
+   * TypeScript may lead, never lag — and only until the twin lands, because
+   * the rot guard below fails the moment the Python snapshot grows the same
+   * name, which is the signal to delete the entry rather than to grow it.
+   *
+   * It is a LEAD, not an asymmetry: nothing here says the two surfaces differ
+   * on purpose, only that one of them arrived first. An entry that is really a
+   * deliberate divergence belongs in `why` with no field at all.
+   */
+  readonly modelsMethodsAheadOfPython?: readonly string[];
 }
 
 const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
@@ -112,6 +132,45 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
       "notices is missing here.",
     pythonAsyncModelsClasses: ["AsyncModels"],
   },
+  {
+    id: "discovery-methods-land-first-in-typescript",
+    why:
+      "`comfy.models.schema` and `comfy.models.list` reach Router's two discovery routes — the " +
+      "per-model OpenAPI document and the paginated model catalog — which the contract has " +
+      "declared all along and neither SDK called. The shape is settled here first, on purpose: " +
+      "the same two methods belong on `comfy_sdk.models.Models`/`AsyncModels` and are a " +
+      "follow-up on the Python SDK, so the naming is negotiated once rather than twice. This " +
+      "is a LAG, not a divergence — the entry fails the moment the Python snapshot grows " +
+      "either name, which is when it should be deleted rather than kept.",
+    modelsMethodsAheadOfPython: ["schema", "list"],
+  },
+  {
+    id: "queue-error-buckets-land-first-in-typescript",
+    why:
+      "The vendored Router contract's most recent sync grew three queue-tier error buckets — " +
+      "`cancelled`, `queue_timeout` and `request_not_found` — and this SDK's spec-coverage gate " +
+      "requires a class per bucket the moment the spec declares one. The Python SDK's twin (its " +
+      "reconcile of the same spec sync, comfy-python-sdk#159) is still open, so its committed " +
+      "surface snapshot does not carry them yet. This is a LEAD, not a divergence: the rot guard " +
+      "below fails the moment the Python snapshot grows any of the three, which is the signal to " +
+      "delete this entry rather than keep it.",
+    routerErrorClassesAheadOfPython: [
+      ["Cancelled", "cancelled"],
+      ["QueueTimeout", "queue_timeout"],
+      ["RequestNotFound", "request_not_found"],
+    ],
+  },
+  {
+    id: "collect-switched-off-by-budget",
+    why:
+      "Python switches the collect loop off with a BOOLEAN (`RetryPolicy.retry_collectable=False`) " +
+      "beside its `collect_max_elapsed` budget; TypeScript has the budget only, and " +
+      "`collectBudgetMs: 0` is how it is switched off — the same way `budgetMs: 0` already " +
+      "switches ordinary retries off, so the option surface stays one kind of thing rather " +
+      "than a number and a flag that can disagree with each other. The BUDGET itself is " +
+      "compared for real below (`collect_max_elapsed` seconds against `DEFAULT_COLLECT_BUDGET_MS` " +
+      "milliseconds), so the sizing cannot drift; only the off-switch is spelled differently.",
+  },
 ];
 
 const RENAMES: Record<string, string> = Object.fromEntries(
@@ -124,6 +183,9 @@ const AHEAD_OF_PYTHON: readonly (readonly [string, string])[] = INTENTIONAL_ASYM
   (a) => a.routerErrorClassesAheadOfPython ?? [],
 );
 const AHEAD_CLASS_NAMES = new Set(AHEAD_OF_PYTHON.map(([className]) => className));
+const AHEAD_MODELS_METHODS = new Set(
+  INTENTIONAL_ASYMMETRIES.flatMap((a) => a.modelsMethodsAheadOfPython ?? []),
+);
 const AHEAD_ERROR_TYPES = new Set(AHEAD_OF_PYTHON.map(([, errorType]) => errorType));
 
 interface PythonSurface {
@@ -134,6 +196,7 @@ interface PythonSurface {
   routerErrorTypeOrder: string[];
   routerErrorTypeByStatus: Record<string, string>;
   exportedErrorClasses: string[];
+  retryPolicyFields: Record<string, string>;
 }
 
 async function loadPythonSurface(): Promise<PythonSurface> {
@@ -147,6 +210,7 @@ async function loadPythonSurface(): Promise<PythonSurface> {
     ["routerErrorTypeOrder", surface.routerErrorTypeOrder.length],
     ["routerErrorTypeByStatus", Object.keys(surface.routerErrorTypeByStatus).length],
     ["exportedErrorClasses", surface.exportedErrorClasses.length],
+    ["retryPolicyFields", Object.keys(surface.retryPolicyFields).length],
   ];
   for (const [name, size] of sections) {
     if (size === 0) {
@@ -277,7 +341,43 @@ describe("cross-SDK surface parity", () => {
     );
     expect(pythonSync.length, "no synchronous Python `models` class in the snapshot").toBe(1);
 
-    expect(nameDivergences("comfy.models", pythonSync[0][1], methodNames(models))).toEqual([]);
+    // Filtered on BOTH sides, so the day the Python SDK catches up produces
+    // exactly ONE failure — the rot guard below, whose message says to delete
+    // the entry — rather than a divergence line per method.
+    expect(
+      nameDivergences(
+        "comfy.models",
+        pythonSync[0][1].filter((name) => !AHEAD_MODELS_METHODS.has(name)),
+        methodNames(models).filter((name) => !AHEAD_MODELS_METHODS.has(name)),
+      ),
+    ).toEqual([]);
+  });
+
+  it("keeps every declared `models` lead live, and only in the leading direction", async () => {
+    // Same rot rule as the router-class lead: an entry has to name a method
+    // this SDK really has, and it has to STOP naming one the Python SDK has
+    // caught up on — otherwise the allowlist goes on excusing a divergence
+    // that no longer exists and hides the next real one.
+    const python = await loadPythonSurface();
+    const pythonMethods = new Set(
+      Object.entries(python.modelsMethods)
+        .filter(([className]) => !ASYNC_MODELS_CLASSES.has(className))
+        .flatMap(([, methods]) => methods),
+    );
+    const typescriptMethods = new Set(methodNames(models));
+
+    for (const name of AHEAD_MODELS_METHODS) {
+      expect(
+        typescriptMethods.has(name),
+        `the allowlist says \`comfy.models.${name}\` leads the Python SDK, but this SDK does ` +
+          "not expose it",
+      ).toBe(true);
+      expect(
+        pythonMethods.has(name),
+        `the Python SDK now carries \`models.${name}\` — delete its entry from ` +
+          "INTENTIONAL_ASYMMETRIES so the two surfaces are compared again",
+      ).toBe(false);
+    }
   });
 
   it("declares no async-only method name on the Python side", async () => {
@@ -292,7 +392,7 @@ describe("cross-SDK surface parity", () => {
     );
     for (const className of ASYNC_MODELS_CLASSES) {
       const methods = python.modelsMethods[className] ?? [];
-      const extra = methods.filter((name) => !sync.has(name));
+      const extra = methods.filter((name) => !sync.has(name) && !AHEAD_MODELS_METHODS.has(name));
       expect(extra, `${className} declares methods the synchronous class does not`).toEqual([]);
     }
   });
@@ -475,5 +575,80 @@ describe("python surface extraction", () => {
         '_ERROR_TYPE_BY_STATUS: dict[int, str] = {\n    401: "unauthorized",\n    504: "provider_timeout",\n}\n',
       ),
     ).toEqual({ 401: "unauthorized", 504: "provider_timeout" });
+  });
+});
+
+describe("the collect budget", () => {
+  it("is sized identically in both SDKs", async () => {
+    // The one number whose correctness IS the feature: a collect budget
+    // shorter than one Router deadline window can never start the attempt it
+    // exists for, so the two SDKs agreeing on the class but not on the bound
+    // would leave the same 504 collected in one language and raised in the
+    // other. Compared as a value, not as a name.
+    const { retryPolicyFields } = await loadPythonSurface();
+    const pythonSeconds = retryPolicyFields.collect_max_elapsed;
+    expect(
+      pythonSeconds,
+      "the Python SDK's RetryPolicy no longer declares `collect_max_elapsed` — see " +
+        "DEFAULT_COLLECT_BUDGET_MS in src/sdk/retry.ts",
+    ).toBeTruthy();
+    expect(Number(pythonSeconds) * 1000).toBe(DEFAULT_COLLECT_BUDGET_MS);
+
+    // And it is a SEPARATE budget on both sides, longer than the ordinary one.
+    expect(Number(retryPolicyFields.max_elapsed) * 1000).toBeLessThan(DEFAULT_RETRY_BUDGET_MS + 1);
+    expect(DEFAULT_COLLECT_BUDGET_MS).toBeGreaterThan(DEFAULT_RETRY_BUDGET_MS);
+  });
+
+  it("names the off-switch the two SDKs spell differently, and proves the TypeScript one", async () => {
+    // Python: `retry_collectable=False`. TypeScript: `collectBudgetMs: 0`.
+    // Declared as an intentional asymmetry above; asserted here so the entry
+    // cannot outlive either side of what it describes.
+    const { retryPolicyFields } = await loadPythonSurface();
+    expect(retryPolicyFields.retry_collectable).toBe("True");
+    expect(
+      INTENTIONAL_ASYMMETRIES.some((a) => a.id === "collect-switched-off-by-budget"),
+      "the collect off-switch asymmetry must stay declared while the two spellings differ",
+    ).toBe(true);
+    expect(resolveRetry({ collectBudgetMs: 0 }).collectBudgetMs).toBe(0);
+    // On by default on both sides.
+    expect(resolveRetry(undefined).collectBudgetMs).toBe(DEFAULT_COLLECT_BUDGET_MS);
+  });
+
+  it("refuses to yield an empty retry policy", () => {
+    // Same rule as every other extractor here: an unreadable `RetryPolicy`
+    // must be a hard failure, because an empty one would agree with any budget.
+    expect(() => extractRetryPolicyFields("# nothing here\n")).toThrow(/RetryPolicy/);
+    expect(() => extractRetryPolicyFields("@dataclass\nclass RetryPolicy:\n    pass\n")).toThrow(
+      /zero/,
+    );
+  });
+
+  it("reads a field and its default off a RetryPolicy body", () => {
+    expect(
+      extractRetryPolicyFields(
+        "class RetryPolicy:\n    max_elapsed: float = 60.0\n    retry_collectable: bool = True\n",
+      ),
+    ).toEqual({ max_elapsed: "60.0", retry_collectable: "True" });
+  });
+
+  it("reads past a docstring, a trailing comment and a spaced default", () => {
+    // A field-shaped line INSIDE the docstring is prose and must not count —
+    // stale documentation would otherwise keep a removed field "present". A
+    // trailing comment or a default with spaces in it is still one field.
+    expect(
+      extractRetryPolicyFields(
+        [
+          "class RetryPolicy:",
+          '    """Policy.',
+          "",
+          "    collect_max_elapsed: float = 9999.0",
+          '    """',
+          "",
+          "    max_elapsed: float = 60.0  # seconds",
+          "    hooks: list[str] = field(default_factory=list)",
+          "",
+        ].join("\n"),
+      ),
+    ).toEqual({ max_elapsed: "60.0", hooks: "field(default_factory=list)" });
   });
 });

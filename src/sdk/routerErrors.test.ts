@@ -5,11 +5,13 @@ import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 import {
+  Cancelled,
   ClientDisconnected,
   ConcurrencyLimitExceeded,
   ContentPolicyViolation,
   DeadlineExceeded,
   ERROR_TYPE_HEADER,
+  errorFromCompletion,
   Forbidden,
   InsufficientCredits,
   InternalError,
@@ -18,9 +20,13 @@ import {
   NotEnabled,
   ProviderError,
   ProviderTimeout,
+  QueueTimeout,
   RateLimited,
   REQUEST_ERROR_TYPES,
   REQUEST_ID_HEADER,
+  parseRetryAfter,
+  RequestNotFound,
+  RETRY_AFTER_HEADER,
   ROUTER_ERROR_TYPES,
   RouterError,
   ServiceUnavailable,
@@ -48,6 +54,9 @@ const CLASSES: Array<[RouterErrorType, typeof RouterError]> = [
   ["not_enabled", NotEnabled],
   ["service_unavailable", ServiceUnavailable],
   ["rate_limited", RateLimited],
+  ["cancelled", Cancelled],
+  ["queue_timeout", QueueTimeout],
+  ["request_not_found", RequestNotFound],
 ];
 
 /**
@@ -71,11 +80,11 @@ async function raise(response: Response): Promise<never> {
 }
 
 describe("the closed error-type set", () => {
-  it("is the six request-level buckets plus the nine transport-level ones", () => {
+  it("is the six request-level buckets plus the twelve transport-level ones", () => {
     expect(REQUEST_ERROR_TYPES).toHaveLength(6);
-    expect(TRANSPORT_ERROR_TYPES).toHaveLength(9);
+    expect(TRANSPORT_ERROR_TYPES).toHaveLength(12);
     expect(ROUTER_ERROR_TYPES).toEqual([...REQUEST_ERROR_TYPES, ...TRANSPORT_ERROR_TYPES]);
-    expect(new Set(ROUTER_ERROR_TYPES).size).toBe(15);
+    expect(new Set(ROUTER_ERROR_TYPES).size).toBe(18);
   });
 
   it("has exactly one class per bucket, and no class outside it", () => {
@@ -92,8 +101,11 @@ describe("the closed error-type set", () => {
   it("omits the buckets deferred past this release", () => {
     // Adding one of these is a decision someone makes on purpose, in lockstep
     // with the server and the sibling SDK — not a constant that quietly widens
-    // a set two SDKs build their exception hierarchies from.
-    for (const deferred of ["file_download_error", "cancelled", "queue_timeout"]) {
+    // a set two SDKs build their exception hierarchies from. `cancelled` and
+    // `queue_timeout` used to sit here too; the vendored contract now declares
+    // them (with `request_not_found`), so they are typed above rather than
+    // deferred, and only `file_download_error` remains out of the spec.
+    for (const deferred of ["file_download_error"]) {
       expect(ROUTER_ERROR_TYPES).not.toContain(deferred);
     }
   });
@@ -122,7 +134,9 @@ describe("the class hierarchy", () => {
     // Python SDK's base declares `error_type = ""` for the same reason and
     // `surface-parity.test.ts` compares the two.
     expect(new RouterError("boom").errorType).toBe("");
-    expect(new RouterError("boom", { errorType: "queue_timeout" }).errorType).toBe("queue_timeout");
+    expect(new RouterError("boom", { errorType: "file_download_error" }).errorType).toBe(
+      "file_download_error",
+    );
     // Every subclass still reports its own bucket — the base default is not
     // inherited by anything that declares one.
     for (const [type, cls] of CLASSES) {
@@ -377,7 +391,7 @@ describe("an error_type from a newer server", () => {
   // must degrade to the base class rather than throw something untyped —
   // "treat an unknown value as internal_error" is advice for the caller, not
   // licence for the SDK to rewrite what the server actually said.
-  it.each(["file_download_error", "cancelled", "queue_timeout", "something_invented_next_year"])(
+  it.each(["file_download_error", "something_invented_next_year"])(
     "produces the base RouterError carrying %s verbatim",
     (unknownType) => {
       const err = toRouterError(
@@ -413,8 +427,8 @@ describe("an error_type from a newer server", () => {
   it("is catchable as a RouterError", async () => {
     const response = stubErrorResponse(
       500,
-      { detail: "nope", error_type: "queue_timeout" },
-      { [ERROR_TYPE_HEADER]: "queue_timeout" },
+      { detail: "nope", error_type: "file_download_error" },
+      { [ERROR_TYPE_HEADER]: "file_download_error" },
     );
     await expect(raise(response)).rejects.toBeInstanceOf(RouterError);
   });
@@ -544,5 +558,181 @@ describe("InvalidInput and the 422 detail[] shape", () => {
     expect(err).toBeInstanceOf(InvalidInput);
     expect((err as InvalidInput).detail).toEqual([]);
     expect(err.message).toBe("The request was rejected as invalid for this model.");
+  });
+});
+
+describe("errorFromCompletion", () => {
+  it("names the bucket, not `HTTP 0`, when the completion carries no detail", () => {
+    // Regression: the message fell through to `HTTP ${status}` with the
+    // sentinel status `0` this path passes, so an ordinary cancelled or
+    // failed completion read `HTTP 0` — a status no server sent, and the one
+    // string a caller actually logs. The `httpStatus: null` override already
+    // guarded the FIELD; the message was missed.
+    const err = errorFromCompletion({ status: "COMPLETED", error_type: "provider_error" }, "req-1");
+    expect(err).not.toBeNull();
+    expect(err?.message).not.toContain("HTTP 0");
+    expect(err?.message).toBe("the request completed with error_type 'provider_error'");
+    // The field guard still holds.
+    expect(err?.httpStatus).toBeNull();
+  });
+
+  it("prefers the server's detail over the bucket fallback", () => {
+    const err = errorFromCompletion(
+      { status: "COMPLETED", error_type: "provider_error", detail: "upstream said no" },
+      "req-1",
+    );
+    expect(err?.message).toBe("upstream said no");
+  });
+
+  it("returns null for a completion that names no error_type", () => {
+    // The ordinary success path. Every caller has to read `null` as "no error
+    // found", never as "no error possible".
+    expect(errorFromCompletion({ status: "COMPLETED" }, "req-1")).toBeNull();
+    expect(errorFromCompletion({ status: "COMPLETED", error_type: "" }, "req-1")).toBeNull();
+    expect(errorFromCompletion({ status: "COMPLETED", error_type: "   " }, "req-1")).toBeNull();
+    expect(errorFromCompletion({ error_type: 7 }, "req-1")).toBeNull();
+    // A body that is not an object at all is a provider payload, not an
+    // envelope, so there is nothing in it the queue could have reported.
+    expect(errorFromCompletion([1, 2, 3], "req-1")).toBeNull();
+    expect(errorFromCompletion(null, "req-1")).toBeNull();
+  });
+
+  it("maps a completion's bucket through the same table a response goes through", () => {
+    for (const errorType of ROUTER_ERROR_TYPES) {
+      const err = errorFromCompletion({ status: "COMPLETED", error_type: errorType }, "req-1");
+      expect(err, errorType).toBeInstanceOf(RouterError);
+      expect(err?.errorType).toBe(errorType);
+      expect(err?.constructor.name, errorType).toBe(
+        toRouterError(0, new Headers({ [ERROR_TYPE_HEADER]: errorType }), {}).constructor.name,
+      );
+    }
+  });
+
+  it("leaves httpStatus null — the poll that found it was a 200", () => {
+    // Reporting a status here would invite a caller to branch on a code the
+    // server never sent, and would read as a transport condition a retry
+    // could survive. A completion is the server's final answer.
+    const err = errorFromCompletion({ status: "COMPLETED", error_type: "provider_error" }, "r");
+    expect(err?.httpStatus).toBeNull();
+  });
+
+  it("carries the QUEUED request's id, not the poll's", () => {
+    const err = errorFromCompletion({ status: "COMPLETED", error_type: "internal_error" }, "req-9");
+    expect(err?.requestId).toBe("req-9");
+    expect(errorFromCompletion({ error_type: "internal_error" }, null)?.requestId).toBeNull();
+  });
+
+  it("keeps a bucket this release does not recognize, as the base class", () => {
+    const err = errorFromCompletion({ status: "COMPLETED", error_type: "from_the_future" }, "r");
+    expect(err).toBeInstanceOf(RouterError);
+    expect(err?.constructor).toBe(RouterError);
+    expect(err?.errorType).toBe("from_the_future");
+  });
+
+  it("keeps the per-field detail[] of an invalid_input completion", () => {
+    const err = errorFromCompletion(
+      {
+        status: "COMPLETED",
+        error_type: "invalid_input",
+        detail: [{ loc: ["body", "seed"], msg: "must be >= 0", type: "greater_than" }],
+      },
+      "req-1",
+    );
+    expect(err).toBeInstanceOf(InvalidInput);
+    expect((err as InvalidInput).detail).toHaveLength(1);
+    expect(err?.message).toBe("body.seed: must be >= 0");
+  });
+
+  it("cannot be talked into an untyped throw by a prototype-shaped bucket", () => {
+    for (const errorType of ["constructor", "toString", "__proto__"]) {
+      const err = errorFromCompletion({ status: "COMPLETED", error_type: errorType }, "r");
+      expect(err, errorType).toBeInstanceOf(RouterError);
+      expect(err?.errorType).toBe(errorType);
+    }
+  });
+});
+
+describe("Retry-After", () => {
+  // Not `new Headers()`: its constructor strips leading and trailing whitespace
+  // from values, which would hide whether the parser trims at all.
+  const headersOf = (value: string) => ({
+    get: (name: string) => (name.toLowerCase() === RETRY_AFTER_HEADER.toLowerCase() ? value : null),
+  });
+
+  it("reads the delay-seconds form the Router contract pins", () => {
+    // `RouterRetryAfterHeader` is `type: integer, minimum: 1`, so this is the
+    // only form Router can send.
+    expect(parseRetryAfter(headersOf("2"))).toBe(2);
+    expect(parseRetryAfter(headersOf("  30 "))).toBe(30);
+  });
+
+  it("keeps a zero rather than flattening it to absent — they say different things", () => {
+    // `null` means "nothing to collect"; `0` means "there is a handle, but the
+    // pace is nonsense". `nextCollectDelayMs` in ./retry.ts acts on that
+    // difference by falling back to its own backoff instead of spinning.
+    expect(parseRetryAfter(headersOf("0"))).toBe(0);
+  });
+
+  it("reads anything that is not a whole number of seconds as absent", () => {
+    // Notably the HTTP-date form, which an intermediary may send and this SDK
+    // cannot pace from. And notably NOT via `parseInt`, which would read
+    // "2 hours" as a two-second pace the response never named.
+    // The last one is all digits and still absent: it is past
+    // `Number.MAX_SAFE_INTEGER`, and pacing from it would schedule a sleep no
+    // process outlives.
+    for (const value of [
+      "Wed, 21 Oct 2015 07:28:00 GMT",
+      "2 hours",
+      "-1",
+      "1.5",
+      "",
+      "  ",
+      "99999999999999999999",
+    ]) {
+      expect(parseRetryAfter(headersOf(value)), value).toBeNull();
+    }
+    expect(parseRetryAfter(new Headers())).toBeNull();
+  });
+
+  it("rides onto every RouterError, not just the two buckets that carry one", () => {
+    // On the base class so a caller who caught a `RouterError` can pace a
+    // manual re-ask without narrowing first — and so an unrecognized bucket
+    // from a newer server keeps a pace it sent.
+    const inFlight = toRouterError(
+      409,
+      stubErrorResponse(
+        409,
+        {},
+        { [ERROR_TYPE_HEADER]: "concurrency_limit_exceeded", [RETRY_AFTER_HEADER]: "2" },
+      ).headers,
+      { detail: "already in progress" },
+    );
+    expect(inFlight).toBeInstanceOf(ConcurrencyLimitExceeded);
+    expect(inFlight.retryAfter).toBe(2);
+
+    const deadline = toRouterError(
+      504,
+      stubErrorResponse(
+        504,
+        {},
+        { [ERROR_TYPE_HEADER]: "deadline_exceeded", [RETRY_AFTER_HEADER]: "5" },
+      ).headers,
+      { detail: "gave up holding" },
+    );
+    expect(deadline).toBeInstanceOf(DeadlineExceeded);
+    expect(deadline.retryAfter).toBe(5);
+  });
+
+  it("is null on the answers that named none, which is the deterministic-refusal shape", () => {
+    // The contract's spent/mismatched-key 409 carries no `Retry-After` at all,
+    // because waiting changes nothing — the answer is a NEW key.
+    const refused = toRouterError(
+      409,
+      stubErrorResponse(409, {}, { [ERROR_TYPE_HEADER]: "invalid_input" }).headers,
+      { detail: "key already used for a different request" },
+    );
+    expect(refused).toBeInstanceOf(InvalidInput);
+    expect(refused.retryAfter).toBeNull();
+    expect(new RouterError("boom").retryAfter).toBeNull();
   });
 });

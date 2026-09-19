@@ -4,8 +4,8 @@
  *
  * Router answers every failure with a coarse, machine-readable bucket on the
  * `X-Comfy-Error-Type` response header (and, for the request-level body
- * shape, in `error_type` as well). The bucket set is *closed* at fifteen
- * values in this release: six request-level and nine transport-level. This
+ * shape, in `error_type` as well). The bucket set is *closed* at eighteen
+ * values in this release: six request-level and twelve transport-level. This
  * module turns that value into a class an integrator can `catch`. The names
  * below are the shared set: the Python SDK spells every one of them
  * identically, so a snippet, a doc page or a forum answer transfers between
@@ -49,18 +49,18 @@
  *   done until a class exists for it here.
  *
  * These classes are namespaced (`routerErrors.*`) rather than exported from
- * the package root because three of the fifteen names — `Unauthorized`,
+ * the package root because three of the eighteen names — `Unauthorized`,
  * `Forbidden`, `InsufficientCredits` — already exist at the root as
  * workflow-API exceptions descending from `ComfyError`. The Python SDK has
  * the same three at the top level of `comfy_sdk`, so both SDKs resolve the
  * collision the same way: a dedicated module, and the class names themselves
  * left untouched.
  *
- * Four of the fifteen buckets — `deadline_exceeded`, `not_enabled`,
- * `service_unavailable` and `rate_limited` — are newer than the Python SDK's
- * table. Until its twin lands they are declared as leading this SDK in
- * `surface-parity.test.ts`'s allowlist, which fails once the Python side
- * catches up so the entry cannot outlive the lag.
+ * Three of the eighteen buckets — `cancelled`, `queue_timeout` and
+ * `request_not_found`, the queue tier the vendored contract most recently grew
+ * — are newer than the Python SDK's table. Until its twin lands they are
+ * declared as leading this SDK in `surface-parity.test.ts`'s allowlist, which
+ * fails once the Python side catches up so the entry cannot outlive the lag.
  */
 
 /**
@@ -85,27 +85,35 @@ export const REQUEST_ERROR_TYPES = [
 ] as const;
 
 /**
- * The nine transport-level buckets, in the order the error contract lists
+ * The twelve transport-level buckets, in the order the error contract lists
  * them. They are part of the same closed set — a caller reads one value off
  * one header — but they are raised before or around the model call rather
  * than derived from a provider response.
  *
- * Three pairs here share an HTTP status and are separate buckets precisely
- * because the status cannot tell them apart, so a caller that branches on
- * status alone gets the wrong answer for one of each pair:
+ * The last three (`cancelled`, `queue_timeout`, `request_not_found`) are the
+ * QUEUE tier: they are reported by the queued `submit`/`handle` surface, three
+ * of them by status codes an older bucket already owns. In all, four HTTP
+ * statuses here carry more than one bucket, and the status alone cannot tell
+ * them apart — so a caller that branches on status gets the wrong answer for
+ * all but the oldest member of each:
  *
  * - `403` is `forbidden` (an entitlement decision about this caller) **or**
  *   `not_enabled` (a state of the Router rollout, nothing to do with the
  *   caller's entitlements).
+ * - `404` is `model_not_found` (the `{provider}/{model}` id names nothing)
+ *   **or** `request_not_found` (a queued `request_id` that names nothing).
+ * - `409` is `concurrency_limit_exceeded` **or** `cancelled` (collecting the
+ *   result of a request the caller withdrew).
  * - `429` is `concurrency_limit_exceeded` (clears when one of the caller's
  *   own in-flight calls finishes) **or** `rate_limited` (clears only when a
  *   time window rolls).
  * - `504` is `provider_timeout` (the partner ran out of time) **or**
- *   `deadline_exceeded` (Comfy stopped holding the connection).
+ *   `deadline_exceeded` (Comfy stopped holding the connection) **or**
+ *   `queue_timeout` (a queued request was never admitted).
  *
- * The header is what disambiguates each pair; `ERROR_TYPE_BY_STATUS` below
- * is only consulted when there is no header at all, and it deliberately
- * keeps naming the older member of each pair.
+ * The header is what disambiguates each; `ERROR_TYPE_BY_STATUS` below is only
+ * consulted when there is no header at all, and it deliberately keeps naming
+ * the older member of each shared status.
  */
 export const TRANSPORT_ERROR_TYPES = [
   "unauthorized",
@@ -117,12 +125,15 @@ export const TRANSPORT_ERROR_TYPES = [
   "not_enabled",
   "service_unavailable",
   "rate_limited",
+  "cancelled",
+  "queue_timeout",
+  "request_not_found",
 ] as const;
 
 /** The closed error-type set for this release: request-level, then transport-level. */
 export const ROUTER_ERROR_TYPES = [...REQUEST_ERROR_TYPES, ...TRANSPORT_ERROR_TYPES] as const;
 
-/** One of the fifteen buckets this release knows about. */
+/** One of the eighteen buckets this release knows about. */
 export type RouterErrorType = (typeof ROUTER_ERROR_TYPES)[number];
 
 /** `X-Comfy-Error-Type` — the coarse bucket, set on every Router error response. */
@@ -132,7 +143,46 @@ export const ERROR_TYPE_HEADER = "X-Comfy-Error-Type";
 export const REQUEST_ID_HEADER = "X-Comfy-Request-Id";
 
 /**
- * One model-level validation failure, in the fal/FastAPI `detail[]` form.
+ * `Retry-After` — seconds to wait before re-sending the SAME request under the
+ * SAME `Idempotency-Key`.
+ *
+ * Router sets it on exactly the two answers such a re-send can COLLECT from: a
+ * `409` naming `concurrency_limit_exceeded` (the original call for that key is
+ * still running) and a `504` naming `deadline_exceeded` (Comfy stopped holding
+ * the connection but still holds a handle to a generation the provider is
+ * running). Its absence is meaningful, not merely missing: it is Router saying
+ * there is nothing to collect, which is why `isCollectable` in `./retry.ts`
+ * gates on the header being present at all.
+ */
+export const RETRY_AFTER_HEADER = "Retry-After";
+
+/**
+ * Read `Retry-After` as a whole number of seconds, or `null`.
+ *
+ * The Router contract pins this header to `type: integer, minimum: 1`, so the
+ * delay-seconds form is the only one it can send and anything else — the
+ * HTTP-date form an intermediary may use, a decimal, a negative, a blank — is
+ * a value this SDK cannot pace from and reads as absent. Deliberately strict
+ * rather than `parseInt`: `parseInt` reads `"2 hours"` as `2` and would invent
+ * a pace out of a string that named none.
+ *
+ * `0` is kept and NOT flattened to `null`, because the two say different
+ * things. `null` means the response named nothing to collect; `0` means it did
+ * name a handle but paced it uselessly, and the caller of
+ * `nextCollectDelayMs` falls back to its own backoff for that one rather than
+ * spinning. See `./retry.ts`.
+ */
+export function parseRetryAfter(headers: HeadersLike): number | null {
+  const raw = headers.get(RETRY_AFTER_HEADER);
+  if (raw === null) return null;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const seconds = Number(trimmed);
+  return Number.isSafeInteger(seconds) ? seconds : null;
+}
+
+/**
+ * One model-level validation failure, in the FastAPI `detail[]` form.
  *
  * `type` is the SPECIFIC provider reason (`value_error`, `missing`,
  * `image_too_small`, `unsupported_audio_format`, `greater_than`,
@@ -177,6 +227,8 @@ export interface RouterErrorOptions {
   requestId?: string | null;
   /** The HTTP status the failure arrived with. `null` when it was not an HTTP failure. */
   httpStatus?: number | null;
+  /** See {@link RouterError.retryAfter}. */
+  retryAfter?: number | null;
 }
 
 /**
@@ -215,6 +267,22 @@ export class RouterError extends Error {
   /** The HTTP status this failure arrived with, or `null`. */
   readonly httpStatus: number | null;
 
+  /**
+   * Seconds Router asked the caller to wait before re-sending this request
+   * under the same `Idempotency-Key`, off `Retry-After`; `null` when the
+   * response carried no usable one.
+   *
+   * It is on the BASE class rather than on the two buckets that can carry it,
+   * so a caller who caught a `RouterError` can pace a manual re-ask without
+   * first narrowing to a subclass — and so an unrecognized bucket from a newer
+   * server keeps a pace it sent. A non-null value on a
+   * {@link ConcurrencyLimitExceeded} `409` or a {@link DeadlineExceeded} `504`
+   * is Router saying it still holds the generation your key names; `models.run`
+   * already re-asks for you inside its collect budget, and this is what is left
+   * to re-ask with once that budget is spent.
+   */
+  readonly retryAfter: number | null;
+
   constructor(message: string, options: RouterErrorOptions = {}) {
     super(message);
     // Restore the prototype explicitly. Extending a built-in is the classic
@@ -229,6 +297,7 @@ export class RouterError extends Error {
     this.errorType = options.errorType ?? (new.target as typeof RouterError).errorType;
     this.requestId = options.requestId ?? null;
     this.httpStatus = options.httpStatus ?? null;
+    this.retryAfter = options.retryAfter ?? null;
   }
 }
 
@@ -304,7 +373,31 @@ export class Forbidden extends RouterError {
   static override readonly errorType = "forbidden";
 }
 
-/** Too many concurrent requests for this account. */
+/**
+ * Two different conditions share this bucket, and the STATUS is what says
+ * which — so a caller that branches on the class alone is answering the wrong
+ * question:
+ *
+ * - At **`429`** the account's slot pool is full: every call the workspace is
+ *   allowed to hold in flight is already held, and this one was refused before
+ *   it reached the model. It clears when one of the caller's OWN in-flight
+ *   calls finishes, which is what separates it from {@link RateLimited} on the
+ *   same status. Nothing is running under this request's key.
+ * - At **`409` with a {@link RouterError.retryAfter}** the same key is still
+ *   running: another call is already in flight for the `Idempotency-Key` this
+ *   request presented, and re-sending THAT SAME key after `Retry-After`
+ *   seconds collects its result rather than starting a second generation.
+ *   `models.run` re-asks for you, on the server's own pace, for as long as its
+ *   `retry.collectBudgetMs` allows — so a `409` that reaches a caller is one
+ *   that outlived that budget, and {@link RouterError.retryAfter} is the pace
+ *   to re-ask at manually.
+ *
+ * A `409` with NO `Retry-After` is neither of those: it is the contract's
+ * deterministic key refusal (the key names a different request, or its answer
+ * cannot be replayed), it arrives as {@link InvalidInput} rather than this
+ * class, and the answer is a NEW key. Waiting changes nothing there, which is
+ * why the header is absent.
+ */
 export class ConcurrencyLimitExceeded extends RouterError {
   static override readonly errorType = "concurrency_limit_exceeded";
 }
@@ -325,10 +418,22 @@ export class InternalError extends RouterError {
  * says which side ran out of time; this one is Comfy's own bound, so nothing
  * about the request was rejected and the same request may be retried. It says
  * nothing about the charge: a provider generation that completed is billed
- * regardless of whether the caller received the response. Retry it with the
- * SAME `Idempotency-Key` — when the provider had already accepted the
- * generation, the retry collects that generation rather than dispatching
- * another, and a `Retry-After` on the `504` says when to ask.
+ * regardless of whether the caller received the response.
+ *
+ * Retry it with the SAME `Idempotency-Key` — when the provider had already
+ * accepted the generation, the retry collects that generation rather than
+ * dispatching another, and the `Retry-After` on the `504` says when to ask.
+ * `models.run` performs that collect itself, paced by that header and
+ * bounded by `retry.collectBudgetMs` (twenty minutes by default: one Router
+ * deadline window to reach the `504`, one to collect what it left running), so
+ * this reaches a caller only once the collect budget or the call's own
+ * `timeoutMs` deadline is spent. {@link RouterError.retryAfter} carries the
+ * pace to re-ask at by hand after that.
+ *
+ * The `Retry-After` is present only when Comfy still holds a handle to a
+ * running generation. A `504` WITHOUT it — an intermediary's, or a bound that
+ * expired before the provider accepted anything — has nothing to collect, and
+ * the same-key re-send falls back to the ordinary 5xx backoff instead.
  */
 export class DeadlineExceeded extends RouterError {
   static override readonly errorType = "deadline_exceeded";
@@ -372,6 +477,62 @@ export class RateLimited extends RouterError {
   static override readonly errorType = "rate_limited";
 }
 
+// -- queue buckets -----------------------------------------------------------
+
+/**
+ * A queued request was withdrawn before it produced a result — through the
+ * cancel route, or by an operator — and it is TERMINAL.
+ *
+ * It is not by itself a statement about the charge: a request cancelled while
+ * still `IN_QUEUE` was never dispatched and cannot be charged, while one
+ * cancelled after it was admitted may still be, since a partner generation that
+ * completes is charged whether or not anyone collected it — which is why the
+ * cancel route calls the ask a request, not a guarantee. It is NOT
+ * {@link ClientDisconnected}: that says nobody is listening any more while a
+ * generation may still be running and billable; this says the request itself
+ * was withdrawn. The status read answers `200` with this in the body (the
+ * request ended, so the read succeeded); collecting the result answers `409` —
+ * the read worked and found a request whose terminal state, the caller's own
+ * decision, leaves nothing to return. Deliberately not `410` (which on that
+ * route means the result aged out of retention) and not a `5xx` (which would
+ * report the caller's own cancellation as a Router fault worth retrying).
+ */
+export class Cancelled extends RouterError {
+  static override readonly errorType = "cancelled";
+}
+
+/**
+ * A queued request waited past its queue timeout without ever being admitted.
+ * **Terminal, unbilled, and it never took a concurrency slot** — the job never
+ * reached a provider.
+ *
+ * Deliberately not {@link DeadlineExceeded}, which is the synchronous route's
+ * connection bound and may leave a generation running and billable; this one
+ * provably never started. It is returned under `504`, shared with
+ * {@link ProviderTimeout} and {@link DeadlineExceeded} because a status can
+ * only say a clock ran out — which clock (the partner's, Comfy's connection
+ * bound, or the queue's admission bound) is what `errorType` carries. The
+ * request is terminal: submit a new one rather than re-reading this one.
+ */
+export class QueueTimeout extends RouterError {
+  static override readonly errorType = "queue_timeout";
+}
+
+/**
+ * The `request_id` names no queued request of the caller's under this model.
+ *
+ * The second of the two conditions the queued reads' `404` covers; the first is
+ * the `{provider}/{model}` id resolving to no partner model, which is
+ * {@link ModelNotFound} and carries fuzzy suggestions. It also covers the
+ * right-id / wrong-model URL the path shape refuses, and it is deliberately
+ * indistinguishable from a request in another workspace, so a probe with a
+ * guessed id learns nothing. A request that merely aged out of its retention
+ * window is `410`, not this.
+ */
+export class RequestNotFound extends RouterError {
+  static override readonly errorType = "request_not_found";
+}
+
 type RouterErrorClass = new (message: string, options: RouterErrorOptions) => RouterError;
 
 const BY_ERROR_TYPE: Record<string, RouterErrorClass> = {
@@ -390,6 +551,9 @@ const BY_ERROR_TYPE: Record<string, RouterErrorClass> = {
   not_enabled: NotEnabled,
   service_unavailable: ServiceUnavailable,
   rate_limited: RateLimited,
+  cancelled: Cancelled,
+  queue_timeout: QueueTimeout,
+  request_not_found: RequestNotFound,
 };
 
 /**
@@ -410,7 +574,11 @@ const BY_ERROR_TYPE: Record<string, RouterErrorClass> = {
  * here, and adding them would be a regression rather than an improvement: a
  * header-less `403` cannot be told from a `forbidden`, a header-less `429`
  * from a `concurrency_limit_exceeded`, or a header-less `504` from a
- * `provider_timeout`. Guessing the newer member of the pair would relabel
+ * `provider_timeout`. The queue tier adds three more of the same shape —
+ * `cancelled` shares `409`, `queue_timeout` shares `504`, and
+ * `request_not_found` shares `404` — and stays out for the same reason: the
+ * table keeps naming `model_not_found` for `404` and the run-route member for
+ * `409`/`504`. Guessing the newer member of a shared status would relabel
  * failures this table has always classified, on exactly the responses that
  * carry the least evidence.
  *
@@ -518,7 +686,12 @@ export function toRouterError(status: number, headers: HeadersLike, body: unknow
   // Python SDK does with the same response.
   const errorType = headerType || bodyType || statusType;
 
-  const options: RouterErrorOptions = { errorType, requestId, httpStatus: status };
+  const options: RouterErrorOptions = {
+    errorType,
+    requestId,
+    httpStatus: status,
+    retryAfter: parseRetryAfter(headers),
+  };
   // Own-property lookup only. A plain `BY_ERROR_TYPE[errorType]` would resolve
   // an `error_type` of `constructor` or `toString` off `Object.prototype` and
   // hand back something that is not a RouterError at all — and the whole point
@@ -538,6 +711,69 @@ export function toRouterError(status: number, headers: HeadersLike, body: unknow
     return new InvalidInput(message, { ...options, detail: entries });
   }
 
-  const message = typeof envelope.detail === "string" ? envelope.detail : `HTTP ${status}`;
+  // `status` is `0` only when `errorFromCompletion` built this from a
+  // COMPLETED payload, where there was no failing HTTP status to name. Saying
+  // `HTTP 0` there reports a status no server ever sent — the same thing the
+  // `httpStatus: null` override in that function exists to prevent, and the
+  // message is the half a caller actually reads and logs. Fall back to the
+  // bucket instead, matching the Python SDK's `error_from_completion`, which
+  // the doc on that function claims parity with.
+  const message =
+    typeof envelope.detail === "string"
+      ? envelope.detail
+      : status > 0
+        ? `HTTP ${status}`
+        : `the request completed with error_type '${errorType ?? ""}'`;
   return new (cls ?? RouterError)(message, options);
+}
+
+/**
+ * The typed exception a COMPLETED queued request reports, or `null`.
+ *
+ * The queue (`comfy.models.submit` and friends) expresses a failure — and a
+ * cancellation — the same way it expresses a success: the request reaches
+ * `COMPLETED`, and the failure rides in the body as an `error_type`. There is
+ * no error STATUS to read, since the poll that discovered it was a `200`, so a
+ * client that only mapped HTTP status codes would hand a caller a failed
+ * generation back as a successful result. This maps that body through the same
+ * `error_type` table {@link toRouterError} uses, so one bucket is one class
+ * however it arrived.
+ *
+ * Returns `null` when the payload names no `error_type`, which is the ordinary
+ * success path; every caller has to read that as "no error found" rather than
+ * as "no error possible".
+ *
+ * `httpStatus` is left `null` on what this builds, deliberately: there was no
+ * failing status, and reporting one would invite a caller to branch on a code
+ * the server never sent. That also keeps `./retry.ts` out of it — a completion
+ * carrying an `error_type` is the server's final answer about a request that
+ * already ran, not a transport condition another attempt could survive.
+ *
+ * Like {@link toRouterError} it never throws: a malformed body degrades to the
+ * least specific exception the payload still supports. Mirrors the Python
+ * SDK's `error_from_completion`.
+ */
+export function errorFromCompletion(body: unknown, requestId: string | null): RouterError | null {
+  if (!isRecord(body)) return null;
+  const raw = body.error_type;
+  if (typeof raw !== "string" || raw.trim() === "") return null;
+  // Routed through the shared builder so the `detail[]` handling, the
+  // unknown-bucket fallback and the prototype-pollution guard are the ones
+  // already tested there. The stand-in headers name no bucket, so the body's
+  // `error_type` is what decides the class, and the status argument is `0` —
+  // outside `ERROR_TYPE_BY_STATUS` — so nothing is inferred from it. They DO
+  // carry the request id, because a completion arrives on a `200` whose own
+  // `X-Comfy-Request-Id` identifies the poll rather than the queued request,
+  // and the queued request's id is the one worth quoting.
+  const headers: HeadersLike = {
+    get: (name) => (name === REQUEST_ID_HEADER ? requestId : null),
+  };
+  const error = toRouterError(0, headers, { ...body, error_type: raw.trim() });
+  // `httpStatus` is `readonly`, and `0` is not a status any server sent.
+  return Object.defineProperty(error, "httpStatus", {
+    value: null,
+    writable: false,
+    enumerable: true,
+    configurable: true,
+  });
 }

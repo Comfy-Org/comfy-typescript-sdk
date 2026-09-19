@@ -18,7 +18,9 @@
  *   `fetch`/undici streams the encoded body to the wire.
  * - **per-request timeout/abort** — every method accepts `signal` and
  *   `timeoutMs`; `AbortSignal.any` composes a caller's signal with this
- *   client's default timeout (or overrides/disables it per call).
+ *   client's default timeout (or overrides/disables it per call), and
+ *   `./dispatcher.ts` derives undici's own inactivity limits from the same
+ *   deadline so that a signal is genuinely the only clock on the request.
  *
  * This layer contains no orchestration, retries, hashing, or SSE
  * reconnection — those live in `../sdk`. Mirrors `comfy_low.transport` in
@@ -26,11 +28,13 @@
  * the package README for why).
  */
 
+import { clampTimerMs, withInactivityLimits } from "./dispatcher.js";
 import { errorFromEnvelope } from "./errors.js";
 import type {
   Asset,
   AssetFromHashData,
   Job,
+  JobLogs,
   JobWorkflowResponse,
   PostJobsData,
 } from "./generated/types.gen.js";
@@ -57,6 +61,15 @@ export interface RequestOptions {
 }
 
 export interface ComfyLowOptions {
+  /**
+   * Replaces the platform `fetch`. Supplying one also hands you the transport:
+   * this client stops attaching undici's per-request inactivity limits (see
+   * `./dispatcher.ts`), because `dispatcher` is undici's own non-standard init
+   * key and a delegate for the copy Node ships cannot be handed to a `fetch`
+   * from a separately installed undici. Own the limits yourself — with
+   * `setGlobalDispatcher` on your undici, or an `Agent` carrying
+   * `headersTimeout`/`bodyTimeout` — or requests still cap at undici's 300 s.
+   */
   fetch?: typeof fetch;
   timeoutMs?: number;
   /**
@@ -179,6 +192,12 @@ export class ComfyLow {
    */
   readonly #apiKey?: string;
   private readonly fetchImpl: typeof fetch;
+  /**
+   * Is `fetchImpl` the platform `fetch`, rather than one the caller injected?
+   * Only then is the transport ours to add undici's inactivity limits to — see
+   * {@link ComfyLowOptions.fetch}.
+   */
+  private readonly ownsTransport: boolean;
   private readonly defaultTimeoutMs: number;
   private readonly userAgent: string;
 
@@ -186,6 +205,7 @@ export class ComfyLow {
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.#apiKey = apiKey;
     this.fetchImpl = options.fetch ?? fetch;
+    this.ownsTransport = options.fetch === undefined;
     this.defaultTimeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.userAgent = buildUserAgent(options.clientInfo);
   }
@@ -246,13 +266,26 @@ export class ComfyLow {
     return headers;
   }
 
+  /**
+   * This request's deadline in milliseconds: the caller's `timeoutMs`, this
+   * client's default when they passed none, or `null` for no deadline. Split
+   * out from {@link resolveSignal} because the deadline drives two things now
+   * — the abort signal and the transport's own inactivity limits (see
+   * `./dispatcher.ts`) — and they must be derived from the same number.
+   */
+  private effectiveTimeoutMs(timeoutMs: number | null | undefined): number | null {
+    return timeoutMs === undefined ? this.defaultTimeoutMs : timeoutMs;
+  }
+
   private resolveSignal(
     callerSignal: AbortSignal | undefined,
-    timeoutMs: number | null | undefined,
+    effectiveTimeoutMs: number | null,
   ): AbortSignal | undefined {
-    const effective = timeoutMs === undefined ? this.defaultTimeoutMs : timeoutMs;
-    if (effective === null) return callerSignal;
-    const timeoutSignal = AbortSignal.timeout(effective);
+    if (effectiveTimeoutMs === null) return callerSignal;
+    // Clamped for the same reason the inactivity limits are: past ~25 days
+    // `AbortSignal.timeout` schedules a delay `setTimeout` folds to 1 ms, so an
+    // unclamped deadline there aborts at once instead of never.
+    const timeoutSignal = AbortSignal.timeout(clampTimerMs(effectiveTimeoutMs));
     return callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
   }
 
@@ -269,14 +302,21 @@ export class ComfyLow {
       headers.set("Content-Type", "application/json");
       body = JSON.stringify(options.json);
     }
-    const signal = this.resolveSignal(options.signal, options.timeoutMs);
-    return this.fetchImpl(url, {
+    const timeoutMs = this.effectiveTimeoutMs(options.timeoutMs);
+    const signal = this.resolveSignal(options.signal, timeoutMs);
+    const init: RequestInit = {
       method,
       headers,
       body,
       signal,
       redirect: options.redirect ?? "follow",
-    });
+    };
+    // `withInactivityLimits` is what keeps undici's own 300s headers/body
+    // timers from capping a longer deadline: they live on the dispatcher, out
+    // of `signal`'s reach, and firing one costs the caller the HTTP status and
+    // the server request id along with the request. Skipped for an injected
+    // `fetch`, whose transport is the caller's to configure.
+    return this.fetchImpl(url, this.ownsTransport ? withInactivityLimits(init, timeoutMs) : init);
   }
 
   private async parseOrRaise<T>(response: Response, ok: readonly number[]): Promise<T> {
@@ -498,6 +538,36 @@ export class ComfyLow {
   }
 
   /**
+   * `GET /api/v2/jobs/{id}/logs` — what the run printed, or `null` on the
+   * `204` that means this job has no log.
+   *
+   * `null` is the normal answer, not an error, and the contract deliberately
+   * does not say why: the surface captures no logs at all (Comfy Cloud
+   * today), the job has not finished, the run was killed before the worker
+   * could report one, or the log is withheld. Only one of those resolves
+   * itself — a job still running may have a log once it is terminal — so a
+   * `null` read after a terminal status is final. Accepts a job id or the
+   * job's own `urls.logs` link; the link is the form to prefer, since a
+   * surface may mount the operation under a prefix a hand-built path would
+   * miss. The text is whatever the workflow wrote to standard output:
+   * untrusted, to be rendered as plain text and never interpreted.
+   */
+  async getJobLogs(
+    jobIdOrLogsUrl: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<JobLogs | null> {
+    const path = looksLikePath(jobIdOrLogsUrl)
+      ? jobIdOrLogsUrl
+      : `/jobs/${encodeURIComponent(jobIdOrLogsUrl)}/logs`;
+    const response = await this.request("GET", path, { signal: options.signal });
+    if (response.status === 204) {
+      await response.body?.cancel();
+      return null;
+    }
+    return this.parseOrRaise<JobLogs>(response, [200]);
+  }
+
+  /**
    * `GET /api/v2/jobs/{id}/events` — raw live SSE iterator (escape hatch).
    * No reconnection here; a single connection's frames. `../sdk` adds the
    * reconnect loop. No default timeout: an idle stream must not time out
@@ -545,6 +615,7 @@ export const OPERATION_IDS = [
   "postJobs",
   "getJob",
   "getJobWorkflow",
+  "getJobLogs",
   "getJobEvents",
   "cancelJob",
 ] as const;
@@ -560,6 +631,7 @@ export const OPERATION_METHODS: Record<(typeof OPERATION_IDS)[number], keyof Com
   postJobs: "postJobs",
   getJob: "getJob",
   getJobWorkflow: "getJobWorkflow",
+  getJobLogs: "getJobLogs",
   getJobEvents: "getJobEvents",
   cancelJob: "cancelJob",
 };

@@ -17,15 +17,46 @@ export {
   type ComfyConfig,
 } from "./credentials.js";
 export {
+  CONTENT_TYPE_HEADER,
+  DEFAULT_DISCOVERY_TIMEOUT_MS,
+  DEFAULT_MAX_RESPONSE_BYTES,
   DEFAULT_RUN_TIMEOUT_MS,
   ERROR_TYPE_HEADER,
+  ETAG_HEADER,
+  IF_NONE_MATCH_HEADER,
   models,
   REQUEST_ID_HEADER,
+  type CatalogModel,
+  type DiscoveryOptions,
+  type ListOptions,
+  type ModelList,
+  type ModelPage,
   type Models,
+  type RunBinaryResult,
+  type RunJsonResult,
   type RunOptions,
   type RunResult,
+  type SchemaDocument,
+  type SchemaOptions,
+  type SchemaResult,
+  type SchemaUnchanged,
 } from "./models.js";
 export {
+  CANCEL_TIMEOUT_MS,
+  COMPLETED,
+  DEFAULT_SUBMIT_TIMEOUT_MS,
+  MAX_RETRY_AFTER_MS,
+  MIN_REQUEST_TIMEOUT_MS,
+  nextPollDelayMs,
+  RequestHandle,
+  type QueueUpdate,
+  type SubmitOptions,
+  type SubscribeOptions,
+  type WaitOptions,
+} from "./modelRequests.js";
+export { MAX_REQUEST_ID_LENGTH } from "./modelRoutes.js";
+export {
+  DEFAULT_COLLECT_BUDGET_MS,
   DEFAULT_RETRY_BASE_DELAY_MS,
   DEFAULT_RETRY_BUDGET_MS,
   DEFAULT_RETRY_MAX_DELAY_MS,
@@ -60,7 +91,7 @@ export {
  * `routerErrors.RouterError`. Also reachable as `@comfyorg/sdk/errors`.
  *
  * They are namespaced rather than flattened into the exports above because
- * three of the fifteen names (`Unauthorized`, `Forbidden`,
+ * three of the eighteen names (`Unauthorized`, `Forbidden`,
  * `InsufficientCredits`) are already taken here by the workflow-API
  * exceptions, which descend from `ComfyError`. See `./routerErrors.ts`.
  */

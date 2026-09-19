@@ -2,6 +2,11 @@
   "compilerOptions": {
     "target": "ES2022",
     "lib": ["ES2022"],
+    // Explicit since TypeScript 6: the compiler no longer pulls every
+    // `node_modules/@types/*` package into the program on its own, and the
+    // fetch/stream globals this SDK uses (`fetch`, `Response`, `AbortSignal`,
+    // `Blob`, `URL`) come from `@types/node`.
+    "types": ["node"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "strict": true,
