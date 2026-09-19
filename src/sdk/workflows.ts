@@ -32,7 +32,9 @@ export class Workflow {
   /**
    * Set `node.inputs.field`. `value` may be a plain JSON value or an asset
    * handle; handles are substituted into `core/ASSET` objects when the
-   * workflow is submitted.
+   * workflow is submitted. An asset handle may only be set on an input that
+   * takes a filename (a loader node's file widget); it cannot be set on an
+   * IMAGE/VIDEO/AUDIO socket.
    */
   setInput(nodeId: string, field: string, value: unknown): void {
     const node = (this.json[nodeId] ??= {}) as Record<string, unknown>;
