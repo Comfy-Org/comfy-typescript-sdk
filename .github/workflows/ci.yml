@@ -215,3 +215,25 @@ jobs:
 
       - name: Scan for internal-only references
         run: node scripts/check-public-repo-hygiene.mjs
+
+  # Regression guard for the split pin pair this repo shipped between #135 and
+  # #153: a Comfy-Org/github-workflows caller pins the same upstream commit
+  # twice (`uses:` + `workflows_ref:`) and nothing but this check ties the two
+  # together. See scripts/check-workflow-pins.mjs for the full why.
+  workflow-pins:
+    name: workflow-pins (reusable pin pair)
+    runs-on: ubuntu-latest
+    # The daily schedule exists for `sdk-parity` only; this job's inputs all
+    # live in this repo and cannot change without a push.
+    if: github.event_name != 'schedule'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Check the reusable-workflow pins agree
+        run: node scripts/check-workflow-pins.mjs

@@ -47,6 +47,14 @@ updates:
       # Dependabot names a reusable by its FULL path, and a bare `dependency-name`
       # is an exact match (the exact form covers `owner/repo`, the `/*` form the
       # per-file names). Do NOT collapse to `Comfy-Org/github-workflows*`.
+      #
+      # No `versions:` or `update-types:` on purpose -- the ignore is TOTAL,
+      # security advisories included. That is not an oversight to narrow later:
+      # the problem is not which versions Dependabot picks, it is that it
+      # cannot move this dependency correctly at ALL, so a security bump would
+      # split the pair exactly like a routine one. The upstream bump-*-callers
+      # fleet is what moves these pins, and scripts/check-workflow-pins.mjs
+      # fails CI if the pair is ever split again -- by Dependabot, or by hand.
       - dependency-name: "Comfy-Org/github-workflows"
       - dependency-name: "Comfy-Org/github-workflows/*"
     groups:
