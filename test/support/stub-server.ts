@@ -115,6 +115,15 @@ export interface ServerState {
   /** When true, `GET /jobs/{id}/logs` 404s with `job_not_found` — the job
    * itself is unknown, not yours, or past retention. */
   jobLogsGone: boolean;
+  /**
+   * Shallow-merged over the `GET /jobs/{id}` body, so a test can serve the
+   * fields the default fixture pins to their empty shape — `started_at`,
+   * `completed_at`, `progress`, `queue_position`, `metrics` — as a running or
+   * finished job would carry them. Poll only: `POST /jobs` and the cancel
+   * response are left alone, so a test can prove a handle adopted these on
+   * `refresh()` rather than having held them all along.
+   */
+  jobFieldOverrides: Record<string, unknown> | null;
   /** How many times `GET /jobs/{id}/logs` was hit. */
   jobLogsCount: number;
   /** The exact request path of the last `GET .../jobs/{id}/logs`, so a test
@@ -183,6 +192,7 @@ function defaultState(): ServerState {
     jobLogs: null,
     jobUrlsIncludeLogs: true,
     jobLogsGone: false,
+    jobFieldOverrides: null,
     jobLogsCount: 0,
     jobLogsLastPath: null,
     deletedAssets: new Set(),
@@ -488,11 +498,10 @@ export class StubServer {
     // Stamp the polled job's own id as job_id, matching a real server: an
     // output belongs to the job that produced it.
     const outputs = status === "succeeded" ? [{ ...OUTPUT, job_id: jobId }] : [];
-    sendJson(
-      res,
-      200,
-      jobJson(jobId, status, outputs, state.jobUrlsOrigin, state.jobUrlsIncludeLogs),
-    );
+    sendJson(res, 200, {
+      ...jobJson(jobId, status, outputs, state.jobUrlsOrigin, state.jobUrlsIncludeLogs),
+      ...state.jobFieldOverrides,
+    });
   }
 
   private serveJobLogs(path: string, res: ServerResponse): void {

@@ -794,6 +794,37 @@ key of their own. On a self-hosted proxy it's the content endpoint (normal auth
 still applies) and `expiresAt` is `null`. It works on every backend and never
 downloads the bytes first.
 
+## What a job carries
+
+A `Job` handle reads whatever state it currently holds — nothing re-fetches implicitly, so `await job.refresh()` (or `wait()`/`result()`, which poll for you) is what advances it:
+
+| Accessor            | Type                                          | What it is                                                                                       |
+| ------------------- | --------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `job.id`            | `string`                                      | Server-assigned ID; enough on its own to rebuild the handle via `client.jobs.get(id)`            |
+| `job.status`        | `string`                                      | `queued`, `running`, `canceling`, `succeeded`, `canceled`, `failed`, `expired`                   |
+| `job.outputs`       | `Output[]`                                    | Every output across all nodes; empty until the job succeeds                                      |
+| `job.error`         | `JobError \| null`                            | Failure detail when the job ended `failed`                                                       |
+| `job.createdAt`     | `Date`                                        | When the server accepted the job                                                                 |
+| `job.startedAt`     | `Date \| null`                                | When it started executing; `null` while still queued                                             |
+| `job.completedAt`   | `Date \| null`                                | When it reached a terminal state; `null` before it did                                           |
+| `job.expiresAt`     | `Date`                                        | Retention deadline — after this the job and its outputs are gone                                 |
+| `job.progress`      | `Progress \| null`                            | Latest progress snapshot the handle holds (see the caveat below)                                 |
+| `job.queuePosition` | `number \| null`                              | Place in the queue as of the state the handle holds                                              |
+| `job.metrics`       | `Record<string, number \| null> \| undefined` | Per-run measurements (`queue_ms`, `execution_ms`, …); `undefined` on a surface that reports none |
+| `job.urls`          | `JobUrls`                                     | The job's own `self` / `events` / `cancel` links, plus `logs` where the surface captures logs    |
+
+How long a run took is `completedAt` minus `startedAt`:
+
+```ts
+const job = await client.run(wf);
+if (job.startedAt && job.completedAt) {
+  const ms = job.completedAt.getTime() - job.startedAt.getTime();
+  console.log(`took ${String(ms)}ms`);
+}
+```
+
+Three things worth knowing. `JobError`, `Progress` and `JobUrls` above are the **generated wire models**, exported from `@comfyorg/sdk/low` — so `job.progress` is the snake_case snapshot (`value`, `nodes_done`, `nodes_total`, `current_node`, `step`, `steps`, `message`), not the camelCase `Progress` _event_ of the same name that `job.events()` yields. Second, `job.progress` is whatever the last poll carried. The contract says a poll returns the latest snapshot — the same data the SSE stream pushes — but Comfy Cloud has been reported to send `null` there even for a running job, so read a `null` as "this state carries no snapshot", not as "not running", and take live progress from `job.events()` (see [Live progress](#live-progress)). Third, the object-valued accessors (`progress`, `metrics`, `urls`) hand back a snapshot copy, so editing what you get back does not rewrite the handle's own state.
+
 ## The workflow behind a job
 
 A job handle rehydrated by ID alone — `await client.jobs.get(jobId)` — has
