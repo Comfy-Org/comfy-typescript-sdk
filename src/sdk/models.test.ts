@@ -113,6 +113,9 @@ describe("comfy.models.run on success", () => {
         // `null` here is "the provider asked for served it", not "unknown".
         servingProvider: null,
         droppedParams: null,
+        // A fresh run: Router sends no `Idempotent-Replayed` at all, so this
+        // is "ran for real, and was charged for" rather than "unknown".
+        replayed: false,
       });
     });
   });
@@ -208,6 +211,82 @@ describe("comfy.models.run on success", () => {
       const result = await comfy.models.run(MODEL, {});
       expect(result.requestId).toBeNull();
     });
+  });
+});
+
+describe("comfy.models.run and Idempotent-Replayed", () => {
+  /** A model whose partner answers with bytes, for the binary arm below. */
+  const AUDIO_MODEL = "elevenlabs/eleven_v3";
+  const MP3 = new Uint8Array([0x49, 0x44, 0x33, 0x04]);
+
+  it("reports replayed: false on a fresh run, which sends no such header", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+
+      const result = await comfy.models.run(MODEL, {});
+
+      // The fixture really is a fresh run: the stub only stamps the header
+      // when asked, so `false` here is read off an absent header rather than
+      // off a `false` nothing sends.
+      expect(server.state.idempotentReplayed).toBe(false);
+      expect(result.replayed).toBe(false);
+    });
+  });
+
+  it("reports replayed: true on a plain 200 that carries the header", async () => {
+    // No collect loop and no retry involved — a caller's OWN re-send under a
+    // supplied `idempotencyKey` reaches Router as one ordinary request and is
+    // answered off the record. That path never touches `retry.ts`, so it is
+    // worth its own fixture rather than being left to the collect tests.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.idempotentReplayed = true;
+
+      const result = await comfy.models.run(MODEL, {});
+
+      expect(result.kind).toBe("json");
+      expect(result.replayed).toBe(true);
+    });
+  });
+
+  it("reports it on the binary arm too — the two arms mirror each other", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "audio/mpeg";
+      server.state.body = MP3;
+      server.state.idempotentReplayed = true;
+
+      const result = await comfy.models.run(AUDIO_MODEL, {});
+
+      // A replayed generation is handed back byte for byte, so the arm a
+      // replay lands on is the arm the original landed on.
+      expect(result.kind).toBe("binary");
+      expect(result.replayed).toBe(true);
+    });
+  });
+
+  it("branches on the header's PRESENCE, not on its value", async () => {
+    // Router's own contract says to: "The header is absent on a fresh run
+    // rather than sent as `false`, so branch on its presence." So a literal
+    // `false` on the wire — which Router does not send, but which a proxy or a
+    // later server could — is still a replay, because its ARRIVAL is the only
+    // thing that carries meaning. Reading the value instead would report a
+    // replayed call as a fresh charge, which is the exact confusion this field
+    // exists to end.
+    for (const value of ["false", "", "0"]) {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.respond = () => ({
+          status: 200,
+          body: { images: [] },
+          headers: { "Idempotent-Replayed": value },
+        });
+
+        const result = await comfy.models.run(MODEL, {});
+
+        expect(result.replayed, JSON.stringify(value)).toBe(true);
+      });
+    }
   });
 });
 
@@ -639,6 +718,7 @@ describe("comfy.models.run on a binary result", () => {
         requestId: "6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21",
         servingProvider: null,
         droppedParams: null,
+        replayed: false,
       });
     });
   });
@@ -812,6 +892,9 @@ describe("comfy.models.run on a binary result", () => {
       // Both attempts under the one key: the collect is a re-ask for the
       // generation the first attempt already started, not a second run.
       expect(new Set(server.state.idempotencyKeys).size).toBe(1);
+      // And the caller can SEE that: the bytes came off the key's record, so
+      // a spend tracker must not count this result a second time.
+      expect(result.replayed).toBe(true);
       expect(result.kind).toBe("binary");
       if (result.kind !== "binary") throw new Error("unreachable");
       expect(result.contentType).toBe("audio/mpeg");
@@ -1417,6 +1500,8 @@ describe("comfy.models.run collecting a generation under the same key", () => {
       // safe. A fresh key would dispatch, and bill, a second generation.
       expect(server.state.idempotencyKeys).toHaveLength(3);
       expect(new Set(server.state.idempotencyKeys).size).toBe(1);
+      // Router says so on the answer itself, and the SDK passes it on.
+      expect(result.replayed).toBe(true);
     });
   }, 20_000);
 
@@ -1434,6 +1519,7 @@ describe("comfy.models.run collecting a generation under the same key", () => {
       expect(result.data).toEqual({ images: [{ url: "https://example.invalid/out.png" }] });
       expect(server.state.requestCount).toBe(2);
       expect(new Set(server.state.idempotencyKeys).size).toBe(1);
+      expect(result.replayed).toBe(true);
     });
   }, 20_000);
 
@@ -1456,6 +1542,7 @@ describe("comfy.models.run collecting a generation under the same key", () => {
       expect(result.requestId).toBe("6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21");
       expect(server.state.requestCount).toBe(2);
       expect(new Set(server.state.idempotencyKeys).size).toBe(1);
+      expect(result.replayed).toBe(true);
       // Backoff pacing (milliseconds), not the second the header did not name.
       expect(Date.now() - started).toBeLessThan(500);
     });
@@ -1487,6 +1574,7 @@ describe("comfy.models.run collecting a generation under the same key", () => {
       expect(result.data).toEqual({ images: [{ url: "https://example.invalid/out.png" }] });
       expect(server.state.requestCount).toBe(3);
       expect(new Set(server.state.idempotencyKeys).size).toBe(1);
+      expect(result.replayed).toBe(true);
     });
   }, 20_000);
 
