@@ -5,13 +5,18 @@ on:
     branches: [main]
   push:
     branches: [main]
-  # Daily, for `sdk-parity` alone (every other job is gated off below). That
-  # job is the only one whose input lives in ANOTHER repository: it re-derives
-  # the Python SDK's public surface from that repo's default branch, so a
-  # Python-side change is drift here the moment it merges there. On
-  # pull_request/push it would be noticed only whenever this repo's next PR
-  # happens to run CI, which can be days. 07:17 UTC is off the top of the hour
-  # on purpose -- GitHub delays cron runs that pile onto :00.
+  # Daily, for `sdk-parity` and `cursor-review-pin-freshness` (every other job
+  # is gated off below). Those two are the jobs whose input lives in ANOTHER
+  # repository, which is what makes a schedule the only trigger that works:
+  # `sdk-parity` re-derives the Python SDK's public surface from that repo's
+  # default branch, so a Python-side change is drift here the moment it merges
+  # there; `cursor-review-pin-freshness` asks github-workflows whether this
+  # repo's cursor-review pin has fallen behind, where the failure being watched
+  # for is precisely that NOTHING happens here. On pull_request/push either
+  # would be noticed only whenever this repo's next PR happens to run CI, which
+  # can be days -- and for the pin, never, since a frozen pin produces no PRs.
+  # 07:17 UTC is off the top of the hour on purpose -- GitHub delays cron runs
+  # that pile onto :00.
   schedule:
     - cron: "17 7 * * *"
 
@@ -29,8 +34,9 @@ jobs:
   test:
     name: Test (node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
-    # The daily schedule exists for `sdk-parity` only; this job's inputs all
-    # live in this repo and cannot change without a push.
+    # The daily schedule exists for `sdk-parity` and
+    # `cursor-review-pin-freshness` only; this job's inputs all live in this
+    # repo and cannot change without a push.
     if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
@@ -77,8 +83,9 @@ jobs:
   build-check:
     name: build-check (publish dry run)
     runs-on: ubuntu-latest
-    # The daily schedule exists for `sdk-parity` only; this job's inputs all
-    # live in this repo and cannot change without a push.
+    # The daily schedule exists for `sdk-parity` and
+    # `cursor-review-pin-freshness` only; this job's inputs all live in this
+    # repo and cannot change without a push.
     if: github.event_name != 'schedule'
     steps:
       - name: Check out repository
@@ -201,8 +208,9 @@ jobs:
   public-repo-hygiene:
     name: public-repo-hygiene
     runs-on: ubuntu-latest
-    # The daily schedule exists for `sdk-parity` only; this job's inputs all
-    # live in this repo and cannot change without a push.
+    # The daily schedule exists for `sdk-parity` and
+    # `cursor-review-pin-freshness` only; this job's inputs all live in this
+    # repo and cannot change without a push.
     if: github.event_name != 'schedule'
     steps:
       - name: Check out repository
@@ -223,8 +231,9 @@ jobs:
   workflow-pins:
     name: workflow-pins (reusable pin pair)
     runs-on: ubuntu-latest
-    # The daily schedule exists for `sdk-parity` only; this job's inputs all
-    # live in this repo and cannot change without a push.
+    # The daily schedule exists for `sdk-parity` and
+    # `cursor-review-pin-freshness` only; this job's inputs all live in this
+    # repo and cannot change without a push.
     if: github.event_name != 'schedule'
     steps:
       - name: Check out repository
@@ -237,3 +246,255 @@ jobs:
 
       - name: Check the reusable-workflow pins agree
         run: node scripts/check-workflow-pins.mjs
+
+  # Staleness watchdog for the OTHER half of the cursor-review pin problem.
+  # `workflow-pins` above proves the two pins agree with each OTHER; nothing
+  # proves they agree with UPSTREAM, and a pin that is stale but internally
+  # consistent is therefore invisible. Checked against github-workflows@main on
+  # 2026-09-19, nothing else closes that gap: its cursor-review.yml only
+  # `::warning::`s on a non-40-hex workflows_ref and runs no ancestry or
+  # currency check at all (the stricter shape+ancestry guard the org README
+  # describes is pr-risk.yml's, not this reusable's) -- and that README says in
+  # its own words that "what is still not machine-checked is that the pin is
+  # the current one". The bump fleet is the only thing that moves these pins,
+  # and it only reaches repos listed in its roster secret: this repo was
+  # missing from that roster for three weeks and nothing anywhere said so.
+  #
+  # Schedule-only, and that is the point rather than an optimization: the
+  # failure mode being watched for is that NOTHING HAPPENS, so the check must
+  # not wait on a PR or a push to notice.
+  cursor-review-pin-freshness:
+    name: cursor-review-pin-freshness (upstream pin staleness)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    permissions:
+      contents: read
+      # `issues: write` for the sticky issue below; `pull-requests: read` to
+      # look for an open bump PR before calling the pin abandoned.
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Check the pinned github-workflows commit is current
+        id: assess
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUMP_BRANCH: ci/bump-cursor-review
+          # The fleet's queue is serialised and a bump PR still needs a human
+          # to merge it, so an upstream commit this repo has not picked up yet
+          # is not evidence of anything being stuck until it has had a few days.
+          GRACE_SECONDS: "259200" # 3 days
+        run: |
+          set -euo pipefail
+
+          # Reuse the pin parser rather than grepping the YAML again, so this
+          # job and `workflow-pins` can never disagree about which line is the
+          # pin. `--print-pin` writes the SHA and nothing else; it enforces
+          # 40-hex and deliberately leaves the `uses:`/`workflows_ref` equality
+          # assertion to `workflow-pins`, which owns the split-pin case.
+          pin="$(node scripts/check-workflow-pins.mjs --print-pin cursor-review.yml)"
+          echo "pin=$pin" >>"$GITHUB_OUTPUT"
+          echo "Pinned github-workflows commit: $pin"
+
+          # Blobless and no checkout: this needs commits and trees to run `git
+          # log` with a pathspec, never file contents. github-workflows is
+          # public, so the ambient token is enough.
+          git clone --filter=blob:none --no-checkout --quiet \
+            https://github.com/Comfy-Org/github-workflows /tmp/gw
+
+          if ! git -C /tmp/gw merge-base --is-ancestor "$pin" origin/main 2>/dev/null; then
+            echo "::error::pin $pin is not an ancestor of github-workflows main (unknown commit, or pinned to a fork/PR branch). Re-pin both pins to a commit on main."
+            exit 1
+          fi
+
+          # MIRRORS `WATCHED_PATHSPECS` in github-workflows'
+          # .github/workflows/bump-cursor-review-callers.yml -- that list is
+          # upstream's own definition of "consumer-visible", exclusions
+          # included, and re-syncing this from there is the only correct way to
+          # change it. A commit touching nothing else cannot affect a pinned
+          # caller, so it must not count as staleness.
+          behind="$(git -C /tmp/gw log --format='%H %cI' "$pin..origin/main" -- \
+            .github/workflows/cursor-review.yml \
+            .github/cursor-review \
+            scripts/check-pr-size \
+            ':(exclude)scripts/check-pr-size/*_test.go')"
+
+          if [ -z "$behind" ]; then
+            echo "state=current" >>"$GITHUB_OUTPUT"
+            echo "Nothing consumer-visible has landed upstream since $pin. Pin is current."
+            exit 0
+          fi
+
+          # NEWEST is what a bump would move the pin TO, so it is what the issue
+          # body quotes. OLDEST is what the clock runs on, and that split is NOT
+          # interchangeable: the fleet delivers the whole backlog in one bump, so
+          # the question is "how long has the FIRST thing this repo owes been
+          # sitting there", not "how recently did upstream commit". Timing the
+          # newest commit would restart the grace window on every upstream push
+          # -- measured 2026-09-19 over the last 25 consumer-visible commits, the
+          # median gap between them is 0.39 days and only 4 of 24 gaps reach 3
+          # days -- so a frozen caller would be silently re-forgiven roughly
+          # every nine hours and this watchdog would almost never fire, which is
+          # the exact three-week invisibility it exists to end.
+          newest="$(printf '%s\n' "$behind" | head -n 1)"
+          oldest="$(printf '%s\n' "$behind" | tail -n 1)"
+          behind_count="$(printf '%s\n' "$behind" | wc -l | tr -d ' ')"
+
+          newest_sha="${newest%% *}"
+          newest_date="${newest##* }"
+          oldest_sha="${oldest%% *}"
+          oldest_date="${oldest##* }"
+          {
+            echo "newest_sha=$newest_sha"
+            echo "newest_date=$newest_date"
+            echo "oldest_sha=$oldest_sha"
+            echo "oldest_date=$oldest_date"
+            echo "behind_count=$behind_count"
+          } >>"$GITHUB_OUTPUT"
+          echo "$behind_count consumer-visible upstream commit(s) not picked up."
+          echo "  oldest unpicked: $oldest_sha ($oldest_date)"
+          echo "  newest upstream: $newest_sha ($newest_date)"
+
+          age="$(( $(date -u +%s) - $(date -u -d "$oldest_date" +%s) ))"
+          if [ "$age" -lt "$GRACE_SECONDS" ]; then
+            echo "state=grace" >>"$GITHUB_OUTPUT"
+            echo "The oldest unpicked commit is $((age / 3600))h old, inside the $((GRACE_SECONDS / 86400))-day grace window. Passing."
+            exit 0
+          fi
+
+          # Past the grace window, so the question is no longer "is it stale"
+          # but "is anything moving it". The fleet pushes a STABLE branch, so
+          # an open PR from it means delivery happened and only the merge is
+          # owed -- a different problem, with a different owner, and not this
+          # watchdog's to redden.
+          #
+          # `set -e` makes an API failure here kill the step rather than read
+          # as an empty result. That direction matters: a blip that looked like
+          # "no bump PR" would file a stale-pin issue naming a cause nobody
+          # established, and the sticky-issue step below is gated on the
+          # verdict, not on `failure()`, so a red step files nothing.
+          bump_pr="$(gh pr list --repo "$GH_REPO" --state open \
+            --head "$BUMP_BRANCH" --json number --jq '.[0].number // empty')"
+
+          if [ -n "$bump_pr" ]; then
+            echo "bump_pr=$bump_pr" >>"$GITHUB_OUTPUT"
+            echo "state=delivered" >>"$GITHUB_OUTPUT"
+            echo "::notice::the github-workflows pin is stale, but bump PR #$bump_pr is open on $BUMP_BRANCH -- the fleet delivered and only the merge is owed."
+            exit 0
+          fi
+
+          echo "state=stale" >>"$GITHUB_OUTPUT"
+          echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) landed $((age / 86400)) days ago -- and no open PR exists on $BUMP_BRANCH. Nothing is moving this pin."
+          exit 1
+
+      # Same sticky-issue shape as `sdk-parity`: one open issue, commented on
+      # by each repeat run so the history lives on the thread, closed by the
+      # first run that finds the pin current again.
+      #
+      # Gated on the VERDICT rather than on `failure()`: a clone or API failure
+      # reddens the scheduled run (visible as a step annotation) but must not
+      # file an issue claiming the pin is stale when nothing established that.
+      - name: Open or update the stale-pin issue
+        if: failure() && steps.assess.outputs.state == 'stale'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: "cursor-review: the github-workflows pin is stale and no bump PR has arrived"
+          BUMP_BRANCH: ci/bump-cursor-review
+          PIN: ${{ steps.assess.outputs.pin }}
+          NEWEST_SHA: ${{ steps.assess.outputs.newest_sha }}
+          NEWEST_DATE: ${{ steps.assess.outputs.newest_date }}
+          OLDEST_SHA: ${{ steps.assess.outputs.oldest_sha }}
+          OLDEST_DATE: ${{ steps.assess.outputs.oldest_date }}
+          BEHIND_COUNT: ${{ steps.assess.outputs.behind_count }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Exact title match off the plain issue list -- the search API is
+          # eventually consistent, and a miss here would open a second issue.
+          existing="$(gh issue list --state open --limit 100 --json number,title \
+            --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
+          body="$(printf '%s\n' \
+            "\`.github/workflows/ci-cursor-review.yml\` is pinned to \`$PIN\`, which is" \
+            "**$BEHIND_COUNT consumer-visible commit(s) behind \`Comfy-Org/github-workflows@main\`**." \
+            "" \
+            "| | commit | landed |" \
+            "| --- | --- | --- |" \
+            "| oldest not picked up | \`$OLDEST_SHA\` | $OLDEST_DATE |" \
+            "| newest upstream (what a bump moves to) | \`$NEWEST_SHA\` | $NEWEST_DATE |" \
+            "" \
+            "The oldest one has been sitting there past the 3-day grace window and no PR is" \
+            "open on the \`$BUMP_BRANCH\` branch, so nothing is moving the pin." \
+            "" \
+            "Two things to check, in this order:" \
+            "" \
+            "1. **Is this repo still on the bump fleet's roster?** The fleet only visits repos" \
+            "   listed in the \`CURSOR_REVIEW_CALLERS\` secret on \`Comfy-Org/github-workflows\`," \
+            "   whose canonical copy lives in the private ops repo (deliberately not named here --" \
+            "   this repo is public). A fleet run logs a \`roster: N caller(s)\` audit line; if" \
+            "   this repo is missing, add it there and re-dispatch the fleet. That was the" \
+            "   original failure -- a silently dropped roster entry, for three weeks." \
+            "2. **Or hand-bump.** Move BOTH pins in \`.github/workflows/ci-cursor-review.yml\`" \
+            "   (the \`uses:\` SHA and the \`workflows_ref:\` input) to \`$NEWEST_SHA\`, update the" \
+            "   trailing \`# github-workflows main (short)\` comment, and verify with:" \
+            "" \
+            "       node scripts/check-workflow-pins.mjs" \
+            "" \
+            "This issue closes itself on the first daily run that finds the pin current again." \
+            "" \
+            "Run: $RUN_URL")"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$TITLE" --body "$body"
+          fi
+
+      # Delivered-but-unmerged is a pass, so it never reaches the step above --
+      # but if the issue is already open it should say why it is still open.
+      # When no issue is open the `::notice::` from `assess` is the whole
+      # record, which is right: an owed merge is already visible as a PR.
+      - name: Note the open bump PR on the stale-pin issue
+        if: success() && steps.assess.outputs.state == 'delivered'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: "cursor-review: the github-workflows pin is stale and no bump PR has arrived"
+          BUMP_BRANCH: ci/bump-cursor-review
+          BUMP_PR: ${{ steps.assess.outputs.bump_pr }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          existing="$(gh issue list --state open --limit 100 --json number,title \
+            --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$(printf '%s\n' \
+              "The bump fleet has delivered: #$BUMP_PR is open on \`$BUMP_BRANCH\`." \
+              "Only the merge is owed now, so this issue stays open -- and closes itself -- on the" \
+              "first daily run after that PR lands." \
+              "" \
+              "Run: $RUN_URL")"
+          fi
+
+      - name: Close the stale-pin issue once the pin is current again
+        if: success() && steps.assess.outputs.state != 'delivered'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: "cursor-review: the github-workflows pin is stale and no bump PR has arrived"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          existing="$(gh issue list --state open --limit 100 --json number,title \
+            --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" \
+              --comment "The \`Comfy-Org/github-workflows\` pin is current again. Run: $RUN_URL"
+          fi
