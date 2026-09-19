@@ -66,9 +66,11 @@ import { requireCredentials, resolveBaseUrl } from "./credentials.js";
 import { ComfyError } from "./exceptions.js";
 import { fillRoute, parseModelId, parseRequestId } from "./modelRoutes.js";
 import {
+  type BuiltRunResult,
   CREDITS_USED_HEADER,
   DROPPED_PARAMS_HEADER,
   FALLBACK_PROVIDER_HEADER,
+  parseCreditsUsed,
   parseDroppedParams,
   type RunResult,
 } from "./models.js";
@@ -824,7 +826,7 @@ export class RequestHandle<TData = unknown> {
    * one fetch, so collecting a result twice — or from a second process — costs
    * no more than the first time.
    */
-  async get(options: WaitOptions = {}): Promise<RunResult<TData>> {
+  async get(options: WaitOptions = {}): Promise<BuiltRunResult<TData>> {
     const timeoutMs = options.timeoutMs ?? null;
     const deadlineAt = timeoutMs === null ? null : Date.now() + timeoutMs;
     let completion: QueueUpdate | null = null;
@@ -848,7 +850,7 @@ export class RequestHandle<TData = unknown> {
   async collect(
     completion: QueueUpdate | null,
     options: { signal?: AbortSignal; budgetMs: number | null; retry: RetryOptions | false },
-  ): Promise<RunResult<TData>> {
+  ): Promise<BuiltRunResult<TData>> {
     if (completion === null) {
       // Unreachable while `events` always yields the completion it stops on;
       // checked anyway, because the alternative is a null dereference in the
@@ -909,7 +911,7 @@ export class RequestHandle<TData = unknown> {
       requestId: response.headers.get(REQUEST_ID_HEADER),
       servingProvider: response.headers.get(FALLBACK_PROVIDER_HEADER),
       droppedParams: parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER)),
-      creditsUsed: response.headers.get(CREDITS_USED_HEADER),
+      creditsUsed: parseCreditsUsed(response.headers.get(CREDITS_USED_HEADER)),
     };
   }
 

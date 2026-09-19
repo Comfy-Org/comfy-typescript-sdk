@@ -47,6 +47,8 @@ import { comfy } from "./comfy.js";
 import { COMFY_ROUTER_BASE_URL, config } from "./credentials.js";
 import {
   CATALOG_ROUTE_TEMPLATE,
+  DROPPED_PARAMS_HEADER,
+  FALLBACK_PROVIDER_HEADER,
   models,
   RUN_ROUTE_TEMPLATE,
   SCHEMA_ROUTE_TEMPLATE,
@@ -67,6 +69,44 @@ describe("router route contract (spec/router-openapi.yaml)", () => {
       "the vendored Router contract moved the runRouterModel path — update RUN_ROUTE_TEMPLATE " +
         "in src/sdk/models.ts to match it (comfy.models.run 404s until you do)",
     ).toBe(RUN_ROUTE_TEMPLATE);
+  });
+
+  /**
+   * The rot guard for `CREDITS_USED_HEADER`, which is the one header constant
+   * in `src/sdk/models.ts` pinned to nothing.
+   *
+   * `X-Comfy-Request-Id` and the two `X-Comfy-Router-*` disclosure headers are
+   * declared by the run route's `200`; `X-Comfy-Credits-Used` ships on real
+   * Router responses but is absent from this vendored copy, so there is no
+   * spec value to compare the constant against and its failure mode is
+   * SILENT — a name wrong by one segment reports `creditsUsed: null` on every
+   * run forever, which is indistinguishable from the "Router reported no
+   * cost" the field is documented to mean.
+   *
+   * So this watches for the sync that ends that, exactly as the queue-route
+   * block below used to watch for the `requests` collection: the day the
+   * contract declares a credits header, this reddens and says to replace it
+   * with a real pin. Without it, the TSDoc's "the next Router sync is the
+   * point to add that pin" is an instruction with nothing to trigger it.
+   */
+  it("has no credits header in the contract yet — delete this guard the day it does", async () => {
+    const { runSuccessHeaderNames } = await readRouterRouteContract();
+    // Sanity: the read works at all. A selector that silently returned
+    // nothing would satisfy the guard below while seeing nothing, which is
+    // the "empty set reads as agreement" failure this file exists to refuse.
+    expect(runSuccessHeaderNames).toContain(FALLBACK_PROVIDER_HEADER.toLowerCase());
+    expect(runSuccessHeaderNames).toContain(DROPPED_PARAMS_HEADER.toLowerCase());
+
+    const credits = runSuccessHeaderNames.filter((name) => name.includes("credits"));
+    expect(
+      credits,
+      "spec/router-openapi.yaml now declares a credits header on runRouterModel's 200 " +
+        `(${credits.join(", ")}). CREDITS_USED_HEADER in src/sdk/models.ts has been unpinned ` +
+        "prose until now — replace THIS guard with an assertion that the constant equals the " +
+        "declared name, the way RUN_ROUTE_TEMPLATE is pinned above. If the declared name " +
+        "differs from the constant, that mismatch is the bug this guard was waiting for: " +
+        "every run has been reporting creditsUsed: null.",
+    ).toEqual([]);
   });
 
   it("spells COMFY_ROUTER_BASE_URL the host the contract declares", async () => {

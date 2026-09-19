@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { attachedDispatcher } from "../../test/support/dispatchers.js";
 import { RouterStubServer, withRouterStub } from "../../test/support/router-stub-server.js";
-import { parseDroppedParams } from "./models.js";
+import { parseCreditsUsed, parseDroppedParams } from "./models.js";
 import {
   comfy,
   ComfyError,
@@ -261,6 +261,33 @@ describe("comfy.models.run and X-Comfy-Credits-Used", () => {
     });
   });
 
+  it("reads a blank header as absent rather than as a cost of zero", async () => {
+    // A present-but-empty `X-Comfy-Credits-Used:` is the one value that
+    // defeats the whole `string | null` design if it is passed through: `""`
+    // survives the documented `creditsUsed != null` presence check and then
+    // reads as `0` through `Number("")`, so a caller following the TSDoc to
+    // the letter books a run as free that Router never priced.
+    for (const blank of ["", "   "]) {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.creditsUsed = blank;
+
+        const result = await comfy.models.run(MODEL, {});
+
+        expect(result.creditsUsed).toBeNull();
+      });
+    }
+  });
+
+  it("trims a padded value rather than handing back the padding", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.creditsUsed = " 0.42 ";
+
+      expect((await comfy.models.run(MODEL, {})).creditsUsed).toBe("0.42");
+    });
+  });
+
   it('keeps a reported "0" distinguishable from an absent header', async () => {
     await withRouterStub(async (server) => {
       useStub(server);
@@ -283,6 +310,26 @@ describe("comfy.models.run and X-Comfy-Credits-Used", () => {
       expect(reportedZero.creditsUsed !== null).toBe(true);
       expect(notReported.creditsUsed !== null).toBe(false);
       expect(Number(reportedZero.creditsUsed) !== 0).toBe(Number(notReported.creditsUsed) !== 0);
+    });
+  });
+
+  describe("parseCreditsUsed", () => {
+    it("normalizes only absence and blankness", () => {
+      expect(parseCreditsUsed(null)).toBeNull();
+      expect(parseCreditsUsed("")).toBeNull();
+      expect(parseCreditsUsed("\t \n")).toBeNull();
+      expect(parseCreditsUsed(" 0.42 ")).toBe("0.42");
+      // A reported zero is a COST, and survives every trimming above.
+      expect(parseCreditsUsed("0")).toBe("0");
+    });
+
+    it("hands back a value it cannot read rather than guessing at a price", () => {
+      // What `Headers.get` produces from a header sent twice. Picking one of
+      // the two figures would invent a charge; returning `null` would claim
+      // Router reported nothing, when it reported this. Neither is this
+      // SDK's call to make, so the caller's own parse is where it fails.
+      expect(parseCreditsUsed("0.42, 0.42")).toBe("0.42, 0.42");
+      expect(parseCreditsUsed("free")).toBe("free");
     });
   });
 });
