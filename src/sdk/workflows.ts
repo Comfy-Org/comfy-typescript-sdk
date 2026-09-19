@@ -32,9 +32,12 @@ export class Workflow {
   /**
    * Set `node.inputs.field`. `value` may be a plain JSON value or an asset
    * handle; handles are substituted into `core/ASSET` objects when the
-   * workflow is submitted. An asset handle may only be set on an input that
-   * takes a filename (a loader node's file widget); it cannot be set on an
-   * IMAGE/VIDEO/AUDIO socket.
+   * workflow is submitted. A handle resolves to a filename on the server, so
+   * it must be set on an input that takes one — a loader node's file widget —
+   * whose output is then linked into the consuming node. Nothing here
+   * validates that: a handle set directly on an IMAGE/VIDEO/AUDIO/MASK socket
+   * is accepted at submit and fails at execution, because the node receives a
+   * string.
    */
   setInput(nodeId: string, field: string, value: unknown): void {
     const node = (this.json[nodeId] ??= {}) as Record<string, unknown>;

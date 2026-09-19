@@ -110,9 +110,12 @@ function blobPart(data: Uint8Array): Uint8Array<ArrayBuffer> {
  * deduped against the server, and uploaded only on first use — either when
  * you {@link Asset.commit} explicitly, or when a workflow referencing it is
  * submitted. Assign one to a node input via `workflow.setInput(...)` and it
- * is substituted as a `core/ASSET` reference. An asset handle may only be set
- * on an input that takes a filename (a loader node's file widget); it cannot
- * be set on an IMAGE/VIDEO/AUDIO socket.
+ * is substituted as a `core/ASSET` reference. A handle resolves to a filename
+ * on the server, so it must be set on an input that takes one — a loader
+ * node's file widget — whose output is then linked into the consuming node.
+ * Nothing validates that: a handle set directly on an IMAGE/VIDEO/AUDIO/MASK
+ * socket is accepted at submit and fails at execution, because the node
+ * receives a string.
  */
 export class Asset {
   readonly [ASSET_HANDLE] = true as const;
