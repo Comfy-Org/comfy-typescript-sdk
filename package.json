@@ -54,6 +54,7 @@
     "test:coverage": "vitest run --coverage",
     "check:spec-drift": "node scripts/check-spec-drift.mjs",
     "check:sdk-parity": "node scripts/sync-python-surface.mjs",
+    "check:workflow-pins": "node scripts/check-workflow-pins.mjs",
     "sync:python-surface": "node scripts/sync-python-surface.mjs --write"
   },
   "dependencies": {
