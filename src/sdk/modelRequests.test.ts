@@ -270,6 +270,32 @@ describe("comfy.models.submit stamps the Idempotency-Key onto every failure", ()
     });
   });
 
+  it("gives concurrent submits sharing one AbortController their OWN key", async () => {
+    // Same hazard as `models.run`: one already-aborted signal is the reason
+    // object BOTH calls reject with, so stamping it in place would let the
+    // first call decide the key the second one reads.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      const controller = new AbortController();
+      controller.abort();
+
+      const [a, b] = (await Promise.all([
+        comfy.models
+          .submit(MODEL, {}, { signal: controller.signal, idempotencyKey: "k-one" })
+          .catch((e: unknown) => e),
+        comfy.models
+          .submit(MODEL, {}, { signal: controller.signal, idempotencyKey: "k-two" })
+          .catch((e: unknown) => e),
+      ])) as (Error & Record<string, unknown>)[];
+
+      expect(a.name).toBe("AbortError");
+      expect(b.name).toBe("AbortError");
+      expect(a.idempotencyKey).toBe("k-one");
+      expect(b.idempotencyKey).toBe("k-two");
+      expect((controller.signal.reason as Record<string, unknown>).idempotencyKey).toBeUndefined();
+    });
+  });
+
   it("stamps the RouterError a bare 502 decodes to", async () => {
     await withRouterStub(async (server) => {
       useStub(server);

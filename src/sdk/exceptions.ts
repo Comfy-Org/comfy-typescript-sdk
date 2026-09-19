@@ -217,52 +217,208 @@ export async function translate<T>(fn: () => Promise<T>): Promise<T> {
  */
 const STAMPED_ATTRIBUTES = ["requestId", "retryAfter"] as const;
 
+/** Options for {@link stampIdempotencyKey} and {@link stamping}. */
+export interface StampOptions {
+  /**
+   * The signal the CALLER handed this call, when there is one.
+   *
+   * `fetch` rejects with `signal.reason`, and `AbortSignal.any` hands the
+   * composite the SOURCE signal's reason OBJECT rather than a copy — so when
+   * one `AbortController` is shared across concurrent `run`/`submit` calls,
+   * every one of them rejects with the very same throwable. Stamping that in
+   * place would write the first call's key onto an object the other calls (and
+   * the caller, as `controller.signal.reason`) are still holding, so they would
+   * each read a key belonging to a DIFFERENT generation — and a manual collect
+   * under someone else's key is worse than no key at all. Naming the caller's
+   * signal here is how the stamp recognises that object and hands this call a
+   * private stand-in instead.
+   */
+  callerSignal?: AbortSignal | undefined;
+  /**
+   * What `retryAfter` should read when the throwable carries none of its own.
+   * Defaults to `null`. The collect path passes the pace Router named on the
+   * 409/504 that started the collect, so a failure to collect hands back the
+   * pace as well as the key.
+   */
+  retryAfter?: number | null;
+}
+
 /**
- * Attach `idempotencyKey` to `exc` in place and hand it back.
+ * Is `exc` an object other calls are holding too, so that writing this call's
+ * key onto it would be read by one of them as its own?
+ *
+ * Two ways that happens: it is the caller's abort reason (handed to every
+ * concurrent call on that controller), or it already carries a key that is not
+ * ours (some other call stamped it first, by a route we did not plumb).
+ */
+function isSharedAcrossCalls(
+  exc: object,
+  idempotencyKey: string,
+  callerSignal: AbortSignal | undefined,
+): boolean {
+  if (callerSignal?.aborted === true && (callerSignal.reason as unknown) === exc) return true;
+  let existing: unknown;
+  try {
+    existing = (exc as Record<string, unknown>).idempotencyKey;
+  } catch {
+    // A throwing getter: not something we can classify, and not something we
+    // can safely write to either. `writeStamp` re-reads it and bails the same
+    // way, leaving the error untouched.
+    return false;
+  }
+  return typeof existing === "string" && existing !== idempotencyKey;
+}
+
+/**
+ * A private stand-in for a throwable this call must not mutate: same
+ * prototype, same message, same stack, same own properties — everything a
+ * caller branches on (`err.name === "AbortError"`, `instanceof DOMException`,
+ * `instanceof TypeError`) reads identically. Only the object identity differs,
+ * which is the point: the caller's `controller.signal.reason` is left exactly
+ * as they handed it to us.
+ *
+ * `null` when there is no faithful stand-in to make, in which case the caller
+ * keeps an UNSTAMPED error rather than one carrying another generation's key.
+ */
+function replicate(exc: object): object | null {
+  const descriptors = Object.getOwnPropertyDescriptors(exc);
+  // Another call's key is the whole reason we are standing this object in.
+  delete descriptors.idempotencyKey;
+  // `stack` is an ACCESSOR on both a V8 `Error` and a Node `DOMException`, and
+  // its getter is bound to the object it was installed on — copying the
+  // descriptor would hand the stand-in a getter that answers for the original.
+  // Read the string out here and pin it as a data property below instead.
+  let stack: unknown;
+  try {
+    stack = (exc as Record<string, unknown>).stack;
+  } catch {
+    stack = undefined;
+  }
+  delete descriptors.stack;
+  const pinStack = (replica: object): void => {
+    if (typeof stack !== "string") return;
+    Object.defineProperty(replica, "stack", {
+      value: stack,
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+  };
+  if (exc instanceof DOMException) {
+    // `DOMException` keeps `name`/`message` in internal slots behind prototype
+    // accessors, so a descriptor copy of one reads back as a `TypeError`
+    // ("Value of `this` must be of DOMException") the moment anyone touches
+    // `err.name`. It has to be rebuilt through the constructor, which carries
+    // both — and re-defining them here would shadow those accessors.
+    const replica = new DOMException(exc.message, exc.name);
+    delete descriptors.name;
+    delete descriptors.message;
+    Object.defineProperties(replica, descriptors);
+    pinStack(replica);
+    return replica;
+  }
+  const prototype = Object.getPrototypeOf(exc) as object | null;
+  // An `Error` (its `message` is an own data property, so the descriptor copy
+  // carries it, and the prototype carries the class) or a plain object — the
+  // other thing `controller.abort(reason)` is routinely handed. Both are
+  // faithfully reproduced by copying own descriptors onto a fresh object.
+  if (exc instanceof Error || prototype === Object.prototype || prototype === null) {
+    const replica = Object.create(prototype) as object;
+    Object.defineProperties(replica, descriptors);
+    pinStack(replica);
+    return replica;
+  }
+  // Anything else may keep state in internal slots a descriptor copy cannot
+  // reach (the way a `DOMException` does), and a stand-in that reads wrong is
+  // worse than no stamp — so the error travels on untouched.
+  return null;
+}
+
+/** Write the key and the guaranteed attributes onto `target`, in place. */
+function writeStamp(target: object, idempotencyKey: string, options: StampOptions): object {
+  const record = target as Record<string, unknown>;
+  const defaults: Record<string, unknown> = {
+    requestId: null,
+    retryAfter: options.retryAfter ?? null,
+  };
+  try {
+    if (record.idempotencyKey === undefined || record.idempotencyKey === null)
+      record.idempotencyKey = idempotencyKey;
+    // A value check, not an `in` check, for all three alike: an error carrying
+    // an own `requestId: undefined` reads as the `null` the docstring promises.
+    for (const name of STAMPED_ATTRIBUTES)
+      if (record[name] === undefined) record[name] = defaults[name];
+  } catch {
+    // `Object.isExtensible` passing does not make the write safe, and this
+    // module is strict-mode ESM: an own non-writable `idempotencyKey` holding
+    // `undefined`, a getter-only accessor, or a Proxy with a throwing `set`
+    // trap each raise a `TypeError` from here — inside `stamping`'s catch,
+    // where it would REPLACE the transport failure this helper exists to
+    // preserve. The error travels on with whatever the stamp managed to write.
+  }
+  return target;
+}
+
+/**
+ * Attach `idempotencyKey` to `exc` and hand back the error to throw.
  *
  * The transport failures `comfy.models.run` / `comfy.models.submit` re-throw
  * are undici's own `TypeError` ("fetch failed") and `DOMException`
  * (`AbortError`) — throwables this SDK does not construct, so there is no
  * constructor argument to thread the key through and no subclass to catch by.
- * Stamping the own property in place is how those raw errors carry the
+ * Stamping the own property is how those raw errors carry the
  * `Idempotency-Key` all the same: on a transport failure comfy-api never
  * minted an `X-Comfy-Request-Id`, so the key is the only value that correlates
  * the failure to the server-side record. Mirrors Python's `_stamp()`.
  *
+ * Stamps IN PLACE — same object, same stack — except when the throwable is
+ * shared with other calls, which is the caller's abort reason: `fetch` rejects
+ * with `signal.reason` and `AbortSignal.any` propagates the source signal's
+ * reason object, so one `AbortController` driving N concurrent calls rejects
+ * all N with one object. That one gets a private per-call stand-in instead
+ * (see {@link replicate}), leaving `controller.signal.reason` exactly as the
+ * caller built it. Pass {@link StampOptions.callerSignal} so this is detected.
+ *
  * Never overwrites a value already set — so a {@link ComfyError} built WITH a
  * key keeps it (the field is `readonly` at the type level only; the write goes
  * through a `Record` cast deliberately, and the guard makes it a no-op there).
- * A `null` key writes nothing; a non-object or non-extensible throwable (a
- * string, a frozen object) passes through untouched. `requestId` and
- * `retryAfter` are defaulted to `null` when absent, so a stamped transport
- * error reads every attribute the way a caller who caught a ComfyError expects,
- * without clobbering a value the error already carried.
+ * A `null` key writes nothing; a non-object, a non-extensible throwable (a
+ * string, a frozen object) or one whose write raises passes through untouched.
+ * `requestId` and `retryAfter` are defaulted to `null` when absent, so a
+ * stamped transport error reads every attribute the way a caller who caught a
+ * ComfyError expects, without clobbering a value the error already carried.
  */
-export function stampIdempotencyKey<E>(exc: E, idempotencyKey: string | null): E {
-  if (
-    idempotencyKey === null ||
-    exc === null ||
-    typeof exc !== "object" ||
-    !Object.isExtensible(exc)
-  )
-    return exc;
-  const target = exc as unknown as Record<string, unknown>;
-  if (target.idempotencyKey === undefined || target.idempotencyKey === null)
-    target.idempotencyKey = idempotencyKey;
-  for (const name of STAMPED_ATTRIBUTES) if (!(name in target)) target[name] = null;
-  return exc;
+export function stampIdempotencyKey<E>(
+  exc: E,
+  idempotencyKey: string | null,
+  options: StampOptions = {},
+): E {
+  if (idempotencyKey === null || exc === null || typeof exc !== "object") return exc;
+  if (isSharedAcrossCalls(exc, idempotencyKey, options.callerSignal)) {
+    const replica = replicate(exc);
+    if (replica === null) return exc;
+    return writeStamp(replica, idempotencyKey, options) as E;
+  }
+  if (!Object.isExtensible(exc)) return exc;
+  return writeStamp(exc, idempotencyKey, options) as E;
 }
 
 /**
- * Run `fn`; anything it throws leaves stamped with `idempotencyKey`, the same
- * object with the same stack. Mirrors the second arm of Python's
+ * Run `fn`; anything it throws leaves stamped with `idempotencyKey` — the same
+ * object with the same stack, unless that object is shared with other calls
+ * (see {@link StampOptions.callerSignal}), in which case a private stand-in
+ * carries the key instead. Mirrors the second arm of Python's
  * `translating(idempotency_key=…)` — the arm that stamps a raw transport
  * failure rather than translating a protocol error.
  */
-export async function stamping<T>(idempotencyKey: string | null, fn: () => Promise<T>): Promise<T> {
+export async function stamping<T>(
+  idempotencyKey: string | null,
+  fn: () => Promise<T>,
+  options: StampOptions = {},
+): Promise<T> {
   try {
     return await fn();
   } catch (exc) {
-    throw stampIdempotencyKey(exc, idempotencyKey);
+    throw stampIdempotencyKey(exc, idempotencyKey, options);
   }
 }

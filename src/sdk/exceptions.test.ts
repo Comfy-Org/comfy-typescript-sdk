@@ -139,6 +139,141 @@ describe("stampIdempotencyKey", () => {
     expect(stampIdempotencyKey("just a string", "k-5")).toBe("just a string");
     expect(stampIdempotencyKey(null, "k-6")).toBeNull();
   });
+
+  // The shared-throwable case. `fetch` rejects with `signal.reason`, and
+  // `AbortSignal.any` propagates the SOURCE signal's reason object rather than
+  // a copy — so one `AbortController` driving N concurrent calls rejects all N
+  // with one object, and stamping it in place would hand N-1 callers a key
+  // belonging to someone else's generation.
+  it("stands in for the caller's shared abort reason instead of stamping it", () => {
+    const controller = new AbortController();
+    controller.abort();
+    const reason = controller.signal.reason as DOMException;
+
+    const first = stampIdempotencyKey(reason, "k-one", {
+      callerSignal: controller.signal,
+    }) as DOMException & Record<string, unknown>;
+    const second = stampIdempotencyKey(reason, "k-two", {
+      callerSignal: controller.signal,
+    }) as DOMException & Record<string, unknown>;
+
+    // Each call reads its OWN key, not whichever one got there first.
+    expect(first.idempotencyKey).toBe("k-one");
+    expect(second.idempotencyKey).toBe("k-two");
+    expect(first).not.toBe(reason);
+    expect(second).not.toBe(first);
+    // And the caller's own state is exactly as they built it.
+    expect((reason as unknown as Record<string, unknown>).idempotencyKey).toBeUndefined();
+  });
+
+  it("keeps the class, name, message and stack on the stand-in", () => {
+    const controller = new AbortController();
+    controller.abort();
+    const reason = controller.signal.reason as DOMException;
+
+    const standIn = stampIdempotencyKey(reason, "k-shape", {
+      callerSignal: controller.signal,
+    }) as DOMException;
+
+    // Everything a caller branches on reads identically; only identity differs.
+    // `DOMException` keeps name/message in internal slots behind prototype
+    // accessors, so this is the case a descriptor copy would silently break.
+    expect(standIn).toBeInstanceOf(DOMException);
+    expect(standIn.name).toBe("AbortError");
+    expect(standIn.message).toBe(reason.message);
+    expect(standIn.stack).toBe(reason.stack);
+  });
+
+  it("stands in for an Error already carrying a different call's key", () => {
+    // Belt and braces for a shared throwable that reaches the stamp by a route
+    // `callerSignal` does not cover.
+    const shared = new TypeError("fetch failed");
+    stampIdempotencyKey(shared, "k-first");
+
+    const standIn = stampIdempotencyKey(shared, "k-second") as TypeError & Record<string, unknown>;
+
+    expect(standIn).not.toBe(shared);
+    expect(standIn).toBeInstanceOf(TypeError);
+    expect(standIn.message).toBe("fetch failed"); // own data props survive
+    expect(standIn.idempotencyKey).toBe("k-second");
+    expect((shared as unknown as Record<string, unknown>).idempotencyKey).toBe("k-first");
+  });
+
+  it("stands in for a plain-object abort reason too", () => {
+    // `controller.abort(reason)` takes any value, and a plain object is the
+    // other thing callers routinely hand it.
+    const controller = new AbortController();
+    controller.abort({ code: "gave-up" });
+    const reason = controller.signal.reason as Record<string, unknown>;
+
+    const standIn = stampIdempotencyKey(reason, "k-plain", {
+      callerSignal: controller.signal,
+    }) as Record<string, unknown>;
+
+    expect(standIn).not.toBe(reason);
+    expect(standIn.code).toBe("gave-up");
+    expect(standIn.idempotencyKey).toBe("k-plain");
+    expect(reason.idempotencyKey).toBeUndefined();
+  });
+
+  it("leaves an exotic shared throwable untouched rather than faking a stand-in", () => {
+    // A `Map` keeps its entries in internal slots a descriptor copy cannot
+    // reach; a stand-in that reads wrong is worse than no stamp.
+    const controller = new AbortController();
+    controller.abort(new Map([["k", "v"]]));
+    const reason = controller.signal.reason as Map<string, string>;
+
+    const returned = stampIdempotencyKey(reason, "k-exotic", { callerSignal: controller.signal });
+
+    expect(returned).toBe(reason);
+    expect((reason as unknown as Record<string, unknown>).idempotencyKey).toBeUndefined();
+  });
+
+  it("passes a throwable whose key cannot be written through, rather than raising", () => {
+    // `Object.isExtensible` passing does not make the write safe: a getter-only
+    // accessor reading `undefined` slips past the value guard and then throws
+    // from the assignment in strict-mode ESM.
+    const err = new Error("boom") as Error & Record<string, unknown>;
+    Object.defineProperty(err, "idempotencyKey", { get: () => undefined, configurable: false });
+
+    expect(() => stampIdempotencyKey(err, "k-getter")).not.toThrow();
+    expect(err.idempotencyKey).toBeUndefined();
+  });
+
+  it("passes a Proxy with a throwing set trap through, rather than raising", () => {
+    const proxied = new Proxy(new Error("boom"), {
+      set() {
+        throw new TypeError("no writes here");
+      },
+    });
+
+    // The transport failure this helper exists to preserve must not be
+    // replaced by a TypeError raised from inside the stamp.
+    expect(() => stampIdempotencyKey(proxied, "k-proxy")).not.toThrow();
+    expect(stampIdempotencyKey(proxied, "k-proxy")).toBe(proxied);
+  });
+
+  it("defaults an own requestId of undefined to null, like idempotencyKey", () => {
+    // A value check, not an `in` check — the docstring promises `string | null`,
+    // never `undefined`.
+    const err = new Error("boom") as Error & Record<string, unknown>;
+    err.requestId = undefined;
+
+    stampIdempotencyKey(err, "k-uniform");
+
+    expect(err.requestId).toBeNull();
+  });
+
+  it("writes the retryAfter default it was handed", () => {
+    // The collect path passes the pace Router named on the 409/504 that started
+    // the collect, so a failure to collect hands back the pace as well as the key.
+    const err = stampIdempotencyKey(new TypeError("fetch failed"), "k-pace", {
+      retryAfter: 7,
+    }) as TypeError & Record<string, unknown>;
+
+    expect(err.retryAfter).toBe(7);
+    expect(err.idempotencyKey).toBe("k-pace");
+  });
 });
 
 describe("stamping", () => {

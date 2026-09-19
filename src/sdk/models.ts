@@ -99,6 +99,7 @@ import {
   Forbidden,
   InsufficientCredits,
   NotFound,
+  stampIdempotencyKey,
   stamping,
   Unauthorized,
 } from "./exceptions.js";
@@ -1141,7 +1142,15 @@ async function run<TData = unknown>(
   // three `ComfyError`s inside already carry the key, so the stamp is a no-op
   // on them. The pre-mint input checks above stay OUTSIDE, unstamped, as in
   // Python — there is no key to stamp before one is minted.
-  return stamping(idempotencyKey, async () => {
+  return stamping(idempotencyKey, runLoop, {
+    // The caller's own signal: `fetch` rejects with its `reason`, and that one
+    // object is shared by every concurrent call on the same `AbortController`,
+    // so the stamp must hand this call a private stand-in rather than write our
+    // key onto state the caller (and their other calls) still hold.
+    callerSignal: options.signal,
+  });
+
+  async function runLoop(): Promise<RunResult<TData>> {
     for (;;) {
       const remainingMs = clock().remainingMs;
       const signal = composeSignal(options.signal, remainingMs);
@@ -1235,7 +1244,18 @@ async function run<TData = unknown>(
         // A caller's abort is theirs: never retried, never re-dressed.
         if (options.signal?.aborted) throw exc;
         const delay = nextDelayMs();
-        if (delay === null) throw exc;
+        // Out of budget. If this call was COLLECTING, `collectingAt` holds the
+        // pace Router named on the 409/504 that started the collect, and the
+        // generation is still the server's to hand over — so the failure goes
+        // back carrying that pace, exactly as the sibling `request_timeout`
+        // branch above does. Without this the outer stamp would default
+        // `retryAfter` to `null` and tell the caller the server named no pace,
+        // when the SDK knew one.
+        if (delay === null)
+          throw stampIdempotencyKey(exc, idempotencyKey, {
+            callerSignal: options.signal,
+            retryAfter: collectingAt,
+          });
         // Abortable, so an abort during the backoff stops the loop here rather
         // than sleeping out the delay and sending one more attempt.
         await abortableSleep(delay, options.signal);
@@ -1250,7 +1270,7 @@ async function run<TData = unknown>(
       }
       return finish<TData>(model, response, responseBody, idempotencyKey);
     }
-  });
+  }
 }
 
 /** UTF-8, non-fatal, BOM-stripping — the same decode `Response.text()` does. */

@@ -993,20 +993,29 @@ export async function submit<TData = unknown>(
   // `Error` subclass with no `idempotencyKey` of its own — the key is the only
   // value that correlates either failure to the server-side record. `subscribe`
   // reaches this through its own `submit` call and inherits the stamp.
-  return stamping(idempotencyKey, async () => {
-    const response = await send({
-      method: "POST",
-      url: queueUrl(MODEL_REQUESTS_ROUTE_TEMPLATE, model, null, "submit"),
-      body: JSON.stringify(input),
-      idempotencyKey,
-      signal: options.signal,
-      budgetMs: options.timeoutMs === undefined ? DEFAULT_SUBMIT_TIMEOUT_MS : options.timeoutMs,
-      retry: options.retry ?? {},
-      what: "submit",
-    });
-    const body = decode(response, [200, 201, 202]);
-    return new RequestHandle<TData>(model, requestIdOf(body, response), options.retry ?? {});
-  });
+  return stamping(
+    idempotencyKey,
+    async () => {
+      const response = await send({
+        method: "POST",
+        url: queueUrl(MODEL_REQUESTS_ROUTE_TEMPLATE, model, null, "submit"),
+        body: JSON.stringify(input),
+        idempotencyKey,
+        signal: options.signal,
+        budgetMs: options.timeoutMs === undefined ? DEFAULT_SUBMIT_TIMEOUT_MS : options.timeoutMs,
+        retry: options.retry ?? {},
+        what: "submit",
+      });
+      const body = decode(response, [200, 201, 202]);
+      return new RequestHandle<TData>(model, requestIdOf(body, response), options.retry ?? {});
+    },
+    {
+      // See `models.run`: one `AbortController` shared across concurrent calls
+      // rejects every one of them with the SAME `signal.reason`, so the stamp
+      // gives this call a private stand-in rather than writing our key onto it.
+      callerSignal: options.signal,
+    },
+  );
 }
 
 /**
