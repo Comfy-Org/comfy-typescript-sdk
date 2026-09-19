@@ -19,6 +19,22 @@ entry. See CONTRIBUTING.md.
 
 ### Added
 
+- **The rest of a job's state is readable off the handle.** `Job` held the
+  whole v2 job model privately and re-exported four fields, so a caller who
+  wanted a run's duration had to cast past `private` to reach the timestamps.
+  Eight read-only accessors now cover the remainder of the wire contract:
+  `createdAt` and `expiresAt` (`Date`), `startedAt` and `completedAt`
+  (`Date | null` — both are nullable on the wire, and a duration is
+  `completedAt` minus `startedAt`), `progress`, `queuePosition`, `metrics` and
+  `urls`. They read whatever state the handle currently holds, exactly like
+  `id`/`status` — nothing re-fetches implicitly — and the object-valued three
+  hand back a snapshot copy so editing the result cannot rewrite the handle's
+  own links. Note that Comfy Cloud's poll response carries `progress: null`
+  even for a running job today, so `job.events()` remains the live-progress
+  source there.
+
+### Added
+
 - **Comfy Router alt-provider controls on `comfy.models.run` —
   `modelProvider`, `strictMode` and `fallbackProvider`.** Three optional
   `RunOptions` fields, sent as the `model_provider`, `strict_mode` and

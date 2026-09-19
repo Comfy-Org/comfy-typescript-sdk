@@ -296,4 +296,127 @@ describe("Job", () => {
     await expect(second).rejects.toBeTruthy();
     expect(Date.now() - start).toBeLessThan(500);
   }, 2000);
+  describe("model accessors", () => {
+    // A running job as the server reports one: started, not finished, with a
+    // live progress snapshot and a place in the queue.
+    const RUNNING = {
+      started_at: "2026-07-10T18:20:30Z",
+      completed_at: null,
+      queue_position: 3,
+      progress: { value: 0.25, nodes_done: 1, nodes_total: 4, current_node: "13" },
+    };
+
+    it("exposes created_at and expires_at as Dates, not wire strings", async () => {
+      const job = await jobs.get("job_01");
+      expect(job.createdAt).toBeInstanceOf(Date);
+      expect(job.createdAt.toISOString()).toBe("2026-07-10T18:20:00.000Z");
+      expect(job.expiresAt).toBeInstanceOf(Date);
+      expect(job.expiresAt.toISOString()).toBe("2026-07-11T18:20:00.000Z");
+    });
+
+    it("keeps the nullable timestamps null while the server reports none", async () => {
+      server.state.pollsToSucceed = 1_000_000; // stays running, never terminal
+      const job = await jobs.get("job_01");
+      expect(job.startedAt).toBeNull();
+      expect(job.completedAt).toBeNull();
+      expect(job.progress).toBeNull();
+    });
+
+    it("adopts the timestamps, progress and queue position a refresh() pulled", async () => {
+      server.state.pollsToSucceed = 1_000_000;
+      const job = await jobs.get("job_01");
+      expect(job.startedAt).toBeNull();
+      expect(job.queuePosition).toBe(0);
+
+      server.state.jobFieldOverrides = RUNNING;
+      await job.refresh();
+
+      expect(job.startedAt?.toISOString()).toBe("2026-07-10T18:20:30.000Z");
+      expect(job.completedAt).toBeNull();
+      expect(job.queuePosition).toBe(3);
+      expect(job.progress).toEqual({
+        value: 0.25,
+        nodes_done: 1,
+        nodes_total: 4,
+        current_node: "13",
+      });
+    });
+
+    it("gives a job's duration off completedAt/startedAt once it finishes", async () => {
+      server.state.jobFieldOverrides = {
+        started_at: "2026-07-10T18:20:30Z",
+        completed_at: "2026-07-10T18:21:12Z",
+      };
+      const job = await jobs.get("job_01");
+      await job.result();
+      expect(job.status).toBe("succeeded");
+      expect(job.completedAt).not.toBeNull();
+      expect(job.startedAt).not.toBeNull();
+      expect(job.completedAt!.getTime() - job.startedAt!.getTime()).toBe(42_000);
+    });
+
+    it("exposes queue_position as null when the server reports none", async () => {
+      server.state.jobFieldOverrides = { queue_position: null };
+      const job = await jobs.get("job_01");
+      expect(job.queuePosition).toBeNull();
+    });
+
+    it("passes metrics through, and reports undefined on a surface that sends none", async () => {
+      const job = await jobs.get("job_01");
+      expect(job.metrics).toEqual({ queue_ms: 9000, execution_ms: null });
+
+      // `metrics` is optional on the wire — absent, not null, is the shape a
+      // surface that measures nothing sends.
+      server.state.jobFieldOverrides = { metrics: undefined };
+      await job.refresh();
+      expect(job.metrics).toBeUndefined();
+    });
+
+    it("exposes the job's own links, including the optional logs one", async () => {
+      const job = await jobs.get("job_01");
+      expect(job.urls.self).toBe("/api/v2/jobs/job_01");
+      expect(job.urls.events).toBe("/api/v2/jobs/job_01/events");
+      expect(job.urls.cancel).toBe("/api/v2/jobs/job_01/cancel");
+      expect(job.urls.logs).toBe("/api/v2/jobs/job_01/logs");
+    });
+
+    it("adopts created_at, expires_at and the links a refresh() pulled", async () => {
+      const job = await jobs.get("job_01");
+      expect(job.createdAt.toISOString()).toBe("2026-07-10T18:20:00.000Z");
+      expect(job.urls.logs).toBe("/api/v2/jobs/job_01/logs");
+
+      // Re-queued behind a retention extension, on a surface that stopped
+      // offering a logs link — both are state the next poll carries.
+      server.state.jobFieldOverrides = {
+        created_at: "2026-07-10T19:00:00Z",
+        expires_at: "2026-07-12T19:00:00Z",
+      };
+      server.state.jobUrlsIncludeLogs = false;
+      await job.refresh();
+
+      expect(job.createdAt.toISOString()).toBe("2026-07-10T19:00:00.000Z");
+      expect(job.expiresAt.toISOString()).toBe("2026-07-12T19:00:00.000Z");
+      expect(job.urls.logs).toBeUndefined();
+    });
+
+    it("hands back snapshots, so editing what an accessor returned cannot rewrite the handle", async () => {
+      server.state.jobFieldOverrides = RUNNING;
+      const job = await jobs.get("job_01");
+
+      job.urls.self = "http://example.invalid/hijacked";
+      job.urls.logs = undefined;
+      job.progress!.value = 1;
+      job.metrics!.queue_ms = -1;
+
+      expect(job.urls.self).toBe("/api/v2/jobs/job_01");
+      expect(job.urls.logs).toBe("/api/v2/jobs/job_01/logs");
+      expect(job.progress?.value).toBe(0.25);
+      expect(job.metrics?.queue_ms).toBe(9000);
+
+      // The links the handle itself follows are the untouched ones.
+      const before = server.state.jobPollCount;
+      await job.refresh();
+      expect(server.state.jobPollCount).toBe(before + 1);
+    });
+  });
 });

@@ -35,6 +35,11 @@ const DEFAULT_429_RECONNECT_PAUSE_MS = 2_000;
 // otherwise stall reconnection indefinitely.
 const MAX_RECONNECT_PAUSE_MS = 60_000;
 
+/** A nullable wire timestamp as a `Date`, keeping `null` as `null`. */
+function toDate(value: string | null): Date | null {
+  return value === null ? null : new Date(value);
+}
+
 /**
  * A handle to one submitted job — rehydratable from its ID alone via
  * `client.jobs.get(id)`.
@@ -42,7 +47,10 @@ const MAX_RECONNECT_PAUSE_MS = 60_000;
  * Every accessor reads the state currently on the handle; nothing re-fetches
  * implicitly. {@link Job.wait} or {@link Job.result} advances it to a
  * terminal state, {@link Job.refresh} pulls fresh state once, and
- * {@link Job.events} streams live progress.
+ * {@link Job.events} streams live progress. The object-valued accessors
+ * ({@link Job.progress}, {@link Job.metrics}, {@link Job.urls}) hand back a
+ * snapshot copy, so editing what you get back cannot rewrite the handle's own
+ * state — notably the links it polls and cancels through.
  */
 export class Job {
   private readonly low: ComfyLow;
@@ -71,6 +79,64 @@ export class Job {
   /** Failure detail when the job ended `failed`, otherwise `null`. */
   get error(): LowJob["error"] {
     return this.model.error;
+  }
+
+  /** When the server accepted this job. Set for every job, from submit onwards. */
+  get createdAt(): Date {
+    return new Date(this.model.created_at);
+  }
+
+  /** When the job started executing, or `null` while it is still queued. */
+  get startedAt(): Date | null {
+    return toDate(this.model.started_at);
+  }
+
+  /**
+   * When the job reached a terminal state, or `null` before it did.
+   *
+   * With {@link Job.startedAt} this is how long the run took:
+   * `job.completedAt.getTime() - job.startedAt.getTime()`.
+   */
+  get completedAt(): Date | null {
+    return toDate(this.model.completed_at);
+  }
+
+  /** Retention deadline — after this the job and its outputs are gone. A platform property, not an API constant. */
+  get expiresAt(): Date {
+    return new Date(this.model.expires_at);
+  }
+
+  /**
+   * Latest progress snapshot the handle holds, or `null` when the state it
+   * holds carries none.
+   *
+   * A snapshot is complete in itself — one fully re-syncs a consumer. The
+   * contract says a poll returns the latest one, but Comfy Cloud has been
+   * reported to send `null` here even for a running job, so `null` means
+   * "this state carries no snapshot" rather than "not running" — take live
+   * progress from {@link Job.events}.
+   *
+   * This is the generated wire model (`Progress` from `@comfyorg/sdk/low`,
+   * snake_case), NOT the camelCase `Progress` event of the same name that
+   * {@link Job.events} yields.
+   */
+  get progress(): LowJob["progress"] {
+    return this.model.progress === null ? null : { ...this.model.progress };
+  }
+
+  /** Place in the queue as of the state this handle holds, or `null` when the server reports none. */
+  get queuePosition(): number | null {
+    return this.model.queue_position;
+  }
+
+  /** Per-run measurements keyed by name (e.g. `queue_ms`, `execution_ms`), or `undefined` on a surface that reports none. A value is `null` until that metric is available. */
+  get metrics(): LowJob["metrics"] {
+    return this.model.metrics === undefined ? undefined : { ...this.model.metrics };
+  }
+
+  /** The job's own links — `self`, `events`, `cancel`, and `logs` on a surface that captures logs. Follow these rather than building paths from {@link Job.id}. */
+  get urls(): LowJob["urls"] {
+    return { ...this.model.urls };
   }
 
   /**
