@@ -145,7 +145,55 @@ export async function readRouterRouteContract(specPath = ROUTER_SPEC_PATH) {
     serverUrl,
     parameterNames: pathParameterNames(doc, pathItem, pathItem.post),
     retryAfterStatuses: retryAfterStatuses(doc, pathItem),
+    runSuccessHeaders: runSuccessHeaders(doc, pathItem),
   };
+}
+
+/**
+ * The headers the run route's `200` declares, as
+ * `{ <header name>: <component name the $ref points at>, required }`.
+ *
+ * The acquisition half of the `IDEMPOTENT_REPLAYED_HEADER` pin in
+ * `src/sdk/router-spec-contract.test.ts`. Three things are wanted there and
+ * the raw name alone gives none of them: the SPELLING the SDK reads a header
+ * by (a name wrong by one segment reports "absent" forever, which is a silent
+ * failure rather than a loud one), the COMPONENT it resolves to (so a sync
+ * that repoints the name at some other header's definition is visible), and
+ * `required` (the presence semantics `parseReplayed` encodes — a header
+ * declared `required: true` could not be read as a marker by its arrival).
+ *
+ * The `$ref` is read UNRESOLVED on purpose: resolving it yields the
+ * description and schema, which is exactly what a repointed `$ref` would
+ * change without changing anything comparable. `required` is read resolved,
+ * because that is where it is written.
+ */
+export function runSuccessHeaders(doc, pathItem) {
+  const responses = deref(doc, pathItem.post.responses ?? {});
+  const ok = deref(doc, responses["200"] ?? {});
+  if (ok === null || typeof ok !== "object") {
+    fail(`spec/router-openapi.yaml: ${RUN_OPERATION_ID} declares no \`200\` response`);
+  }
+  const headers = ok.headers ?? {};
+  if (headers === null || typeof headers !== "object" || Object.keys(headers).length === 0) {
+    fail(
+      `spec/router-openapi.yaml: ${RUN_OPERATION_ID}'s \`200\` declares no response headers. ` +
+        "An empty set would read as agreement with any constant.",
+    );
+  }
+  const byName = {};
+  for (const [name, raw] of Object.entries(headers)) {
+    const ref = raw !== null && typeof raw === "object" ? raw.$ref : undefined;
+    const component =
+      typeof ref === "string" && ref.startsWith("#/components/headers/")
+        ? ref.slice("#/components/headers/".length)
+        : null;
+    const resolved = deref(doc, raw);
+    if (resolved === null || typeof resolved !== "object") {
+      fail(`spec/router-openapi.yaml: malformed response header ${JSON.stringify(name)}`);
+    }
+    byName[name] = { component, required: resolved.required === true };
+  }
+  return byName;
 }
 
 /**

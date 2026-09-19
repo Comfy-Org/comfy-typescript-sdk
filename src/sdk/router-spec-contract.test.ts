@@ -47,6 +47,7 @@ import { comfy } from "./comfy.js";
 import { COMFY_ROUTER_BASE_URL, config } from "./credentials.js";
 import {
   CATALOG_ROUTE_TEMPLATE,
+  IDEMPOTENT_REPLAYED_HEADER,
   models,
   RUN_ROUTE_TEMPLATE,
   SCHEMA_ROUTE_TEMPLATE,
@@ -67,6 +68,35 @@ describe("router route contract (spec/router-openapi.yaml)", () => {
       "the vendored Router contract moved the runRouterModel path — update RUN_ROUTE_TEMPLATE " +
         "in src/sdk/models.ts to match it (comfy.models.run 404s until you do)",
     ).toBe(RUN_ROUTE_TEMPLATE);
+  });
+
+  it("spells IDEMPOTENT_REPLAYED_HEADER the replay marker the contract declares", async () => {
+    // The same pinning the route templates get, for the one header whose
+    // drift is SILENT in both directions. `parseReplayed` reads this header by
+    // its PRESENCE, so a constant wrong by one character reports
+    // `replayed: false` on every replay forever — indistinguishable from the
+    // fresh run the field is there to tell a replay apart from — and a
+    // contract that made the header `required: true` would mean its arrival no
+    // longer marks anything, which is the other half of the same assumption.
+    const { runSuccessHeaders } = await readRouterRouteContract();
+    const declared = runSuccessHeaders[IDEMPOTENT_REPLAYED_HEADER];
+    expect(
+      declared,
+      `the vendored Router contract's runRouterModel 200 no longer declares a ` +
+        `\`${IDEMPOTENT_REPLAYED_HEADER}\` header — update IDEMPOTENT_REPLAYED_HEADER in ` +
+        "src/sdk/models.ts to whatever it declares instead (every run reports replayed: false " +
+        "until you do, which reads as a fresh charge on a call that was not charged)",
+    ).toBeDefined();
+    expect(
+      declared?.component,
+      `${IDEMPOTENT_REPLAYED_HEADER} now resolves to a different header component`,
+    ).toBe("RouterIdempotentReplayedHeader");
+    expect(
+      declared?.required,
+      "the contract now declares the replay marker `required` — it would then be sent on a " +
+        "fresh run too, and parseReplayed in src/sdk/models.ts must stop reading it as a " +
+        "presence flag and read its VALUE instead",
+    ).toBe(false);
   });
 
   it("spells COMFY_ROUTER_BASE_URL the host the contract declares", async () => {

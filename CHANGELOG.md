@@ -30,6 +30,17 @@ entry. See CONTRIBUTING.md.
   set, so a run that names none of the three is byte-for-byte the request it
   always was. These are run-route only — the queued `submit`/`subscribe`
   surface does not accept them.
+- **`RunJsonResult.replayed` / `RunBinaryResult.replayed`** — `true` when
+  Router served the call from its `Idempotency-Key` record (`Idempotent-Replayed`)
+  rather than by running the model again, so a replayed result can be told from
+  a fresh charge: a replay restates the original run and is not billed a second
+  time, so a spend tracker must skip it rather than add it up again. Derived
+  from the header's PRESENCE, because Router omits it on a fresh run rather
+  than sending `false`. It happens on this SDK's own collect loop (the same-key
+  re-send after a paced `409`/`504`) and on a caller's own retry under a
+  supplied `idempotencyKey`. Always `false` from `RequestHandle.get()` — the
+  queued result route carries no replay marker — so deduplicate re-collection
+  by `RequestHandle.requestId` instead.
 - **Three queue-tier `routerErrors` classes — `Cancelled`, `QueueTimeout`
   and `RequestNotFound`** — for the `cancelled`, `queue_timeout` and
   `request_not_found` buckets the vendored Router contract now declares, so a
