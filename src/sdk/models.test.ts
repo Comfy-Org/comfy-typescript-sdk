@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { attachedDispatcher } from "../../test/support/dispatchers.js";
 import { RouterStubServer, withRouterStub } from "../../test/support/router-stub-server.js";
+import { parseDroppedParams } from "./models.js";
 import {
   comfy,
   ComfyError,
@@ -104,7 +105,15 @@ describe("comfy.models.run on success", () => {
 
       const result = await comfy.models.run(MODEL, { prompt: "a cat" });
 
-      expect(result).toEqual({ kind: "json", data: payload, requestId: "req-abc-123" });
+      expect(result).toEqual({
+        kind: "json",
+        data: payload,
+        requestId: "req-abc-123",
+        // A run that named no alt-provider control discloses nothing about one:
+        // `null` here is "the provider asked for served it", not "unknown".
+        servingProvider: null,
+        droppedParams: null,
+      });
     });
   });
 
@@ -129,6 +138,35 @@ describe("comfy.models.run on success", () => {
       await comfy.models.run(MODEL, {});
       expect(server.state.lastMethod).toBe("POST");
       expect(server.state.lastPath).toBe("/v2/models/bfl/flux-2-pro");
+    });
+  });
+
+  it("appends no query for the alt-provider controls unless the caller set one", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      await comfy.models.run(MODEL, { prompt: "a cat" });
+      // Byte-for-byte the path this route has always used — no trailing `?`.
+      expect(server.state.lastPath).toBe("/v2/models/bfl/flux-2-pro");
+    });
+  });
+
+  it("sends the alt-provider controls as query params, in a fixed order, only when set", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      await comfy.models.run(MODEL, { prompt: "a cat" }, { modelProvider: "fal" });
+      expect(server.state.lastPath).toBe("/v2/models/bfl/flux-2-pro?model_provider=fal");
+
+      await comfy.models.run(MODEL, { prompt: "a cat" }, { strictMode: true });
+      expect(server.state.lastPath).toBe("/v2/models/bfl/flux-2-pro?strict_mode=true");
+
+      await comfy.models.run(
+        MODEL,
+        { prompt: "a cat" },
+        { modelProvider: "fal", strictMode: false, fallbackProvider: "false" },
+      );
+      expect(server.state.lastPath).toBe(
+        "/v2/models/bfl/flux-2-pro?model_provider=fal&strict_mode=false&fallback_provider=false",
+      );
     });
   });
 
@@ -668,6 +706,8 @@ describe("comfy.models.run on a binary result", () => {
         kind: "json",
         data: { audio_url: "https://example.invalid/out.mp3" },
         requestId: "6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21",
+        servingProvider: null,
+        droppedParams: null,
       });
     });
   });
@@ -1761,5 +1801,34 @@ describe("comfy.models.run argument validation", () => {
       ).rejects.toBeInstanceOf(TypeError);
     }
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("parseDroppedParams", () => {
+  it("reads the header as JSON, because a comma split would shred its own example", () => {
+    // The spec describes this header as "a JSON array of strings" while
+    // declaring `schema: {type: array}` — OpenAPI's comma-delimited form. Its
+    // own example entry settles which is right: it CONTAINS a comma, so the
+    // comma-delimited reading tears one meaningful disclosure into two
+    // meaningless fragments.
+    const entry = "moderation (fal applies its own, non-configurable safety filtering)";
+    expect(parseDroppedParams(JSON.stringify([entry]))).toEqual([entry]);
+    expect(parseDroppedParams(JSON.stringify([]))).toEqual([]);
+  });
+
+  it("distinguishes an absent header from an empty disclosure", () => {
+    // `null` is "no translation ran, or it dropped nothing"; `[]` is a server
+    // that said so explicitly. Collapsing them would lose the difference.
+    expect(parseDroppedParams(null)).toBeNull();
+    expect(parseDroppedParams(JSON.stringify([]))).toEqual([]);
+  });
+
+  it("keeps a non-JSON value whole rather than guessing at delimiters", () => {
+    // One intact entry a human can read beats two confident fragments.
+    expect(parseDroppedParams("not json")).toEqual(["not json"]);
+    expect(parseDroppedParams("a, b")).toEqual(["a, b"]);
+    // JSON that is not an array of strings is not a disclosure list either.
+    expect(parseDroppedParams(JSON.stringify({ a: 1 }))).toEqual(['{"a":1}']);
+    expect(parseDroppedParams(JSON.stringify([1, 2]))).toEqual(["[1,2]"]);
   });
 });

@@ -34,16 +34,12 @@
  * one-way vendored copy, and the SDK is the side that follows.
  */
 
-import { readFile } from "node:fs/promises";
-
 import { describe, expect, it } from "vitest";
-import { parse } from "yaml";
 
 import {
   readRouterOperations,
   readRouterRouteContract,
   routerOperations,
-  ROUTER_SPEC_PATH,
   templatePlaceholders,
 } from "../../scripts/router-route-contract.mjs";
 import { withRouterStub } from "../../test/support/router-stub-server.js";
@@ -192,6 +188,30 @@ const ROUTE_COVERAGE: Record<string, { method: keyof typeof models | null; why: 
       "`run()` and `schema()` take. Exposing it is additive and unblocked; it is left out here " +
       "only because nothing has asked for it yet.",
   },
+  submitRouterModelRequest: {
+    method: "submit",
+    why: "the queued submission route — `comfy.models.submit` posts a request to it.",
+  },
+  getRouterModelRequestResult: {
+    method: "handle",
+    why:
+      "the queued request's RESULT route, collected through the RequestHandle that " +
+      "`comfy.models.submit`/`handle` return (`RequestHandle.get`), and by `subscribe`. It maps " +
+      "to `handle` because that is the `comfy.models` method whose returned object addresses it.",
+  },
+  getRouterModelRequestStatus: {
+    method: "handle",
+    why:
+      "the queued request's STATUS route, polled through the RequestHandle from " +
+      "`comfy.models.submit`/`handle` (`RequestHandle.status`/`events`) and driven by `subscribe`.",
+  },
+  cancelRouterModelRequest: {
+    method: "handle",
+    why:
+      "the queued request's CANCEL route (`RequestHandle.cancel`, and the best-effort cancel " +
+      "`subscribe` issues on timeout), reached through the handle `comfy.models.submit`/`handle` " +
+      "return.",
+  },
 };
 
 describe("router route coverage (spec/router-openapi.yaml)", () => {
@@ -304,25 +324,63 @@ describe("the operation extractor the coverage check reads through", () => {
 });
 
 /**
- * The four QUEUE routes (`comfy.models.submit` and the handle it returns) are
- * not in the vendored contract yet — the operations are authored upstream but
- * held, and the one-way sync strips a held operation. So there is nothing in
- * `spec/router-openapi.yaml` to compare them against, and the pin has to be a
- * RELATION instead: each one is the run route plus a fixed suffix under a
- * `requests` collection, which is how the Python SDK binds the same four.
+ * The four QUEUE routes (`comfy.models.submit` and the handle it returns), now
+ * that the vendored contract DECLARES them.
  *
- * That relation is worth pinning even without a spec, because it is what makes
- * a sync that moves the RUN route move these too — the failure mode it closes
- * is the run route being updated and the queue routes silently left behind,
- * 404ing every `submit` while `run` works.
- *
- * The last test here is the rot guard: it fails the day the vendored contract
- * DOES declare the collection, which is the signal to replace this whole block
- * with a comparison against the spec — the same shape the run route already
- * gets above.
+ * They used to be held out of the one-way sync, so this block pinned them by a
+ * RELATION to the run route (each is that route plus a fixed suffix under a
+ * `requests` collection) and carried a rot guard that fired the day the
+ * collection arrived in `spec/router-openapi.yaml`. It has arrived — the four
+ * `*RouterModelRequest*` operations are in the contract — so the pin is now a
+ * comparison against the spec, the same shape the run route gets above: a sync
+ * that moves any of the four reddens here rather than 404ing `submit` at
+ * runtime. The relation is kept as a second, cheaper assertion because it is
+ * still true and still documents the collection's shape.
  */
-describe("queued model-request routes (not yet in spec/router-openapi.yaml)", () => {
-  it("extends the run route with a `requests` collection", () => {
+describe("queued model-request routes (spec/router-openapi.yaml)", () => {
+  it("spells each queue constant the path the contract declares for its operation", async () => {
+    const byId = new Map(
+      (await readRouterOperations()).map((operation) => [operation.operationId, operation]),
+    );
+    const pins: [string, string, string, string][] = [
+      // [operationId, HTTP method, the constant's value, its name]
+      [
+        "submitRouterModelRequest",
+        "post",
+        MODEL_REQUESTS_ROUTE_TEMPLATE,
+        "MODEL_REQUESTS_ROUTE_TEMPLATE",
+      ],
+      [
+        "getRouterModelRequestResult",
+        "get",
+        MODEL_REQUEST_ROUTE_TEMPLATE,
+        "MODEL_REQUEST_ROUTE_TEMPLATE",
+      ],
+      [
+        "getRouterModelRequestStatus",
+        "get",
+        MODEL_REQUEST_STATUS_ROUTE_TEMPLATE,
+        "MODEL_REQUEST_STATUS_ROUTE_TEMPLATE",
+      ],
+      [
+        "cancelRouterModelRequest",
+        "put",
+        MODEL_REQUEST_CANCEL_ROUTE_TEMPLATE,
+        "MODEL_REQUEST_CANCEL_ROUTE_TEMPLATE",
+      ],
+    ];
+    for (const [operationId, method, constant, name] of pins) {
+      const declared = byId.get(operationId);
+      expect(declared, `spec/router-openapi.yaml no longer declares ${operationId}`).toBeDefined();
+      expect(
+        declared?.path,
+        `the vendored contract moved ${operationId} — update ${name} in src/sdk/modelRequests.ts`,
+      ).toBe(constant);
+      expect(declared?.method, `${operationId} changed HTTP method`).toBe(method);
+    }
+  });
+
+  it("still extends the run route with a `requests` collection", () => {
     expect(MODEL_REQUESTS_ROUTE_TEMPLATE).toBe(`${RUN_ROUTE_TEMPLATE}/requests`);
     expect(MODEL_REQUEST_ROUTE_TEMPLATE).toBe(`${MODEL_REQUESTS_ROUTE_TEMPLATE}/{request_id}`);
     expect(MODEL_REQUEST_STATUS_ROUTE_TEMPLATE).toBe(`${MODEL_REQUEST_ROUTE_TEMPLATE}/status`);
@@ -342,27 +400,5 @@ describe("queued model-request routes (not yet in spec/router-openapi.yaml)", ()
     ]) {
       expect(templatePlaceholders(template)).toEqual([...parameterNames, "request_id"]);
     }
-  });
-
-  it("still has nothing in the vendored contract to be pinned against", async () => {
-    // The rot guard. When this fails, the queue operations have arrived in the
-    // vendored spec: read their paths out of it the way `readRouterRouteContract`
-    // reads `runRouterModel`'s, and compare the four constants against THOSE
-    // instead of against the relation above.
-    // Narrowed at runtime rather than asserted: `src/**` forbids unsafe type
-    // assertions, and a spec that parsed to something other than a mapping
-    // would otherwise reach `Object.keys` as a lie about its own shape.
-    const doc: unknown = parse(await readFile(ROUTER_SPEC_PATH, "utf-8"));
-    const paths = typeof doc === "object" && doc !== null && "paths" in doc ? doc.paths : undefined;
-    const queuePaths =
-      typeof paths === "object" && paths !== null
-        ? Object.keys(paths).filter((path) => path.includes("/requests"))
-        : [];
-    expect(
-      queuePaths,
-      "spec/router-openapi.yaml now declares the queued model-request routes — pin the four " +
-        "MODEL_REQUEST* constants in src/sdk/modelRequests.ts against the spec and delete the " +
-        "relation assertions in this block",
-    ).toEqual([]);
   });
 });

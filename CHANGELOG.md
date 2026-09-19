@@ -17,6 +17,25 @@ Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
 entry. See CONTRIBUTING.md.
 -->
 
+### Added
+
+- **Comfy Router alt-provider controls on `comfy.models.run` —
+  `modelProvider`, `strictMode` and `fallbackProvider`.** Three optional
+  `RunOptions` fields, sent as the `model_provider`, `strict_mode` and
+  `fallback_provider` query params on the synchronous run route.
+  `modelProvider` selects an alternate serving provider (e.g. `"fal"`);
+  `strictMode` (default `false`) toggles native ↔ provider translation, and
+  `true` passes the provider's own raw shape both ways; `fallbackProvider`
+  accepts `"false"` to opt out of provider-fallback. Each is sent ONLY when
+  set, so a run that names none of the three is byte-for-byte the request it
+  always was. These are run-route only — the queued `submit`/`subscribe`
+  surface does not accept them.
+- **Three queue-tier `routerErrors` classes — `Cancelled`, `QueueTimeout`
+  and `RequestNotFound`** — for the `cancelled`, `queue_timeout` and
+  `request_not_found` buckets the vendored Router contract now declares, so a
+  queued failure carrying one of them is a typed `catch` rather than a bare
+  `RouterError`.
+
 ### Fixed
 
 - **`idempotencyKey` is now stamped onto _every_ error `comfy.models.run` and `comfy.models.submit` throw, including raw transport failures and aborts.** Previously only the `run` response-path `ComfyError` carried it; undici's transport-failure `TypeError` ("fetch failed"), an already-aborted signal's `AbortError`, and the queue path's `RouterError` (e.g. a bare `502` `ProviderError`) all escaped without it. On a transport failure the server never minted an `X-Comfy-Request-Id`, so the key is the only value that correlates the failure to the server-side record. It is now attached as an own `idempotencyKey` property on the raw throwable (its identity, message and stack are otherwise untouched), and `routerErrors.RouterError` gained a typed `idempotencyKey` field. Mirrors the Python SDK's `exceptions.translating(idempotency_key=…)`.
