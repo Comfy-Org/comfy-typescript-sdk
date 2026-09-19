@@ -12,12 +12,34 @@
  * async class since JS is async-native (no separate sync variant).
  */
 
-import { basename, extname } from "node:path";
-
 import type { Asset as LowAsset, ComfyLow } from "../low/index.js";
 import { ASSET_HANDLE, assetReference, newIdempotencyKey } from "./core.js";
 import { translate } from "./exceptions.js";
 import { hashBytes, hashFile } from "./hashing.js";
+
+// `node:path` equivalents, inlined so this module carries no Node built-in
+// import and stays loadable in a browser.
+//
+// `node:path` dispatches on the platform: `path.win32` treats `\` as a
+// separator, `path.posix` treats it as an ordinary filename character. We
+// match that, so a POSIX file genuinely named `a\b.txt` keeps its backslash
+// as it always has. A browser has no filesystem paths — `File.name` carries
+// no separator and a URL pathname uses `/` — so it takes the POSIX rules.
+const WINDOWS = typeof process !== "undefined" && process.platform === "win32";
+
+function basename(p: string): string {
+  const trimmed = WINDOWS ? p.replace(/[/\\]+$/, "") : p.replace(/\/+$/, "");
+  const cut = WINDOWS
+    ? Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"))
+    : trimmed.lastIndexOf("/");
+  return cut === -1 ? trimmed : trimmed.slice(cut + 1);
+}
+
+function extname(p: string): string {
+  const base = basename(p);
+  const dot = base.lastIndexOf(".");
+  return dot <= 0 ? "" : base.slice(dot);
+}
 
 const DEFAULT_CONTENT_TYPE = "application/octet-stream";
 
