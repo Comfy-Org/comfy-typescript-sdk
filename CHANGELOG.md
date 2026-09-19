@@ -36,6 +36,10 @@ entry. See CONTRIBUTING.md.
   queued failure carrying one of them is a typed `catch` rather than a bare
   `RouterError`.
 
+### Fixed
+
+- **`idempotencyKey` is now stamped onto _every_ error `comfy.models.run` and `comfy.models.submit` throw, including raw transport failures and aborts.** Previously only the `run` response-path `ComfyError` carried it; undici's transport-failure `TypeError` ("fetch failed"), an already-aborted signal's `AbortError`, and the queue path's `RouterError` (e.g. a bare `502` `ProviderError`) all escaped without it. On a transport failure the server never minted an `X-Comfy-Request-Id`, so the key is the only value that correlates the failure to the server-side record. It is now attached as an own `idempotencyKey` property on the raw throwable (its class, `name`, message and stack are otherwise untouched), and `routerErrors.RouterError` gained a typed `idempotencyKey` field. A failure to collect a generation additionally carries the `Retry-After` pace Router named, rather than reporting none. Where the throwable is one the caller owns and other calls share — an `AbortController`'s `signal.reason`, which `fetch` hands to every concurrent call on that controller — each call receives an equivalent per-call error carrying ITS OWN key instead, so no caller reads a key belonging to another generation and `controller.signal.reason` is left unmodified. Mirrors the Python SDK's `exceptions.translating(idempotency_key=…)`.
+
 ## [0.3.0] - 2026-09-14
 
 ### Added

@@ -63,7 +63,7 @@ import { buildUserAgent } from "../low/index.js";
 import { abortableSleep } from "./abortable-sleep.js";
 import { backoffSchedule, newIdempotencyKey } from "./core.js";
 import { requireCredentials, resolveBaseUrl } from "./credentials.js";
-import { ComfyError } from "./exceptions.js";
+import { ComfyError, stamping } from "./exceptions.js";
 import { fillRoute, parseModelId, parseRequestId } from "./modelRoutes.js";
 import {
   DROPPED_PARAMS_HEADER,
@@ -596,7 +596,7 @@ async function send(call: QueueCall): Promise<QueueResponse> {
       if (isTimeout(exc, call.signal)) {
         throw new ComfyError(
           `the model queue's ${call.what} call exceeded the deadline left for it`,
-          { code: "request_timeout", cause: exc },
+          { code: "request_timeout", cause: exc, idempotencyKey: call.idempotencyKey ?? null },
         );
       }
       const delay = nextAttemptDelayMs(attempt, retry, clock());
@@ -987,18 +987,35 @@ export async function submit<TData = unknown>(
   // response replays the original acceptance rather than queueing — and
   // billing — a second generation. A fresh `submit` mints a fresh key.
   const idempotencyKey = options.idempotencyKey ?? newIdempotencyKey();
-  const response = await send({
-    method: "POST",
-    url: queueUrl(MODEL_REQUESTS_ROUTE_TEMPLATE, model, null, "submit"),
-    body: JSON.stringify(input),
+  // Everything from here leaves stamped with the key: `send`'s raw transport
+  // re-throw carries no request id (comfy-api never minted one for a call that
+  // never landed), and the `RouterError` `decode` raises on a non-2xx is a bare
+  // `Error` subclass with no `idempotencyKey` of its own — the key is the only
+  // value that correlates either failure to the server-side record. `subscribe`
+  // reaches this through its own `submit` call and inherits the stamp.
+  return stamping(
     idempotencyKey,
-    signal: options.signal,
-    budgetMs: options.timeoutMs === undefined ? DEFAULT_SUBMIT_TIMEOUT_MS : options.timeoutMs,
-    retry: options.retry ?? {},
-    what: "submit",
-  });
-  const body = decode(response, [200, 201, 202]);
-  return new RequestHandle<TData>(model, requestIdOf(body, response), options.retry ?? {});
+    async () => {
+      const response = await send({
+        method: "POST",
+        url: queueUrl(MODEL_REQUESTS_ROUTE_TEMPLATE, model, null, "submit"),
+        body: JSON.stringify(input),
+        idempotencyKey,
+        signal: options.signal,
+        budgetMs: options.timeoutMs === undefined ? DEFAULT_SUBMIT_TIMEOUT_MS : options.timeoutMs,
+        retry: options.retry ?? {},
+        what: "submit",
+      });
+      const body = decode(response, [200, 201, 202]);
+      return new RequestHandle<TData>(model, requestIdOf(body, response), options.retry ?? {});
+    },
+    {
+      // See `models.run`: one `AbortController` shared across concurrent calls
+      // rejects every one of them with the SAME `signal.reason`, so the stamp
+      // gives this call a private stand-in rather than writing our key onto it.
+      callerSignal: options.signal,
+    },
+  );
 }
 
 /**

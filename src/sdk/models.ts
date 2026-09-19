@@ -99,6 +99,8 @@ import {
   Forbidden,
   InsufficientCredits,
   NotFound,
+  stampIdempotencyKey,
+  stamping,
   Unauthorized,
 } from "./exceptions.js";
 import {
@@ -1133,113 +1135,141 @@ async function run<TData = unknown>(
     if (collectingAt === null) retryAttempt += 1;
     else collectAttempt += 1;
   };
-  for (;;) {
-    const remainingMs = clock().remainingMs;
-    const signal = composeSignal(options.signal, remainingMs);
-    let response: Response;
-    let responseBody: Uint8Array = EMPTY_BODY;
-    // Non-null once this response has been classified as one to ask again
-    // about, and is then the backoff before that re-ask.
-    let repeatAfterMs: number | null = null;
-    try {
-      // `withInactivityLimits` derives undici's own headers/body timers from
-      // the same remaining budget as `signal`. Without it this call is capped
-      // at undici's 300s default however long the deadline says, which is
-      // fatal here specifically: the server holds this one request open for
-      // the whole generation, so nothing arrives on it — not even response
-      // headers — until the model has finished.
-      response = await fetch(
-        url,
-        withInactivityLimits({ method: "POST", headers, body, signal }, remainingMs),
-      );
+  // Everything the loop can throw leaves stamped with the key: the raw
+  // `TypeError`/`DOMException` a transport failure or a caller's abort
+  // re-throws below carries no other handle back to the server-side record,
+  // and comfy-api never minted a request id for a call that never landed. The
+  // three `ComfyError`s inside already carry the key, so the stamp is a no-op
+  // on them. The pre-mint input checks above stay OUTSIDE, unstamped, as in
+  // Python — there is no key to stamp before one is minted.
+  return stamping(idempotencyKey, runLoop, {
+    // The caller's own signal: `fetch` rejects with its `reason`, and that one
+    // object is shared by every concurrent call on the same `AbortController`,
+    // so the stamp must hand this call a private stand-in rather than write our
+    // key onto state the caller (and their other calls) still hold.
+    callerSignal: options.signal,
+  });
 
-      const errorType = response.headers.get(ERROR_TYPE_HEADER);
-      const retryAfter = parseRetryAfter(response.headers);
-
-      // Classified from the status line and the headers, BEFORE the body is
-      // touched. What a response means is not something its body decides
-      // here, and deciding it first is what keeps the cap from overruling it:
-      // a retryable 502 behind an oversized CDN error page stays retryable,
-      // and a collectable 409/504 stays collectable, instead of a cap breach
-      // turning either into a fatal error with the budget unspent and a
-      // generation still running.
-      //
-      // Collect first, and EXCLUSIVELY: a `deadline_exceeded` 504 is a 5xx
-      // too, so both branches would take it — but they are different actions
-      // on different budgets, and the server's own verdict about what it is
-      // holding wins over this module's guess. Which also means a collect
-      // that runs out of `collectBudgetMs` raises rather than falling back
-      // into the ordinary backoff: the class is decided per failure, not
-      // retried in both. `retryAfter !== null` is redundant with
-      // `isCollectable`, which refuses a missing pace — it is written out so
-      // the call below needs no cast.
-      if (retryAfter !== null && isCollectable(response.status, errorType, retryAfter)) {
-        collectingAt = retryAfter;
-        // `null` here means out of collect budget (or past the deadline) —
-        // fall through to the 409/504 the server last gave, which carries its
-        // own `Retry-After` for a caller who wants to re-ask by hand.
-        repeatAfterMs = nextDelayMs();
-      } else if (isRetryableStatus(response.status, errorType)) {
-        // Mid-collect this is still a collect: the 5xx is the re-ask failing
-        // to land, not a verdict on the generation, so it is paced and
-        // budgeted as one (`nextDelayMs` reads `collectingAt`). `null` is out
-        // of budget — fall through and raise the last failure the server
-        // actually gave, rather than a synthetic "retries exhausted".
-        repeatAfterMs = nextDelayMs();
-      }
-
-      if (repeatAfterMs === null) {
-        // Inside the same `try` as the fetch on purpose: the deadline covers
-        // body consumption too, so a signal that fires while the result is
-        // still streaming rejects HERE, and translating it in only one of the
-        // two places would leak a bare DOMException out of the other.
-        //
-        // Bytes rather than `response.text()`, because this route's 200 is not
-        // always a text document: a partner whose generation IS the response
-        // body answers with its own media type, and `text()` would UTF-8-decode
-        // those bytes lossily and irreversibly before anything got to look at
-        // the `Content-Type`. Decoding is deferred to the one branch that wants
-        // a string ({@link decodeUtf8}), which is what `text()` would have done
-        // anyway.
-        responseBody = await readBodyWithin(response, maxBytes, model, idempotencyKey);
-      } else {
-        // Never read: the whole content of a response this call is going to
-        // ask again about is "ask again", which the status line already said.
-        // Dropping it spends neither the download nor the cap on it.
-        await response.body?.cancel().catch(() => undefined);
-      }
-    } catch (exc) {
-      // A body this call would not buffer leaves the loop immediately. It is a
-      // verdict about THIS response, not a transport failure, and the retry
-      // loop sitting around the read is exactly what would make it expensive:
-      // every attempt would re-download the same oversized body until the
-      // budget expired, multiplying the cost of the one thing that already
-      // failed.
-      if (isTooLarge(exc)) throw exc;
-      if (isTimeout(exc, options.signal)) {
-        throw new ComfyError(
-          `models.run("${model}") exceeded its ${String(timeoutMs)}ms deadline before the model finished; ` +
-            "raise it with timeoutMs, or pass timeoutMs: null and your own signal",
-          { code: "request_timeout", cause: exc, idempotencyKey, retryAfter: collectingAt },
+  async function runLoop(): Promise<RunResult<TData>> {
+    for (;;) {
+      const remainingMs = clock().remainingMs;
+      const signal = composeSignal(options.signal, remainingMs);
+      let response: Response;
+      let responseBody: Uint8Array = EMPTY_BODY;
+      // Non-null once this response has been classified as one to ask again
+      // about, and is then the backoff before that re-ask.
+      let repeatAfterMs: number | null = null;
+      try {
+        // `withInactivityLimits` derives undici's own headers/body timers from
+        // the same remaining budget as `signal`. Without it this call is capped
+        // at undici's 300s default however long the deadline says, which is
+        // fatal here specifically: the server holds this one request open for
+        // the whole generation, so nothing arrives on it — not even response
+        // headers — until the model has finished.
+        response = await fetch(
+          url,
+          withInactivityLimits({ method: "POST", headers, body, signal }, remainingMs),
         );
-      }
-      // A caller's abort is theirs: never retried, never re-dressed.
-      if (options.signal?.aborted) throw exc;
-      const delay = nextDelayMs();
-      if (delay === null) throw exc;
-      // Abortable, so an abort during the backoff stops the loop here rather
-      // than sleeping out the delay and sending one more attempt.
-      await abortableSleep(delay, options.signal);
-      countAttempt();
-      continue;
-    }
 
-    if (repeatAfterMs !== null) {
-      await abortableSleep(repeatAfterMs, options.signal);
-      countAttempt();
-      continue;
+        const errorType = response.headers.get(ERROR_TYPE_HEADER);
+        const retryAfter = parseRetryAfter(response.headers);
+
+        // Classified from the status line and the headers, BEFORE the body is
+        // touched. What a response means is not something its body decides
+        // here, and deciding it first is what keeps the cap from overruling it:
+        // a retryable 502 behind an oversized CDN error page stays retryable,
+        // and a collectable 409/504 stays collectable, instead of a cap breach
+        // turning either into a fatal error with the budget unspent and a
+        // generation still running.
+        //
+        // Collect first, and EXCLUSIVELY: a `deadline_exceeded` 504 is a 5xx
+        // too, so both branches would take it — but they are different actions
+        // on different budgets, and the server's own verdict about what it is
+        // holding wins over this module's guess. Which also means a collect
+        // that runs out of `collectBudgetMs` raises rather than falling back
+        // into the ordinary backoff: the class is decided per failure, not
+        // retried in both. `retryAfter !== null` is redundant with
+        // `isCollectable`, which refuses a missing pace — it is written out so
+        // the call below needs no cast.
+        if (retryAfter !== null && isCollectable(response.status, errorType, retryAfter)) {
+          collectingAt = retryAfter;
+          // `null` here means out of collect budget (or past the deadline) —
+          // fall through to the 409/504 the server last gave, which carries its
+          // own `Retry-After` for a caller who wants to re-ask by hand.
+          repeatAfterMs = nextDelayMs();
+        } else if (isRetryableStatus(response.status, errorType)) {
+          // Mid-collect this is still a collect: the 5xx is the re-ask failing
+          // to land, not a verdict on the generation, so it is paced and
+          // budgeted as one (`nextDelayMs` reads `collectingAt`). `null` is out
+          // of budget — fall through and raise the last failure the server
+          // actually gave, rather than a synthetic "retries exhausted".
+          repeatAfterMs = nextDelayMs();
+        }
+
+        if (repeatAfterMs === null) {
+          // Inside the same `try` as the fetch on purpose: the deadline covers
+          // body consumption too, so a signal that fires while the result is
+          // still streaming rejects HERE, and translating it in only one of the
+          // two places would leak a bare DOMException out of the other.
+          //
+          // Bytes rather than `response.text()`, because this route's 200 is not
+          // always a text document: a partner whose generation IS the response
+          // body answers with its own media type, and `text()` would UTF-8-decode
+          // those bytes lossily and irreversibly before anything got to look at
+          // the `Content-Type`. Decoding is deferred to the one branch that wants
+          // a string ({@link decodeUtf8}), which is what `text()` would have done
+          // anyway.
+          responseBody = await readBodyWithin(response, maxBytes, model, idempotencyKey);
+        } else {
+          // Never read: the whole content of a response this call is going to
+          // ask again about is "ask again", which the status line already said.
+          // Dropping it spends neither the download nor the cap on it.
+          await response.body?.cancel().catch(() => undefined);
+        }
+      } catch (exc) {
+        // A body this call would not buffer leaves the loop immediately. It is a
+        // verdict about THIS response, not a transport failure, and the retry
+        // loop sitting around the read is exactly what would make it expensive:
+        // every attempt would re-download the same oversized body until the
+        // budget expired, multiplying the cost of the one thing that already
+        // failed.
+        if (isTooLarge(exc)) throw exc;
+        if (isTimeout(exc, options.signal)) {
+          throw new ComfyError(
+            `models.run("${model}") exceeded its ${String(timeoutMs)}ms deadline before the model finished; ` +
+              "raise it with timeoutMs, or pass timeoutMs: null and your own signal",
+            { code: "request_timeout", cause: exc, idempotencyKey, retryAfter: collectingAt },
+          );
+        }
+        // A caller's abort is theirs: never retried, never re-dressed.
+        if (options.signal?.aborted) throw exc;
+        const delay = nextDelayMs();
+        // Out of budget. If this call was COLLECTING, `collectingAt` holds the
+        // pace Router named on the 409/504 that started the collect, and the
+        // generation is still the server's to hand over — so the failure goes
+        // back carrying that pace, exactly as the sibling `request_timeout`
+        // branch above does. Without this the outer stamp would default
+        // `retryAfter` to `null` and tell the caller the server named no pace,
+        // when the SDK knew one.
+        if (delay === null)
+          throw stampIdempotencyKey(exc, idempotencyKey, {
+            callerSignal: options.signal,
+            retryAfter: collectingAt,
+          });
+        // Abortable, so an abort during the backoff stops the loop here rather
+        // than sleeping out the delay and sending one more attempt.
+        await abortableSleep(delay, options.signal);
+        countAttempt();
+        continue;
+      }
+
+      if (repeatAfterMs !== null) {
+        await abortableSleep(repeatAfterMs, options.signal);
+        countAttempt();
+        continue;
+      }
+      return finish<TData>(model, response, responseBody, idempotencyKey);
     }
-    return finish<TData>(model, response, responseBody, idempotencyKey);
   }
 }
 
