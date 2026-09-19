@@ -14,11 +14,21 @@
  * separate sync client here (JS is async-native, so the Python SDK's
  * sync/async split collapses to one class).
  *
+ * Credentials resolve in a fixed order at construction: the explicit `apiKey`
+ * option, then the `COMFY_API_KEY` environment variable, then — targeting
+ * Comfy Cloud, which always requires a key — a local `MissingCredentials`
+ * naming that variable, thrown before any request rather than surfacing as a
+ * server 401 on the first call. A deployment named by `COMFY_BASE_URL` may
+ * have no auth at all (a self-hosted ComfyUI behind the API proxy), so there
+ * an unresolved key stays valid and means "send no credentials".
+ *
  * @example
  * ```ts
  * import { Comfy } from "@comfyorg/sdk";
  *
- * const client = new Comfy({ apiKey: "ck_..." }); // Comfy Cloud
+ * const client = new Comfy({ apiKey: "comfyui-..." }); // Comfy Cloud
+ * // ...or COMFY_API_KEY in the environment, which `new Comfy()` reads when
+ * // no `apiKey` is passed.
  * // COMFY_BASE_URL=http://127.0.0.1:8189 in the environment targets a
  * // self-hosted proxy instead, where no key is needed.
  *
@@ -35,6 +45,7 @@ import type { AssetReference } from "../low/index.js";
 import { ApiError, ComfyLow, type ComfyLowOptions } from "../low/index.js";
 import { abortableSleep } from "./abortable-sleep.js";
 import { AssetFactory } from "./assets.js";
+import { CREDENTIALS_ENV_VAR } from "./credentials.js";
 import {
   findAssetHandles,
   looksLikeUiFormat,
@@ -43,7 +54,13 @@ import {
   SUCCESS,
 } from "./core.js";
 import type { AssetHandleLike } from "./core.js";
-import { JobFailed, QueueFull, WorkflowFormatUi, toSdkError } from "./exceptions.js";
+import {
+  JobFailed,
+  MissingCredentials,
+  QueueFull,
+  WorkflowFormatUi,
+  toSdkError,
+} from "./exceptions.js";
 import { Job, JobFactory } from "./jobs.js";
 import type { Workflow, WorkflowGraph } from "./workflows.js";
 import { WorkflowFactory } from "./workflows.js";
@@ -89,7 +106,94 @@ function resolveBaseUrl(): string {
   return raw;
 }
 
+/**
+ * Whether two base URLs name the same deployment.
+ *
+ * Compared by normalized origin (scheme, host, effective port — the rule the
+ * transport already applies to credentials) plus path, rather than by string.
+ * `https://cloud.comfy.org:443/` is Comfy Cloud with its default port written
+ * out, and reading it as *some other* deployment would hand the caller a
+ * keyless client and a server 401 on the first request instead of the local
+ * error {@link resolveApiKey} promises.
+ *
+ * The path is part of the comparison because a deployment mounted under the
+ * same host (`https://cloud.comfy.org/self-hosted`) is a different target, and
+ * the keyless carve-out has to keep applying to it.
+ *
+ * Both arguments are already-validated http(s) URLs — the caller's comes from
+ * {@link resolveBaseUrl}, which parses and rejects anything else before this
+ * runs — so neither `new URL` can throw. Catching here instead would have to
+ * answer "is it Comfy Cloud?" with a guess, and the safe-looking guess (`no`)
+ * is the one that hands back a keyless client.
+ */
+function sameDeployment(url: string, other: string): boolean {
+  const a = new URL(url);
+  const b = new URL(other);
+  return a.origin === b.origin && stripTrailingSlash(a.pathname) === stripTrailingSlash(b.pathname);
+}
+
+function stripTrailingSlash(path: string): string {
+  return path.replace(/\/$/, "");
+}
+
+/**
+ * The explicit `apiKey`, then `COMFY_API_KEY`, then a clear local error.
+ *
+ * Read per construction (like {@link resolveBaseUrl}) so one process can build
+ * successive clients under different credentials and a test can stub the
+ * environment. Surrounding whitespace is stripped and a blank value counts as
+ * unset at either source, so `COMFY_API_KEY=` in a shell profile — or a key
+ * read out of a file with a trailing newline — behaves the way it looks; a
+ * runtime with no `process` (a browser) simply never sees the variable.
+ *
+ * Comfy Cloud always requires a key, so exhausting both sources *there* throws
+ * {@link MissingCredentials} at construction with no network call attempted: a
+ * missing credential reported as a server 401 sends the caller looking at
+ * their key's validity instead of at its absence. A deployment named by
+ * `COMFY_BASE_URL` may legitimately have none (a self-hosted ComfyUI behind
+ * the API proxy), so there an unresolved key is not an error and keeps its
+ * documented meaning — send no credentials at all.
+ *
+ * This is the order `comfy_sdk`'s `_resolve_api_key` uses in the Python SDK,
+ * and it reads the same variable `comfy.models.*` resolves through
+ * `resolveCredentials()`. The two surfaces stay separate on purpose — a
+ * `comfy.config({ credentials })` call does NOT configure a class client,
+ * which is what keeps the namespace's process-global binding out of a
+ * multi-tenant server's per-request clients — but neither of them can now be
+ * reached with a key in the environment and no key in hand.
+ */
+function resolveApiKey(explicit: string | undefined, baseUrl: string): string | undefined {
+  if (explicit !== undefined && typeof explicit !== "string") {
+    // Falling through to the environment here would authenticate as whatever
+    // `COMFY_API_KEY` names while the caller believes they supplied a key.
+    // Names the offending *type* only — never the value — so a mistyped
+    // secret cannot land in a log or a stack, the same rule `config()` follows.
+    throw new TypeError(`Comfy({ apiKey }) must be a string or undefined, got ${typeof explicit}`);
+  }
+  for (const candidate of [explicit, globalThis.process?.env?.[CREDENTIALS_ENV_VAR]]) {
+    const trimmed = candidate?.trim();
+    if (trimmed) return trimmed;
+  }
+  if (sameDeployment(baseUrl, COMFY_CLOUD_BASE_URL)) {
+    throw new MissingCredentials(
+      `no API key: pass apiKey to the client, or set ${CREDENTIALS_ENV_VAR} in the environment. ` +
+        `Comfy Cloud (${COMFY_CLOUD_BASE_URL}) requires one; set ${BASE_URL_ENV_VAR} to target ` +
+        "a deployment that does not.",
+      { code: "missing_credentials" },
+    );
+  }
+  return undefined;
+}
+
 export interface ComfyOptions {
+  /**
+   * This client's own credential, sent as the `Authorization` bearer token.
+   * Omit it to fall back to `COMFY_API_KEY` in the environment — see
+   * {@link resolveApiKey} for the full order.
+   *
+   * Unrelated to the `apiKey` {@link Comfy.submit} and {@link Comfy.run}
+   * accept, which authenticates partner (API) nodes inside a workflow.
+   */
   apiKey?: string;
   timeoutMs?: number;
   fetch?: ComfyLowOptions["fetch"];
@@ -115,6 +219,9 @@ function guardUiFormat(workflow: Workflow): void {
  * {@link Comfy.run} (submit, then poll to terminal) or {@link Comfy.submit}
  * (submit and return immediately). Targets Comfy Cloud unless the
  * `COMFY_BASE_URL` environment variable names another deployment.
+ *
+ * `apiKey` is optional: omit it to fall back to `COMFY_API_KEY`. Against
+ * Comfy Cloud, neither throws {@link MissingCredentials} at construction.
  */
 export class Comfy {
   private readonly low: ComfyLow;
@@ -122,7 +229,12 @@ export class Comfy {
   readonly workflows: WorkflowFactory;
   readonly jobs: JobFactory;
 
-  /** Connect to Comfy Cloud, or to whatever deployment `COMFY_BASE_URL` names. */
+  /**
+   * Connect to Comfy Cloud, or to whatever deployment `COMFY_BASE_URL` names.
+   *
+   * @throws {MissingCredentials} targeting Comfy Cloud with no `apiKey` and no
+   * `COMFY_API_KEY` in the environment — before any network call.
+   */
   constructor(options: ComfyOptions = {}) {
     // Untyped JS callers get no compile error for the old positional base URL,
     // and it would otherwise be ignored silently.
@@ -131,7 +243,9 @@ export class Comfy {
         `Comfy takes no base URL; set ${BASE_URL_ENV_VAR} in the environment to target another deployment`,
       );
     }
-    this.low = new ComfyLow(resolveBaseUrl(), options.apiKey, {
+    // The base URL first: it decides whether a missing key is an error at all.
+    const baseUrl = resolveBaseUrl();
+    this.low = new ComfyLow(baseUrl, resolveApiKey(options.apiKey, baseUrl), {
       timeoutMs: options.timeoutMs,
       fetch: options.fetch,
       clientInfo: options.clientInfo,

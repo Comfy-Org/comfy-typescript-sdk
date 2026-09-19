@@ -5,9 +5,14 @@
  * the ergonomics an integrator porting from a comparable hosted-inference
  * client already has in their fingers, and a familiar one-line configuration
  * call is most of what makes that port feel small. The class client
- * (`new Comfy({ apiKey })`) is unchanged and still resolves per instance —
- * the two surfaces coexist, and the asymmetry with the Python SDK (which
- * resolves per client instance only) is intentional, not a parity gap.
+ * (`new Comfy({ apiKey })`) still resolves per instance and is NOT configured
+ * by `config()` — the two surfaces coexist, and this ADDITIONAL module-level
+ * one is the asymmetry with the Python SDK (which has per-instance resolution
+ * only). That is intentional, not a parity gap: keeping a process-global
+ * binding off the class client is what keeps it out of a multi-tenant
+ * server's per-request clients. Both surfaces do read the same
+ * {@link CREDENTIALS_ENV_VAR} when nothing was supplied, in the same order —
+ * see `resolveApiKey` in `./client.ts`.
  *
  * ```ts
  * import { comfy } from "@comfyorg/sdk";

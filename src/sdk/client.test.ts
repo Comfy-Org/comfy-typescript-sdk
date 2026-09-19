@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StubServer } from "../../test/support/stub-server.js";
 import { abortableSleep } from "./abortable-sleep.js";
 import { BASE_URL_ENV_VAR, Comfy } from "./client.js";
+import { CREDENTIALS_ENV_VAR } from "./credentials.js";
 import { IdempotencyKeyReuse, QueueFull, WorkflowFormatUi } from "./exceptions.js";
 
 // Spies on (not replaces) abortableSleep by default, so every other test
@@ -18,8 +19,11 @@ describe("Comfy", () => {
     server = new StubServer();
     await server.start();
     // Clients read their target from the environment, so pointing them at the
-    // stub is part of standing it up.
+    // stub is part of standing it up. The credential comes from the same
+    // place, and the stub needs none — so it is cleared rather than left to
+    // whatever the ambient shell exports.
     vi.stubEnv(BASE_URL_ENV_VAR, server.baseUrl);
+    vi.stubEnv(CREDENTIALS_ENV_VAR, undefined);
     client = new Comfy();
   });
 

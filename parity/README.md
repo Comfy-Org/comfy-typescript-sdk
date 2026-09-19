@@ -28,6 +28,14 @@ pnpm test                  # see which symbols actually diverged
 
 Then either mirror the change in this SDK, or — if the difference is deliberate — add it to the `INTENTIONAL_ASYMMETRIES` allowlist in `src/sdk/surface-parity.test.ts` with the reason. An allowlist entry is a design decision, not a way to quiet a failure.
 
+## Credential resolution: extracted, not yet asserted
+
+`scripts/python-surface.mjs` reads the Python client's credential resolution — the `COMFY_API_KEY` / `COMFY_BASE_URL` variable names, the Comfy Cloud base URL, the order `_resolve_api_key` tries its sources in, and the error it raises when they are exhausted against Comfy Cloud — and `extractPythonSurface` emits it as a `credentialResolution` section. The class clients now resolve identically, so this is the behaviour a name-only check cannot see, in the same sense the status fallback table is.
+
+The section is **not in the committed snapshot yet**, and so nothing in `surface-parity.test.ts` compares it against this SDK: refreshing the snapshot today is blocked on unrelated Python-side drift that the `sdk-parity` job is already failing on (a `RouterRunResult` dataclass the extractor's fixed class list refuses, a Python-only `run_detailed` method, and a moved set of root error exports). Until that is dealt with, the TypeScript half of credential resolution is pinned by `src/sdk/apiKeyEnv.test.ts` and by the `credential-resolution` entry's `sharedCredentialOrder` rot guard in `surface-parity.test.ts`, which derives the order from real constructions.
+
+When the snapshot can be refreshed, add `credentialResolution` to `loadPythonSurface`'s non-empty section list and compare `apiKeyEnvVar` / `cloudBaseUrl` / `order` / `missingKeyError` (through `RENAMES`) against the values that test already derives.
+
 ## What this deliberately does not check
 
 - **Behaviour.** Surface only: names, and the `error_type` each error class maps to. Two methods with the same name that do different things pass.

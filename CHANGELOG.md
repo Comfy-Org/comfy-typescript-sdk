@@ -17,6 +17,23 @@ Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
 entry. See CONTRIBUTING.md.
 -->
 
+### Changed
+
+- **`new Comfy()` now resolves `COMFY_API_KEY`, matching the Python SDK.** The
+  class client takes its credential from the explicit `apiKey` option, then
+  from `COMFY_API_KEY` in the environment (trimmed; blank counts as unset, and
+  it is read per construction), then — targeting Comfy Cloud, which always
+  requires one — throws `MissingCredentials` at construction naming both ways
+  to supply it, before any request. `comfy.models.*` already read that
+  variable; the class client did not, so `new Comfy()` used to send no
+  `Authorization` header and come back with a bare `401` from the server.
+  Pointing `COMFY_BASE_URL` at another deployment keeps today's keyless flow
+  exactly as it was: an unresolved key there is not an error and means "send no
+  credentials". The `new Comfy({ apiKey: process.env.COMFY_API_KEY })`
+  workaround in the README is gone. **Note for callers who relied on the old
+  behaviour:** `new Comfy()` against Comfy Cloud with no key anywhere now
+  throws locally instead of failing on the first call.
+
 ### Added
 
 - **Comfy Router alt-provider controls on `comfy.models.run` —

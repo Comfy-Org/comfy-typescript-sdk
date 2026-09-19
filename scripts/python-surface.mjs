@@ -31,7 +31,11 @@ export const PYTHON_SOURCE_FILES = {
   exceptions: "src/comfy_sdk/exceptions.py",
   packageInit: "src/comfy_sdk/__init__.py",
   retry: "src/comfy_sdk/retry.py",
+  client: "src/comfy_sdk/client.py",
 };
+
+/** The Python resolver whose order the class client here has to match. */
+export const PYTHON_API_KEY_RESOLVER = "_resolve_api_key";
 
 /** The two `models` namespace classes: the sync client's, then the async client's. */
 export const PYTHON_MODELS_CLASSES = ["Models", "AsyncModels"];
@@ -54,6 +58,25 @@ function fail(message) {
 function classBody(source, className) {
   const lines = source.split("\n");
   const start = lines.findIndex((line) => new RegExp(`^class ${className}\\b`).test(line));
+  if (start === -1) return null;
+
+  const body = [];
+  for (let i = start + 1; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (line.trim() !== "" && !/^\s/.test(line)) break;
+    body.push(line);
+  }
+  return body;
+}
+
+/**
+ * The lines of a top-level `def <name>` body, or `null` if there is no such
+ * function. Ends the same way {@link classBody} does — at the next line that
+ * starts in column 0 with something other than whitespace.
+ */
+function functionBody(source, functionName) {
+  const lines = source.split("\n");
+  const start = lines.findIndex((line) => new RegExp(`^def ${functionName}\\b`).test(line));
   if (start === -1) return null;
 
   const body = [];
@@ -309,6 +332,124 @@ export function extractRetryPolicyFields(source) {
   return fields;
 }
 
+/**
+ * How the Python client resolves its API key: the two environment variable
+ * names, the Comfy Cloud base URL, the order the sources are tried in, the
+ * error raised when they are exhausted against Comfy Cloud, and whether an
+ * unresolved key stays legal off it.
+ *
+ * A BEHAVIOUR rather than a name, like the status fallback table: the two SDKs
+ * can spell every symbol identically and still disagree about the single most
+ * common first line of code. `new Comfy()` reading no environment while
+ * `comfy_sdk.Comfy()` reads `COMFY_API_KEY` is precisely the drift this
+ * records, so the parity test can derive the same facts from this SDK by
+ * CONSTRUCTING clients and compare the two.
+ *
+ * The shapes read here are the resolver's contract rather than incidental
+ * formatting — the candidate sequence IS the documented precedence, and the
+ * cloud-guarded raise IS the "Comfy Cloud always requires a key" rule.
+ *
+ * The committed snapshot does not carry this section yet and nothing compares
+ * it — see "Credential resolution: extracted, not yet asserted" in
+ * `parity/README.md` for why, and for the two lines that turn it on.
+ */
+export function extractCredentialResolution(source) {
+  const constant = (name) => {
+    const match = new RegExp(`^${name}\\s*(?::[^=\\n]+)?=\\s*"([^"]+)"`, "m").exec(source);
+    if (!match) {
+      fail(`${PYTHON_SOURCE_FILES.client}: no \`${name}\` string constant found.`);
+    }
+    return match[1];
+  };
+
+  const body = functionBody(source, PYTHON_API_KEY_RESOLVER);
+  if (body === null) {
+    fail(`${PYTHON_SOURCE_FILES.client}: no \`def ${PYTHON_API_KEY_RESOLVER}\` found.`);
+  }
+  const text = body.join("\n");
+
+  // `for candidate in (explicit, os.environ.get(API_KEY_ENV_VAR)):` — the
+  // tuple's order is the precedence, so it is read rather than assumed.
+  const sequence = /for\s+\w+\s+in\s+\(([^)]*\)?[^)]*)\)\s*:/.exec(text);
+  if (!sequence) {
+    fail(
+      `${PYTHON_SOURCE_FILES.client}: \`${PYTHON_API_KEY_RESOLVER}\` declares no ` +
+        "`for ... in (...)` candidate sequence. That tuple IS the documented precedence; " +
+        "an unread one would let the two SDKs try their sources in different orders.",
+    );
+  }
+  const order = splitTopLevel(sequence[1])
+    .map((expr) => expr.trim())
+    .filter(Boolean)
+    .map((expr) => {
+      if (expr === "explicit") return "explicit";
+      if (expr.includes("API_KEY_ENV_VAR")) return "environment";
+      fail(
+        `${PYTHON_SOURCE_FILES.client}: \`${PYTHON_API_KEY_RESOLVER}\` tries an unrecognized ` +
+          `credential source \`${expr}\`. Teach this extractor what it is — a source it cannot ` +
+          "name is a source the parity check cannot compare.",
+      );
+      return expr;
+    });
+  if (order.length < 2) {
+    fail(
+      `${PYTHON_SOURCE_FILES.client}: \`${PYTHON_API_KEY_RESOLVER}\` yielded ${String(order.length)} ` +
+        "credential source(s). Fewer than two is a broken extraction, not a precedence.",
+    );
+  }
+
+  const raise = /raise\s+(\w+)\(/.exec(text);
+  if (!raise) {
+    fail(
+      `${PYTHON_SOURCE_FILES.client}: \`${PYTHON_API_KEY_RESOLVER}\` raises nothing. Comfy ` +
+        "Cloud always requires a key, so exhausting every source there is a local error.",
+    );
+  }
+  const guardIndex = text.search(/_same_deployment\([^)]*COMFY_CLOUD_BASE_URL[^)]*\)/);
+  if (guardIndex === -1 || guardIndex > raise.index) {
+    fail(
+      `${PYTHON_SOURCE_FILES.client}: \`${PYTHON_API_KEY_RESOLVER}\` does not guard its raise ` +
+        "with a Comfy Cloud check. An unguarded one would make a keyless self-hosted " +
+        "deployment an error, which is the flow both SDKs promise to keep working.",
+    );
+  }
+  if (!/return\s+None\s*$/.test(text.trimEnd())) {
+    fail(
+      `${PYTHON_SOURCE_FILES.client}: \`${PYTHON_API_KEY_RESOLVER}\` does not end by returning ` +
+        "`None`. Off Comfy Cloud an unresolved key means `send no credentials`, and a " +
+        "resolver that stopped saying so would be a divergence this check must see.",
+    );
+  }
+
+  return {
+    resolver: PYTHON_API_KEY_RESOLVER,
+    apiKeyEnvVar: constant("API_KEY_ENV_VAR"),
+    baseUrlEnvVar: constant("BASE_URL_ENV_VAR"),
+    cloudBaseUrl: constant("COMFY_CLOUD_BASE_URL"),
+    order,
+    missingKeyError: raise[1],
+  };
+}
+
+/** Split a Python tuple's text on its own commas, ignoring nested calls. */
+function splitTopLevel(text) {
+  const parts = [];
+  let depth = 0;
+  let current = "";
+  for (const char of text) {
+    if (char === "(" || char === "[") depth += 1;
+    else if (char === ")" || char === "]") depth -= 1;
+    if (char === "," && depth === 0) {
+      parts.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  parts.push(current);
+  return parts;
+}
+
 /** The names in a module's `__all__`, in declaration order. */
 function dunderAll(source, file) {
   const block = /^__all__[^=]*=\s*\[([\s\S]*?)^\]/m.exec(source);
@@ -344,7 +485,7 @@ export function extractExportedErrorClasses(exceptionsSource, initSource) {
 }
 
 /**
- * Build the whole manifest from the four Python source files.
+ * Build the whole manifest from the Python source files.
  *
  * `sources` is keyed by the keys of {@link PYTHON_SOURCE_FILES}.
  */
@@ -366,5 +507,6 @@ export function extractPythonSurface(sources, { repo, ref }) {
     routerErrorTypeByStatus: extractErrorTypeByStatus(sources.routerExceptions),
     exportedErrorClasses: extractExportedErrorClasses(sources.exceptions, sources.packageInit),
     retryPolicyFields: extractRetryPolicyFields(sources.retry),
+    credentialResolution: extractCredentialResolution(sources.client),
   };
 }
