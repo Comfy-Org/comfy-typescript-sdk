@@ -33,6 +33,19 @@
  * than a silent miss, so it does not justify carrying a YAML parser into a job
  * that deliberately runs without `pnpm install`.
  *
+ * Two modes, ONE parser (`findCallers`) shared between them:
+ *
+ *   node scripts/check-workflow-pins.mjs
+ *     The lint above. Exits 1 on any disagreement.
+ *
+ *   node scripts/check-workflow-pins.mjs --print-pin cursor-review.yml
+ *     Prints that caller's `workflows_ref` SHA on stdout and nothing else, so
+ *     a workflow can capture it with `$(...)`. Used by the
+ *     `cursor-review-pin-freshness` job in ci.yml, which needs the pinned
+ *     commit to ask github-workflows whether anything consumer-visible has
+ *     landed since. It shares the parser rather than re-deriving the SHA with
+ *     its own `grep`, so the two cannot disagree about which line is the pin.
+ *
  * Run: node scripts/check-workflow-pins.mjs
  */
 
@@ -70,9 +83,6 @@ const WORKFLOWS_REF_RE = /^\s*workflows_ref:\s*(["']?)([^\s"']+?)\1\s*(?:#.*)?$/
 // version spellings, not SHAs, and are left alone.
 const SHORT_SHA_RE = /\b[0-9a-f]{7,40}\b/g;
 
-const errors = [];
-const checked = [];
-
 /**
  * The lines belonging to the job that owns the `uses:` on `usesIndex`.
  *
@@ -94,23 +104,57 @@ function jobBodyAfter(lines, usesIndex, usesIndent) {
   return body;
 }
 
-for (const file of readdirSync(WORKFLOWS_DIR).sort()) {
-  if (!file.endsWith(".yml") && !file.endsWith(".yaml")) continue;
-  const rel = `.github/workflows/${file}`;
-  const lines = readFileSync(join(WORKFLOWS_DIR, file), "utf8").split("\n");
+/**
+ * Every `Comfy-Org/github-workflows` caller in `.github/workflows`, parsed.
+ *
+ * PARSING ONLY -- it asserts nothing at all. Both modes read these records, so
+ * neither can drift from the other about what counts as a caller, which line
+ * holds its `uses:` ref, or where its `workflows_ref` input lives.
+ */
+function findCallers() {
+  const callers = [];
 
-  for (let i = 0; i < lines.length; i++) {
-    // A whole-line comment can quote a `uses:` while documenting it; the
-    // header of ci-cursor-review.yml does exactly that.
-    if (lines[i].trimStart().startsWith("#")) continue;
-    const m = USES_RE.exec(lines[i]);
-    if (!m) continue;
+  for (const file of readdirSync(WORKFLOWS_DIR).sort()) {
+    if (!file.endsWith(".yml") && !file.endsWith(".yaml")) continue;
+    const rel = `.github/workflows/${file}`;
+    const lines = readFileSync(join(WORKFLOWS_DIR, file), "utf8").split("\n");
 
-    const [, indentStr, , workflowPath, ref, comment] = m;
-    const usesLineNo = i + 1;
-    const reusable = workflowPath.split("/").pop();
+    for (let i = 0; i < lines.length; i++) {
+      // A whole-line comment can quote a `uses:` while documenting it; the
+      // header of ci-cursor-review.yml does exactly that.
+      if (lines[i].trimStart().startsWith("#")) continue;
+      const m = USES_RE.exec(lines[i]);
+      if (!m) continue;
+
+      const [, indentStr, , workflowPath, ref, comment] = m;
+      const body = jobBodyAfter(lines, i, indentStr.length);
+      const workflowsRef = body
+        .map(({ line, lineNo }) => {
+          const rm = WORKFLOWS_REF_RE.exec(line);
+          return rm ? { value: rm[2], lineNo } : null;
+        })
+        .find(Boolean);
+
+      callers.push({
+        rel,
+        reusable: workflowPath.split("/").pop(),
+        usesLineNo: i + 1,
+        ref,
+        comment,
+        workflowsRef: workflowsRef ?? null,
+      });
+    }
+  }
+
+  return callers;
+}
+
+/** The three pin assertions, as a list of human-readable problems. */
+function lint(callers) {
+  const errors = [];
+
+  for (const { rel, reusable, usesLineNo, ref, comment, workflowsRef } of callers) {
     const at = `${rel}:${usesLineNo}`;
-    checked.push(`${rel}:${usesLineNo} -> ${reusable}`);
 
     // (1) The `uses:` ref must be immutable.
     if (!FULL_SHA_RE.test(ref)) {
@@ -140,16 +184,7 @@ for (const file of readdirSync(WORKFLOWS_DIR).sort()) {
     }
 
     // (2) `workflows_ref` must be the same commit as `uses:`.
-    const indent = indentStr.length;
-    const body = jobBodyAfter(lines, i, indent);
-    const refLine = body
-      .map(({ line, lineNo }) => {
-        const rm = WORKFLOWS_REF_RE.exec(line);
-        return rm ? { value: rm[2], lineNo } : null;
-      })
-      .find(Boolean);
-
-    if (!refLine) {
+    if (!workflowsRef) {
       if (REQUIRES_WORKFLOWS_REF.has(reusable)) {
         errors.push(
           `${at}: this job calls \`${reusable}\`, which requires a ` +
@@ -161,38 +196,108 @@ for (const file of readdirSync(WORKFLOWS_DIR).sort()) {
       continue;
     }
 
-    if (refLine.value !== ref) {
+    if (workflowsRef.value !== ref) {
       errors.push(
-        `${rel}:${refLine.lineNo}: \`workflows_ref\` is \`${refLine.value}\` but ` +
+        `${rel}:${workflowsRef.lineNo}: \`workflows_ref\` is \`${workflowsRef.value}\` but ` +
           `\`uses:\` (line ${usesLineNo}) is pinned to \`${ref}\`. The two must be ` +
           `the same commit, or the review runs with prompts/scripts from a ` +
           `different commit than the workflow definition.`,
       );
     }
   }
+
+  return errors;
 }
 
-if (errors.length > 0) {
-  console.error(
-    `check-workflow-pins: ${errors.length} problem(s) with the ` +
-      `${REUSABLE_OWNER_REPO} pin pair(s):\n`,
-  );
-  for (const e of errors) console.error(`  - ${e}`);
-  console.error(
-    `\nBoth pins move together. See the \`ignore:\` block in ` +
-      `.github/dependabot.yml for why Dependabot must not move them for you.`,
-  );
+function fail(message) {
+  console.error(`check-workflow-pins: ${message}`);
   process.exit(1);
 }
 
-if (checked.length === 0) {
-  // Not an error -- the repo may simply not call these reusables any more --
-  // but a lint that silently checks nothing is worse than no lint, so say so.
-  console.log(`check-workflow-pins: no ${REUSABLE_OWNER_REPO} callers found; nothing to check.`);
+/**
+ * Print ONE caller's `workflows_ref` SHA on stdout, and nothing else.
+ *
+ * Deliberately does NOT assert that `workflows_ref` equals the `uses:` ref:
+ * that is the lint's assertion and the `workflow-pins` job's red build, and
+ * reddening a second job for the same split pin would just double the noise.
+ * What it does enforce is that the value is a full 40-hex SHA, because every
+ * caller of this mode feeds it to git as a commit-ish -- a tag or branch there
+ * would resolve to a moving target and make the answer meaningless.
+ */
+function printPin(callers, wanted) {
+  const matches = callers.filter((c) => c.reusable === wanted);
+  if (matches.length === 0) {
+    fail(
+      `--print-pin ${wanted}: no ${REUSABLE_OWNER_REPO} caller of \`${wanted}\` found ` +
+        `under .github/workflows. Either the caller was removed or the reusable was renamed.`,
+    );
+  }
+  if (matches.length > 1) {
+    fail(
+      `--print-pin ${wanted}: ${matches.length} callers of \`${wanted}\` found ` +
+        `(${matches.map((c) => `${c.rel}:${c.usesLineNo}`).join(", ")}); this mode returns ` +
+        `one pin and cannot choose between them.`,
+    );
+  }
+
+  const [caller] = matches;
+  const at = `${caller.rel}:${caller.usesLineNo}`;
+  if (!caller.workflowsRef) {
+    fail(`--print-pin ${wanted}: ${at} sets no \`workflows_ref\`; there is no pin to print.`);
+  }
+
+  const pin = caller.workflowsRef.value;
+  if (!FULL_SHA_RE.test(pin)) {
+    fail(
+      `${caller.rel}:${caller.workflowsRef.lineNo}: \`workflows_ref\` is \`${pin}\`, not a ` +
+        `full 40-hex commit SHA. Re-pin it to a commit; \`node scripts/check-workflow-pins.mjs\` ` +
+        `explains the pair this belongs to.`,
+    );
+  }
+
+  process.stdout.write(`${pin}\n`);
+}
+
+// --- CLI ------------------------------------------------------------------
+const argv = process.argv.slice(2);
+const printPinArg = (() => {
+  const i = argv.indexOf("--print-pin");
+  if (i !== -1) return argv[i + 1] ?? "";
+  const inline = argv.find((a) => a.startsWith("--print-pin="));
+  return inline === undefined ? null : inline.slice("--print-pin=".length);
+})();
+
+if (printPinArg !== null) {
+  if (printPinArg === "") {
+    fail("--print-pin needs a reusable workflow file name, e.g. `--print-pin cursor-review.yml`.");
+  }
+  printPin(findCallers(), printPinArg);
 } else {
-  console.log(
-    `check-workflow-pins: ${checked.length} ${REUSABLE_OWNER_REPO} caller(s) ` +
-      `checked, all pins agree.\n` +
-      checked.map((c) => `  - ${c}`).join("\n"),
-  );
+  const callers = findCallers();
+  const errors = lint(callers);
+
+  if (errors.length > 0) {
+    console.error(
+      `check-workflow-pins: ${errors.length} problem(s) with the ` +
+        `${REUSABLE_OWNER_REPO} pin pair(s):\n`,
+    );
+    for (const e of errors) console.error(`  - ${e}`);
+    console.error(
+      `\nBoth pins move together. See the \`ignore:\` block in ` +
+        `.github/dependabot.yml for why Dependabot must not move them for you.`,
+    );
+    process.exit(1);
+  }
+
+  if (callers.length === 0) {
+    // Not an error -- the repo may simply not call these reusables any more --
+    // but a lint that silently checks nothing is worse than no lint, so say so.
+    console.log(`check-workflow-pins: no ${REUSABLE_OWNER_REPO} callers found; nothing to check.`);
+  } else {
+    console.log(
+      `check-workflow-pins: ${callers.length} ${REUSABLE_OWNER_REPO} caller(s) ` +
+        `checked, all pins agree.\n` +
+        callers.map((c) => `  - ${c.rel}:${c.usesLineNo} -> ${c.reusable}`).join("\n"),
+    );
+  }
 }
