@@ -241,6 +241,75 @@ describe("comfy.models.run and Idempotency-Key", () => {
   });
 });
 
+describe("comfy.models.run stamps the Idempotency-Key onto every failure", () => {
+  it("stamps a raw transport failure, preserving its TypeError identity", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.resetTimes = 1; // socket destroyed mid-request — no status at all
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { retry: false, idempotencyKey: "k-transport" })
+        .catch((e: unknown) => e)) as TypeError & Record<string, unknown>;
+
+      expect(err).toBeInstanceOf(TypeError);
+      expect(err.message).toBe("fetch failed"); // identity + message untouched
+      expect(err.idempotencyKey).toBe("k-transport");
+      // On a transport failure there is no response to read either off.
+      expect(err.requestId).toBeNull();
+      expect(err.retryAfter).toBeNull();
+    });
+  });
+
+  it("stamps a transport failure with the key the SDK minted when none was passed", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.resetTimes = 1;
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { retry: false })
+        .catch((e: unknown) => e)) as TypeError & Record<string, unknown>;
+
+      expect(err).toBeInstanceOf(TypeError);
+      expect(server.state.idempotencyKeys).toHaveLength(1);
+      expect(err.idempotencyKey).toBe(server.state.idempotencyKeys[0]);
+    });
+  });
+
+  it("stamps an already-aborted signal's AbortError", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      const controller = new AbortController();
+      controller.abort();
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { signal: controller.signal, idempotencyKey: "k-abort" })
+        .catch((e: unknown) => e)) as Error & Record<string, unknown>;
+
+      expect(err).not.toBeInstanceOf(ComfyError);
+      expect(err.name).toBe("AbortError");
+      expect(err.idempotencyKey).toBe("k-abort");
+    });
+  });
+
+  it("stamps a bare 502 without overwriting the retryAfter it read off the header", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 502;
+      server.state.retryAfter = "12";
+      server.state.body = { detail: "bad gateway", error_type: "provider_error" };
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { retry: false, idempotencyKey: "k-502" })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.httpStatus).toBe(502);
+      expect(err.idempotencyKey).toBe("k-502");
+      expect(err.retryAfter).toBe(12); // the header's pace survives the stamp
+    });
+  });
+});
+
 describe("comfy.models.run deadline", () => {
   it("defaults to minutes, not tens of seconds", () => {
     expect(DEFAULT_RUN_TIMEOUT_MS).toBeGreaterThanOrEqual(60_000);
@@ -1437,6 +1506,45 @@ describe("comfy.models.run collecting a generation under the same key", () => {
     });
   }, 20_000);
 
+  it("hands back the collect pace, not just the key, when the collect budget runs out", async () => {
+    // A collect that dies on a dropped socket rather than on a status: Router
+    // named a pace on the 409 that started the collect and is STILL holding the
+    // generation, so the failure has to carry that pace as well as the key —
+    // otherwise the caller is told the server named none and has nothing to
+    // time a manual re-ask by. The sibling `request_timeout` branch already
+    // does this; the raw transport re-throw used to default `retryAfter` to
+    // `null` and drop it.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.failTimes = 1;
+      server.state.failStatus = 409;
+      server.state.failErrorType = "concurrency_limit_exceeded";
+      server.state.failRetryAfter = "1";
+      server.state.idempotentReplayed = true;
+      // Ordered AFTER the 409, so the socket drops on the COLLECT attempt.
+      server.state.resetTimes = 1;
+      server.state.resetAfterFail = true;
+
+      const err = (await comfy.models
+        .run(
+          MODEL,
+          {},
+          {
+            idempotencyKey: "k-collect",
+            // Exactly the one paced re-ask fits; the transport failure that ends
+            // it lands with the collect budget already spent.
+            retry: { budgetMs: 60_000, baseDelayMs: 5, maxDelayMs: 10, collectBudgetMs: 1_000 },
+          },
+        )
+        .catch((e: unknown) => e)) as Error & Record<string, unknown>;
+
+      expect(err).toBeInstanceOf(TypeError); // the raw transport failure, not a status
+      expect(err.idempotencyKey).toBe("k-collect");
+      expect(err.retryAfter).toBe(1); // the pace Router named on the 409
+      expect(server.state.requestCount).toBe(2);
+    });
+  }, 20_000);
+
   it("collects a Retry-After: 0 on its own backoff rather than spinning", async () => {
     // `0` is a pace the SDK cannot honour literally — re-asking with no delay
     // would drain `collectBudgetMs` in a tight loop of full model-run POSTs.
@@ -1666,6 +1774,44 @@ describe("comfy.models.run cancellation", () => {
       expect(err.name).toBe("AbortError");
       expect(err).not.toBeInstanceOf(ComfyError);
       expect(err).not.toBeInstanceOf(TypeError);
+    });
+  }, 10_000);
+
+  it("gives concurrent runs sharing one AbortController their OWN key", async () => {
+    // `fetch` rejects with `signal.reason`, and `AbortSignal.any` propagates the
+    // source signal's reason OBJECT — so both of these calls reject with one and
+    // the same `DOMException`. Stamping it in place would let whichever call got
+    // there first decide the key BOTH callers then read, and a manual collect
+    // under someone else's key re-asks for someone else's generation while your
+    // own stays uncollectable.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.hang = true;
+      const controller = new AbortController();
+      const first = comfy.models.run(
+        MODEL,
+        {},
+        { signal: controller.signal, idempotencyKey: "k-one" },
+      );
+      const second = comfy.models.run(
+        MODEL,
+        {},
+        { signal: controller.signal, idempotencyKey: "k-two" },
+      );
+      await waitFor(() => server.state.requestCount === 2);
+      controller.abort();
+
+      const [a, b] = (await Promise.all([
+        first.catch((e: unknown) => e),
+        second.catch((e: unknown) => e),
+      ])) as (Error & Record<string, unknown>)[];
+
+      expect(a.name).toBe("AbortError");
+      expect(b.name).toBe("AbortError");
+      expect(a.idempotencyKey).toBe("k-one");
+      expect(b.idempotencyKey).toBe("k-two");
+      // And the caller's controller is left exactly as they built it.
+      expect((controller.signal.reason as Record<string, unknown>).idempotencyKey).toBeUndefined();
     });
   }, 10_000);
 
