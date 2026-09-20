@@ -152,18 +152,20 @@ export async function readRouterRouteContract(specPath = ROUTER_SPEC_PATH) {
 /**
  * The header names the run route's `200` declares, lowercased and sorted.
  *
- * This is the acquisition half of the credits-header rot guard in
- * `src/sdk/router-spec-contract.test.ts`. `CREDITS_USED_HEADER` is the one
- * header constant in `src/sdk/models.ts` pinned to NOTHING — the vendored
- * contract does not declare `X-Comfy-Credits-Used`, so unlike the route
- * templates there is no spec value to compare it against. The guard watches
- * for the sync that changes that, and it needs to see the declared set to do
- * it.
+ * This is the acquisition half of the credits-header pin in
+ * `src/sdk/router-spec-contract.test.ts`, which compares `CREDITS_USED_HEADER`
+ * in `src/sdk/models.ts` against the name the contract declares. That constant
+ * spent one release pinned to NOTHING, because the vendored contract did not
+ * declare `X-Comfy-Credits-Used`; the sync that brought
+ * `RouterCreditsUsedHeader` is what turned the rot guard that stood there into
+ * a real comparison.
  *
  * Unlike {@link retryAfterStatuses} this does NOT fail on an empty result: a
- * `200` legitimately need not declare headers, and the guard's question is
- * whether a credits header has ARRIVED, for which "none declared" is a real
- * and expected answer rather than a broken read.
+ * `200` legitimately need not declare headers, so reporting the empty set is a
+ * truthful read. The caller is where that becomes an assertion — the pin
+ * demands the credits header be present AND spelled the way the SDK spells it,
+ * so a sync that drops the header reddens there rather than passing vacuously
+ * here.
  */
 export function runSuccessHeaderNames(doc, pathItem) {
   const responses = deref(doc, pathItem.post.responses ?? {});

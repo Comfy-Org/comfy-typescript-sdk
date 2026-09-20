@@ -47,6 +47,7 @@ import { comfy } from "./comfy.js";
 import { COMFY_ROUTER_BASE_URL, config } from "./credentials.js";
 import {
   CATALOG_ROUTE_TEMPLATE,
+  CREDITS_USED_HEADER,
   DROPPED_PARAMS_HEADER,
   FALLBACK_PROVIDER_HEADER,
   models,
@@ -72,41 +73,40 @@ describe("router route contract (spec/router-openapi.yaml)", () => {
   });
 
   /**
-   * The rot guard for `CREDITS_USED_HEADER`, which is the one header constant
-   * in `src/sdk/models.ts` pinned to nothing.
+   * The pin for `CREDITS_USED_HEADER`, which until the sync that landed
+   * `RouterCreditsUsedHeader` was the one header constant in
+   * `src/sdk/models.ts` pinned to NOTHING.
    *
-   * `X-Comfy-Request-Id` and the two `X-Comfy-Router-*` disclosure headers are
-   * declared by the run route's `200`; `X-Comfy-Credits-Used` ships on real
-   * Router responses but is absent from this vendored copy, so there is no
-   * spec value to compare the constant against and its failure mode is
-   * SILENT — a name wrong by one segment reports `creditsUsed: null` on every
-   * run forever, which is indistinguishable from the "Router reported no
-   * cost" the field is documented to mean.
+   * It matters more than the other two because its drift is SILENT. A route
+   * that moves 404s loudly; a credits header name wrong by one segment reports
+   * `creditsUsed: null` on every run forever, which is exactly the value the
+   * field is documented to carry when Router reported no cost. Nothing else in
+   * the repo could catch it: the stub hard-codes the same literal the SDK
+   * expects, so SDK and fixture agree with each other while both disagree with
+   * Router.
    *
-   * So this watches for the sync that ends that, exactly as the queue-route
-   * block below used to watch for the `requests` collection: the day the
-   * contract declares a credits header, this reddens and says to replace it
-   * with a real pin. Without it, the TSDoc's "the next Router sync is the
-   * point to add that pin" is an instruction with nothing to trigger it.
+   * This replaces the rot guard that stood here while the contract declared no
+   * credits header — it watched for the arrival, and the arrival happened. The
+   * name it brought MATCHES the constant, so the SDK was reading the right
+   * header all along; this is what keeps that true through the next sync.
    */
-  it("has no credits header in the contract yet — delete this guard the day it does", async () => {
+  it("spells CREDITS_USED_HEADER the credits header the contract declares on runRouterModel's 200", async () => {
     const { runSuccessHeaderNames } = await readRouterRouteContract();
-    // Sanity: the read works at all. A selector that silently returned
-    // nothing would satisfy the guard below while seeing nothing, which is
-    // the "empty set reads as agreement" failure this file exists to refuse.
+    // Sanity: the read works at all. A selector that silently returned nothing
+    // would satisfy an "is it declared" check vacuously, which is the "empty
+    // set reads as agreement" failure this file exists to refuse.
     expect(runSuccessHeaderNames).toContain(FALLBACK_PROVIDER_HEADER.toLowerCase());
     expect(runSuccessHeaderNames).toContain(DROPPED_PARAMS_HEADER.toLowerCase());
 
     const credits = runSuccessHeaderNames.filter((name) => name.includes("credits"));
     expect(
       credits,
-      "spec/router-openapi.yaml now declares a credits header on runRouterModel's 200 " +
-        `(${credits.join(", ")}). CREDITS_USED_HEADER in src/sdk/models.ts has been unpinned ` +
-        "prose until now — replace THIS guard with an assertion that the constant equals the " +
-        "declared name, the way RUN_ROUTE_TEMPLATE is pinned above. If the declared name " +
-        "differs from the constant, that mismatch is the bug this guard was waiting for: " +
-        "every run has been reporting creditsUsed: null.",
-    ).toEqual([]);
+      "the vendored Router contract changed which credits headers runRouterModel's 200 " +
+        "declares. Exactly one is expected, and CREDITS_USED_HEADER in src/sdk/models.ts is " +
+        "the SDK's copy of its name. If the header was REMOVED, comfy.models.run now reports " +
+        "creditsUsed: null on every call and this pin is how you found out — do not delete it " +
+        "to go green.",
+    ).toEqual([CREDITS_USED_HEADER.toLowerCase()]);
   });
 
   it("spells COMFY_ROUTER_BASE_URL the host the contract declares", async () => {

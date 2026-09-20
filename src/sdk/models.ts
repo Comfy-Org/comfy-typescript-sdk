@@ -220,11 +220,14 @@ export const DROPPED_PARAMS_HEADER = "X-Comfy-Router-Dropped-Params";
  * `X-Comfy-Credits-Used` — what Router priced this call at, in credits. See
  * {@link RunJsonResult.creditsUsed}.
  *
- * Not in `spec/router-openapi.yaml` yet: the header ships on Router's run
- * responses, but the vendored contract's `runRouterModel` `200` does not
- * declare it, so there is nothing here to pin the name against the way
- * `router-spec-contract.test.ts` pins the route. The next Router sync that
- * brings a `RouterCreditsUsedHeader` is the point to add that pin.
+ * Pinned against the vendored contract: `runRouterModel`'s `200` declares
+ * `X-Comfy-Credits-Used` (as `RouterCreditsUsedHeader`), and
+ * `router-spec-contract.test.ts` asserts this constant spells that declared
+ * name. Until the sync that brought it, this was the one header constant in
+ * this file pinned to nothing, watched by a rot guard in that same file —
+ * because the drift it would suffer is SILENT: a name wrong by one segment
+ * reports `creditsUsed: null` on every run forever, which is indistinguishable
+ * from the "Router reported no cost" this field is documented to mean.
  */
 export const CREDITS_USED_HEADER = "X-Comfy-Credits-Used";
 
@@ -345,6 +348,13 @@ export interface RunJsonResult<TData = unknown> {
    *   unreported one are different answers, so branch on PRESENCE
    *   (`creditsUsed != null`) and never on the value being non-zero — the
    *   falsiness of `"0"`'s numeric reading is exactly the bug.
+   *
+   * Success-only, and that is the contract's own word rather than this SDK's
+   * choice: `RouterCreditsUsedHeader` says it "is written only on the path
+   * that returns a result, which a refused call never reaches". So a run that
+   * was priced and then failed does not carry a cost here to be dropped —
+   * there is nothing on the throwing paths to lift, and {@link ComfyError}
+   * carrying no credits field is the contract's shape, not an omission.
    *
    * `string | null` rather than `number | null` on purpose, the same way
    * {@link droppedParams} keeps the server's own shape: the wire value is
