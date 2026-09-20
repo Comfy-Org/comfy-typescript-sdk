@@ -33,11 +33,17 @@
  * buried deeper (inside a block scalar, or under a nested mapping) are both
  * ignored, so neither can stand in for a pin the job does not actually pass.
  *
- * Documented limit: a `with:` written as a FLOW mapping (`with: { ... }`) is not
- * parsed, so its `workflows_ref` reads as absent. Nothing in this repo does
- * that, and on a reusable in `REQUIRES_WORKFLOWS_REF` it fails loudly as a
- * missing input rather than passing silently -- so it does not justify carrying
- * a YAML parser into a job that deliberately runs without `pnpm install`.
+ * Documented limits, both of which read as "input absent". On a reusable in
+ * `REQUIRES_WORKFLOWS_REF` that fails LOUDLY as a missing input rather than
+ * passing silently, which is the direction this lint is allowed to be wrong in
+ * -- so neither justifies carrying a YAML parser into a job that deliberately
+ * runs without `pnpm install`:
+ *
+ *   - a `with:` written as a FLOW mapping (`with: { ... }`) is not parsed;
+ *   - a `with:` block written ABOVE its job's `uses:` is not seen, because the
+ *     scan starts at the `uses:` line. YAML mappings are unordered, so that is
+ *     a legal spelling; it is just not one any caller here uses, and the
+ *     resulting error names the `uses:` line, so the fix is to move the block.
  *
  * Two modes, ONE parser (`findCallers`) shared between them:
  *

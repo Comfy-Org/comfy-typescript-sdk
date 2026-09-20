@@ -490,18 +490,48 @@ jobs:
               "Run: $RUN_URL")"
           fi
 
-      - name: Close the stale-pin issue once the pin is current again
+      # Closes on `current` AND on `grace`, and the two are not the same
+      # sentence. `grace` is in fact the NORMAL state to land in after a bump:
+      # the oldest unpicked commit is under 3 days old, which -- at the 0.39-day
+      # median gap between consumer-visible upstream commits measured above --
+      # is what a bump produces almost every time, because upstream keeps
+      # committing while the PR is in review. Closing on it is right (this
+      # issue's premise is that NOTHING is moving the pin, and something just
+      # did), but saying "current again" there would be false, so the comment is
+      # written per state.
+      - name: Close the stale-pin issue once the pin is moving again
         if: success() && steps.assess.outputs.state != 'delivered'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TITLE: "cursor-review: the github-workflows pin is stale and no bump PR has arrived"
+          STATE: ${{ steps.assess.outputs.state }}
+          # Unset on `current` -- `assess` exits before writing them -- and
+          # unread on that branch. `env:` always defines the name, so `set -u`
+          # is satisfied either way.
+          BEHIND_COUNT: ${{ steps.assess.outputs.behind_count }}
+          OLDEST_SHA: ${{ steps.assess.outputs.oldest_sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           existing="$(gh issue list --state open --limit 100 --json number,title \
             --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
           if [ -n "$existing" ]; then
-            gh issue close "$existing" \
-              --comment "The \`Comfy-Org/github-workflows\` pin is current again. Run: $RUN_URL"
+            if [ "$STATE" = "current" ]; then
+              verdict="The \`Comfy-Org/github-workflows\` pin is current again."
+            else
+              verdict="$(printf '%s ' \
+                "The pin has moved. It is still $BEHIND_COUNT consumer-visible commit(s) behind" \
+                "\`Comfy-Org/github-workflows@main\`, but the oldest one it has not picked up" \
+                "(\`$OLDEST_SHA\`) landed inside the 3-day grace window -- so something is moving" \
+                "this pin again, which is what this issue was open about. It reopens on the first" \
+                "daily run that finds the pin frozen past the grace window again.")"
+              # `printf '%s '` joins the lines with a space and leaves one
+              # trailing; drop it so the `Run:` line below is not double-spaced.
+              verdict="${verdict% }"
+            fi
+            gh issue close "$existing" --comment "$(printf '%s\n' \
+              "$verdict" \
+              "" \
+              "Run: $RUN_URL")"
           fi
