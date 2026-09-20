@@ -217,6 +217,28 @@ export const FALLBACK_PROVIDER_HEADER = "X-Comfy-Router-Fallback-Provider";
 export const DROPPED_PARAMS_HEADER = "X-Comfy-Router-Dropped-Params";
 
 /**
+ * `Idempotent-Replayed` — present (and `true`) only when Router served this
+ * response from an `Idempotency-Key`'s record instead of running the model
+ * again. See {@link RunJsonResult.replayed}. Pinned against the vendored
+ * contract's `RouterIdempotentReplayedHeader` in `router-spec-contract.test.ts`.
+ */
+export const IDEMPOTENT_REPLAYED_HEADER = "Idempotent-Replayed";
+
+/**
+ * Whether the `Idempotent-Replayed` header was present.
+ *
+ * Presence, not value: Router omits the header on a fresh run rather than
+ * sending `false`, and its own contract says so in as many words ("branch on
+ * its presence"). So a `false` on the wire — which nothing is documented to
+ * send, but which a proxy or a future server could — still reads as a replay,
+ * because the only thing the header's arrival can mean is that this answer
+ * came off the record.
+ */
+export function parseReplayed(raw: string | null): boolean {
+  return raw !== null;
+}
+
+/**
  * Parse the `X-Comfy-Router-Dropped-Params` header value.
  *
  * The spec describes this header as "a JSON array of strings" in prose while
@@ -289,6 +311,26 @@ export interface RunJsonResult<TData = unknown> {
    * `null` when no translation ran, or it ran and dropped nothing.
    */
   droppedParams: readonly string[] | null;
+  /**
+   * `Idempotent-Replayed`: `true` when Router answered this call from the
+   * record held against its `Idempotency-Key` rather than by running the model
+   * again.
+   *
+   * A replay is not charged a second time. It happens on this SDK's own
+   * collect loop (a same-key re-send after a `409 concurrency_limit_exceeded`
+   * or `504 deadline_exceeded`) and on a caller's own retry under a supplied
+   * `idempotencyKey`. On a replay every disclosure field RESTATES the original
+   * run rather than describing a second one, so a spend tracker must SKIP a
+   * result with `replayed: true` instead of adding its cost up again.
+   *
+   * Derived from the header's PRESENCE, exactly as the Python SDK's
+   * `RouterRunResult.replayed` is: Router omits the header on a fresh run
+   * rather than sending `false`. Always `false` on a result from
+   * {@link RequestHandle.get}: the queued result route never carries the
+   * header, and re-collecting the same handle is deduplicated by
+   * `RequestHandle.requestId` instead.
+   */
+  replayed: boolean;
 }
 
 /**
@@ -319,6 +361,8 @@ export interface RunBinaryResult {
   servingProvider: string | null;
   /** As {@link RunJsonResult.droppedParams}. */
   droppedParams: readonly string[] | null;
+  /** As {@link RunJsonResult.replayed}. */
+  replayed: boolean;
 }
 
 /**
@@ -1310,6 +1354,10 @@ function finish<TData>(
   // cannot tell an alt-provider run from a native one.
   const servingProvider = response.headers.get(FALLBACK_PROVIDER_HEADER);
   const droppedParams = parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER));
+  // Read here for the same reason: whether this answer came off the
+  // `Idempotency-Key`'s record or from a run that really happened is not
+  // recoverable from the body, which a replay restates verbatim.
+  const replayed = parseReplayed(response.headers.get(IDEMPOTENT_REPLAYED_HEADER));
   if (!response.ok) throw errorFromResponse(response, decodeUtf8(responseBody), idempotencyKey);
 
   // A 202 is a task handle, not a result. This route is the synchronous one,
@@ -1360,6 +1408,7 @@ function finish<TData>(
       requestId,
       servingProvider,
       droppedParams,
+      replayed,
     };
   }
 
@@ -1387,6 +1436,7 @@ function finish<TData>(
         requestId,
         servingProvider,
         droppedParams,
+        replayed,
       };
     }
     throw new ComfyError(
@@ -1400,7 +1450,7 @@ function finish<TData>(
       },
     );
   }
-  return { kind: "json", data: data as TData, requestId, servingProvider, droppedParams };
+  return { kind: "json", data: data as TData, requestId, servingProvider, droppedParams, replayed };
 }
 
 // -- discovery: the model catalog, and one model's published schemas ---------

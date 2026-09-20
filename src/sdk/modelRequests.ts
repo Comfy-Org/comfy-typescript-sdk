@@ -68,7 +68,9 @@ import { fillRoute, parseModelId, parseRequestId } from "./modelRoutes.js";
 import {
   DROPPED_PARAMS_HEADER,
   FALLBACK_PROVIDER_HEADER,
+  IDEMPOTENT_REPLAYED_HEADER,
   parseDroppedParams,
+  parseReplayed,
   type RunResult,
 } from "./models.js";
 import {
@@ -821,7 +823,9 @@ export class RequestHandle<TData = unknown> {
    *
    * Calling it on a request that has already completed is one status poll and
    * one fetch, so collecting a result twice — or from a second process — costs
-   * no more than the first time.
+   * no more than the first time. The second collection carries `replayed:
+   * false` — this route has no replay marker — so deduplicate spend by
+   * {@link RequestHandle.requestId}, not by `replayed`.
    */
   async get(options: WaitOptions = {}): Promise<RunResult<TData>> {
     const timeoutMs = options.timeoutMs ?? null;
@@ -897,12 +901,19 @@ export class RequestHandle<TData = unknown> {
     // so a queued run cannot address an alternate provider and has nothing to
     // disclose — but reading them keeps the two result shapes identical and
     // means this path needs no edit on the day that route does gain them.
+    //
+    // `Idempotent-Replayed` is read rather than hard-coded `false` for that
+    // same reason. It reads `false` on every real response — the queued result
+    // route carries no replay marker, and this route's own re-collection is
+    // deduplicated by `requestId` rather than by a header — but writing the
+    // literal would bake that in where a header read simply stays correct.
     return {
       kind: "json",
       data: body as TData,
       requestId: response.headers.get(REQUEST_ID_HEADER),
       servingProvider: response.headers.get(FALLBACK_PROVIDER_HEADER),
       droppedParams: parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER)),
+      replayed: parseReplayed(response.headers.get(IDEMPOTENT_REPLAYED_HEADER)),
     };
   }
 

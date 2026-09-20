@@ -97,6 +97,21 @@ interface Asymmetry {
    * deliberate divergence belongs in `why` with no field at all.
    */
   readonly modelsMethodsAheadOfPython?: readonly string[];
+  /**
+   * Python `models` method names that TypeScript does not carry BY DESIGN,
+   * because the thing they add is already on TypeScript's default return
+   * shape. Filtered from the Python side of the name comparison. Guarded
+   * below: the entry fails if this SDK ever exposes the camelCase twin.
+   *
+   * Distinct from `modelsMethodsAheadOfPython`, which is a LAG that should end
+   * — this one never ends, because the method is not coming. The guard is
+   * therefore the mirror image: a lead's rot guard fires when Python GROWS the
+   * name, and this one fires when TypeScript grows the twin.
+   */
+  readonly pythonMethodsSubsumedByTypescript?: readonly (readonly [
+    pythonName: string,
+    typescriptTwin: string,
+  ])[];
 }
 
 const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
@@ -109,7 +124,12 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
       "method, class or error_type name differs because of it — and this check compares " +
       "names, so the entry suppresses nothing. It is declared anyway: a future reviewer " +
       "who notices the difference should find it listed as a decision, not wonder whether " +
-      "the check simply cannot see it.",
+      "the check simply cannot see it. Because TypeScript's `run` already returns that " +
+      "envelope — `data`, `requestId`, `servingProvider`, `droppedParams`, `replayed` — " +
+      "Python's opt-in `run_detailed` (its `RouterRunResult`) has no counterpart here: the " +
+      "fields it adds are what `run` returns by default. A `runDetailed` would be an envelope " +
+      "around an envelope.",
+    pythonMethodsSubsumedByTypescript: [["run_detailed", "runDetailed"]],
   },
   {
     id: "credential-resolution",
@@ -187,6 +207,9 @@ const AHEAD_MODELS_METHODS = new Set(
   INTENTIONAL_ASYMMETRIES.flatMap((a) => a.modelsMethodsAheadOfPython ?? []),
 );
 const AHEAD_ERROR_TYPES = new Set(AHEAD_OF_PYTHON.map(([, errorType]) => errorType));
+const SUBSUMED_PYTHON_METHODS_PAIRS: readonly (readonly [string, string])[] =
+  INTENTIONAL_ASYMMETRIES.flatMap((a) => a.pythonMethodsSubsumedByTypescript ?? []);
+const SUBSUMED_PYTHON_METHODS = new Set(SUBSUMED_PYTHON_METHODS_PAIRS.map(([py]) => py));
 
 interface PythonSurface {
   source: { repo: string; ref: string; files: string[] };
@@ -344,13 +367,40 @@ describe("cross-SDK surface parity", () => {
     // Filtered on BOTH sides, so the day the Python SDK catches up produces
     // exactly ONE failure — the rot guard below, whose message says to delete
     // the entry — rather than a divergence line per method.
+    // `SUBSUMED_PYTHON_METHODS` is filtered on the PYTHON side only: those
+    // names are deliberately absent here, and the guard below is what keeps
+    // the entry honest by failing if the TypeScript twin ever appears.
     expect(
       nameDivergences(
         "comfy.models",
-        pythonSync[0][1].filter((name) => !AHEAD_MODELS_METHODS.has(name)),
+        pythonSync[0][1].filter(
+          (name) => !AHEAD_MODELS_METHODS.has(name) && !SUBSUMED_PYTHON_METHODS.has(name),
+        ),
         methodNames(models).filter((name) => !AHEAD_MODELS_METHODS.has(name)),
       ),
     ).toEqual([]);
+  });
+
+  it("keeps every subsumed Python method subsumed", () => {
+    // The rot guard for `pythonMethodsSubsumedByTypescript`. An entry claims
+    // the Python method adds nothing TypeScript's default return shape does
+    // not already carry; the day this SDK grows the twin, that claim is over
+    // and the filter above is hiding a real comparison.
+    //
+    // Deliberately NOT asserted: that the Python snapshot still contains the
+    // method. `parity/python-surface.json` is refreshed by a separate job, and
+    // an entry that only becomes valid after the next refresh would make this
+    // change red before it and green after — so the guard is written on the
+    // side this repo controls.
+    const typescriptMethods = methodNames(models);
+    for (const [pythonName, typescriptTwin] of SUBSUMED_PYTHON_METHODS_PAIRS) {
+      expect(
+        typescriptMethods,
+        `\`comfy.models.${typescriptTwin}\` now exists — delete the subsumed entry for ` +
+          `\`${pythonName}\` from INTENTIONAL_ASYMMETRIES so the two surfaces are compared ` +
+          "again",
+      ).not.toContain(typescriptTwin);
+    }
   });
 
   it("keeps every declared `models` lead live, and only in the leading direction", async () => {
