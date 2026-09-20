@@ -27,11 +27,17 @@
  * are a `uses:` line and one `with:` key, both of which are unambiguous on
  * their own line.
  *
- * Documented limit: a `workflows_ref:` written INSIDE a block scalar in the
- * same job (rather than as a real `with:` key) would be read as the input.
- * Nothing in this repo does that, and the failure is a loud false alarm rather
- * than a silent miss, so it does not justify carrying a YAML parser into a job
- * that deliberately runs without `pnpm install`.
+ * Position is read, not just spelling: the input is recognised only as a DIRECT
+ * CHILD of the calling job's `with:` block, which is the only place GitHub
+ * accepts one. A same-indent `workflows_ref:` (a sibling of `uses:`) and one
+ * buried deeper (inside a block scalar, or under a nested mapping) are both
+ * ignored, so neither can stand in for a pin the job does not actually pass.
+ *
+ * Documented limit: a `with:` written as a FLOW mapping (`with: { ... }`) is not
+ * parsed, so its `workflows_ref` reads as absent. Nothing in this repo does
+ * that, and on a reusable in `REQUIRES_WORKFLOWS_REF` it fails loudly as a
+ * missing input rather than passing silently -- so it does not justify carrying
+ * a YAML parser into a job that deliberately runs without `pnpm install`.
  *
  * Two modes, ONE parser (`findCallers`) shared between them:
  *
@@ -84,24 +90,60 @@ const WORKFLOWS_REF_RE = /^\s*workflows_ref:\s*(["']?)([^\s"']+?)\1\s*(?:#.*)?$/
 const SHORT_SHA_RE = /\b[0-9a-f]{7,40}\b/g;
 
 /**
- * The lines belonging to the job that owns the `uses:` on `usesIndex`.
+ * The `workflows_ref` INPUT of the job that owns the `uses:` on `usesIndex`,
+ * or `null` if that job passes none.
  *
- * A job's `uses:`, `with:` and `secrets:` are siblings at the same indent, so
- * the job body runs until a line appears at a SHALLOWER indent than that --
- * which is the next job's key, or the next top-level key. Blank lines and
- * whole-line comments carry no structure and never end the body (a comment is
- * often written flush-left).
+ * GitHub accepts a reusable-workflow input only at `jobs.<id>.with.<input>`, so
+ * that is the only place this looks. Position, not just spelling, is what makes
+ * a line the pin:
+ *
+ * - A job's `uses:`, `with:` and `secrets:` are siblings at the same indent, so
+ *   the job body runs until a line appears at a SHALLOWER indent -- the next
+ *   job's key, or the next top-level key.
+ * - Inside the body, only a DIRECT CHILD of `with:` is an input. A
+ *   `workflows_ref:` written as a sibling of `uses:` is not passed to the
+ *   reusable at all (it makes the job invalid), and one nested deeper than the
+ *   `with:` children -- inside a block scalar, or under a nested mapping -- is
+ *   part of some other input's value. Neither may satisfy the pin, or this lint
+ *   would pass a caller whose real `workflows_ref` is missing or split.
+ *
+ * Blank lines and whole-line comments carry no structure and never end a block
+ * (a comment is often written flush-left).
  */
-function jobBodyAfter(lines, usesIndex, usesIndent) {
-  const body = [];
+function workflowsRefInput(lines, usesIndex, usesIndent) {
+  let inWith = false;
+  // The indent shared by `with:`'s direct children, learned from the first one.
+  let withChildIndent = null;
+
   for (let i = usesIndex + 1; i < lines.length; i++) {
     const line = lines[i];
-    if (line.trim() === "" || line.trim().startsWith("#")) continue;
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed.startsWith("#")) continue;
     const indent = line.length - line.trimStart().length;
+
+    // Shallower than `uses:` -- the job is over.
     if (indent < usesIndent) break;
-    body.push({ line, lineNo: i + 1 });
+
+    // A sibling of `uses:`: opens the `with:` block, or closes it.
+    if (indent === usesIndent) {
+      inWith = /^with:\s*(?:#.*)?$/.test(trimmed);
+      withChildIndent = null;
+      continue;
+    }
+
+    // Deeper than `uses:`, but outside `with:` (a `secrets:` value, a block
+    // scalar under a job-level key) -- not an input.
+    if (!inWith) continue;
+
+    withChildIndent ??= indent;
+    // Deeper than the `with:` children: inside another input's value.
+    if (indent !== withChildIndent) continue;
+
+    const rm = WORKFLOWS_REF_RE.exec(line);
+    if (rm) return { value: rm[2], lineNo: i + 1 };
   }
-  return body;
+
+  return null;
 }
 
 /**
@@ -127,13 +169,6 @@ function findCallers() {
       if (!m) continue;
 
       const [, indentStr, , workflowPath, ref, comment] = m;
-      const body = jobBodyAfter(lines, i, indentStr.length);
-      const workflowsRef = body
-        .map(({ line, lineNo }) => {
-          const rm = WORKFLOWS_REF_RE.exec(line);
-          return rm ? { value: rm[2], lineNo } : null;
-        })
-        .find(Boolean);
 
       callers.push({
         rel,
@@ -141,7 +176,7 @@ function findCallers() {
         usesLineNo: i + 1,
         ref,
         comment,
-        workflowsRef: workflowsRef ?? null,
+        workflowsRef: workflowsRefInput(lines, i, indentStr.length),
       });
     }
   }

@@ -381,8 +381,15 @@ jobs:
           # "no bump PR" would file a stale-pin issue naming a cause nobody
           # established, and the sticky-issue step below is gated on the
           # verdict, not on `failure()`, so a red step files nothing.
+          #
+          # `--head` filters by branch NAME only -- `--repo` picks the base
+          # repo, not the head one -- so an unrelated fork PR whose branch
+          # happens to be called `ci/bump-cursor-review` would read as a
+          # delivered bump and mute the watchdog. Only a same-repo branch can
+          # be the fleet's, so cross-repository PRs are dropped.
           bump_pr="$(gh pr list --repo "$GH_REPO" --state open \
-            --head "$BUMP_BRANCH" --json number --jq '.[0].number // empty')"
+            --head "$BUMP_BRANCH" --json number,isCrossRepository \
+            --jq '[.[] | select(.isCrossRepository == false)][0].number // empty')"
 
           if [ -n "$bump_pr" ]; then
             echo "bump_pr=$bump_pr" >>"$GITHUB_OUTPUT"
