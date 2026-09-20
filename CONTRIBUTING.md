@@ -104,7 +104,9 @@ Two more jobs run on the pull request and have no local `pnpm` script:
   artifact at PR time instead of at release time. Reproduce locally with
   `pnpm build && pnpm pack`.
 - **`hygiene / public-repo-hygiene`** — see [below](#public-repo-hygiene). It
-  runs from its own workflow file, not `ci.yml`.
+  runs from its own workflow file, not `ci.yml`. A companion one-step job in
+  that file, **`public-repo-hygiene`**, simply re-exports its result under the
+  name `main`'s branch protection requires, and fails whenever it fails.
 
 ## Generated code (do not hand-edit)
 

@@ -194,6 +194,12 @@ The three other checks:
   `.github/workflows/public-repo-hygiene.yml` and run
   `python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root <this repo>`.
   See section 3.
+- **`public-repo-hygiene`** — a one-step gate in that same workflow file that
+  re-exports the job above under the bare name `main`'s branch protection
+  requires. A reusable-workflow call always reports as
+  `<caller job> / <called job>`, so it can never satisfy a required context
+  named `public-repo-hygiene` on its own. Nothing to reproduce; it passes iff
+  `hygiene / public-repo-hygiene` passed.
 - **`sdk-parity`** — `node scripts/sync-python-surface.mjs`. The only job that
   reaches the network. See section 6.
 

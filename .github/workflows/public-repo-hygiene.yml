@@ -27,3 +27,30 @@ jobs:
       # REQUIRED, and must equal the `uses:` SHA above — the reusable asserts
       # they match, which is what pins the checker to the reviewed commit.
       workflows_ref: aad06972e20732d6a9167552c5b3247c4f5bac58
+
+  # Branch protection on main requires a status check named exactly
+  # `public-repo-hygiene`. A reusable-workflow call cannot produce that name:
+  # GitHub reports the called job as `<caller job> / <called job>`, so the job
+  # above surfaces as `hygiene / public-repo-hygiene` and would leave the
+  # required context permanently unreported. This gate re-exports the result
+  # under the required name so the migration needs no branch-protection edit.
+  #
+  # `if: always()` is load-bearing. Without it a failing `hygiene` would leave
+  # this job *skipped*, and branch protection counts a skipped required check as
+  # satisfied — a hygiene failure would sail through the gate it exists to man.
+  public-repo-hygiene:
+    name: public-repo-hygiene
+    needs: hygiene
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require the shared hygiene job to have passed
+        env:
+          HYGIENE_RESULT: ${{ needs.hygiene.result }}
+        run: |
+          echo "shared public-repo-hygiene job result: $HYGIENE_RESULT"
+          if [ "$HYGIENE_RESULT" != "success" ]; then
+            echo "::error::Shared public-repo-hygiene job did not succeed (result: $HYGIENE_RESULT)."
+            exit 1
+          fi
