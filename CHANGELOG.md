@@ -45,7 +45,8 @@ entry. See CONTRIBUTING.md.
   interfaces so that a consumer's own `RunJsonResult`/`RunBinaryResult`
   literal — a test double written against `0.4.0`, which shipped these
   interfaces without it — keeps compiling; every result this SDK returns sets
-  it.
+  it. Success-only, per the Router contract: the header is written on the path
+  that returns a result, so a call that throws carries no cost to report.
 - **Three queue-tier `routerErrors` classes — `Cancelled`, `QueueTimeout`
   and `RequestNotFound`** — for the `cancelled`, `queue_timeout` and
   `request_not_found` buckets the vendored Router contract now declares, so a
