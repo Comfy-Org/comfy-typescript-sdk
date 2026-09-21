@@ -36,6 +36,19 @@ entry. See CONTRIBUTING.md.
   queued failure carrying one of them is a typed `catch` rather than a bare
   `RouterError`.
 
+### Fixed
+
+- **The `droppedParams` doc comments now match the vendored Router contract.**
+  The TSDoc on `parseDroppedParams` and `RunJsonResult.droppedParams` still
+  described the pre-sync spec: it called the declared
+  `X-Comfy-Router-Dropped-Params` schema a defect that would be reverted, and
+  said only an explicit `modelProvider` translation could populate the field.
+  The spec declares that header as one JSON-encoded string deliberately — each
+  entry is a sentence carrying commas of its own — and names an automatic
+  `fallback_provider` retry as a second producer, so a call that never set
+  `modelProvider` can still come back with a non-null `droppedParams`. Comments
+  only; the parsing and the header handling are unchanged.
+
 ## [0.3.0] - 2026-09-14
 
 ### Added

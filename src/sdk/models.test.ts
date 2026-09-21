@@ -1737,11 +1737,10 @@ describe("comfy.models.run argument validation", () => {
 
 describe("parseDroppedParams", () => {
   it("reads the header as JSON, because a comma split would shred its own example", () => {
-    // The spec describes this header as "a JSON array of strings" while
-    // declaring `schema: {type: array}` — OpenAPI's comma-delimited form. Its
-    // own example entry settles which is right: it CONTAINS a comma, so the
-    // comma-delimited reading tears one meaningful disclosure into two
-    // meaningless fragments.
+    // The spec declares this header as a single JSON-encoded string precisely
+    // because its entries carry commas of their own — the example entry below
+    // CONTAINS one — so the parser has to JSON-decode it. A comma split would
+    // tear that one meaningful disclosure into two meaningless fragments.
     const entry = "moderation (fal applies its own, non-configurable safety filtering)";
     expect(parseDroppedParams(JSON.stringify([entry]))).toEqual([entry]);
     expect(parseDroppedParams(JSON.stringify([]))).toEqual([]);
