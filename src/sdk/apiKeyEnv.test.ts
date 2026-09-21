@@ -158,17 +158,24 @@ describe("no credential at all", () => {
     expect(await authorization()).toBeNull();
   });
 
-  it.each(["https://cloud.comfy.org:443", "https://cloud.comfy.org/", "HTTPS://cloud.comfy.org"])(
-    "still recognizes Comfy Cloud written as %j",
-    (spelling) => {
-      // Compared by normalized origin and path, not by string: reading one of
-      // these as *some other* deployment would hand back a keyless client and a
-      // server 401 instead of this local error.
-      vi.stubEnv(BASE_URL_ENV_VAR, spelling);
-      vi.stubEnv(CREDENTIALS_ENV_VAR, undefined);
-      expect(() => construct()).toThrow(MissingCredentials);
-    },
-  );
+  it.each([
+    "https://cloud.comfy.org:443",
+    "https://cloud.comfy.org/",
+    "HTTPS://cloud.comfy.org",
+    // Doubled trailing slashes -- what string-concatenating a base URL with a
+    // "/" prefix produces. Python's `_same_deployment` rstrips them all, so
+    // stripping only the last one here would be a silent cross-SDK divergence
+    // in the unsafe direction: a keyless client aimed at Comfy Cloud.
+    "https://cloud.comfy.org//",
+    "https://cloud.comfy.org:443//",
+  ])("still recognizes Comfy Cloud written as %j", (spelling) => {
+    // Compared by normalized origin and path, not by string: reading one of
+    // these as *some other* deployment would hand back a keyless client and a
+    // server 401 instead of this local error.
+    vi.stubEnv(BASE_URL_ENV_VAR, spelling);
+    vi.stubEnv(CREDENTIALS_ENV_VAR, undefined);
+    expect(() => construct()).toThrow(MissingCredentials);
+  });
 
   it("treats a deployment mounted under the same host as a different target", async () => {
     // The keyless carve-out has to keep applying to it.

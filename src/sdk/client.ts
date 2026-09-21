@@ -129,11 +129,21 @@ function resolveBaseUrl(): string {
 function sameDeployment(url: string, other: string): boolean {
   const a = new URL(url);
   const b = new URL(other);
-  return a.origin === b.origin && stripTrailingSlash(a.pathname) === stripTrailingSlash(b.pathname);
+  return (
+    a.origin === b.origin && stripTrailingSlashes(a.pathname) === stripTrailingSlashes(b.pathname)
+  );
 }
 
-function stripTrailingSlash(path: string): string {
-  return path.replace(/\/$/, "");
+/**
+ * Every trailing slash, not just the last one — `rstrip("/")`, which is what
+ * the Python `_same_deployment` this mirrors applies.
+ *
+ * Stripping only one would read `https://cloud.comfy.org//` as path `/`
+ * against Comfy Cloud's ``, i.e. as some OTHER deployment, and hand back the
+ * keyless client and the server 401 this whole path exists to replace.
+ */
+function stripTrailingSlashes(path: string): string {
+  return path.replace(/\/+$/, "");
 }
 
 /**
