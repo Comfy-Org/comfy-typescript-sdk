@@ -33,12 +33,28 @@
  * buried deeper (inside a block scalar, or under a nested mapping) are both
  * ignored, so neither can stand in for a pin the job does not actually pass.
  *
+ * The scan is structure-aware in the two places text matching would otherwise
+ * be wrong in the SILENT direction:
+ *
+ * - Block scalars (`run: |`) are skipped, so a `uses:` line quoted inside a
+ *   shell script body is not mistaken for a caller. This file's own sibling
+ *   ci.yml writes issue bodies about workflow pins inside `run: |`, so that is
+ *   a live shape here, not a hypothetical one. A phantom caller would fail the
+ *   lint on a pin that does not exist and, worse, make `--print-pin` ambiguous
+ *   and take the daily `cursor-review-pin-freshness` watchdog down with it.
+ * - The `uses` KEY may be quoted (`"uses":`), which YAML allows and which must
+ *   not read as "no uses: here".
+ *
+ * A STEP's `- uses:` is deliberately NOT matched. `jobs.<id>.uses` is the only
+ * place GitHub accepts a reusable-workflow call; a `- uses:` inside `steps:` is
+ * a composite ACTION, which pins once and has no `workflows_ref` to disagree
+ * with. Matching it would make this lint demand a pin that cannot exist.
+ *
  * One documented limit, which reads as "input absent": a `with:` written as a
- * FLOW mapping (`with: { ... }`) is not parsed. On a reusable in
- * `REQUIRES_WORKFLOWS_REF` that fails LOUDLY as a missing input rather than
- * passing silently, which is the direction this lint is allowed to be wrong in
- * -- so it does not justify carrying a YAML parser into a job that deliberately
- * runs without `pnpm install`.
+ * FLOW mapping (`with: { ... }`) is not parsed. That fails LOUDLY as a missing
+ * input rather than passing silently, which is the direction this lint is
+ * allowed to be wrong in -- so it does not justify carrying a YAML parser into
+ * a job that deliberately runs without `pnpm install`.
  *
  * Block-mapping key ORDER is not a limit: `with:` may sit above or below its
  * job's `uses:`, because the scan covers the whole job body rather than only
@@ -72,28 +88,54 @@ const WORKFLOWS_DIR = join(ROOT, ".github", "workflows");
 // is not this lint's business (it has no `workflows_ref` to disagree with).
 const REUSABLE_OWNER_REPO = "Comfy-Org/github-workflows";
 
-// Reusables that REQUIRE `workflows_ref` (upstream declares it
-// `required: true` with no default). Dropping the input from one of these
-// callers is the same bug as splitting the pair -- the reusable would load
-// its scripts from an empty ref -- so absence is an error, not a skip. Add a
-// reusable here when it starts taking the input.
-const REQUIRES_WORKFLOWS_REF = new Set(["cursor-review.yml"]);
+// `workflows_ref` is REQUIRED of every caller unless the reusable it calls is
+// named here. The default is deliberately fail-CLOSED: an opt-in allowlist
+// means a reusable nobody remembered to add is skipped in silence, which is the
+// same split-pin escape this script exists to catch -- and it would swallow the
+// flow-mapping `with:` limit too, since that also reads as "input absent".
+// Failing closed turns both into a red build naming the file and the line.
+//
+// Add a reusable here only after checking upstream that its `workflow_call`
+// declares no `workflows_ref` input at all. Empty today: the org's reusables
+// that this repo calls all take one.
+const NO_WORKFLOWS_REF = new Set([]);
 
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 // `uses: Comfy-Org/github-workflows/.github/workflows/<name>.yml@<ref>  # <comment>`
 // The value may be quoted (`uses: "owner/repo/...@sha"`). Unquoted is what
 // every caller doc writes, but a quoted one must not read as "no uses: here" --
 // a silent skip is the one direction this lint must never fail in.
+// Matched only as a job-level mapping KEY, never as a step's `- uses:` (see
+// the header). The key and the value may each be quoted.
 const USES_RE = new RegExp(
-  String.raw`^(\s*)uses:\s*(["']?)` +
+  String.raw`^(\s*)(["']?)uses\2\s*:\s*(["']?)` +
     REUSABLE_OWNER_REPO.replace("/", "\\/") +
-    String.raw`\/(\S+?)@([^\s"']+?)\2\s*(?:#(.*))?$`,
+    String.raw`\/(\S+?)@([^\s"']+?)\3\s*(?:#(.*))?$`,
 );
 const WORKFLOWS_REF_RE = /^\s*workflows_ref:\s*(["']?)([^\s"']+?)\1\s*(?:#.*)?$/;
-// A short-SHA candidate inside the trailing comment: 7-40 hex characters as a
+// A line that opens a BLOCK SCALAR (`run: |`, `body: >-`). Group 1 spans the
+// indent AND any `- ` sequence marker, so its length is the KEY's column --
+// block content is indented deeper than the key, which for `- run: |` is not
+// the same as deeper than the dash.
+const BLOCK_SCALAR_RE = /^(\s*(?:-\s+)?)[^\s#][^:]*:\s*[|>][0-9+-]*\s*(?:#.*)?$/;
+// Short-SHA candidates inside the trailing comment. The DOCUMENTED spelling
+// parenthesises the abbreviation (`# github-workflows main (425c154)`), so when
+// the comment carries any parenthesised candidate those are the whole set --
+// anything else in the comment is prose and not a claim about this pin.
+const PAREN_SHA_RE = /\(([0-9a-f]{7,40})\)/g;
+// Fallback for a comment written without parentheses: 7-40 hex characters as a
 // whole word. 7 is git's minimum abbreviation, so shorter tokens (`# v7`) are
-// version spellings, not SHAs, and are left alone.
-const SHORT_SHA_RE = /\b[0-9a-f]{7,40}\b/g;
+// version spellings. All-DIGIT runs are dropped: `20260919` is a date, and a
+// real abbreviated SHA that happens to be all digits is a 1-in-1.7-million
+// coincidence that costs only a comment reworded to the parenthesised form.
+const BARE_SHA_RE = /\b[0-9a-f]{7,40}\b/g;
+
+/** Commit abbreviations the trailing comment claims, most precise form first. */
+function commentShaCandidates(comment) {
+  const parenthesised = [...comment.matchAll(PAREN_SHA_RE)].map((m) => m[1]);
+  if (parenthesised.length > 0) return parenthesised;
+  return (comment.match(BARE_SHA_RE) ?? []).filter((c) => /[a-f]/.test(c));
+}
 
 /**
  * The `workflows_ref` INPUT of the job that owns the `uses:` on `usesIndex`,
@@ -188,14 +230,35 @@ function findCallers() {
     const rel = `.github/workflows/${file}`;
     const lines = readFileSync(join(WORKFLOWS_DIR, file), "utf8").split("\n");
 
+    // Column of the key owning the block scalar we are inside, or null.
+    let blockKeyIndent = null;
+
     for (let i = 0; i < lines.length; i++) {
+      const trimmed = lines[i].trimStart();
+      const indent = lines[i].length - trimmed.length;
+
+      // Inside a block scalar: content is anything indented deeper than its
+      // key, plus blank lines. The first line at or above the key's column
+      // ends it and is then read normally.
+      if (blockKeyIndent !== null) {
+        if (trimmed === "" || indent > blockKeyIndent) continue;
+        blockKeyIndent = null;
+      }
+
       // A whole-line comment can quote a `uses:` while documenting it; the
       // header of ci-cursor-review.yml does exactly that.
-      if (lines[i].trimStart().startsWith("#")) continue;
+      if (trimmed.startsWith("#")) continue;
+
+      const bm = BLOCK_SCALAR_RE.exec(lines[i]);
+      if (bm) {
+        blockKeyIndent = bm[1].length;
+        continue;
+      }
+
       const m = USES_RE.exec(lines[i]);
       if (!m) continue;
 
-      const [, indentStr, , workflowPath, ref, comment] = m;
+      const [, indentStr, , , workflowPath, ref, comment] = m;
 
       callers.push({
         rel,
@@ -233,7 +296,7 @@ function lint(callers) {
     // Checked before the pair so a stale comment is reported even on a caller
     // that takes no `workflows_ref`.
     if (comment) {
-      for (const candidate of comment.match(SHORT_SHA_RE) ?? []) {
+      for (const candidate of commentShaCandidates(comment)) {
         if (!ref.startsWith(candidate)) {
           errors.push(
             `${at}: the trailing comment names commit \`${candidate}\`, but ` +
@@ -247,12 +310,14 @@ function lint(callers) {
 
     // (2) `workflows_ref` must be the same commit as `uses:`.
     if (!workflowsRef) {
-      if (REQUIRES_WORKFLOWS_REF.has(reusable)) {
+      if (!NO_WORKFLOWS_REF.has(reusable)) {
         errors.push(
-          `${at}: this job calls \`${reusable}\`, which requires a ` +
-            `\`workflows_ref\` input, but none is set. Without it the reusable ` +
-            `loads its prompts/scripts from an empty ref. Add ` +
-            `\`workflows_ref: ${ref}\` under \`with:\`.`,
+          `${at}: this job calls \`${reusable}\` but passes no ` +
+            `\`workflows_ref\` input. An omitted input arrives as \`''\`, and the ` +
+            `reusable would load its prompts/scripts from an empty ref. Add ` +
+            `\`workflows_ref: ${ref}\` under \`with:\` -- or, if \`${reusable}\` ` +
+            `genuinely declares no such input upstream, add it to ` +
+            `\`NO_WORKFLOWS_REF\` in this script.`,
         );
       }
       continue;

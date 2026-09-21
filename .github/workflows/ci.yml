@@ -235,6 +235,10 @@ jobs:
     # `cursor-review-pin-freshness` only; this job's inputs all live in this
     # repo and cannot change without a push.
     if: github.event_name != 'schedule'
+    # Reads the checkout and nothing else.
+    permissions:
+      contents: read
+    timeout-minutes: 5
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -267,6 +271,9 @@ jobs:
     name: cursor-review-pin-freshness (upstream pin staleness)
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
+    # A stalled clone or API call must not hold a runner -- and this job's
+    # token can write issues -- for the six-hour default.
+    timeout-minutes: 10
     permissions:
       contents: read
       # `issues: write` for the sticky issue below; `pull-requests: read` to
@@ -292,6 +299,13 @@ jobs:
           # to merge it, so an upstream commit this repo has not picked up yet
           # is not evidence of anything being stuck until it has had a few days.
           GRACE_SECONDS: "259200" # 3 days
+          # A SECOND, longer clock, on the bump PR itself. `delivered` suspends
+          # this watchdog on the strength of an open PR, so without an upper
+          # bound one abandoned or permanently-red PR on that branch mutes the
+          # watchdog forever -- the same silent freeze it exists to end, now
+          # with an alibi. A delivered bump that nobody has merged in a week is
+          # stuck, and stuck is what this job reports.
+          BUMP_PR_GRACE_SECONDS: "604800" # 7 days
         run: |
           set -euo pipefail
 
@@ -310,8 +324,31 @@ jobs:
           git clone --filter=blob:none --no-checkout --quiet \
             https://github.com/Comfy-Org/github-workflows /tmp/gw
 
-          if ! git -C /tmp/gw merge-base --is-ancestor "$pin" origin/main 2>/dev/null; then
-            echo "::error::pin $pin is not an ancestor of github-workflows main (unknown commit, or pinned to a fork/PR branch). Re-pin both pins to a commit on main."
+          # `merge-base --is-ancestor` exits 1 for "not an ancestor" and 2+ for
+          # a hard error -- an unreadable object, `origin/main` gone after an
+          # upstream default-branch rename, a partial-clone fetch failure.
+          # Discarding stderr and folding the two together reports an
+          # infrastructure fault as "re-pin both pins" against a pin that is in
+          # fact correct. Only exit 1 is a verdict about the pin, and only a
+          # verdict files an issue.
+          ancestry_rc=0
+          ancestry_err="$(git -C /tmp/gw merge-base --is-ancestor "$pin" origin/main 2>&1)" \
+            || ancestry_rc=$?
+
+          if [ "$ancestry_rc" -eq 1 ]; then
+            reason="The pinned commit \`$pin\` is not an ancestor of \`Comfy-Org/github-workflows@main\` -- an unknown commit, or both pins moved to a fork or PR branch. Re-pin \`uses:\` and \`workflows_ref:\` in \`.github/workflows/ci-cursor-review.yml\` to a commit that is on \`main\`, then run \`node scripts/check-workflow-pins.mjs\`."
+            {
+              echo "state=broken"
+              echo "broken_reason=$reason"
+            } >>"$GITHUB_OUTPUT"
+            echo "::error::$reason"
+            exit 1
+          elif [ "$ancestry_rc" -ne 0 ]; then
+            # NO verdict written: nothing here established anything about the
+            # pin, so the issue steps below must stay out of it. The red run
+            # and this annotation are the whole record, which is right for a
+            # fault that is very likely transient.
+            echo "::error::could not determine whether $pin is an ancestor of github-workflows main -- git exited $ancestry_rc: ${ancestry_err:-(no output)}"
             exit 1
           fi
 
@@ -321,10 +358,46 @@ jobs:
           # included, and re-syncing this from there is the only correct way to
           # change it. A commit touching nothing else cannot affect a pinned
           # caller, so it must not count as staleness.
-          behind="$(git -C /tmp/gw log --format='%H %cI' "$pin..origin/main" -- \
-            .github/workflows/cursor-review.yml \
-            .github/cursor-review \
-            scripts/check-pr-size \
+          watched=(
+            .github/workflows/cursor-review.yml
+            .github/cursor-review
+            scripts/check-pr-size
+          )
+
+          # A hand-copy held in sync by a comment WILL drift, and this one would
+          # drift SILENTLY HEALTHY: `git log` over a path upstream has renamed
+          # matches nothing, so `behind` comes back empty, `state=current` is
+          # written, and this job reports "pin is current" and closes its own
+          # issue every day no matter how stale the pin really is. That is the
+          # same degrade-to-invisible that hid the original three-week outage,
+          # so the drift is made to fail CLOSED instead: every watched path must
+          # still resolve upstream. `ls-tree` reads trees only, which the
+          # blobless clone already has.
+          missing=""
+          for path in "${watched[@]}"; do
+            [ -n "$(git -C /tmp/gw ls-tree origin/main -- "$path")" ] || missing="$missing \`$path\`"
+          done
+          if [ -n "$missing" ]; then
+            reason="This job's watched-pathspec list no longer matches \`Comfy-Org/github-workflows@main\`: ${missing# } does not exist there any more. Until the list is re-synced, a staleness check over those paths matches nothing and would report the pin current however stale it is, so it is failing closed instead. Copy \`WATCHED_PATHSPECS\` out of upstream's \`.github/workflows/bump-cursor-review-callers.yml\` into the \`watched\` array in \`.github/workflows/ci.yml\`."
+            {
+              echo "state=broken"
+              echo "broken_reason=$reason"
+            } >>"$GITHUB_OUTPUT"
+            echo "::error::$reason"
+            exit 1
+          fi
+
+          # `--first-parent` anchors the clock to when work LANDED on main.
+          # Without it the range includes commits from merged side branches,
+          # which keep their pre-merge committer dates -- so a long-lived branch
+          # merged today can contribute an "oldest unpicked commit" that is
+          # already weeks old, blowing the grace window on day one and filing an
+          # issue saying nothing is moving the pin when the fleet has had a day.
+          # A merge commit is still reported when it changes a watched path, so
+          # nothing consumer-visible is lost; only its date changes, to the one
+          # that answers the question being asked.
+          behind="$(git -C /tmp/gw log --first-parent --format='%H %cI' "$pin..origin/main" -- \
+            "${watched[@]}" \
             ':(exclude)scripts/check-pr-size/*_test.go')"
 
           if [ -z "$behind" ]; then
@@ -387,25 +460,94 @@ jobs:
           # happens to be called `ci/bump-cursor-review` would read as a
           # delivered bump and mute the watchdog. Only a same-repo branch can
           # be the fleet's, so cross-repository PRs are dropped.
-          bump_pr="$(gh pr list --repo "$GH_REPO" --state open \
-            --head "$BUMP_BRANCH" --json number,isCrossRepository \
-            --jq '[.[] | select(.isCrossRepository == false)][0].number // empty')"
+          bump="$(gh pr list --repo "$GH_REPO" --state open \
+            --head "$BUMP_BRANCH" --json number,isCrossRepository,createdAt \
+            --jq '[.[] | select(.isCrossRepository == false)][0] // empty')"
 
-          if [ -n "$bump_pr" ]; then
-            echo "bump_pr=$bump_pr" >>"$GITHUB_OUTPUT"
+          bump_pr=""
+          bump_age_days=""
+          if [ -n "$bump" ]; then
+            bump_pr="$(printf '%s' "$bump" | jq -r '.number')"
+            bump_created="$(printf '%s' "$bump" | jq -r '.createdAt')"
+            bump_age="$(( $(date -u +%s) - $(date -u -d "$bump_created" +%s) ))"
+            bump_age_days="$(( bump_age / 86400 ))"
+            {
+              echo "bump_pr=$bump_pr"
+              echo "bump_age_days=$bump_age_days"
+            } >>"$GITHUB_OUTPUT"
+          fi
+
+          # `delivered` SUSPENDS this watchdog, so it needs an upper bound of
+          # its own. Without one, a single abandoned or permanently-red PR on
+          # that branch makes this job exit 0 every day forever while the pin
+          # stays frozen -- the exact silent freeze this exists to end, only now
+          # with an alibi. Worse, if the pin first went stale while that PR was
+          # open no sticky issue was ever opened, so the `[ -n "$existing" ]`
+          # guard on the note step below leaves a `::notice::` on a scheduled
+          # run as the only record. Past the bump-PR window the verdict
+          # escalates to `stale`, which files the issue and names the stuck PR
+          # as the thing to chase.
+          if [ -n "$bump_pr" ] && [ "$bump_age" -lt "$BUMP_PR_GRACE_SECONDS" ]; then
             echo "state=delivered" >>"$GITHUB_OUTPUT"
-            echo "::notice::the github-workflows pin is stale, but bump PR #$bump_pr is open on $BUMP_BRANCH -- the fleet delivered and only the merge is owed."
+            echo "::notice::the github-workflows pin is stale, but bump PR #$bump_pr is open on $BUMP_BRANCH ($bump_age_days day(s) old) -- the fleet delivered and only the merge is owed."
             exit 0
           fi
 
           echo "state=stale" >>"$GITHUB_OUTPUT"
-          echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) landed $((age / 86400)) days ago -- and no open PR exists on $BUMP_BRANCH. Nothing is moving this pin."
+          if [ -n "$bump_pr" ]; then
+            echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) landed $((age / 86400)) days ago. Bump PR #$bump_pr is open on $BUMP_BRANCH but has been unmerged for $bump_age_days days, so delivery is not what is missing -- the merge is."
+          else
+            echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) landed $((age / 86400)) days ago -- and no open PR exists on $BUMP_BRANCH. Nothing is moving this pin."
+          fi
           exit 1
 
-      # Same sticky-issue shape as `sdk-parity`: one open issue, commented on
-      # by each repeat run so the history lives on the thread, closed by the
-      # first run that finds the pin current again.
+      # --- Sticky-issue bookkeeping -------------------------------------
       #
+      # Two issues, one per failure MODE, because they have different owners
+      # and different fixes: the pin is stale (chase the bump), or this job
+      # cannot answer the question at all (fix the job or the pin's target).
+      # Both are looked up by LABEL rather than by listing issues and matching
+      # titles off the first page: `gh issue list --limit 100` returns only the
+      # 100 newest-created open issues, so on a busier repo the match silently
+      # misses -- and a miss is not benign in either direction. On the stale
+      # path it takes `gh issue create` instead of `gh issue comment`, filing a
+      # fresh duplicate every day the pin stays stale; on the note and close
+      # paths it skips the comment and the close, leaving alerts open forever.
+      # At most one issue ever carries each label, so a label lookup cannot
+      # truncate. The label is created idempotently before each lookup so the
+      # first run on a fresh repo does not have to be the one that remembered.
+      - name: Open or update the watchdog-blocked issue
+        if: failure() && steps.assess.outputs.state == 'broken'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE_LABEL: cursor-review-pin
+          TITLE: "cursor-review: the pin-freshness watchdog cannot run"
+          REASON: ${{ steps.assess.outputs.broken_reason }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh label create "$ISSUE_LABEL" --force --color ededed \
+            --description "cursor-review pin freshness watchdog" >/dev/null
+          existing="$(gh issue list --state open --label "$ISSUE_LABEL" --limit 100 \
+            --json number,title --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
+          body="$(printf '%s\n' \
+            "The daily \`cursor-review-pin-freshness\` job stopped before it could judge whether" \
+            "the \`Comfy-Org/github-workflows\` pin is current, so **the pin is not being watched**" \
+            "until this is fixed. This is not a staleness report -- it is the watchdog saying it" \
+            "cannot answer the question." \
+            "" \
+            "$REASON" \
+            "" \
+            "This issue closes itself on the first daily run that reaches a verdict again." \
+            "" \
+            "Run: $RUN_URL")"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$TITLE" --label "$ISSUE_LABEL" --body "$body"
+          fi
+
       # Gated on the VERDICT rather than on `failure()`: a clone or API failure
       # reddens the scheduled run (visible as a step annotation) but must not
       # file an issue claiming the pin is stale when nothing established that.
@@ -414,7 +556,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TITLE: "cursor-review: the github-workflows pin is stale and no bump PR has arrived"
+          ISSUE_LABEL: cursor-review-pin
+          TITLE: "cursor-review: the github-workflows pin is stale and nothing is moving it"
           BUMP_BRANCH: ci/bump-cursor-review
           PIN: ${{ steps.assess.outputs.pin }}
           NEWEST_SHA: ${{ steps.assess.outputs.newest_sha }}
@@ -422,13 +565,26 @@ jobs:
           OLDEST_SHA: ${{ steps.assess.outputs.oldest_sha }}
           OLDEST_DATE: ${{ steps.assess.outputs.oldest_date }}
           BEHIND_COUNT: ${{ steps.assess.outputs.behind_count }}
+          # Empty unless a bump PR is open but has itself gone past the
+          # bump-PR window, which is the other way this verdict is reached.
+          BUMP_PR: ${{ steps.assess.outputs.bump_pr }}
+          BUMP_AGE_DAYS: ${{ steps.assess.outputs.bump_age_days }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          # Exact title match off the plain issue list -- the search API is
-          # eventually consistent, and a miss here would open a second issue.
-          existing="$(gh issue list --state open --limit 100 --json number,title \
-            --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
+          gh label create "$ISSUE_LABEL" --force --color ededed \
+            --description "cursor-review pin freshness watchdog" >/dev/null
+
+          if [ -n "$BUMP_PR" ]; then
+            cause="$(printf '%s ' \
+              "PR #$BUMP_PR is open on \`$BUMP_BRANCH\` but has been unmerged for" \
+              "$BUMP_AGE_DAYS days, so delivery is not what is missing -- the merge is.")"
+          else
+            cause="$(printf '%s ' \
+              "No PR is open on the \`$BUMP_BRANCH\` branch, so nothing is moving the pin.")"
+          fi
+          cause="${cause% }"
+
           body="$(printf '%s\n' \
             "\`.github/workflows/ci-cursor-review.yml\` is pinned to \`$PIN\`, which is" \
             "**$BEHIND_COUNT consumer-visible commit(s) behind \`Comfy-Org/github-workflows@main\`**." \
@@ -438,54 +594,102 @@ jobs:
             "| oldest not picked up | \`$OLDEST_SHA\` | $OLDEST_DATE |" \
             "| newest upstream (what a bump moves to) | \`$NEWEST_SHA\` | $NEWEST_DATE |" \
             "" \
-            "The oldest one has been sitting there past the 3-day grace window and no PR is" \
-            "open on the \`$BUMP_BRANCH\` branch, so nothing is moving the pin." \
+            "The oldest one has been sitting there past the 3-day grace window. $cause" \
             "" \
-            "Two things to check, in this order:" \
+            "Things to check, in this order:" \
             "" \
-            "1. **Is this repo still on the bump fleet's roster?** The fleet only visits repos" \
+            "1. **Is there a bump PR waiting on a human?** If one is named above, it has already" \
+            "   delivered both pins and only the merge is owed -- review and land it, or close it" \
+            "   so this job stops counting it as delivery." \
+            "2. **Is this repo still on the bump fleet's roster?** The fleet only visits repos" \
             "   listed in the \`CURSOR_REVIEW_CALLERS\` secret on \`Comfy-Org/github-workflows\`," \
             "   whose canonical copy lives in the private ops repo (deliberately not named here --" \
             "   this repo is public). A fleet run logs a \`roster: N caller(s)\` audit line; if" \
             "   this repo is missing, add it there and re-dispatch the fleet. That was the" \
             "   original failure -- a silently dropped roster entry, for three weeks." \
-            "2. **Or hand-bump.** Move BOTH pins in \`.github/workflows/ci-cursor-review.yml\`" \
+            "3. **Or hand-bump.** Move BOTH pins in \`.github/workflows/ci-cursor-review.yml\`" \
             "   (the \`uses:\` SHA and the \`workflows_ref:\` input) to \`$NEWEST_SHA\`, update the" \
             "   trailing \`# github-workflows main (short)\` comment, and verify with:" \
             "" \
             "       node scripts/check-workflow-pins.mjs" \
             "" \
-            "This issue closes itself on the first daily run that finds the pin current again." \
+            "This issue closes itself on the first daily run that finds the pin moving again." \
             "" \
             "Run: $RUN_URL")"
+
+          existing="$(gh issue list --state open --label "$ISSUE_LABEL" --limit 100 \
+            --json number,title --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --body "$body"
+            exit 0
+          fi
+
+          # REOPEN rather than open a second thread. The close step below tells
+          # the reader this issue "reopens if the pin freezes again", and the
+          # sticky-issue design is built on one thread carrying the history --
+          # both of which are false if every stale cycle starts a fresh issue.
+          closed="$(gh issue list --state closed --label "$ISSUE_LABEL" --limit 100 \
+            --json number,title --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
+          if [ -n "$closed" ]; then
+            gh issue reopen "$closed"
+            gh issue comment "$closed" --body "$body"
           else
-            gh issue create --title "$TITLE" --body "$body"
+            gh issue create --title "$TITLE" --label "$ISSUE_LABEL" --body "$body"
           fi
 
       # Delivered-but-unmerged is a pass, so it never reaches the step above --
       # but if the issue is already open it should say why it is still open.
       # When no issue is open the `::notice::` from `assess` is the whole
-      # record, which is right: an owed merge is already visible as a PR.
+      # record, which is right: an owed merge is already visible as a PR, and
+      # the bump-PR window above means this cannot stay quiet indefinitely.
       - name: Note the open bump PR on the stale-pin issue
         if: success() && steps.assess.outputs.state == 'delivered'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TITLE: "cursor-review: the github-workflows pin is stale and no bump PR has arrived"
+          ISSUE_LABEL: cursor-review-pin
+          TITLE: "cursor-review: the github-workflows pin is stale and nothing is moving it"
           BUMP_BRANCH: ci/bump-cursor-review
           BUMP_PR: ${{ steps.assess.outputs.bump_pr }}
+          BUMP_AGE_DAYS: ${{ steps.assess.outputs.bump_age_days }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          existing="$(gh issue list --state open --limit 100 --json number,title \
-            --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
+          gh label create "$ISSUE_LABEL" --force --color ededed \
+            --description "cursor-review pin freshness watchdog" >/dev/null
+          existing="$(gh issue list --state open --label "$ISSUE_LABEL" --limit 100 \
+            --json number,title --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --body "$(printf '%s\n' \
-              "The bump fleet has delivered: #$BUMP_PR is open on \`$BUMP_BRANCH\`." \
-              "Only the merge is owed now, so this issue stays open -- and closes itself -- on the" \
-              "first daily run after that PR lands." \
+              "The bump fleet has delivered: #$BUMP_PR is open on \`$BUMP_BRANCH\` and is" \
+              "$BUMP_AGE_DAYS day(s) old. Only the merge is owed now, so this issue stays open --" \
+              "and closes itself -- on the first daily run after that PR lands. If it goes" \
+              "unmerged past 7 days this job stops treating it as delivery and reports the pin" \
+              "stale again, naming the PR as the thing to chase." \
+              "" \
+              "Run: $RUN_URL")"
+          fi
+
+      # Any verdict at all -- `current`, `grace` or `delivered` -- means the job
+      # got past the ancestry and pathspec checks, which is exactly what the
+      # watchdog-blocked issue is about.
+      - name: Close the watchdog-blocked issue once the job can run again
+        if: success() && steps.assess.outputs.state != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE_LABEL: cursor-review-pin
+          TITLE: "cursor-review: the pin-freshness watchdog cannot run"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh label create "$ISSUE_LABEL" --force --color ededed \
+            --description "cursor-review pin freshness watchdog" >/dev/null
+          existing="$(gh issue list --state open --label "$ISSUE_LABEL" --limit 100 \
+            --json number,title --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" --comment "$(printf '%s\n' \
+              "The watchdog reached a verdict again, so the pin is being watched." \
               "" \
               "Run: $RUN_URL")"
           fi
@@ -504,7 +708,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TITLE: "cursor-review: the github-workflows pin is stale and no bump PR has arrived"
+          ISSUE_LABEL: cursor-review-pin
+          TITLE: "cursor-review: the github-workflows pin is stale and nothing is moving it"
           STATE: ${{ steps.assess.outputs.state }}
           # Unset on `current` -- `assess` exits before writing them -- and
           # unread on that branch. `env:` always defines the name, so `set -u`
@@ -514,8 +719,10 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          existing="$(gh issue list --state open --limit 100 --json number,title \
-            --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
+          gh label create "$ISSUE_LABEL" --force --color ededed \
+            --description "cursor-review pin freshness watchdog" >/dev/null
+          existing="$(gh issue list --state open --label "$ISSUE_LABEL" --limit 100 \
+            --json number,title --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
           if [ -n "$existing" ]; then
             if [ "$STATE" = "current" ]; then
               verdict="The \`Comfy-Org/github-workflows\` pin is current again."
