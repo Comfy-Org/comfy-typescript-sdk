@@ -300,7 +300,16 @@ function isJobLevelUses(lines, usesIndex, usesIndent, inBlock) {
   const job = owningKey(lines, usesIndex, usesIndent, inBlock);
   if (job === null || !JOB_ID_KEY_RE.test(job.trimmed)) return false;
   const jobs = owningKey(lines, job.index, job.indent, inBlock);
-  return jobs !== null && jobs.indent === 0 && JOBS_KEY_RE.test(jobs.trimmed);
+  if (jobs === null || !JOBS_KEY_RE.test(jobs.trimmed)) return false;
+  // `jobs:` must be a ROOT key, which is asked STRUCTURALLY -- nothing
+  // shallower owns it -- rather than as `indent === 0`. A YAML block mapping
+  // may legally begin at any column provided it is consistent, and GitHub
+  // accepts a workflow whose root mapping is indented; against a column test
+  // every caller in such a file read as not-job-level and was dropped from the
+  // lint with no output, the silent skip this file's header promises never
+  // happens. `owningKey` already skips blanks, comments and block-scalar
+  // content, so a flush-left comment or heredoc body cannot pose as an owner.
+  return owningKey(lines, jobs.index, jobs.indent, inBlock) === null;
 }
 
 /**
