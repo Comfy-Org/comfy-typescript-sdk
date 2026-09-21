@@ -331,17 +331,36 @@ jobs:
           # stderr goes to a FILE, not into `pin_out`: folding it in with
           # `2>&1` would splice any future diagnostic straight into the value
           # and feed it to git as a commit-ish.
+          # EVERY scratch path this step uses lives under one per-run
+          # directory rather than at a fixed, predictable `/tmp/...` name. The
+          # runners are GitHub-hosted and ephemeral today, so nothing here is
+          # reachable on them -- but the sibling scratch root further down
+          # already uses `mktemp -d` and these did not, and on a reused or
+          # self-hosted runner the difference bites twice: a leftover `gw`
+          # directory makes the clone below fail into the no-verdict fault path
+          # every day, and a pre-planted symlink at any of the `.err` names
+          # turns its `2>` redirect into an arbitrary-file overwrite as the
+          # runner user.
+          gwtmp="$(mktemp -d)"
+          trap 'rm -rf "$gwtmp"' EXIT
+
           pin_rc=0
           pin_out="$(node scripts/check-workflow-pins.mjs --print-pin cursor-review.yml \
-            2>/tmp/print-pin.err)" || pin_rc=$?
+            2>"$gwtmp/print-pin.err")" || pin_rc=$?
           # The 40-hex assertion is the script's own, repeated here because
           # everything downstream hands `$pin` to git: a value that is not a
           # commit-ish must fail as a stated verdict, never as a git error.
-          if [ "$pin_rc" -ne 0 ] || ! printf '%s' "$pin_out" | grep -Eq '^[0-9a-f]{40}$'; then
+          # Tested as a WHOLE VALUE, not with `grep`: `grep -Eq '^...$'` anchors
+          # per LINE, so a multi-line `pin_out` whose second line happened to be
+          # 40 hex would pass this re-assertion, and `pin` would then carry
+          # embedded newlines into `echo "pin=$pin" >>"$GITHUB_OUTPUT"` --
+          # injecting extra `key=value` records, a forged `state=` among them,
+          # into the very outputs every issue step below is gated on.
+          if [ "$pin_rc" -ne 0 ] || ! [[ "$pin_out" =~ ^[0-9a-f]{40}$ ]]; then
             # Flattened onto one line: `broken_reason` crosses $GITHUB_OUTPUT,
             # which is line-oriented, and this one carries another program's
             # stderr.
-            pin_err="$(tr '\n' ' ' </tmp/print-pin.err)"
+            pin_err="$(tr '\n' ' ' <"$gwtmp/print-pin.err")"
             reason="This job could not read a usable pin out of \`.github/workflows/ci-cursor-review.yml\`, so it cannot judge staleness at all. \`node scripts/check-workflow-pins.mjs --print-pin cursor-review.yml\` exited $pin_rc saying: ${pin_err:-(no output)}. That will not clear on its own -- fix the caller or the lint, then re-run."
             {
               echo "state=broken"
@@ -358,7 +377,7 @@ jobs:
           # log` with a pathspec, never file contents. github-workflows is
           # public, so the ambient token is enough.
           git clone --filter=blob:none --no-checkout --quiet \
-            https://github.com/Comfy-Org/github-workflows /tmp/gw
+            https://github.com/Comfy-Org/github-workflows "$gwtmp/gw"
 
           # THE LIKELIEST GENUINELY-WRONG PIN is one that names no commit here
           # at all -- a mistyped SHA, a commit force-pushed away, one that only
@@ -394,7 +413,7 @@ jobs:
           # the 128 that a malformed name raises is only ever a real repository
           # fault here. stderr is still captured, for that fault's annotation.
           exists_rc=0
-          GIT_NO_LAZY_FETCH=1 git -C /tmp/gw cat-file -e "$pin" 2>/tmp/cat-exists.err \
+          GIT_NO_LAZY_FETCH=1 git -C "$gwtmp/gw" cat-file -e "$pin" 2>"$gwtmp/cat-exists.err" \
             || exists_rc=$?
           if [ "$exists_rc" -ne 0 ] && [ "$exists_rc" -ne 1 ]; then
             # Flattened like every other captured diagnostic in this step: this
@@ -403,7 +422,7 @@ jobs:
             # annotation -- the rest would be emitted as raw log lines, where a
             # relayed line beginning with `::` is parsed as a workflow command
             # rather than as text.
-            exists_err="$(tr '\n' ' ' </tmp/cat-exists.err)"
+            exists_err="$(tr '\n' ' ' <"$gwtmp/cat-exists.err")"
             echo "::error::could not determine whether $pin exists in github-workflows -- git exited $exists_rc: ${exists_err:-(no output)}"
             exit 1
           fi
@@ -415,9 +434,9 @@ jobs:
             # to fold into the existence check. A fault reading the type is
             # still a fault.
             type_rc=0
-            pin_type="$(git -C /tmp/gw cat-file -t "$pin" 2>/tmp/cat-type.err)" || type_rc=$?
+            pin_type="$(git -C "$gwtmp/gw" cat-file -t "$pin" 2>"$gwtmp/cat-type.err")" || type_rc=$?
             if [ "$type_rc" -ne 0 ]; then
-              type_err="$(tr '\n' ' ' </tmp/cat-type.err)"
+              type_err="$(tr '\n' ' ' <"$gwtmp/cat-type.err")"
               echo "::error::could not read the object type of $pin in github-workflows -- git exited $type_rc: ${type_err:-(no output)}"
               exit 1
             fi
@@ -446,10 +465,10 @@ jobs:
           # as "re-pin both pins" against a pin that is in fact correct. Only
           # exit 1 is a verdict about the pin, and only a verdict files an issue.
           ancestry_rc=0
-          git -C /tmp/gw merge-base --is-ancestor "$pin" origin/main 2>/tmp/ancestry.err \
+          git -C "$gwtmp/gw" merge-base --is-ancestor "$pin" origin/main 2>"$gwtmp/ancestry.err" \
             || ancestry_rc=$?
           # Flattened for the same reason as `exists_err` above.
-          ancestry_err="$(tr '\n' ' ' </tmp/ancestry.err)"
+          ancestry_err="$(tr '\n' ' ' <"$gwtmp/ancestry.err")"
 
           if [ "$ancestry_rc" -eq 1 ]; then
             reason="The pinned commit \`$pin\` exists in \`Comfy-Org/github-workflows\` but is not an ancestor of \`main\` -- both pins were moved to a side branch, or \`main\` was rewritten. Re-pin \`uses:\` and \`workflows_ref:\` in \`.github/workflows/ci-cursor-review.yml\` to a commit that is on \`main\`, then run \`node scripts/check-workflow-pins.mjs\`."
@@ -494,7 +513,7 @@ jobs:
           # line landing mid-block ends the watched list early and silently
           # narrows what counts as staleness. Same reason the pin read above
           # routes stderr to a file.
-          upstream_src="$(git -C /tmp/gw show "origin/main:$bump_yaml" 2>/tmp/upstream-show.err)" || upstream_rc=$?
+          upstream_src="$(git -C "$gwtmp/gw" show "origin/main:$bump_yaml" 2>"$gwtmp/upstream-show.err")" || upstream_rc=$?
           if [ "$upstream_rc" -ne 0 ]; then
             # A path that is simply GONE upstream is permanent and
             # deterministic, so it is a VERDICT about the pin's watchability,
@@ -513,7 +532,7 @@ jobs:
             # as present and drop a permanent upstream rename onto the fault
             # path, which writes no `state` and files no issue.
             probe_rc=0
-            probe_out="$(git -C /tmp/gw ls-tree origin/main -- "$bump_yaml" 2>/tmp/bump-probe.err)" || probe_rc=$?
+            probe_out="$(git -C "$gwtmp/gw" ls-tree origin/main -- "$bump_yaml" 2>"$gwtmp/bump-probe.err")" || probe_rc=$?
             if [ "$probe_rc" -eq 0 ] && [ -z "$probe_out" ]; then
               reason="\`$bump_yaml\` does not exist in \`Comfy-Org/github-workflows@main\` any more, so this job cannot read \`WATCHED_PATHSPECS\` and cannot judge staleness at all. That will not clear on its own: upstream renamed or removed the bump workflow. Re-point the extractor in the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\` at upstream's new file."
               {
@@ -525,7 +544,7 @@ jobs:
             fi
             # A FAULT, not a verdict: a lazy-fetch failure or a vanished
             # `origin/main` says nothing about the pin. No `state` is written.
-            show_err="$(tr '\n' ' ' </tmp/upstream-show.err)"
+            show_err="$(tr '\n' ' ' <"$gwtmp/upstream-show.err")"
             echo "::error::could not read $bump_yaml from github-workflows main -- git exited $upstream_rc: ${show_err:-(no output)}"
             exit 1
           fi
@@ -618,8 +637,17 @@ jobs:
             echo "::error::$reason"
             exit 1
           fi
+          # `watched` is read VERBATIM from a list this repo does not control,
+          # and the runner strips leading whitespace before looking for a
+          # workflow command -- so an upstream entry spelled `::stop-commands::<token>`
+          # or `::error::...` would be EXECUTED by echoing it here, letting
+          # upstream suppress or forge this job's own verdict annotations. That
+          # is the same `::`-at-line-start hazard the captured-stderr flattening
+          # already guards against. A leading `::` (after any leading blanks) is
+          # rewritten to the runner's own percent-escape for a colon, so the
+          # entry still prints readably and cannot open a command.
           echo "Watched pathspecs, read from upstream $bump_yaml:"
-          printf '  %s\n' "${watched[@]}"
+          printf '%s\n' "${watched[@]}" | sed -e 's/^[[:space:]]*::/%3A%3A/' -e 's/^/  /'
 
           # Upstream's list can itself name a path that no longer resolves --
           # a rename landed in its `paths:` filter but not here. `git log` over
@@ -652,6 +680,42 @@ jobs:
                   *,exclude,*) continue ;;
                 esac
                 probe="${path#*)}"
+                # STRIPPING THE MAGIC DISCARDS ITS MATCHING SEMANTICS, and for
+                # most keywords the bare remainder no longer means what upstream
+                # wrote: `:(icase)Foo/Bar` handed to `ls-tree` is probed
+                # case-SENSITIVELY, which is the one thing that entry exists to
+                # relax, and `:(attr:...)` is probed as a plain path. Either
+                # reads as MISSING and files a permanent daily `broken` sticky
+                # issue blaming upstream for a rename that never happened --
+                # loud, wrong, and aimed at the wrong repo.
+                #
+                # Only `top` and `literal` leave the remainder naming the same
+                # fixed path: `top` means root-relative, which `ls-tree <ref> --
+                # <path>` already is, and `literal` only disables the wildcards
+                # that the wildcard skip below drops anyway. Every other
+                # keyword is skipped the way a wildcard entry is -- COUNTED as
+                # a positive for the fail-closed guard, not probed, and said
+                # out loud in the log so the gap is visible rather than silent.
+                #
+                # Only a properly TERMINATED prefix is classified here.
+                # `${path#*)}` returns the entry unchanged when there is no
+                # `)`, so an unterminated `:(glob` still falls through to the
+                # still-carrying-magic check below and stays a `broken` verdict.
+                if [ "$probe" != "$path" ]; then
+                  unprobeable=""
+                  IFS=',' read -r -a magic_words <<<"$magic"
+                  for magic_word in "${magic_words[@]}"; do
+                    case "$magic_word" in
+                      top|literal|"") ;;
+                      *) unprobeable=yes ;;
+                    esac
+                  done
+                  if [ -n "$unprobeable" ]; then
+                    echo "  not probed: \`$path\` carries pathspec magic \`$magic\`, whose matching semantics ls-tree cannot reproduce; counted as a positive pathspec and passed to git log verbatim."
+                    positive=$((positive + 1))
+                    continue
+                  fi
+                fi
                 ;;
               :*)
                 # SHORT MAGIC. Parsed one signature letter at a time rather
@@ -754,9 +818,9 @@ jobs:
             # failure must not file a confident `broken` issue about drift that
             # did not happen.
             ls_rc=0
-            ls_out="$(git -C /tmp/gw ls-tree origin/main -- "$probe" 2>/tmp/ls-probe.err)" || ls_rc=$?
+            ls_out="$(git -C "$gwtmp/gw" ls-tree origin/main -- "$probe" 2>"$gwtmp/ls-probe.err")" || ls_rc=$?
             if [ "$ls_rc" -ne 0 ]; then
-              ls_err="$(tr '\n' ' ' </tmp/ls-probe.err)"
+              ls_err="$(tr '\n' ' ' <"$gwtmp/ls-probe.err")"
               echo "::error::could not list \`$probe\` in github-workflows main -- git exited $ls_rc: ${ls_err:-(no output)}"
               exit 1
             fi
@@ -864,11 +928,11 @@ jobs:
           # `%H`/`%cI`, and no commit message carries one, so these delimit
           # unambiguously where whitespace cannot.
           log_rc=0
-          behind_raw="$(git -C /tmp/gw log --first-parent \
+          behind_raw="$(git -C "$gwtmp/gw" log --first-parent \
             --format='%H %cI%x1E%(trailers:key=Skip-caller-bump,valueonly,separator=%x1F,unfold)' \
-            "$pin..origin/main" -- "${watched[@]}" 2>/tmp/behind.err)" || log_rc=$?
+            "$pin..origin/main" -- "${watched[@]}" 2>"$gwtmp/behind.err")" || log_rc=$?
           if [ "$log_rc" -ne 0 ]; then
-            log_err="$(tr '\n' ' ' </tmp/behind.err)"
+            log_err="$(tr '\n' ' ' <"$gwtmp/behind.err")"
             if printf '%s' "$log_err" | grep -qi 'pathspec'; then
               reason="\`git log\` could not use the pathspecs read from \`Comfy-Org/github-workflows@main:$bump_yaml\`, so this job cannot judge staleness at all. git exited $log_rc saying: ${log_err:-(no output)}. That will not clear on its own -- upstream's \`WATCHED_PATHSPECS\` carries a pathspec this check cannot use. Re-check upstream's list and the extractor in the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\`."
               {
@@ -973,17 +1037,32 @@ jobs:
           # A committer date in the FUTURE (clock skew upstream, or a
           # deliberately dated commit) makes `age` negative, which is trivially
           # `-lt $GRACE_SECONDS` -- so the watchdog would write `state=grace`
-          # and close any open stale-pin issue however frozen the pin is, and
-          # unlike the 3-day window that mute is UNBOUNDED: it lasts as long as
-          # that commit stays the oldest unpicked one. Clamped to 0, a future
-          # date reads as "just landed", which is the most generous reading that
-          # is still bounded by the grace window.
+          # and close any open stale-pin issue however frozen the pin is.
+          #
+          # CLAMPING TO 0 DOES NOT BOUND THAT, which an earlier round of this
+          # file claimed it did. `age` is recomputed from the same FIXED
+          # `oldest_date` on every run, so a commit dated a year ahead clamps to
+          # 0 on every daily run for that whole year: `state=grace` written
+          # every time, the stale-pin issue closed every time, the pin frozen
+          # throughout. "Just landed" is a bounded reading only for a date that
+          # advances toward the window's edge, and this one never does -- so the
+          # clamp reproduced exactly the unbounded silencing it was added to
+          # remove.
+          #
+          # A future date is therefore taken the LOUD way: out of grace, and
+          # judged on the evidence below like any other stale pin (an open bump
+          # PR still mutes it, on its own separate clock). Real upstream clock
+          # skew is seconds to minutes against a three-day window, so this
+          # cannot fire on ordinary skew; a date far enough ahead to matter is
+          # itself the anomaly worth reporting.
           age="$(( $(date -u +%s) - $(date -u -d "$oldest_date" +%s) ))"
+          future_dated=""
           if [ "$age" -lt 0 ]; then
-            echo "::warning::the oldest unpicked commit $oldest_sha is dated in the future ($oldest_date); treating it as just-landed."
+            future_dated=yes
+            echo "::warning::the oldest unpicked commit $oldest_sha is dated in the future ($oldest_date); refusing to read that as just-landed, and judging the pin as out of grace."
             age=0
           fi
-          if [ "$age" -lt "$GRACE_SECONDS" ]; then
+          if [ -z "$future_dated" ] && [ "$age" -lt "$GRACE_SECONDS" ]; then
             echo "state=grace" >>"$GITHUB_OUTPUT"
             echo "The oldest unpicked commit is $((age / 3600))h old, inside the $((GRACE_SECONDS / 86400))-day grace window. Passing."
             exit 0
@@ -1067,8 +1146,9 @@ jobs:
             # asserting verdict text. Any of these is transient and lands on
             # `unknown`: a network blip in the fetch, a `--print-pin` that
             # cannot parse the PR's caller, or the race where the PR pins an
-            # upstream commit that landed AFTER `/tmp/gw` was cloned, which
-            # `GIT_NO_LAZY_FETCH=1 cat-file -e` then rejects. Reporting any of
+            # upstream commit that landed AFTER the `$gwtmp/gw` clone was
+            # taken, which `GIT_NO_LAZY_FETCH=1 cat-file -e` then rejects.
+            # Reporting any of
             # those as "the fleet owes a fresh bump" is the fault-as-verdict
             # conflation the rest of this step exists to remove.
             bump_delivers=unknown
@@ -1087,17 +1167,18 @@ jobs:
             then
               head_pin="$(node "$scratch/scripts/check-workflow-pins.mjs" \
                 --print-pin cursor-review.yml 2>/dev/null)" || head_pin=""
-              if ! printf '%s' "$head_pin" | grep -Eq '^[0-9a-f]{40}$'; then
+              # Whole-value, not per-line -- see the `pin_out` assertion above.
+              if ! [[ "$head_pin" =~ ^[0-9a-f]{40}$ ]]; then
                 bump_delivers=unknown
                 echo "Bump PR #$bump_pr: its caller pin did not read as a 40-hex SHA (got \"${head_pin:-(empty)}\"), so delivery could not be verified."
-              elif ! GIT_NO_LAZY_FETCH=1 git -C /tmp/gw cat-file -e "$head_pin" 2>/dev/null; then
+              elif ! GIT_NO_LAZY_FETCH=1 git -C "$gwtmp/gw" cat-file -e "$head_pin" 2>/dev/null; then
                 bump_delivers=unknown
                 echo "Bump PR #$bump_pr pins $head_pin, which is not present in the upstream clone (it may have landed after that clone was taken), so delivery could not be verified."
               else
                 # `--is-ancestor` exits 1 for "not an ancestor" and 128 for a
                 # git-level failure. Only the 1 is a finding about the PR.
                 anc_rc=0
-                git -C /tmp/gw merge-base --is-ancestor \
+                git -C "$gwtmp/gw" merge-base --is-ancestor \
                   "$oldest_sha" "$head_pin" 2>/dev/null || anc_rc=$?
                 case "$anc_rc" in
                   0) bump_delivers=yes ;;

@@ -111,7 +111,36 @@ const REUSABLE_OWNER_REPO = "Comfy-Org/github-workflows";
 // that this repo calls all take one.
 const NO_WORKFLOWS_REF = new Set([]);
 
+// Reusables the `cursor-review-pin-freshness` watchdog in .github/workflows/ci.yml
+// actually watches -- it asks `--print-pin` for ONE named file.
+//
+// The `ignore:` block in .github/dependabot.yml is deliberately repo-WIDE for
+// every `Comfy-Org/github-workflows` reusable, security advisories included,
+// because Dependabot cannot move a double-pinned caller correctly at all. That
+// leaves upstream staleness entirely to the watchdog -- so a SECOND org
+// reusable called from this repo would have its only bump mechanism muted and
+// no freshness alarm to replace it, and `lint()` below would prove nothing more
+// than that its two pins agree with each other while both froze together. That
+// is precisely the silently-frozen pin this whole lint exists to end, so
+// adding such a caller is a red build here until the watchdog is extended to
+// cover it too.
+const WATCHDOG_COVERED = new Set(["cursor-review.yml"]);
+
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
+
+// `owner/repo` as a case-INSENSITIVE regex fragment, one character class per
+// letter. GitHub resolves an owner and a repository name without regard to
+// case, so `comfy-org/github-workflows/...` is a WORKING caller of the very
+// reusable this script exists to police -- but interpolated case-sensitively it
+// was invisible to the scan, and with the canonical-case caller keeping
+// `callers.length` non-zero the repo-wide fail-closed guard below never noticed.
+// An invisible caller may carry a branch ref or a split pin straight past the
+// lint, which is the silent skip this file's header promises never happens.
+// Only the owner and repository are relaxed: the workflow PATH after them is a
+// git path and stays case-sensitive, as do the ref comparisons.
+const caseInsensitiveOwnerRepo = (s) =>
+  s.replace(/[A-Za-z]/g, (ch) => `[${ch.toUpperCase()}${ch.toLowerCase()}]`).replace(/\//g, "\\/");
+
 // `uses: Comfy-Org/github-workflows/.github/workflows/<name>.yml@<ref>  # <comment>`
 // The value may be quoted (`uses: "owner/repo/...@sha"`). Unquoted is what
 // every caller doc writes, but a quoted one must not read as "no uses: here" --
@@ -120,7 +149,7 @@ const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 // the header). The key and the value may each be quoted.
 const USES_RE = new RegExp(
   String.raw`^(\s*)(["']?)uses\2\s*:\s*(["']?)` +
-    REUSABLE_OWNER_REPO.replace("/", "\\/") +
+    caseInsensitiveOwnerRepo(REUSABLE_OWNER_REPO) +
     String.raw`\/(\S+?)@([^\s"']+?)\3(?:\s+#(.*))?\s*$`,
 );
 // The `#` must be preceded by WHITESPACE in both patterns: YAML starts a comment
@@ -140,12 +169,26 @@ const BLOCK_SCALAR_RE = /^(\s*(?:-\s+)?)[^\s#][^:]*:\s*[|>][0-9+-]*\s*(?:#.*)?$/
 // parenthesises the abbreviation (`# github-workflows main (425c154)`), so when
 // the comment carries any parenthesised candidate those are the whole set --
 // anything else in the comment is prose and not a claim about this pin.
-const PAREN_SHA_RE = /\(([0-9a-f]{7,40})\)/g;
+//
+// BOTH patterns accept `A-F` as well as `a-f`. Hex commit IDs are
+// case-insensitive, so `# github-workflows main (DEADBEE)` plainly names a
+// commit -- but matched lowercase-only it yielded no candidate at all and
+// assertion (3) was skipped without a word, the silent direction this file's
+// header promises to avoid. Candidates are lowercased at the COMPARISON site
+// rather than here, so the error message still quotes the comment as written.
+const PAREN_SHA_RE = /\(([0-9a-fA-F]{7,40})\)/g;
 // Fallback for a comment written without parentheses: 7-40 hex characters as a
 // whole word. 7 is git's minimum abbreviation, so shorter tokens (`# v7`) are
 // version spellings. DATE-shaped runs are dropped -- see `commentShaCandidates`
 // for why that test is a LENGTH one rather than "contains no a-f".
-const BARE_SHA_RE = /\b[0-9a-f]{7,40}\b/g;
+const BARE_SHA_RE = /\b[0-9a-fA-F]{7,40}\b/g;
+// A `uses:` MAPPING KEY that opens a block scalar (`uses: >-`, `uses: |`) and
+// so carries its value on the following lines. Same key shapes `USES_RE`
+// tolerates; only the value differs.
+const USES_BLOCK_SCALAR_RE = /^(\s*)(["']?)uses\2\s*:\s*[|>][0-9+-]*\s*(?:#.*)?$/;
+// The same owner/repo, for testing a block scalar's folded VALUE rather than a
+// whole `uses:` line.
+const OWNER_REPO_RE = new RegExp(caseInsensitiveOwnerRepo(REUSABLE_OWNER_REPO));
 // A `<job id>:` key -- a bare key with no value, optionally quoted. GitHub
 // restricts job ids to `[A-Za-z_][A-Za-z0-9_-]*`.
 const JOB_ID_KEY_RE = /^(["']?)[A-Za-z_][A-Za-z0-9_-]*\1\s*:\s*(?:#.*)?$/;
@@ -371,6 +414,34 @@ function findCallers() {
       // header of ci-cursor-review.yml does exactly that.
       if (trimmed.startsWith("#")) continue;
 
+      // A job-level `uses:` written as a BLOCK SCALAR (`uses: >-` with the
+      // value on the next line) is legal YAML that GitHub accepts, and it is
+      // invisible to this scan TWICE over: the header line carries no value for
+      // `USES_RE` to match, and `blockScalarMask` deliberately hides the
+      // continuation lines that do. The repo-wide zero-caller guard in the CLI
+      // below is NOT a backstop for it -- that fires only when the WHOLE
+      // repository yields nothing, so one caller rewritten this way is dropped
+      // in silence for as long as any other caller keeps the count non-zero,
+      // free to carry a branch ref or a split pin. Detect the shape itself.
+      const bs = USES_BLOCK_SCALAR_RE.exec(lines[i]);
+      if (bs) {
+        // The folded value is exactly the lines the mask marks as this key's
+        // content. Only a call to OUR reusable is this lint's business, so an
+        // unrelated `uses: >-` is read and left alone rather than reddened.
+        let folded = "";
+        for (let j = i + 1; j < lines.length && inBlock[j]; j++) folded += ` ${lines[j].trim()}`;
+        if (OWNER_REPO_RE.test(folded) && isJobLevelUses(lines, i, bs[1].length, inBlock)) {
+          fail(
+            `${rel}:${i + 1}: this job calls \`${REUSABLE_OWNER_REPO}\` through a ` +
+              `block-scalar \`uses:\`, which puts the pin on a continuation line where ` +
+              `this text-level scanner cannot read it -- and an unreadable caller is ` +
+              `skipped in silence rather than checked. Write the call as a plain ` +
+              `one-line scalar: \`uses: ${REUSABLE_OWNER_REPO}/.github/workflows/<name>.yml@<40-hex>\`.`,
+          );
+        }
+        continue;
+      }
+
       const m = USES_RE.exec(lines[i]);
       if (!m) continue;
 
@@ -417,7 +488,10 @@ function lint(callers) {
     // that takes no `workflows_ref`.
     if (comment) {
       for (const candidate of commentShaCandidates(comment)) {
-        if (!ref.startsWith(candidate)) {
+        // `ref` is already proven 40-hex LOWERCASE by (1) above, so the
+        // candidate is lowercased for the prefix test -- `DEADBEE` and
+        // `deadbee` name the same commit and neither may read as a mismatch.
+        if (!ref.startsWith(candidate.toLowerCase())) {
           errors.push(
             `${at}: the trailing comment names commit \`${candidate}\`, but ` +
               `\`uses:\` is pinned to \`${ref}\`. Update the comment to ` +
@@ -537,6 +611,21 @@ if (printPinArg !== null) {
         `or the callers really were removed, in which case delete this script ` +
         `along with its \`workflow-pins\` job and the \`cursor-review-pin-freshness\` ` +
         `watchdog that depends on \`--print-pin\`.`,
+    );
+  }
+
+  const unwatched = [...new Set(callers.map((c) => c.reusable))]
+    .filter((r) => !WATCHDOG_COVERED.has(r))
+    .sort();
+  if (unwatched.length > 0) {
+    fail(
+      `${unwatched.map((r) => `\`${r}\``).join(", ")} ` +
+        `${unwatched.length === 1 ? "is a reusable" : "are reusables"} called from this ` +
+        `repo but not watched by the \`cursor-review-pin-freshness\` job in ` +
+        `.github/workflows/ci.yml, while .github/dependabot.yml ignores EVERY ` +
+        `${REUSABLE_OWNER_REPO} reusable -- so nothing would ever tell you that pin had ` +
+        `gone stale. Extend that watchdog to the new reusable and add it to ` +
+        `\`WATCHDOG_COVERED\` in this script, or narrow the Dependabot ignore.`,
     );
   }
 
