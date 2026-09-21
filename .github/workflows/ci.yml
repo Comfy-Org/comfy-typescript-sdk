@@ -33,7 +33,10 @@ on:
   # than the dispatched ref, so the pin it judges is the one that actually
   # ships, and it has a job-level `concurrency` group WITHOUT the event name,
   # so a manual run queues behind the scheduled one instead of racing it on
-  # the same sticky issue.
+  # the same sticky issue. That job-level group covers the CROSS-event race
+  # only; two dispatches of the SAME ref share a run-level group, which no
+  # job-level setting can override, so the `concurrency` block below turns
+  # run-level cancellation off for this event as well.
   workflow_dispatch:
 
 concurrency:
@@ -41,7 +44,27 @@ concurrency:
   # main -- which share a ref -- cannot cancel each other. PR and push refs
   # never collide, so this changes nothing for them.
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Everything EXCEPT `workflow_dispatch` cancels its own predecessor: for a PR
+  # or a push only the newest commit's verdict matters, so superseding the
+  # older run is free.
+  #
+  # `workflow_dispatch` is excluded because `cursor-review-pin-freshness` runs
+  # on it and mutates a shared sticky issue through non-atomic
+  # list-then-mutate sequences (see that job's `concurrency` block). Two
+  # dispatches from the same ref land in the IDENTICAL group above, and a
+  # job-level group does not shield its job from run-level cancellation -- so
+  # with `true` here the second dispatch would kill the first mid-mutation,
+  # between `gh issue reopen` and `gh issue comment`. Leaving run-level
+  # cancellation off for this event is what lets that job's own
+  # `cancel-in-progress: false` actually queue the two runs rather than have
+  # one shot out from under it. Only reachable since this workflow grew a
+  # `workflow_dispatch` trigger: two scheduled runs cannot overlap under a
+  # 10-minute job timeout, and no other event reaches that job.
+  #
+  # The cost is that two same-ref dispatches also run the ordinary test matrix
+  # twice over instead of superseding. A manual dispatch is a rare deliberate
+  # act, and duplicated runner minutes are cheaper than a corrupted alarm.
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 permissions:
   contents: read
@@ -322,8 +345,15 @@ jobs:
     # labelled issues, or have the slower run reopen and comment on a thread
     # the faster one just correctly closed. Before `workflow_dispatch` existed
     # this job ran only on `schedule`, where `cancel-in-progress` guaranteed a
-    # single instance; this group restores that guarantee by dropping the event
-    # name from the key. It QUEUES rather than cancelling, because cancelling
+    # single instance; dropping the event name from the key restores that
+    # guarantee for the cron-vs-dispatch pairing. It does NOT, on its own,
+    # cover dispatch-vs-dispatch: two dispatches of one ref share a run-level
+    # group, a job-level group cannot override run-level cancellation, and so
+    # the second run would cancel the first outright -- mid-mutation -- rather
+    # than queue behind it. The workflow-level `concurrency` above closes that
+    # half by setting `cancel-in-progress` false for `workflow_dispatch`; the
+    # two settings are a pair and neither alone is sufficient.
+    # It QUEUES rather than cancelling, because cancelling
     # would abandon a half-applied issue mutation -- exactly the state being
     # avoided -- and a run waiting on a concurrency group has not started, so
     # `timeout-minutes` is untouched by the wait. GitHub keeps at most one run
@@ -1821,7 +1851,10 @@ jobs:
       #
       # `!cancelled()` and NOT `always()`, which is true for a CANCELLED run as
       # well -- and a cancellation is the one outcome that is not a verdict.
-      # This job is under `cancel-in-progress` and a 10-minute timeout, so a run
+      # This job remains cancellable -- `schedule` still carries run-level
+      # `cancel-in-progress`, the workflow-level exclusion above covers only
+      # `workflow_dispatch`, and a human can cancel any run from the UI -- and
+      # it has a 10-minute timeout besides, so a run
       # killed after `assess` wrote its `state` but before this step would,
       # under `always()`, close the watchdog-blocked issue on the strength of a
       # walk that never finished. `!cancelled()` keeps every real outcome --
