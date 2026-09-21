@@ -33,17 +33,17 @@
  * buried deeper (inside a block scalar, or under a nested mapping) are both
  * ignored, so neither can stand in for a pin the job does not actually pass.
  *
- * Documented limits, both of which read as "input absent". On a reusable in
+ * One documented limit, which reads as "input absent": a `with:` written as a
+ * FLOW mapping (`with: { ... }`) is not parsed. On a reusable in
  * `REQUIRES_WORKFLOWS_REF` that fails LOUDLY as a missing input rather than
  * passing silently, which is the direction this lint is allowed to be wrong in
- * -- so neither justifies carrying a YAML parser into a job that deliberately
- * runs without `pnpm install`:
+ * -- so it does not justify carrying a YAML parser into a job that deliberately
+ * runs without `pnpm install`.
  *
- *   - a `with:` written as a FLOW mapping (`with: { ... }`) is not parsed;
- *   - a `with:` block written ABOVE its job's `uses:` is not seen, because the
- *     scan starts at the `uses:` line. YAML mappings are unordered, so that is
- *     a legal spelling; it is just not one any caller here uses, and the
- *     resulting error names the `uses:` line, so the fix is to move the block.
+ * Block-mapping key ORDER is not a limit: `with:` may sit above or below its
+ * job's `uses:`, because the scan covers the whole job body rather than only
+ * the lines after `uses:`. YAML mappings are unordered, so a caller that spells
+ * it that way is correctly pinned and must not be reported as unpinned.
  *
  * Two modes, ONE parser (`findCallers`) shared between them:
  *
@@ -104,14 +104,22 @@ const SHORT_SHA_RE = /\b[0-9a-f]{7,40}\b/g;
  * a line the pin:
  *
  * - A job's `uses:`, `with:` and `secrets:` are siblings at the same indent, so
- *   the job body runs until a line appears at a SHALLOWER indent -- the next
- *   job's key, or the next top-level key.
+ *   the job body runs from just after its `<job id>:` key until a line appears
+ *   at a SHALLOWER indent -- the next job's key, or the next top-level key.
  * - Inside the body, only a DIRECT CHILD of `with:` is an input. A
  *   `workflows_ref:` written as a sibling of `uses:` is not passed to the
  *   reusable at all (it makes the job invalid), and one nested deeper than the
  *   `with:` children -- inside a block scalar, or under a nested mapping -- is
  *   part of some other input's value. Neither may satisfy the pin, or this lint
  *   would pass a caller whose real `workflows_ref` is missing or split.
+ *
+ * The scan covers the WHOLE job body, not just the part after `uses:`. YAML
+ * mappings are unordered, so `with:` above its job's `uses:` is a legal
+ * spelling; reading only the suffix would miss that pin and report a correctly
+ * pinned caller as passing none. The job's first line is found by walking back
+ * from `uses:` to the nearest shallower line, which is its `<job id>:` key --
+ * a block scalar's content is always indented deeper than the key that owns
+ * it, so nothing inside the job can be mistaken for that boundary.
  *
  * Blank lines and whole-line comments carry no structure and never end a block
  * (a comment is often written flush-left).
@@ -121,7 +129,20 @@ function workflowsRefInput(lines, usesIndex, usesIndent) {
   // The indent shared by `with:`'s direct children, learned from the first one.
   let withChildIndent = null;
 
-  for (let i = usesIndex + 1; i < lines.length; i++) {
+  // Walk back to the job's `<job id>:` key -- the nearest shallower line above
+  // `uses:` -- and start just after it, so a `with:` block written above
+  // `uses:` is still inside the scanned body.
+  let bodyStart = 0;
+  for (let i = usesIndex - 1; i >= 0; i--) {
+    const trimmed = lines[i].trim();
+    if (trimmed === "" || trimmed.startsWith("#")) continue;
+    if (lines[i].length - lines[i].trimStart().length < usesIndent) {
+      bodyStart = i + 1;
+      break;
+    }
+  }
+
+  for (let i = bodyStart; i < lines.length; i++) {
     const line = lines[i];
     const trimmed = line.trim();
     if (trimmed === "" || trimmed.startsWith("#")) continue;
