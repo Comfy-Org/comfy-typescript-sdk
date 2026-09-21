@@ -169,11 +169,50 @@ function commentShaCandidates(comment) {
 }
 
 /**
- * The nearest line above `index` indented SHALLOWER than `indent`, skipping
- * blanks and whole-line comments -- that is, the key that owns it.
+ * Every line that is CONTENT of a block scalar (`key: |`/`>`), by index.
+ *
+ * The forward scan in `findCallers` has always tracked this, but the WALK-BACK
+ * that resolves a `uses:` to its owning key did not -- it read raw lines, so a
+ * column-0 line inside an earlier `run: |` body (a flush-left heredoc body, or
+ * its `EOF` terminator) was returned as the owning key. `isJobLevelUses` then
+ * said false and a genuine job-level caller was dropped with NO output, which
+ * is the silent skip this lint's header promises never happens. Computing the
+ * mask once per file and sharing it keeps the two directions agreeing about
+ * what is structure and what is text.
  */
-function owningKey(lines, index, indent) {
+function blockScalarMask(lines) {
+  const mask = Array.from({ length: lines.length }, () => false);
+  let blockKeyIndent = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trimStart();
+    const indent = lines[i].length - trimmed.length;
+
+    if (blockKeyIndent !== null) {
+      if (trimmed === "" || indent > blockKeyIndent) {
+        mask[i] = true;
+        continue;
+      }
+      blockKeyIndent = null;
+    }
+
+    if (trimmed.startsWith("#")) continue;
+
+    const bm = BLOCK_SCALAR_RE.exec(lines[i]);
+    if (bm) blockKeyIndent = bm[1].length;
+  }
+
+  return mask;
+}
+
+/**
+ * The nearest line above `index` indented SHALLOWER than `indent`, skipping
+ * blanks, whole-line comments and block-scalar CONTENT -- that is, the key that
+ * owns it.
+ */
+function owningKey(lines, index, indent, inBlock) {
   for (let i = index - 1; i >= 0; i--) {
+    if (inBlock[i]) continue;
     const trimmed = lines[i].trim();
     if (trimmed === "" || trimmed.startsWith("#")) continue;
     const ownIndent = lines[i].length - lines[i].trimStart().length;
@@ -196,10 +235,10 @@ function owningKey(lines, index, indent) {
  * be a direct child of a `<job id>:` key, which is itself a direct child of the
  * top-level `jobs:`.
  */
-function isJobLevelUses(lines, usesIndex, usesIndent) {
-  const job = owningKey(lines, usesIndex, usesIndent);
+function isJobLevelUses(lines, usesIndex, usesIndent, inBlock) {
+  const job = owningKey(lines, usesIndex, usesIndent, inBlock);
   if (job === null || !JOB_ID_KEY_RE.test(job.trimmed)) return false;
-  const jobs = owningKey(lines, job.index, job.indent);
+  const jobs = owningKey(lines, job.index, job.indent, inBlock);
   return jobs !== null && jobs.indent === 0 && JOBS_KEY_RE.test(jobs.trimmed);
 }
 
@@ -232,7 +271,7 @@ function isJobLevelUses(lines, usesIndex, usesIndent) {
  * Blank lines and whole-line comments carry no structure and never end a block
  * (a comment is often written flush-left).
  */
-function workflowsRefInput(lines, usesIndex, usesIndent) {
+function workflowsRefInput(lines, usesIndex, usesIndent, inBlock) {
   let inWith = false;
   // The indent shared by `with:`'s direct children, learned from the first one.
   let withChildIndent = null;
@@ -242,6 +281,7 @@ function workflowsRefInput(lines, usesIndex, usesIndent) {
   // `uses:` is still inside the scanned body.
   let bodyStart = 0;
   for (let i = usesIndex - 1; i >= 0; i--) {
+    if (inBlock[i]) continue;
     const trimmed = lines[i].trim();
     if (trimmed === "" || trimmed.startsWith("#")) continue;
     if (lines[i].length - lines[i].trimStart().length < usesIndent) {
@@ -251,6 +291,9 @@ function workflowsRefInput(lines, usesIndex, usesIndent) {
   }
 
   for (let i = bodyStart; i < lines.length; i++) {
+    // Block-scalar CONTENT is text, not structure: a flush-left line in a
+    // `run: |` body must not read as "shallower than `uses:`" and end the job.
+    if (inBlock[i]) continue;
     const line = lines[i];
     const trimmed = line.trim();
     if (trimmed === "" || trimmed.startsWith("#")) continue;
@@ -296,30 +339,19 @@ function findCallers() {
     const rel = `.github/workflows/${file}`;
     const lines = readFileSync(join(WORKFLOWS_DIR, file), "utf8").split("\n");
 
-    // Column of the key owning the block scalar we are inside, or null.
-    let blockKeyIndent = null;
+    // Computed ONCE and shared with the walk-backs below, so the forward and
+    // backward directions can never disagree about which lines are structure.
+    const inBlock = blockScalarMask(lines);
 
     for (let i = 0; i < lines.length; i++) {
-      const trimmed = lines[i].trimStart();
-      const indent = lines[i].length - trimmed.length;
+      // Inside a block scalar: content, never structure.
+      if (inBlock[i]) continue;
 
-      // Inside a block scalar: content is anything indented deeper than its
-      // key, plus blank lines. The first line at or above the key's column
-      // ends it and is then read normally.
-      if (blockKeyIndent !== null) {
-        if (trimmed === "" || indent > blockKeyIndent) continue;
-        blockKeyIndent = null;
-      }
+      const trimmed = lines[i].trimStart();
 
       // A whole-line comment can quote a `uses:` while documenting it; the
       // header of ci-cursor-review.yml does exactly that.
       if (trimmed.startsWith("#")) continue;
-
-      const bm = BLOCK_SCALAR_RE.exec(lines[i]);
-      if (bm) {
-        blockKeyIndent = bm[1].length;
-        continue;
-      }
 
       const m = USES_RE.exec(lines[i]);
       if (!m) continue;
@@ -328,7 +360,7 @@ function findCallers() {
 
       // `jobs.<id>.uses` only -- see `isJobLevelUses`. A composite-action step
       // is not a reusable-workflow call and has no second pin to disagree.
-      if (!isJobLevelUses(lines, i, indentStr.length)) continue;
+      if (!isJobLevelUses(lines, i, indentStr.length, inBlock)) continue;
 
       callers.push({
         rel,
@@ -336,7 +368,7 @@ function findCallers() {
         usesLineNo: i + 1,
         ref,
         comment,
-        workflowsRef: workflowsRefInput(lines, i, indentStr.length),
+        workflowsRef: workflowsRefInput(lines, i, indentStr.length, inBlock),
       });
     }
   }

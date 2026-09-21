@@ -368,8 +368,44 @@ jobs:
           # deterministic breakage would redden the scheduled run every day in
           # silence. Separate it first: a missing object is a verdict about the
           # pin, not a fault in reading it.
-          if ! git -C /tmp/gw cat-file -e "$pin^{commit}" 2>/dev/null; then
-            reason="The pinned commit \`$pin\` does not exist in \`Comfy-Org/github-workflows\` at all -- a mistyped SHA, a commit that was force-pushed away, or one that only ever existed on a fork. Re-pin \`uses:\` and \`workflows_ref:\` in \`.github/workflows/ci-cursor-review.yml\` to a commit that is on \`main\`, then run \`node scripts/check-workflow-pins.mjs\`."
+          # Existence is asked WITHOUT `^{commit}`: peeling a name that resolves
+          # to nothing is a FATAL (128, "Not a valid object name"), which is the
+          # same code a genuine repository fault raises, so the peeling form
+          # cannot tell the two apart. Bare `cat-file -e` answers only the
+          # question being asked and answers it cleanly -- exit 1 with EMPTY
+          # stderr for "no such object", 0 for present -- so a lazy-fetch blip
+          # or an unreadable repo (128, with a message) stays a fault and files
+          # nothing. Discarding stderr here, as this line used to, threw away
+          # the only text that separates them.
+          exists_rc=0
+          exists_err="$(git -C /tmp/gw cat-file -e "$pin" 2>&1)" || exists_rc=$?
+          if [ "$exists_rc" -ne 0 ] && { [ "$exists_rc" -ne 1 ] || [ -n "$exists_err" ]; }; then
+            echo "::error::could not determine whether $pin exists in github-workflows -- git exited $exists_rc: ${exists_err:-(no output)}"
+            exit 1
+          fi
+
+          pin_type=""
+          if [ "$exists_rc" -eq 0 ]; then
+            # Present, so confirm it is a COMMIT and not a tag or blob that
+            # happens to share the SHA space -- the assertion `^{commit}` used
+            # to fold into the existence check. A fault reading the type is
+            # still a fault.
+            type_rc=0
+            pin_type="$(git -C /tmp/gw cat-file -t "$pin" 2>/tmp/cat-type.err)" || type_rc=$?
+            if [ "$type_rc" -ne 0 ]; then
+              type_err="$(tr '\n' ' ' </tmp/cat-type.err)"
+              echo "::error::could not read the object type of $pin in github-workflows -- git exited $type_rc: ${type_err:-(no output)}"
+              exit 1
+            fi
+          fi
+
+          if [ "$exists_rc" -eq 1 ] || [ "$pin_type" != "commit" ]; then
+            if [ "$exists_rc" -eq 1 ]; then
+              detail="does not exist in \`Comfy-Org/github-workflows\` at all -- a mistyped SHA, a commit that was force-pushed away, or one that only ever existed on a fork"
+            else
+              detail="exists in \`Comfy-Org/github-workflows\` but names a \`$pin_type\`, not a commit"
+            fi
+            reason="The pinned commit \`$pin\` $detail. Re-pin \`uses:\` and \`workflows_ref:\` in \`.github/workflows/ci-cursor-review.yml\` to a commit that is on \`main\`, then run \`node scripts/check-workflow-pins.mjs\`."
             {
               echo "state=broken"
               echo "broken_reason=$reason"
@@ -425,7 +461,14 @@ jobs:
           # real list is one `git show` away and there is no reason to guess.
           bump_yaml=.github/workflows/bump-cursor-review-callers.yml
           upstream_rc=0
-          upstream_src="$(git -C /tmp/gw show "origin/main:$bump_yaml" 2>&1)" || upstream_rc=$?
+          # stderr goes to a FILE, never into `upstream_src`: this value is
+          # parsed as YAML below, and `git show` of a blob in a blobless clone
+          # can print promisor-fetch chatter on stderr while SUCCEEDING. Folded
+          # in with `2>&1` that chatter becomes parser input -- an unindented
+          # line landing mid-block ends the watched list early and silently
+          # narrows what counts as staleness. Same reason the pin read above
+          # routes stderr to a file.
+          upstream_src="$(git -C /tmp/gw show "origin/main:$bump_yaml" 2>/tmp/upstream-show.err)" || upstream_rc=$?
           if [ "$upstream_rc" -ne 0 ]; then
             # A path that is simply GONE upstream is permanent and
             # deterministic, so it is a VERDICT about the pin's watchability,
@@ -438,8 +481,13 @@ jobs:
             # without the lazy blob fetch `git show` just failed at. Status and
             # output are captured SEPARATELY, for the reason spelled out at the
             # `ls-tree` probe below.
+            # stderr to a FILE, not `2>&1`: `probe_out` being EMPTY is the
+            # "path is gone upstream" signal, so any advice or warning git
+            # prints on a SUCCESSFUL `ls-tree` would make a vanished path read
+            # as present and drop a permanent upstream rename onto the fault
+            # path, which writes no `state` and files no issue.
             probe_rc=0
-            probe_out="$(git -C /tmp/gw ls-tree origin/main -- "$bump_yaml" 2>&1)" || probe_rc=$?
+            probe_out="$(git -C /tmp/gw ls-tree origin/main -- "$bump_yaml" 2>/tmp/bump-probe.err)" || probe_rc=$?
             if [ "$probe_rc" -eq 0 ] && [ -z "$probe_out" ]; then
               reason="\`$bump_yaml\` does not exist in \`Comfy-Org/github-workflows@main\` any more, so this job cannot read \`WATCHED_PATHSPECS\` and cannot judge staleness at all. That will not clear on its own: upstream renamed or removed the bump workflow. Re-point the extractor in the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\` at upstream's new file."
               {
@@ -451,27 +499,64 @@ jobs:
             fi
             # A FAULT, not a verdict: a lazy-fetch failure or a vanished
             # `origin/main` says nothing about the pin. No `state` is written.
-            echo "::error::could not read $bump_yaml from github-workflows main -- git exited $upstream_rc: ${upstream_src:-(no output)}"
+            show_err="$(tr '\n' ' ' </tmp/upstream-show.err)"
+            echo "::error::could not read $bump_yaml from github-workflows main -- git exited $upstream_rc: ${show_err:-(no output)}"
             exit 1
           fi
 
           # The entries of a `WATCHED_PATHSPECS: |` literal block scalar are the
-          # lines indented deeper than its key. A literal block scalar cannot
-          # contain YAML comments, so every non-blank line in it is an entry.
+          # lines indented deeper than its key.
+          #
+          # The scan is BLOCK-SCALAR AWARE, which a plain textual match for the
+          # key is not: upstream's own `run: |` bodies quote this key while
+          # documenting it, and the first textual hit would consume that quoted
+          # copy instead of the real key. The real block that follows would then
+          # be ignored entirely and the staleness query would run against the
+          # wrong surface. So any `foo: |`/`>` key opens a block whose deeper
+          # lines are CONTENT and are never read as keys, and only a
+          # `WATCHED_PATHSPECS:` seen outside a block counts.
+          #
+          # Once the real block ends, the scan is FINISHED -- a later textual
+          # copy cannot reopen or extend it.
+          #
+          # A literal block scalar cannot contain YAML comments, so a `#` line
+          # inside it would be a pathspec that literally starts with `#`, which
+          # no path does; dropping those keeps one from being probed and pinning
+          # this job into a permanent `broken` verdict blaming upstream for a
+          # rename that never happened.
+          #
           # No early `exit` and no pipe into awk: a pipeline that closes early
           # under `set -o pipefail` is its own failure mode (see `newest` below).
           mapfile -t watched < <(awk '
-            /^[[:space:]]*WATCHED_PATHSPECS:[[:space:]]*\|/ {
-              match($0, /^[[:space:]]*/); key = RLENGTH; found = 1; next
+            BEGIN { blk = -1 }
+            function indent_of(line) { match(line, /^[[:space:]]*/); return RLENGTH }
+            finished { next }
+            {
+              ind = indent_of($0)
+              blank = ($0 ~ /^[[:space:]]*$/)
             }
-            found && !done {
-              if ($0 ~ /^[[:space:]]*$/) next
-              match($0, /^[[:space:]]*/)
-              if (RLENGTH <= key) { done = 1; next }
-              entry = $0
-              sub(/^[[:space:]]+/, "", entry)
-              sub(/[[:space:]]+$/, "", entry)
-              print entry
+            # Inside some block scalar: content only, until a line at or above
+            # the owning key column.
+            blk != -1 {
+              if (blank || ind > blk) {
+                if (found && !blank && ind > key) {
+                  entry = $0
+                  sub(/^[[:space:]]+/, "", entry)
+                  sub(/[[:space:]]+$/, "", entry)
+                  if (entry !~ /^#/) print entry
+                }
+                next
+              }
+              if (found) { finished = 1; next }
+              blk = -1
+            }
+            blank { next }
+            /^[[:space:]]*WATCHED_PATHSPECS:[[:space:]]*\|/ {
+              key = ind; blk = ind; found = 1; next
+            }
+            # Any other block-scalar key opens a block we must skip over.
+            /^[[:space:]]*[^[:space:]#][^:]*:[[:space:]]*[|>][0-9+-]*[[:space:]]*$/ {
+              blk = ind; next
             }
           ' <<<"$upstream_src")
 
@@ -492,34 +577,73 @@ jobs:
           # Upstream's list can itself name a path that no longer resolves --
           # a rename landed in its `paths:` filter but not here. `git log` over
           # a vanished path matches nothing, so this stays a fail-closed probe.
-          # Only POSITIVE entries are probed: `:(exclude)` is a filter, and one
-          # naming a since-deleted path is not a defect. `ls-tree` reads trees
-          # only, which the blobless clone already has.
+          # `ls-tree` reads trees only, which the blobless clone already has.
+          #
+          # Only POSITIVE entries are probed -- `:(exclude)` is a filter, and one
+          # naming a since-deleted path is not a defect -- so only EXCLUSIONS are
+          # skipped. `:*` used to skip every entry carrying
+          # pathspec magic, but `:(glob)p`, `:(icase)p`, `:(top)p`, `:(literal)p`
+          # and `:/p` are all POSITIVE pathspecs -- skipping them meant an
+          # upstream rename of one degraded silently-healthy, the exact hole
+          # this fail-closed probe exists to shut.
+          #
+          # The magic prefix is STRIPPED before probing rather than passed
+          # through, because `ls-tree` rejects most of it outright ("pathspec
+          # magic not supported by this command" for `glob`, `icase` and
+          # `exclude`, verified against git in this repo) -- handing it the raw
+          # entry would exit 128 and turn every magic entry into a daily fault.
+          # `git log` below DOES support the full syntax, so it still receives
+          # the entries verbatim.
           missing=""
-          probed=0
+          positive=0
           for path in "${watched[@]}"; do
             case "$path" in
-              :*) continue ;;
+              :!*) continue ;;
+              :\(*)
+                magic="${path#:\(}"
+                magic="${magic%%)*}"
+                case ",$magic," in
+                  *,exclude,*) continue ;;
+                esac
+                probe="${path#*)}"
+                ;;
+              :/*) probe="${path#:/}" ;;
+              :*)
+                # Unrecognised short magic: not something this probe can turn
+                # into a path, and not demonstrably positive either. Counted,
+                # never probed.
+                positive=$((positive + 1))
+                continue
+                ;;
+              *) probe="$path" ;;
             esac
-            probed=$((probed + 1))
-            # Output and status are captured SEPARATELY. A command substitution
-            # that fails inside `[` neither trips `set -e` nor surfaces its
-            # status, so an unreadable tree or a partial-clone fetch failure
-            # would be indistinguishable from "the path is gone upstream" and
-            # would file a confident `broken` issue about drift that did not
-            # happen -- the same fault-as-verdict conflation the ancestry check
-            # above is structured to avoid.
+            positive=$((positive + 1))
+            case "$probe" in
+              # A wildcard entry does not name one fixed path, so "does it still
+              # exist" is not a question `ls-tree` can answer about it. It still
+              # counts as a positive pathspec for the guard below.
+              *[*?[]*) continue ;;
+            esac
+            # Status and OUTPUT are captured separately, and stderr goes to a
+            # FILE. Emptiness of `ls_out` is the "path is gone upstream" signal,
+            # so folding stderr in with `2>&1` would let any advice or warning
+            # git prints on a SUCCESSFUL `ls-tree` read as "still present" --
+            # fail-open, the direction this probe exists to close. A non-zero
+            # status stays a fault: an unreadable tree or a partial-clone fetch
+            # failure must not file a confident `broken` issue about drift that
+            # did not happen.
             ls_rc=0
-            ls_out="$(git -C /tmp/gw ls-tree origin/main -- "$path" 2>&1)" || ls_rc=$?
+            ls_out="$(git -C /tmp/gw ls-tree origin/main -- "$probe" 2>/tmp/ls-probe.err)" || ls_rc=$?
             if [ "$ls_rc" -ne 0 ]; then
-              echo "::error::could not list \`$path\` in github-workflows main -- git exited $ls_rc: ${ls_out:-(no output)}"
+              ls_err="$(tr '\n' ' ' </tmp/ls-probe.err)"
+              echo "::error::could not list \`$probe\` in github-workflows main -- git exited $ls_rc: ${ls_err:-(no output)}"
               exit 1
             fi
             [ -n "$ls_out" ] || missing="$missing \`$path\`"
           done
 
-          if [ "$probed" -eq 0 ]; then
-            reason="\`WATCHED_PATHSPECS\` in \`Comfy-Org/github-workflows@main:$bump_yaml\` parsed to ${#watched[@]} entry/entries, all of them \`:(exclude)\` filters and none of them a path to watch. A staleness check with no positive pathspec matches nothing and would report the pin current however stale it is, so it is failing closed. Re-check upstream's file and the extractor in \`.github/workflows/ci.yml\`."
+          if [ "$positive" -eq 0 ]; then
+            reason="\`WATCHED_PATHSPECS\` in \`Comfy-Org/github-workflows@main:$bump_yaml\` parsed to ${#watched[@]} entry/entries, none of them a positive pathspec -- they are all \`:(exclude)\`/\`:!\` filters. A staleness check with no positive pathspec matches nothing and would report the pin current however stale it is, so it is failing closed. Re-check upstream's file and the extractor in \`.github/workflows/ci.yml\`."
             {
               echo "state=broken"
               echo "broken_reason=$reason"
@@ -550,8 +674,36 @@ jobs:
           # The `:(exclude)` entries come from upstream's list now, so nothing
           # is appended here -- an extra hand-written exclusion would be exactly
           # the drift this stopped mirroring the list to avoid.
+          # The ONLY git call in this step that used to run with no captured
+          # status -- and it is fed pathspecs this repo does not control, read
+          # verbatim from upstream's `WATCHED_PATHSPECS`. A bare
+          # `var="$(cmd)"` assignment does NOT trip `set -e` on failure, so an
+          # unsupported or malformed pathspec upstream returned an EMPTY
+          # `behind`, which reads exactly like "nothing landed": `state=current`
+          # is written and the job closes its own stale-pin issue while the pin
+          # is frozen. That is the fail-open this whole step is built to avoid.
+          #
+          # A pathspec git refuses to parse is PERMANENT and deterministic, so
+          # it is a verdict (`broken`, sticky issue) rather than a fault -- left
+          # on the fault path it would simply redden the schedule daily and say
+          # nothing. Every other failure stays a fault.
+          log_rc=0
           behind="$(git -C /tmp/gw log --first-parent --format='%H %cI' "$pin..origin/main" -- \
-            "${watched[@]}")"
+            "${watched[@]}" 2>/tmp/behind.err)" || log_rc=$?
+          if [ "$log_rc" -ne 0 ]; then
+            log_err="$(tr '\n' ' ' </tmp/behind.err)"
+            if printf '%s' "$log_err" | grep -qi 'pathspec'; then
+              reason="\`git log\` could not use the pathspecs read from \`Comfy-Org/github-workflows@main:$bump_yaml\`, so this job cannot judge staleness at all. git exited $log_rc saying: ${log_err:-(no output)}. That will not clear on its own -- upstream's \`WATCHED_PATHSPECS\` carries a pathspec this check cannot use. Re-check upstream's list and the extractor in the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\`."
+              {
+                echo "state=broken"
+                echo "broken_reason=$reason"
+              } >>"$GITHUB_OUTPUT"
+              echo "::error::$reason"
+              exit 1
+            fi
+            echo "::error::could not list upstream commits since $pin -- git exited $log_rc: ${log_err:-(no output)}"
+            exit 1
+          fi
 
           if [ -z "$behind" ]; then
             echo "state=current" >>"$GITHUB_OUTPUT"
@@ -601,7 +753,19 @@ jobs:
           echo "  oldest unpicked: $oldest_sha ($oldest_date)"
           echo "  newest upstream: $newest_sha ($newest_date)"
 
+          # A committer date in the FUTURE (clock skew upstream, or a
+          # deliberately dated commit) makes `age` negative, which is trivially
+          # `-lt $GRACE_SECONDS` -- so the watchdog would write `state=grace`
+          # and close any open stale-pin issue however frozen the pin is, and
+          # unlike the 3-day window that mute is UNBOUNDED: it lasts as long as
+          # that commit stays the oldest unpicked one. Clamped to 0, a future
+          # date reads as "just landed", which is the most generous reading that
+          # is still bounded by the grace window.
           age="$(( $(date -u +%s) - $(date -u -d "$oldest_date" +%s) ))"
+          if [ "$age" -lt 0 ]; then
+            echo "::warning::the oldest unpicked commit $oldest_sha is dated in the future ($oldest_date); treating it as just-landed."
+            age=0
+          fi
           if [ "$age" -lt "$GRACE_SECONDS" ]; then
             echo "state=grace" >>"$GITHUB_OUTPUT"
             echo "The oldest unpicked commit is $((age / 3600))h old, inside the $((GRACE_SECONDS / 86400))-day grace window. Passing."
@@ -892,7 +1056,17 @@ jobs:
       # did), but saying "current again" there would be false, so the comment is
       # written per state.
       - name: Close the stale-pin issue once the pin is moving again
-        if: success() && steps.assess.outputs.state != 'delivered'
+        # `success()` is the JOB's cumulative status, not this step's
+        # precondition -- so a transient `gh` failure in the now-unconditional
+        # watchdog-blocked close directly above would skip this step and leave a
+        # stale-pin issue open on a run where the pin is demonstrably moving.
+        # The states are named explicitly rather than filtered with
+        # `!= 'delivered'`, because under `always()` that spelling would also
+        # match `stale`, `broken` and the empty no-verdict fault -- and closing
+        # the stale-pin issue on a `stale` verdict is precisely backwards.
+        if: >-
+          always() && (steps.assess.outputs.state == 'current'
+          || steps.assess.outputs.state == 'grace')
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
