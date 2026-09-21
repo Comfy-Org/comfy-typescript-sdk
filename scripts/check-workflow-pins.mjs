@@ -45,10 +45,21 @@
  * - The `uses` KEY may be quoted (`"uses":`), which YAML allows and which must
  *   not read as "no uses: here".
  *
- * A STEP's `- uses:` is deliberately NOT matched. `jobs.<id>.uses` is the only
- * place GitHub accepts a reusable-workflow call; a `- uses:` inside `steps:` is
- * a composite ACTION, which pins once and has no `workflows_ref` to disagree
- * with. Matching it would make this lint demand a pin that cannot exist.
+ * A STEP's `uses:` is deliberately NOT matched, and that is enforced by
+ * POSITION rather than by spelling: the matched `uses:` must be a direct child
+ * of a `<job id>:` key which is itself a direct child of the top-level `jobs:`.
+ * Spelling alone is not enough -- it rules out `- uses:`, where `uses` is the
+ * step's first key, but the form written throughout this repo (`- name:` on one
+ * line, `uses:` indented beneath) is a plain mapping key and matches. Either
+ * way `jobs.<id>.uses` is the only place GitHub accepts a reusable-workflow
+ * call; a `uses:` inside `steps:` is a composite ACTION, which pins once and
+ * has no `workflows_ref` to disagree with. Matching one would make this lint
+ * demand a pin that cannot exist.
+ *
+ * Finding NO caller at all is an ERROR. This repo calls these reusables, so an
+ * empty scan means the lint checked nothing -- far more likely a caller in a
+ * shape this scanner cannot see than a real removal, and the same edit would
+ * silence `--print-pin` and the daily watchdog with it.
  *
  * One documented limit, which reads as "input absent": a `with:` written as a
  * FLOW mapping (`with: { ... }`) is not parsed. That fails LOUDLY as a missing
@@ -129,12 +140,67 @@ const PAREN_SHA_RE = /\(([0-9a-f]{7,40})\)/g;
 // real abbreviated SHA that happens to be all digits is a 1-in-1.7-million
 // coincidence that costs only a comment reworded to the parenthesised form.
 const BARE_SHA_RE = /\b[0-9a-f]{7,40}\b/g;
+// A `<job id>:` key -- a bare key with no value, optionally quoted. GitHub
+// restricts job ids to `[A-Za-z_][A-Za-z0-9_-]*`.
+const JOB_ID_KEY_RE = /^(["']?)[A-Za-z_][A-Za-z0-9_-]*\1\s*:\s*(?:#.*)?$/;
+const JOBS_KEY_RE = /^(["']?)jobs\1\s*:\s*(?:#.*)?$/;
 
-/** Commit abbreviations the trailing comment claims, most precise form first. */
+/**
+ * Commit abbreviations the trailing comment claims, most precise form first.
+ *
+ * The all-digit filter applies to BOTH branches. It used to sit only on the
+ * fallback, so the parenthesised branch returned every token raw and
+ * short-circuited past it -- and since the caller requires every candidate to
+ * prefix the ref, a perfectly correct
+ * `# github-workflows main (425c154) -- bumped (20260919)` reddened CI over the
+ * date. That is the same false positive the digit filter was added to remove.
+ *
+ * ALL surviving candidates are returned, not just the first. A comment naming a
+ * second commit is ambiguous either way, and honouring only the first would
+ * miss a stale token written after a fresh one -- trading this loud, one-reword
+ * false positive for a silent miss, which is the direction this lint is not
+ * allowed to be wrong in.
+ */
 function commentShaCandidates(comment) {
-  const parenthesised = [...comment.matchAll(PAREN_SHA_RE)].map((m) => m[1]);
+  const looksHex = (c) => /[a-f]/.test(c);
+  const parenthesised = [...comment.matchAll(PAREN_SHA_RE)].map((m) => m[1]).filter(looksHex);
   if (parenthesised.length > 0) return parenthesised;
-  return (comment.match(BARE_SHA_RE) ?? []).filter((c) => /[a-f]/.test(c));
+  return (comment.match(BARE_SHA_RE) ?? []).filter(looksHex);
+}
+
+/**
+ * The nearest line above `index` indented SHALLOWER than `indent`, skipping
+ * blanks and whole-line comments -- that is, the key that owns it.
+ */
+function owningKey(lines, index, indent) {
+  for (let i = index - 1; i >= 0; i--) {
+    const trimmed = lines[i].trim();
+    if (trimmed === "" || trimmed.startsWith("#")) continue;
+    const ownIndent = lines[i].length - lines[i].trimStart().length;
+    if (ownIndent < indent) return { trimmed, indent: ownIndent, index: i };
+  }
+  return null;
+}
+
+/**
+ * True when the `uses:` on `usesIndex` really is `jobs.<id>.uses`.
+ *
+ * SPELLING IS NOT ENOUGH. `USES_RE` only rules out the step form whose FIRST
+ * key is `uses` (`- uses:`); the form this repo writes throughout -- `- name:`
+ * on one line and `uses:` indented beneath it -- is a plain mapping key and
+ * matches it happily. So a step consuming a `Comfy-Org/github-workflows`
+ * composite ACTION would be pulled into the lint, and with `NO_WORKFLOWS_REF`
+ * failing closed it would hard-error demanding a `workflows_ref` input that a
+ * composite action cannot accept -- exactly the outcome the header promises is
+ * avoided. Position is what actually selects a reusable call: the `uses:` must
+ * be a direct child of a `<job id>:` key, which is itself a direct child of the
+ * top-level `jobs:`.
+ */
+function isJobLevelUses(lines, usesIndex, usesIndent) {
+  const job = owningKey(lines, usesIndex, usesIndent);
+  if (job === null || !JOB_ID_KEY_RE.test(job.trimmed)) return false;
+  const jobs = owningKey(lines, job.index, job.indent);
+  return jobs !== null && jobs.indent === 0 && JOBS_KEY_RE.test(jobs.trimmed);
 }
 
 /**
@@ -259,6 +325,10 @@ function findCallers() {
       if (!m) continue;
 
       const [, indentStr, , , workflowPath, ref, comment] = m;
+
+      // `jobs.<id>.uses` only -- see `isJobLevelUses`. A composite-action step
+      // is not a reusable-workflow call and has no second pin to disagree.
+      if (!isJobLevelUses(lines, i, indentStr.length)) continue;
 
       callers.push({
         rel,
@@ -401,6 +471,25 @@ if (printPinArg !== null) {
   printPin(findCallers(), printPinArg);
 } else {
   const callers = findCallers();
+
+  // ZERO CALLERS IS AN ERROR, not a notice. This repo does call these
+  // reusables, so an empty result means this lint checked NOTHING -- and the
+  // likeliest cause is a caller spelled in a shape the scanner cannot see (a
+  // folded `uses: >-`, a flow mapping) rather than a real removal. That edit
+  // would take `--print-pin` down with it and silence the daily
+  // `cursor-review-pin-freshness` watchdog in the same change, so the lint and
+  // its watchdog would go quiet together. Fail loudly instead.
+  if (callers.length === 0) {
+    fail(
+      `no ${REUSABLE_OWNER_REPO} caller found under .github/workflows, so this ` +
+        `lint checked nothing. Either a caller is written in a shape this ` +
+        `text-level scanner cannot see -- a folded \`uses: >-\`, a flow mapping -- ` +
+        `or the callers really were removed, in which case delete this script ` +
+        `along with its \`workflow-pins\` job and the \`cursor-review-pin-freshness\` ` +
+        `watchdog that depends on \`--print-pin\`.`,
+    );
+  }
+
   const errors = lint(callers);
 
   if (errors.length > 0) {
@@ -416,15 +505,9 @@ if (printPinArg !== null) {
     process.exit(1);
   }
 
-  if (callers.length === 0) {
-    // Not an error -- the repo may simply not call these reusables any more --
-    // but a lint that silently checks nothing is worse than no lint, so say so.
-    console.log(`check-workflow-pins: no ${REUSABLE_OWNER_REPO} callers found; nothing to check.`);
-  } else {
-    console.log(
-      `check-workflow-pins: ${callers.length} ${REUSABLE_OWNER_REPO} caller(s) ` +
-        `checked, all pins agree.\n` +
-        callers.map((c) => `  - ${c.rel}:${c.usesLineNo} -> ${c.reusable}`).join("\n"),
-    );
-  }
+  console.log(
+    `check-workflow-pins: ${callers.length} ${REUSABLE_OWNER_REPO} caller(s) ` +
+      `checked, all pins agree.\n` +
+      callers.map((c) => `  - ${c.rel}:${c.usesLineNo} -> ${c.reusable}`).join("\n"),
+  );
 }
