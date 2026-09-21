@@ -372,14 +372,38 @@ jobs:
           # to nothing is a FATAL (128, "Not a valid object name"), which is the
           # same code a genuine repository fault raises, so the peeling form
           # cannot tell the two apart. Bare `cat-file -e` answers only the
-          # question being asked and answers it cleanly -- exit 1 with EMPTY
-          # stderr for "no such object", 0 for present -- so a lazy-fetch blip
-          # or an unreadable repo (128, with a message) stays a fault and files
-          # nothing. Discarding stderr here, as this line used to, threw away
-          # the only text that separates them.
+          # question being asked.
+          #
+          # `GIT_NO_LAZY_FETCH=1` is what makes its EXIT CODE mean only what it
+          # says. This is a `--filter=blob:none` clone, so `remote.origin.promisor`
+          # is set and a MISSING object makes git spawn a lazy `git fetch` that
+          # inherits stderr -- so the likeliest genuinely-wrong pin, a SHA in no
+          # upstream ref, arrives as exit 1 carrying a server-relayed
+          # `fatal: remote error: upload-pack: not our ref <sha>`. An
+          # empty-stderr discriminator therefore routed the ONE case this branch
+          # exists to catch back to the no-verdict fault path. Measured against
+          # git 2.43 on a real blobless clone of github-workflows:
+          #   lazy fetch ON  -- absent:          rc 1, `fatal: remote error: ...`
+          #   lazy fetch OFF -- absent:          rc 1, `warning: lazy fetching disabled ...`
+          #                     present:         rc 0, empty
+          #                     unreadable repo: rc 128, `fatal: ...`
+          # stderr is NON-EMPTY on the missing-object path either way, so it
+          # cannot be part of the test; with lazy fetching off the exit code
+          # alone separates them cleanly -- 1 is a verdict about the pin, any
+          # other non-zero is a fault. `$pin` is already proven 40-hex above, so
+          # the 128 that a malformed name raises is only ever a real repository
+          # fault here. stderr is still captured, for that fault's annotation.
           exists_rc=0
-          exists_err="$(git -C /tmp/gw cat-file -e "$pin" 2>&1)" || exists_rc=$?
-          if [ "$exists_rc" -ne 0 ] && { [ "$exists_rc" -ne 1 ] || [ -n "$exists_err" ]; }; then
+          GIT_NO_LAZY_FETCH=1 git -C /tmp/gw cat-file -e "$pin" 2>/tmp/cat-exists.err \
+            || exists_rc=$?
+          if [ "$exists_rc" -ne 0 ] && [ "$exists_rc" -ne 1 ]; then
+            # Flattened like every other captured diagnostic in this step: this
+            # one can hold a multi-line, server-controlled promisor `fetch`
+            # failure, and only its FIRST line would become the `::error::`
+            # annotation -- the rest would be emitted as raw log lines, where a
+            # relayed line beginning with `::` is parsed as a workflow command
+            # rather than as text.
+            exists_err="$(tr '\n' ' ' </tmp/cat-exists.err)"
             echo "::error::could not determine whether $pin exists in github-workflows -- git exited $exists_rc: ${exists_err:-(no output)}"
             exit 1
           fi
@@ -422,8 +446,10 @@ jobs:
           # as "re-pin both pins" against a pin that is in fact correct. Only
           # exit 1 is a verdict about the pin, and only a verdict files an issue.
           ancestry_rc=0
-          ancestry_err="$(git -C /tmp/gw merge-base --is-ancestor "$pin" origin/main 2>&1)" \
+          git -C /tmp/gw merge-base --is-ancestor "$pin" origin/main 2>/tmp/ancestry.err \
             || ancestry_rc=$?
+          # Flattened for the same reason as `exists_err` above.
+          ancestry_err="$(tr '\n' ' ' </tmp/ancestry.err)"
 
           if [ "$ancestry_rc" -eq 1 ]; then
             reason="The pinned commit \`$pin\` exists in \`Comfy-Org/github-workflows\` but is not an ancestor of \`main\` -- both pins were moved to a side branch, or \`main\` was rewritten. Re-pin \`uses:\` and \`workflows_ref:\` in \`.github/workflows/ci-cursor-review.yml\` to a commit that is on \`main\`, then run \`node scripts/check-workflow-pins.mjs\`."
@@ -530,6 +556,17 @@ jobs:
           mapfile -t watched < <(awk '
             BEGIN { blk = -1 }
             function indent_of(line) { match(line, /^[[:space:]]*/); return RLENGTH }
+            # The column of the KEY on a line, spanning any `- ` sequence
+            # marker. Block content is indented deeper than the KEY, which for
+            # `- run: |` is NOT the same as deeper than the dash: keying the
+            # block off the dash column leaves every sibling key of that `run:`
+            # -- a step-level `env:`, `if:`, `with:` -- satisfying `ind > blk`
+            # and swallowed as scalar content, so a `WATCHED_PATHSPECS:` nested
+            # under such an `env:` is never seen and this job writes a
+            # permanent daily `broken` blaming upstream for a rename that never
+            # happened. The JS sibling spans the marker for exactly this case
+            # (`BLOCK_SCALAR_RE` group 1 is `\s*(?:-\s+)?`); this is the port.
+            function key_col(line) { match(line, /^[[:space:]]*(-[[:space:]]+)?/); return RLENGTH }
             finished { next }
             {
               ind = indent_of($0)
@@ -551,12 +588,22 @@ jobs:
               blk = -1
             }
             blank { next }
-            /^[[:space:]]*WATCHED_PATHSPECS:[[:space:]]*\|/ {
-              key = ind; blk = ind; found = 1; next
+            /^[[:space:]]*(-[[:space:]]+)?WATCHED_PATHSPECS:[[:space:]]*\|/ {
+              key = key_col($0); blk = key; found = 1; next
             }
             # Any other block-scalar key opens a block we must skip over.
-            /^[[:space:]]*[^[:space:]#][^:]*:[[:space:]]*[|>][0-9+-]*[[:space:]]*$/ {
-              blk = ind; next
+            #
+            # The trailing `(#.*)?` is load-bearing, not tidiness: YAML permits
+            # a COMMENT after a block-scalar header, so anchoring `$` straight
+            # after the indicator means `run: | # write the issue body` opens no
+            # block here. That body is then scanned as STRUCTURE, and a
+            # `WATCHED_PATHSPECS: |` quoted inside it is consumed as the real
+            # key -- with `finished` then suppressing the genuine block below.
+            # The JS sibling already tolerates it (`BLOCK_SCALAR_RE` ends
+            # `\s*(?:#.*)?$`); the two extractors must not disagree about what
+            # opens a block.
+            /^[[:space:]]*[^[:space:]#][^:]*:[[:space:]]*[|>][0-9+-]*[[:space:]]*(#.*)?$/ {
+              blk = key_col($0); next
             }
           ' <<<"$upstream_src")
 
@@ -598,7 +645,19 @@ jobs:
           positive=0
           for path in "${watched[@]}"; do
             case "$path" in
-              :!*) continue ;;
+              # `^` is git's DOCUMENTED synonym for `!` in short magic
+              # (gitglossary, "exclude": magic signature `!` or its synonym
+              # `^`). Matching only `!` let a `:^` entry fall through to the
+              # unrecognised-short-magic arm below, where it was COUNTED as a
+              # positive and never probed -- so an upstream list spelling its
+              # exclusions with `^` sailed past the `positive -eq 0`
+              # fail-closed guard carrying no real positive at all, and the
+              # `git log` below then either matched nothing (writing
+              # `state=current` over a frozen pin) or died with "There is
+              # nothing to exclude from by :(exclude) patterns" -- a message
+              # containing no "pathspec", so the classifier there missed it
+              # too and it landed on the silent fault path.
+              :!*|:^*) continue ;;
               :\(*)
                 magic="${path#:\(}"
                 magic="${magic%%)*}"
@@ -607,6 +666,11 @@ jobs:
                 esac
                 probe="${path#*)}"
                 ;;
+              # Short magic COMBINES, so `:/` can be followed by more of it.
+              # `:/!p` and `:/^p` are exclusions wearing a `:/` prefix; the
+              # arm below would strip only the `:/` and probe a literal `!p`
+              # or `^p`, reporting a path that never existed as missing.
+              :/!*|:/^*) continue ;;
               :/*) probe="${path#:/}" ;;
               :*)
                 # Unrecognised short magic: not something this probe can turn
@@ -617,7 +681,40 @@ jobs:
                 ;;
               *) probe="$path" ;;
             esac
+
+            # Stripping the magic can leave `probe` unusable, and `ls-tree`
+            # must not be handed it either way.
+            #
+            # STILL CARRYING MAGIC means the strip did not happen: an
+            # unterminated `:(glob`, where `${path#*)}` finds no `)` and
+            # returns the entry unchanged. `ls-tree` exits 128 on it, which
+            # lands on the fault branch that writes no `state` -- reddening
+            # the schedule daily in silence. It is permanent, deterministic
+            # and a defect in a list this repo does not control, so it is a
+            # `broken` VERDICT with a sticky issue instead.
+            if [ "${probe#:}" != "$probe" ]; then
+              reason="\`Comfy-Org/github-workflows@main:$bump_yaml\` lists \`$path\` in \`WATCHED_PATHSPECS\`, and this job cannot parse its pathspec magic, so it cannot check that the entry still resolves -- and an unchecked entry is exactly the silent drift this probe exists to catch. Re-check upstream's list and the extractor in the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\`."
+              {
+                echo "state=broken"
+                echo "broken_reason=$reason"
+              } >>"$GITHUB_OUTPUT"
+              echo "::error::$reason"
+              exit 1
+            fi
+
             positive=$((positive + 1))
+
+            # An EMPTY probe is NOT a defect, so it must not take that branch:
+            # `:/` and `:(top)` alone are the documented spellings for the
+            # repository ROOT, a positive pathspec that always resolves. It is
+            # simply not one `ls-tree` can be asked about -- `git ls-tree
+            # <ref> -- ""` is fatal with "empty string is not a valid
+            # pathspec" -- so, exactly like a wildcard entry, it counts toward
+            # the fail-closed guard above and skips the probe.
+            if [ -z "$probe" ]; then
+              continue
+            fi
+
             case "$probe" in
               # A wildcard entry does not name one fixed path, so "does it still
               # exist" is not a question `ls-tree` can answer about it. It still
@@ -687,9 +784,29 @@ jobs:
           # it is a verdict (`broken`, sticky issue) rather than a fault -- left
           # on the fault path it would simply redden the schedule daily and say
           # nothing. Every other failure stays a fault.
+          #
+          # The trailer field is read HERE, in the same walk, because the
+          # fleet does not owe a bump for every commit on the watched surface:
+          # upstream's `preflight.sh` honours a `Skip-caller-bump: true`
+          # trailer for comment/docs-only edits inside those paths and
+          # deliberately opens no bump PR for them (`.github/bump-callers/`,
+          # and AGENTS.md tells authors to use it). Counting such a commit as
+          # owed means that once it ages past the grace window this job
+          # reaches `stale` and files the "nothing is moving it" issue while
+          # the fleet behaved exactly as designed -- and the false alert
+          # persists until some later real change advances the pin. It can
+          # also burn the grace window ahead of a genuine commit.
+          #
+          # `%(trailers:...)` is git's OWN parser, which is the point: the
+          # trailing-trailer-block and paragraph-boundary semantics upstream
+          # spells out are its emulation of `git interpret-trailers --parse`,
+          # so asking git directly is the one reading that cannot drift from
+          # it. Re-implementing the jq here is precisely the second copy
+          # upstream's own comment says that directory exists to prevent.
           log_rc=0
-          behind="$(git -C /tmp/gw log --first-parent --format='%H %cI' "$pin..origin/main" -- \
-            "${watched[@]}" 2>/tmp/behind.err)" || log_rc=$?
+          behind_raw="$(git -C /tmp/gw log --first-parent \
+            --format='%H %cI %(trailers:key=Skip-caller-bump,valueonly,separator=%x2C)' \
+            "$pin..origin/main" -- "${watched[@]}" 2>/tmp/behind.err)" || log_rc=$?
           if [ "$log_rc" -ne 0 ]; then
             log_err="$(tr '\n' ' ' </tmp/behind.err)"
             if printf '%s' "$log_err" | grep -qi 'pathspec'; then
@@ -705,9 +822,27 @@ jobs:
             exit 1
           fi
 
+          # Drop the commits that declared themselves bump-irrelevant, and put
+          # the line back into the `<sha> <date>` shape the arithmetic below
+          # parses positionally. `any`, not `all`, matches upstream's gate:
+          # one `true` among repeated trailers is a declaration.
+          behind="$(printf '%s' "$behind_raw" | awk 'NF {
+            skip = 0
+            n = split($3, vals, ",")
+            for (i = 1; i <= n; i++) if (vals[i] == "true") skip = 1
+            if (!skip) print $1, $2
+          }')"
+
           if [ -z "$behind" ]; then
             echo "state=current" >>"$GITHUB_OUTPUT"
-            echo "Nothing consumer-visible has landed upstream since $pin. Pin is current."
+            if [ -n "$behind_raw" ]; then
+              # Worth distinguishing in the log: upstream DID move the watched
+              # surface, and this job is agreeing with the fleet's own
+              # decision not to bump for it rather than failing to see it.
+              echo "Every upstream commit on the watched surface since $pin carries \`Skip-caller-bump: true\`, so the fleet owes no bump for them. Pin is current."
+            else
+              echo "Nothing consumer-visible has landed upstream since $pin. Pin is current."
+            fi
             exit 0
           fi
 
@@ -790,19 +925,73 @@ jobs:
           # delivered bump and mute the watchdog. Only a same-repo branch can
           # be the fleet's, so cross-repository PRs are dropped.
           bump="$(gh pr list --repo "$GH_REPO" --state open \
-            --head "$BUMP_BRANCH" --json number,isCrossRepository,createdAt \
+            --head "$BUMP_BRANCH" --json number,isCrossRepository,createdAt,headRefOid \
             --jq '[.[] | select(.isCrossRepository == false)][0] // empty')"
 
           bump_pr=""
           bump_age_days=""
+          bump_delivers=""
           if [ -n "$bump" ]; then
             bump_pr="$(printf '%s' "$bump" | jq -r '.number')"
             bump_created="$(printf '%s' "$bump" | jq -r '.createdAt')"
             bump_age="$(( $(date -u +%s) - $(date -u -d "$bump_created" +%s) ))"
             bump_age_days="$(( bump_age / 86400 ))"
+            bump_head="$(printf '%s' "$bump" | jq -r '.headRefOid')"
+
+            # EXISTENCE of a PR on that branch is not evidence about THIS
+            # backlog. The fleet reuses one stable branch across bumps, so a PR
+            # opened for an older upstream SHA would keep `delivered` -- and
+            # with it the whole watchdog -- muted for its full window while
+            # being unable to move the caller to what is owed now.
+            #
+            # Delivery means the pin this PR would LAND is at or past the
+            # newest owed commit. Tested by ANCESTRY rather than equality: the
+            # fleet pins callers to upstream's main TIP, which legitimately
+            # sits ahead of the newest commit on the watched surface whenever
+            # an unwatched commit landed after it, and demanding equality there
+            # would call a perfectly good bump undelivered.
+            #
+            # The pin is read through the SAME `--print-pin` parser the top of
+            # this job uses, against a scratch root holding the PR's version of
+            # the caller, so this can never disagree with `workflow-pins` about
+            # which line is the pin.
+            #
+            # Every failure below leaves `bump_delivers` empty, and unprovable
+            # delivery reads as UNDELIVERED -- the watchdog stays loud. Muting
+            # on an unreadable head would reinstate exactly the silent freeze
+            # this check exists to remove.
+            scratch="$(mktemp -d)"
+            mkdir -p "$scratch/scripts" "$scratch/.github/workflows"
+            cp scripts/check-workflow-pins.mjs "$scratch/scripts/"
+            # Fetched by BRANCH, then matched against the SHA the API reported:
+            # fetching a bare SHA needs a server-side allowance this cannot
+            # assume, and the re-check catches the branch moving under us
+            # between the two calls.
+            if git fetch --quiet --depth=1 origin \
+                 "+refs/heads/$BUMP_BRANCH:refs/bump-head" 2>/dev/null \
+              && [ "$(git rev-parse refs/bump-head 2>/dev/null)" = "$bump_head" ] \
+              && git show "refs/bump-head:.github/workflows/ci-cursor-review.yml" \
+                   >"$scratch/.github/workflows/ci-cursor-review.yml" 2>/dev/null
+            then
+              head_pin="$(node "$scratch/scripts/check-workflow-pins.mjs" \
+                --print-pin cursor-review.yml 2>/dev/null)" || head_pin=""
+              if printf '%s' "$head_pin" | grep -Eq '^[0-9a-f]{40}$' \
+                && GIT_NO_LAZY_FETCH=1 git -C /tmp/gw cat-file -e "$head_pin" 2>/dev/null \
+                && git -C /tmp/gw merge-base --is-ancestor \
+                     "$newest_sha" "$head_pin" 2>/dev/null
+              then
+                bump_delivers=yes
+              fi
+              echo "Bump PR #$bump_pr pins the caller to ${head_pin:-(unreadable)}; newest owed is $newest_sha -- delivers: ${bump_delivers:-no}"
+            else
+              echo "Bump PR #$bump_pr: could not read its caller pin, so delivery is unproven and this job is not treating it as delivered."
+            fi
+            rm -rf "$scratch"
+
             {
               echo "bump_pr=$bump_pr"
               echo "bump_age_days=$bump_age_days"
+              echo "bump_delivers=$bump_delivers"
             } >>"$GITHUB_OUTPUT"
           fi
 
@@ -816,14 +1005,17 @@ jobs:
           # run as the only record. Past the bump-PR window the verdict
           # escalates to `stale`, which files the issue and names the stuck PR
           # as the thing to chase.
-          if [ -n "$bump_pr" ] && [ "$bump_age" -lt "$BUMP_PR_GRACE_SECONDS" ]; then
+          if [ -n "$bump_pr" ] && [ -n "$bump_delivers" ] \
+            && [ "$bump_age" -lt "$BUMP_PR_GRACE_SECONDS" ]; then
             echo "state=delivered" >>"$GITHUB_OUTPUT"
             echo "::notice::the github-workflows pin is stale, but bump PR #$bump_pr is open on $BUMP_BRANCH ($bump_age_days day(s) old) -- the fleet delivered and only the merge is owed."
             exit 0
           fi
 
           echo "state=stale" >>"$GITHUB_OUTPUT"
-          if [ -n "$bump_pr" ]; then
+          if [ -n "$bump_pr" ] && [ -z "$bump_delivers" ]; then
+            echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) landed $((age / 86400)) days ago. PR #$bump_pr is open on $BUMP_BRANCH, but its own caller pin does not carry the newest owed commit ($newest_sha) -- the fleet reuses that branch, so this is an older or unreadable bump, not a delivery of this backlog."
+          elif [ -n "$bump_pr" ]; then
             echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) landed $((age / 86400)) days ago. Bump PR #$bump_pr is open on $BUMP_BRANCH but has been unmerged for $bump_age_days days, so delivery is not what is missing -- the merge is."
           else
             echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) landed $((age / 86400)) days ago -- and no open PR exists on $BUMP_BRANCH. Nothing is moving this pin."
@@ -912,13 +1104,19 @@ jobs:
           # bump-PR window, which is the other way this verdict is reached.
           BUMP_PR: ${{ steps.assess.outputs.bump_pr }}
           BUMP_AGE_DAYS: ${{ steps.assess.outputs.bump_age_days }}
+          BUMP_DELIVERS: ${{ steps.assess.outputs.bump_delivers }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           gh label create "$ISSUE_LABEL" --force --color ededed \
             --description "cursor-review pin freshness watchdog" >/dev/null
 
-          if [ -n "$BUMP_PR" ]; then
+          if [ -n "$BUMP_PR" ] && [ -z "$BUMP_DELIVERS" ]; then
+            cause="$(printf '%s ' \
+              "PR #$BUMP_PR is open on \`$BUMP_BRANCH\`, but its own caller pin does not carry" \
+              "the newest owed commit -- the fleet reuses that branch, so this is an older or" \
+              "unreadable bump rather than a delivery of this backlog. A fresh bump is owed.")"
+          elif [ -n "$BUMP_PR" ]; then
             cause="$(printf '%s ' \
               "PR #$BUMP_PR is open on \`$BUMP_BRANCH\` but has been unmerged for" \
               "$BUMP_AGE_DAYS days, so delivery is not what is missing -- the merge is.")"
