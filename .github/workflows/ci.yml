@@ -469,9 +469,30 @@ jobs:
           #
           # Written FIRST, before any `exit`, so every path that can reach an
           # issue step has them.
+          #
+          # Formatted, not integer-divided. `$((s / 86400))` TRUNCATES, so the
+          # published day value only matched the enforced threshold while both
+          # constants stayed exact multiples of 86400: at `GRACE_SECONDS` of
+          # 129600 the durable issue asserted a "1-day grace window" for a
+          # verdict reached under 1.5 days, and anything under a day published
+          # a flat `0`. That is the same value-vs-text divergence these outputs
+          # were added to remove, just one level down. Both are TEXT-only --
+          # nothing compares them numerically, the arithmetic all runs on the
+          # seconds constants -- so a fractional rendering is safe, and it is
+          # preferred over asserting whole days because a mis-set knob should
+          # not take the watchdog itself offline.
+          fmt_days() {
+            awk -v s="$1" 'BEGIN {
+              d = s / 86400
+              if (d == int(d)) { printf "%d", d; exit }
+              t = sprintf("%.2f", d)
+              sub(/0+$/, "", t); sub(/\.$/, "", t)
+              printf "%s", t
+            }'
+          }
           {
-            echo "grace_days=$((GRACE_SECONDS / 86400))"
-            echo "bump_pr_grace_days=$((BUMP_PR_GRACE_SECONDS / 86400))"
+            echo "grace_days=$(fmt_days "$GRACE_SECONDS")"
+            echo "bump_pr_grace_days=$(fmt_days "$BUMP_PR_GRACE_SECONDS")"
           } >>"$GITHUB_OUTPUT"
 
           # Reuse the pin parser rather than grepping the YAML again, so this
@@ -911,21 +932,51 @@ jobs:
           # trust the list it is reading, which is a `broken` verdict by the
           # same standard as a list it cannot parse at all.
           #
-          # The entry is reported with each CR rendered as the literal text
-          # `<CR>`. That keeps the RAW entry visible to whoever reads the
-          # sticky issue -- they need to see what upstream actually wrote --
-          # while guaranteeing the value embedded in `$GITHUB_OUTPUT` is
-          # single-line, so it cannot split `broken_reason=` into a forged
-          # `state=` record or a record with no `=` that makes the runner
-          # reject the whole file.
-          cr_entries=""
+          # ANY control character, not just CR. The awk extractor trims only
+          # leading and trailing `[[:space:]]`, so an entry carrying an
+          # interior ESC, BEL, VT or DEL survived a CR-only check -- and by
+          # this block's own standard those are no more legitimate in a
+          # pathspec than a CR is. The consequence is identical for the
+          # UNPROBED shapes (wildcard, unreproducible magic, empty remainder),
+          # which are the common ones in upstream's glob-heavy list: the entry
+          # skips `ls-tree`, goes straight to `git log`, matches nothing, and
+          # shrinks the backlog toward `state=current` on a frozen pin. It was
+          # also echoed raw into the run log and embedded into
+          # `broken_reason`. The class test is what fails closed: a locale
+          # whose `[[:cntrl:]]` covers more than C0+DEL can only reject MORE,
+          # never less, and a valid multi-byte UTF-8 path is not `cntrl` under
+          # either a UTF-8 or a C locale, so this cannot false-positive on a
+          # legitimate non-ASCII pathspec.
+          #
+          # The entry is reported with each control byte rendered as visible
+          # text -- `<CR>`, `<TAB>`, or `<0xNN>` for the ones with no
+          # conventional short name. That keeps the RAW entry visible to
+          # whoever reads the sticky issue -- they need to see what upstream
+          # actually wrote, and WHICH byte it was -- while guaranteeing the
+          # value embedded in `$GITHUB_OUTPUT` is single-line, so it cannot
+          # split `broken_reason=` into a forged `state=` record or a record
+          # with no `=` that makes the runner reject the whole file.
+          render_ctl() {
+            local str="$1" out="" ch idx
+            for (( idx = 0; idx < ${#str}; idx++ )); do
+              ch="${str:idx:1}"
+              case "$ch" in
+                $'\r') out="$out<CR>" ;;
+                $'\t') out="$out<TAB>" ;;
+                [[:cntrl:]]) out="$out$(printf '<0x%02X>' "'$ch")" ;;
+                *) out="$out$ch" ;;
+              esac
+            done
+            printf '%s' "$out"
+          }
+          ctl_entries=""
           for i in "${!watched[@]}"; do
             case "${watched[i]}" in
-              *$'\r'*) cr_entries="$cr_entries \`${watched[i]//$'\r'/<CR>}\`" ;;
+              *[[:cntrl:]]*) ctl_entries="$ctl_entries \`$(render_ctl "${watched[i]}")\`" ;;
             esac
           done
-          if [ -n "$cr_entries" ]; then
-            reason="\`WATCHED_PATHSPECS\` in \`Comfy-Org/github-workflows@$upstream_branch:$bump_yaml\` contains a carriage return inside${cr_entries# } (each CR shown as \`<CR>\`). A CR is never valid inside a pathspec: \`git log\` would match nothing for that entry and this job would report the pin current however stale it is, so it is failing closed instead. This is upstream's list to fix -- the entry was written with a stray CR, or the block scalar picked one up."
+          if [ -n "$ctl_entries" ]; then
+            reason="\`WATCHED_PATHSPECS\` in \`Comfy-Org/github-workflows@$upstream_branch:$bump_yaml\` contains a control character inside ${ctl_entries# } (each control byte shown as \`<CR>\`, \`<TAB>\` or \`<0xNN>\`). A control character is never valid inside a pathspec: \`git log\` would match nothing for that entry and this job would report the pin current however stale it is, so it is failing closed instead. This is upstream's list to fix -- the entry was written with a stray control byte, or the block scalar picked one up."
             {
               echo "state=broken"
               echo "broken_reason=$reason"
@@ -1813,22 +1864,43 @@ jobs:
       # Two issues, one per failure MODE, because they have different owners
       # and different fixes: the pin is stale (chase the bump), or this job
       # cannot answer the question at all (fix the job or the pin's target).
-      # Both are looked up by LABEL rather than by listing issues and matching
-      # titles off the first page: `gh issue list --limit 100` returns only the
-      # 100 newest-created open issues, so on a busier repo the match silently
-      # misses -- and a miss is not benign in either direction. On the stale
-      # path it takes `gh issue create` instead of `gh issue comment`, filing a
-      # fresh duplicate every day the pin stays stale; on the note and close
-      # paths it skips the comment and the close, leaving alerts open forever.
-      # At most one issue ever carries each label, so a label lookup cannot
-      # truncate. The label is created idempotently before each lookup so the
-      # first run on a fresh repo does not have to be the one that remembered.
+      #
+      # Each mode is identified by its OWN label -- `cursor-review-pin-stale`
+      # and `cursor-review-pin-blocked` -- and every lookup below filters on
+      # that label ALONE. Two reasons, and the first is why listing issues and
+      # matching titles off the first page is not an option: `gh issue list
+      # --limit 100` returns only the 100 newest-created open issues, so on a
+      # busier repo a title match silently misses -- and a miss is not benign
+      # in either direction. On the stale path it takes `gh issue create`
+      # instead of `gh issue comment`, filing a fresh duplicate every day the
+      # pin stays stale; on the note and close paths it skips the comment and
+      # the close, leaving alerts open forever. At most one issue carries a
+      # mode label, so a label lookup cannot truncate.
+      #
+      # The second reason is that the title is a HUMAN-EDITABLE field. These
+      # lookups used to AND the mode label with exact title equality, because
+      # one shared `cursor-review-pin` label could not tell the two modes
+      # apart -- which meant a maintainer who validly retitled the open issue,
+      # even just to add context, made every subsequent lookup miss: the next
+      # stale run filed a second issue and the renamed one was never closed on
+      # recovery. A label is not something a reader edits in passing, so it
+      # identifies the thread across a retitle. The shared
+      # `cursor-review-pin` label stays on both as the grouping label a human
+      # browses by; it is no longer what finds them.
+      #
+      # Both labels are created idempotently before each lookup so the first
+      # run on a fresh repo does not have to be the one that remembered. The
+      # open/update paths take the LOWEST-numbered open match -- the original
+      # sticky thread, the one carrying the history -- and the close paths
+      # close EVERY open match, so a duplicate that somehow exists is
+      # reconciled rather than left falsely open.
       - name: Open or update the watchdog-blocked issue
         if: failure() && steps.assess.outputs.state == 'broken'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           ISSUE_LABEL: cursor-review-pin
+          MODE_LABEL: cursor-review-pin-blocked
           TITLE: "cursor-review: the pin-freshness watchdog cannot run"
           REASON: ${{ steps.assess.outputs.broken_reason }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -1836,8 +1908,10 @@ jobs:
           set -euo pipefail
           gh label create "$ISSUE_LABEL" --force --color ededed \
             --description "cursor-review pin freshness watchdog" >/dev/null
-          existing="$(gh issue list --state open --label "$ISSUE_LABEL" --limit 100 \
-            --json number,title --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
+          gh label create "$MODE_LABEL" --force --color ededed \
+            --description "cursor-review pin freshness watchdog: cannot run" >/dev/null
+          existing="$(gh issue list --state open --label "$MODE_LABEL" --limit 100 \
+            --json number --jq 'min_by(.number).number // empty')"
           body="$(printf '%s\n' \
             "The daily \`cursor-review-pin-freshness\` job stopped before it could judge whether" \
             "the \`Comfy-Org/github-workflows\` pin is current, so **the pin is not being watched**" \
@@ -1858,26 +1932,33 @@ jobs:
           # below does. Without this, every broken -> recovered -> broken cycle
           # files a fresh issue instead of reviving the previous one, splitting
           # the history the sticky-issue design is built around -- and the
-          # accumulating closed same-label issues erode the `--state closed
-          # --limit 100` lookup the stale path depends on.
-          closed="$(gh issue list --state closed --label "$ISSUE_LABEL" --limit 100 \
-            --json number,title --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
+          # accumulating closed issues under this mode's own label erode the
+          # `--state closed --limit 100` lookup on the line below. The stale
+          # mode carries a DIFFERENT label, so neither mode's closed pile can
+          # crowd the other's lookup any more.
+          closed="$(gh issue list --state closed --label "$MODE_LABEL" --limit 100 \
+            --json number --jq 'max_by(.number).number // empty')"
           if [ -n "$closed" ]; then
             gh issue reopen "$closed"
             gh issue comment "$closed" --body "$body"
           else
-            gh issue create --title "$TITLE" --label "$ISSUE_LABEL" --body "$body"
+            gh issue create --title "$TITLE" \
+              --label "$ISSUE_LABEL" --label "$MODE_LABEL" --body "$body"
           fi
 
       # Gated on the VERDICT rather than on `failure()`: a clone or API failure
       # reddens the scheduled run (visible as a step annotation) but must not
       # file an issue claiming the pin is stale when nothing established that.
       - name: Open or update the stale-pin issue
+        # `id:` so the watchdog-blocked close below can require this step to
+        # have SUCCEEDED before it closes its own alert on a `stale` verdict.
+        id: stale_issue
         if: failure() && steps.assess.outputs.state == 'stale'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           ISSUE_LABEL: cursor-review-pin
+          MODE_LABEL: cursor-review-pin-stale
           TITLE: "cursor-review: the github-workflows pin is stale and nothing is moving it"
           BUMP_BRANCH: ci/bump-cursor-review
           PIN: ${{ steps.assess.outputs.pin }}
@@ -1905,6 +1986,8 @@ jobs:
           set -euo pipefail
           gh label create "$ISSUE_LABEL" --force --color ededed \
             --description "cursor-review pin freshness watchdog" >/dev/null
+          gh label create "$MODE_LABEL" --force --color ededed \
+            --description "cursor-review pin freshness watchdog: the pin is stale" >/dev/null
 
           if [ -n "$BUMP_PR" ] && [ "$BUMP_DELIVERS" = no ]; then
             cause="$(printf '%s ' \
@@ -2029,8 +2112,8 @@ jobs:
             "" \
             "<!-- cursor-review-pin: $PIN -->")"
 
-          existing="$(gh issue list --state open --label "$ISSUE_LABEL" --limit 100 \
-            --json number,title --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
+          existing="$(gh issue list --state open --label "$MODE_LABEL" --limit 100 \
+            --json number --jq 'min_by(.number).number // empty')"
           if [ -n "$existing" ]; then
             # Comment once per PIN, not once per run. The block above is the
             # WHOLE report, and a pin that is frozen -- the case this watchdog
@@ -2080,8 +2163,8 @@ jobs:
           # the reader this issue "reopens if the pin freezes again", and the
           # sticky-issue design is built on one thread carrying the history --
           # both of which are false if every stale cycle starts a fresh issue.
-          closed="$(gh issue list --state closed --label "$ISSUE_LABEL" --limit 100 \
-            --json number,title --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
+          closed="$(gh issue list --state closed --label "$MODE_LABEL" --limit 100 \
+            --json number --jq 'max_by(.number).number // empty')"
           if [ -n "$closed" ]; then
             # COMMENT FIRST, THEN REOPEN. The order is load-bearing here, and
             # is the reverse of the broken-watchdog step above, whose body
@@ -2107,7 +2190,8 @@ jobs:
             gh issue comment "$closed" --body "$body"
             gh issue reopen "$closed"
           else
-            gh issue create --title "$TITLE" --label "$ISSUE_LABEL" --body "$body"
+            gh issue create --title "$TITLE" \
+              --label "$ISSUE_LABEL" --label "$MODE_LABEL" --body "$body"
           fi
 
       # Delivered-but-unmerged is a pass, so it never reaches the step above --
@@ -2121,7 +2205,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           ISSUE_LABEL: cursor-review-pin
-          TITLE: "cursor-review: the github-workflows pin is stale and nothing is moving it"
+          MODE_LABEL: cursor-review-pin-stale
           BUMP_BRANCH: ci/bump-cursor-review
           BUMP_PR: ${{ steps.assess.outputs.bump_pr }}
           BUMP_AGE_DAYS: ${{ steps.assess.outputs.bump_age_days }}
@@ -2132,8 +2216,10 @@ jobs:
           set -euo pipefail
           gh label create "$ISSUE_LABEL" --force --color ededed \
             --description "cursor-review pin freshness watchdog" >/dev/null
-          existing="$(gh issue list --state open --label "$ISSUE_LABEL" --limit 100 \
-            --json number,title --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
+          gh label create "$MODE_LABEL" --force --color ededed \
+            --description "cursor-review pin freshness watchdog: the pin is stale" >/dev/null
+          existing="$(gh issue list --state open --label "$MODE_LABEL" --limit 100 \
+            --json number --jq 'min_by(.number).number // empty')"
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --body "$(printf '%s\n' \
               "The bump fleet has delivered: #$BUMP_PR is open on \`$BUMP_BRANCH\` and is" \
@@ -2156,6 +2242,19 @@ jobs:
       # plus an explicit `!= 'broken'` is what actually expresses "reached a
       # verdict": a hard fault writes no `state` and is excluded by `!= ''`.
       #
+      # But a `stale` verdict ALSO requires the stale-pin issue step above to
+      # have SUCCEEDED. That step is the one alert a reader is left with on a
+      # `broken -> stale` transition, and because this gate is deliberately
+      # not `success()`, a transient `gh` failure up there used to close the
+      # watchdog-blocked issue anyway: the run went red with NO sticky issue
+      # open in EITHER mode until the next daily run re-filed one, which is
+      # the both-alerts-gone window the two issues exist to prevent. Requiring
+      # `steps.stale_issue.outcome == 'success'` keeps the deliberate "a stale
+      # verdict still closes the blocked issue" behaviour and drops only the
+      # case where the replacement alert was never filed. On every other state
+      # that step is SKIPPED, not failed, so the clause is scoped to `stale`
+      # rather than asserting success unconditionally.
+      #
       # `!cancelled()` and NOT `always()`, which is true for a CANCELLED run as
       # well -- and a cancellation is the one outcome that is not a verdict.
       # This job remains cancellable -- `schedule` still carries run-level
@@ -2171,24 +2270,38 @@ jobs:
         if: >-
           !cancelled() && steps.assess.outputs.state != ''
           && steps.assess.outputs.state != 'broken'
+          && (steps.assess.outputs.state != 'stale'
+          || steps.stale_issue.outcome == 'success')
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           ISSUE_LABEL: cursor-review-pin
-          TITLE: "cursor-review: the pin-freshness watchdog cannot run"
+          MODE_LABEL: cursor-review-pin-blocked
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           gh label create "$ISSUE_LABEL" --force --color ededed \
             --description "cursor-review pin freshness watchdog" >/dev/null
-          existing="$(gh issue list --state open --label "$ISSUE_LABEL" --limit 100 \
-            --json number,title --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
-          if [ -n "$existing" ]; then
-            gh issue close "$existing" --comment "$(printf '%s\n' \
-              "The watchdog reached a verdict again, so the pin is being watched." \
-              "" \
-              "Run: $RUN_URL")"
-          fi
+          gh label create "$MODE_LABEL" --force --color ededed \
+            --description "cursor-review pin freshness watchdog: cannot run" >/dev/null
+          comment="$(printf '%s\n' \
+            "The watchdog reached a verdict again, so the pin is being watched." \
+            "" \
+            "Run: $RUN_URL")"
+          # EVERY open match, not just the first. The mode label is meant to
+          # carry exactly one thread, but if a duplicate ever does exist --
+          # filed by a run that predates this bookkeeping, or by a human --
+          # closing one and leaving the other open leaves a false "the pin is
+          # not being watched" alert standing, which is the specific outcome
+          # this step exists to clear. Reading from a here-string rather than a
+          # pipe keeps the loop in THIS shell; an empty list yields one empty
+          # line, which the guard drops.
+          open_issues="$(gh issue list --state open --label "$MODE_LABEL" --limit 100 \
+            --json number --jq '.[].number')"
+          while IFS= read -r issue_number; do
+            [ -n "$issue_number" ] || continue
+            gh issue close "$issue_number" --comment "$comment"
+          done <<<"$open_issues"
 
       # Closes on `current` AND on `grace`, and the two are not the same
       # sentence. `grace` is in fact the NORMAL state to land in after a bump:
@@ -2287,7 +2400,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           ISSUE_LABEL: cursor-review-pin
-          TITLE: "cursor-review: the github-workflows pin is stale and nothing is moving it"
+          MODE_LABEL: cursor-review-pin-stale
           STATE: ${{ steps.assess.outputs.state }}
           # Unset on `current` -- `assess` exits before writing them -- and
           # unread on that branch. `env:` always defines the name, so `set -u`
@@ -2306,20 +2419,37 @@ jobs:
           set -euo pipefail
           gh label create "$ISSUE_LABEL" --force --color ededed \
             --description "cursor-review pin freshness watchdog" >/dev/null
-          existing="$(gh issue list --state open --label "$ISSUE_LABEL" --limit 100 \
-            --json number,title --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
-          if [ -n "$existing" ]; then
+          gh label create "$MODE_LABEL" --force --color ededed \
+            --description "cursor-review pin freshness watchdog: the pin is stale" >/dev/null
+
+          # The LOWEST-numbered open match, the same choice the open/update
+          # paths make: that is the original sticky thread, the one carrying
+          # the history -- and the movement proof this step turns on is read
+          # off exactly that thread, so it has to be the same one the stale
+          # step has been recording its pin markers on. The hold branches
+          # below comment on it too. The CLOSE paths still close EVERY open
+          # match (the loop at the bottom), so a duplicate is reconciled
+          # rather than left falsely open.
+          #
+          # Looked up by MODE_LABEL rather than by title: see the long note
+          # above the watchdog-blocked step. The title is human-editable and a
+          # retitle used to make every later lookup miss; this step is the one
+          # where a miss means the alarm never closes at all.
+          existing="$(gh issue list --state open --label "$MODE_LABEL" --limit 100 \
+            --json number --jq 'min_by(.number).number // empty')"
+          if [ -z "$existing" ]; then
+            # No alarm open in this mode, so there is nothing to close and --
+            # more to the point -- no thread to read a marker off. Every branch
+            # below needs one.
+            exit 0
+          fi
+
+          if [ "$STATE" = "current" ]; then
             # `current` closes with no movement proof, deliberately: nothing
             # is owed at all, so this issue's premise is gone whatever removed
             # it. See the long comment above the step.
-            if [ "$STATE" = "current" ]; then
-              gh issue close "$existing" --comment "$(printf '%s\n' \
-                "The \`Comfy-Org/github-workflows\` pin is current again." \
-                "" \
-                "Run: $RUN_URL")"
-              exit 0
-            fi
-
+            verdict="The \`Comfy-Org/github-workflows\` pin is current again."
+          else
             # `grace` from here down: the backlog is inside the window, which
             # is only half of what closing this issue claims. Read the pin
             # recorded on the most recent stale report back off the thread and
@@ -2565,9 +2695,18 @@ jobs:
               echo "::warning::nothing is overdue any more, but the pin is still $PIN -- the same value last recorded on issue #$existing -- so the backlog shrank without the pin moving, most likely because upstream narrowed WATCHED_PATHSPECS. Leaving issue #$existing open until the pin moves or nothing is owed."
               exit 0
             fi
-
-            gh issue close "$existing" --comment "$(printf '%s\n' \
-              "$verdict" \
-              "" \
-              "Run: $RUN_URL")"
           fi
+          comment="$(printf '%s\n' \
+            "$verdict" \
+            "" \
+            "Run: $RUN_URL")"
+          # EVERY open match -- see the note on the watchdog-blocked close
+          # above. Leaving a duplicate stale-pin issue open is worse here than
+          # there: it asserts the pin is frozen on a run that just proved it is
+          # not, which is how a sticky alert loses its credibility.
+          open_issues="$(gh issue list --state open --label "$MODE_LABEL" --limit 100 \
+            --json number --jq '.[].number')"
+          while IFS= read -r issue_number; do
+            [ -n "$issue_number" ] || continue
+            gh issue close "$issue_number" --comment "$comment"
+          done <<<"$open_issues"
