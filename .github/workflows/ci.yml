@@ -5,13 +5,18 @@ on:
     branches: [main]
   push:
     branches: [main]
-  # Daily, for `sdk-parity` alone (every other job is gated off below). That
-  # job is the only one whose input lives in ANOTHER repository: it re-derives
-  # the Python SDK's public surface from that repo's default branch, so a
-  # Python-side change is drift here the moment it merges there. On
-  # pull_request/push it would be noticed only whenever this repo's next PR
-  # happens to run CI, which can be days. 07:17 UTC is off the top of the hour
-  # on purpose -- GitHub delays cron runs that pile onto :00.
+  # Daily, for `sdk-parity` and `cursor-review-pin-freshness` (every other job
+  # is gated off below). Those two are the jobs whose input lives in ANOTHER
+  # repository, which is what makes a schedule the only trigger that works:
+  # `sdk-parity` re-derives the Python SDK's public surface from that repo's
+  # default branch, so a Python-side change is drift here the moment it merges
+  # there; `cursor-review-pin-freshness` asks github-workflows whether this
+  # repo's cursor-review pin has fallen behind, where the failure being watched
+  # for is precisely that NOTHING happens here. On pull_request/push either
+  # would be noticed only whenever this repo's next PR happens to run CI, which
+  # can be days -- and for the pin, never, since a frozen pin produces no PRs.
+  # 07:17 UTC is off the top of the hour on purpose -- GitHub delays cron runs
+  # that pile onto :00.
   schedule:
     - cron: "17 7 * * *"
 
@@ -29,8 +34,9 @@ jobs:
   test:
     name: Test (node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
-    # The daily schedule exists for `sdk-parity` only; this job's inputs all
-    # live in this repo and cannot change without a push.
+    # The daily schedule exists for `sdk-parity` and
+    # `cursor-review-pin-freshness` only; this job's inputs all live in this
+    # repo and cannot change without a push.
     if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
@@ -77,8 +83,9 @@ jobs:
   build-check:
     name: build-check (publish dry run)
     runs-on: ubuntu-latest
-    # The daily schedule exists for `sdk-parity` only; this job's inputs all
-    # live in this repo and cannot change without a push.
+    # The daily schedule exists for `sdk-parity` and
+    # `cursor-review-pin-freshness` only; this job's inputs all live in this
+    # repo and cannot change without a push.
     if: github.event_name != 'schedule'
     steps:
       - name: Check out repository
@@ -201,8 +208,9 @@ jobs:
   public-repo-hygiene:
     name: public-repo-hygiene
     runs-on: ubuntu-latest
-    # The daily schedule exists for `sdk-parity` only; this job's inputs all
-    # live in this repo and cannot change without a push.
+    # The daily schedule exists for `sdk-parity` and
+    # `cursor-review-pin-freshness` only; this job's inputs all live in this
+    # repo and cannot change without a push.
     if: github.event_name != 'schedule'
     steps:
       - name: Check out repository
@@ -215,3 +223,2042 @@ jobs:
 
       - name: Scan for internal-only references
         run: node scripts/check-public-repo-hygiene.mjs
+
+  # Regression guard for the split pin pair this repo shipped between #135 and
+  # #153: a Comfy-Org/github-workflows caller pins the same upstream commit
+  # twice (`uses:` + `workflows_ref:`) and nothing but this check ties the two
+  # together. See scripts/check-workflow-pins.mjs for the full why.
+  workflow-pins:
+    name: workflow-pins (reusable pin pair)
+    runs-on: ubuntu-latest
+    # The daily schedule exists for `sdk-parity` and
+    # `cursor-review-pin-freshness` only; this job's inputs all live in this
+    # repo and cannot change without a push.
+    if: github.event_name != 'schedule'
+    # Reads the checkout and nothing else.
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Check the reusable-workflow pins agree
+        run: node scripts/check-workflow-pins.mjs
+
+  # Staleness watchdog for the OTHER half of the cursor-review pin problem.
+  # `workflow-pins` above proves the two pins agree with each OTHER; nothing
+  # proves they agree with UPSTREAM, and a pin that is stale but internally
+  # consistent is therefore invisible. Checked against github-workflows@main on
+  # 2026-09-19, nothing else closes that gap: its cursor-review.yml only
+  # `::warning::`s on a non-40-hex workflows_ref and runs no ancestry or
+  # currency check at all (the stricter shape+ancestry guard the org README
+  # describes is pr-risk.yml's, not this reusable's) -- and that README says in
+  # its own words that "what is still not machine-checked is that the pin is
+  # the current one". The bump fleet is the only thing that moves these pins,
+  # and it only reaches repos listed in its roster secret: this repo was
+  # missing from that roster for three weeks and nothing anywhere said so.
+  #
+  # Schedule-only, and that is the point rather than an optimization: the
+  # failure mode being watched for is that NOTHING HAPPENS, so the check must
+  # not wait on a PR or a push to notice.
+  #
+  # KNOWN GAP, recorded because it is the one case this job cannot cover from
+  # inside the repo: GitHub disables `schedule` triggers in a PUBLIC repository
+  # after 60 days with no repository activity, and this job has no other
+  # trigger. That is close to the condition it watches for -- a quiet repo whose
+  # pin quietly freezes -- so on a repo dormant for two months the watchdog
+  # stops firing rather than reporting. Any push or manual re-enable restores
+  # it; surviving a genuinely long quiet period needs an org-level scheduler
+  # dispatching this from outside, which is an ops change, not a repo one.
+  cursor-review-pin-freshness:
+    name: cursor-review-pin-freshness (upstream pin staleness)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    # A stalled clone or API call must not hold a runner -- and this job's
+    # token can write issues -- for the six-hour default.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # `issues: write` for the sticky issue below; `pull-requests: read` to
+      # look for an open bump PR before calling the pin abandoned.
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Check the pinned github-workflows commit is current
+        id: assess
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUMP_BRANCH: ci/bump-cursor-review
+          # The branch this job's verdict is ABOUT: a bump PR only counts as
+          # delivering if it lands here. Read from the event payload rather
+          # than hardcoded, so a rename of this repo's own default branch
+          # cannot quietly turn every bump PR into "does not deliver".
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          # The fleet's queue is serialised and a bump PR still needs a human
+          # to merge it, so an upstream commit this repo has not picked up yet
+          # is not evidence of anything being stuck until it has had a few days.
+          GRACE_SECONDS: "259200" # 3 days
+          # How far ahead of this runner's clock an upstream commit date may
+          # sit and still read as "just landed" rather than as an anomaly.
+          # Ordinary committer-clock skew is seconds to minutes; 15 minutes is
+          # well clear of that and still far short of the grace window, so a
+          # date far enough ahead to actually silence the watchdog is still
+          # caught.
+          SKEW_TOLERANCE_SECONDS: "900" # 15 minutes
+          # A SECOND, longer clock, on the bump PR itself. `delivered` suspends
+          # this watchdog on the strength of an open PR, so without an upper
+          # bound one abandoned or permanently-red PR on that branch mutes the
+          # watchdog forever -- the same silent freeze it exists to end, now
+          # with an alibi. A delivered bump that nobody has merged in a week is
+          # stuck, and stuck is what this job reports.
+          BUMP_PR_GRACE_SECONDS: "604800" # 7 days
+        run: |
+          set -euo pipefail
+
+          # The two windows, in DAYS, published for the issue steps.
+          #
+          # Those steps write the durable text a human acts on, and they used
+          # to spell the lengths out by hand -- "3-day grace window", "past 7
+          # days" -- while the values actually enforced are `GRACE_SECONDS`
+          # and `BUMP_PR_GRACE_SECONDS`, which live on this step's `env:`.
+          # Tuning either knob therefore left the sticky issue asserting a
+          # window the verdict was not reached under, and the issue is the
+          # part that outlives the run. They are derived HERE, from the same
+          # variables the arithmetic uses, rather than added to each issue
+          # step's `env:` -- a second copy of the constant is the same
+          # staleness bug one level up. This is the form the log line below
+          # already uses.
+          #
+          # Written FIRST, before any `exit`, so every path that can reach an
+          # issue step has them.
+          #
+          # Formatted, not integer-divided. `$((s / 86400))` TRUNCATES, so the
+          # published day value only matched the enforced threshold while both
+          # constants stayed exact multiples of 86400: at `GRACE_SECONDS` of
+          # 129600 the durable issue asserted a "1-day grace window" for a
+          # verdict reached under 1.5 days, and anything under a day published
+          # a flat `0`. That is the same value-vs-text divergence these outputs
+          # were added to remove, just one level down. Both are TEXT-only --
+          # nothing compares them numerically, the arithmetic all runs on the
+          # seconds constants -- so a fractional rendering is safe, and it is
+          # preferred over asserting whole days because a mis-set knob should
+          # not take the watchdog itself offline.
+          fmt_days() {
+            awk -v s="$1" 'BEGIN {
+              d = s / 86400
+              if (d == int(d)) { printf "%d", d; exit }
+              t = sprintf("%.2f", d)
+              sub(/0+$/, "", t); sub(/\.$/, "", t)
+              printf "%s", t
+            }'
+          }
+          {
+            echo "grace_days=$(fmt_days "$GRACE_SECONDS")"
+            echo "bump_pr_grace_days=$(fmt_days "$BUMP_PR_GRACE_SECONDS")"
+          } >>"$GITHUB_OUTPUT"
+
+          # Reuse the pin parser rather than grepping the YAML again, so this
+          # job and `workflow-pins` can never disagree about which line is the
+          # pin. `--print-pin` writes the SHA and nothing else; it enforces
+          # 40-hex and deliberately leaves the `uses:`/`workflows_ref` equality
+          # assertion to `workflow-pins`, which owns the split-pin case.
+          # A FAILURE here is deterministic and permanent -- the caller was
+          # removed or renamed, or its pin stopped being a full SHA -- so it
+          # must not be left to `set -e`, which would abort before any `state=`
+          # is written and redden the scheduled run daily with no sticky issue.
+          # The lint and this watchdog would then go quiet on the same edit.
+          # stderr goes to a FILE, not into `pin_out`: folding it in with
+          # `2>&1` would splice any future diagnostic straight into the value
+          # and feed it to git as a commit-ish.
+          # EVERY scratch path this step uses lives under one per-run
+          # directory rather than at a fixed, predictable `/tmp/...` name. The
+          # runners are GitHub-hosted and ephemeral today, so nothing here is
+          # reachable on them -- but the sibling scratch root further down
+          # already uses `mktemp -d` and these did not, and on a reused or
+          # self-hosted runner the difference bites twice: a leftover `gw`
+          # directory makes the clone below fail into the no-verdict fault path
+          # every day, and a pre-planted symlink at any of the `.err` names
+          # turns its `2>` redirect into an arbitrary-file overwrite as the
+          # runner user.
+          gwtmp="$(mktemp -d)"
+          trap 'rm -rf "$gwtmp"' EXIT
+
+          pin_rc=0
+          pin_out="$(node scripts/check-workflow-pins.mjs --print-pin cursor-review.yml \
+            2>"$gwtmp/print-pin.err")" || pin_rc=$?
+          # The 40-hex assertion is the script's own, repeated here because
+          # everything downstream hands `$pin` to git: a value that is not a
+          # commit-ish must fail as a stated verdict, never as a git error.
+          # Tested as a WHOLE VALUE, not with `grep`: `grep -Eq '^...$'` anchors
+          # per LINE, so a multi-line `pin_out` whose second line happened to be
+          # 40 hex would pass this re-assertion, and `pin` would then carry
+          # embedded newlines into `echo "pin=$pin" >>"$GITHUB_OUTPUT"` --
+          # injecting extra `key=value` records, a forged `state=` among them,
+          # into the very outputs every issue step below is gated on.
+          if [ "$pin_rc" -ne 0 ] || ! [[ "$pin_out" =~ ^[0-9a-f]{40}$ ]]; then
+            # Flattened onto one line: `broken_reason` crosses $GITHUB_OUTPUT,
+            # which is line-oriented, and this one carries another program's
+            # stderr.
+            #
+            # BOTH terminators are translated, not just `\n`. The runner parses
+            # the output file with .NET line reading, which ends a line on a
+            # bare `\r` as well -- so a lone CR anywhere in this stderr splits
+            # `broken_reason=...` into two records. The tail then either forges
+            # a second `key=value` (a forged `state=` among them -- the very
+            # injection the whole-value `pin_out` assertion above exists to
+            # prevent) or carries no `=` at all, which makes the runner reject
+            # the whole file and drop every `steps.assess.outputs.*` the issue
+            # steps below are gated on. Git's sideband `remote:` progress text
+            # is a live CR carrier, so this is not hypothetical. Every other
+            # `*_err` capture in this job flattens the same way for the same
+            # reason.
+            pin_err="$(tr '\r\n' '  ' <"$gwtmp/print-pin.err")"
+            reason="This job could not read a usable pin out of \`.github/workflows/ci-cursor-review.yml\`, so it cannot judge staleness at all. \`node scripts/check-workflow-pins.mjs --print-pin cursor-review.yml\` exited $pin_rc saying: ${pin_err:-(no output)}. That will not clear on its own -- fix the caller or the lint, then re-run."
+            {
+              echo "state=broken"
+              echo "broken_reason=$reason"
+            } >>"$GITHUB_OUTPUT"
+            echo "::error::$reason"
+            exit 1
+          fi
+          pin="$pin_out"
+          echo "pin=$pin" >>"$GITHUB_OUTPUT"
+          echo "Pinned github-workflows commit: $pin"
+
+          # Blobless and no checkout: this needs commits and trees to run `git
+          # log` with a pathspec, never file contents. github-workflows is
+          # public, so the ambient token is enough.
+          #
+          # The status is CAPTURED rather than left to `set -e`, for the same
+          # reason as every other upstream-facing call in this step: an
+          # uncaptured failure lands on the no-verdict path, which writes no
+          # `state=` and files nothing. Not every clone failure is transient --
+          # if the repository is deleted, made private, or moved without a
+          # redirect, this fails identically every day and the watchdog reddens
+          # in silence, the same permanent-versus-transient conflation the
+          # ancestry branch below was added to undo.
+          clone_rc=0
+          git clone --filter=blob:none --no-checkout --quiet \
+            https://github.com/Comfy-Org/github-workflows "$gwtmp/gw" \
+            2>"$gwtmp/clone.err" || clone_rc=$?
+          if [ "$clone_rc" -ne 0 ]; then
+            # Flattened for the same reason as `broken_reason` above.
+            clone_err="$(tr '\r\n' '  ' <"$gwtmp/clone.err")"
+            # GitHub answers "Repository not found" for a deleted repo AND for
+            # a private one the ambient token cannot see; both are permanent
+            # from here. Anything else -- DNS, TLS, a 5xx, a partial-clone
+            # hiccup -- is assumed transient and left to the no-verdict path.
+            #
+            # The alternatives are ANCHORED on the messages that really are
+            # permanent, because this branch asserts as FACT that the
+            # repository was deleted, made private or moved. A bare `not
+            # found` subsumed the explicit `remote: Repository not found` and
+            # matched those two words anywhere in git's stderr -- an HTTP
+            # reason phrase like `The requested URL returned error: 404 Not
+            # Found`, or an object/pack-level "not found" from a partial-clone
+            # fetch -- and `authentication failed` / `access denied` come just
+            # as easily from a transient token blip as from a permanent loss
+            # of access. Each of those filed a sticky issue stating a cause
+            # nobody established: a fault reported as a verdict, the same
+            # conflation the rest of this step exists to remove, only pointing
+            # the other way. `terminal prompts disabled` stays because git
+            # only emits it once credentials were demanded and refused, which
+            # for an anonymous public clone means the repo is not anonymously
+            # readable any more.
+            #
+            # The two `not found` spellings are the ones GitHub really emits
+            # over HTTPS, verified against git 2.43 -- a deleted or private
+            # repo answers `remote: Repository not found.` followed by
+            # `fatal: repository '<url>' not found`, and both are anchored on
+            # their own leading token so neither can match a 404 reason phrase
+            # or a loose object message.
+            if grep -qiE "remote: repository not found|fatal: repository '[^']*' not found|could not read from remote repository|terminal prompts disabled" <<<"$clone_err"; then
+              reason="\`Comfy-Org/github-workflows\` could not be reached at all -- \`git clone\` exited $clone_rc saying: ${clone_err:-(no output)}. That will not clear on its own: the repository has been deleted, made private, or moved without a redirect. Re-point the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\` at upstream's new home, or retire it."
+              {
+                echo "state=broken"
+                echo "broken_reason=$reason"
+              } >>"$GITHUB_OUTPUT"
+              echo "::error::$reason"
+              exit 1
+            fi
+            # NO verdict written: a network fault says nothing about the pin.
+            echo "::error::could not clone Comfy-Org/github-workflows -- git exited $clone_rc: ${clone_err:-(no output)}"
+            exit 1
+          fi
+
+          # UPSTREAM'S DEFAULT BRANCH, resolved ONCE from the clone's own
+          # `origin/HEAD` symref rather than hardcoded to `origin/main`.
+          #
+          # GitHub lets a repository move its default branch while KEEPING the
+          # old one, so `origin/main` continuing to resolve is NOT evidence
+          # that it is still the branch consumers see. Hardcoded, every check
+          # below -- the ancestry test, the `WATCHED_PATHSPECS` read, the path
+          # probes and the backlog walk -- would keep following a frozen
+          # branch, and this job could write `state=current` and close its own
+          # stale-pin issue while consumer-visible commits piled up on the real
+          # default. That is precisely the silent pass the job exists to catch,
+          # reached by the job itself.
+          default_ref="$(git -C "$gwtmp/gw" symbolic-ref --quiet --short refs/remotes/origin/HEAD)" \
+            || default_ref=""
+          if [ -z "$default_ref" ] \
+            || ! git -C "$gwtmp/gw" rev-parse --verify --quiet "$default_ref" >/dev/null; then
+            reason="This job could not resolve upstream's default branch from \`refs/remotes/origin/HEAD\` in the \`Comfy-Org/github-workflows\` clone${default_ref:+ (it names \`$default_ref\`, which does not resolve)}. It will not fall back to guessing \`main\`: the ancestry check, the \`WATCHED_PATHSPECS\` read, the path probes and the staleness walk all read that ref, and following the wrong branch reports a frozen pin as current. \`git clone\` sets that symref from the remote's own HEAD, so its absence is not transient. Investigate the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\`."
+            {
+              echo "state=broken"
+              echo "broken_reason=$reason"
+            } >>"$GITHUB_OUTPUT"
+            echo "::error::$reason"
+            exit 1
+          fi
+          upstream_branch="${default_ref#origin/}"
+          # Published for the issue-body steps below, which name the branch
+          # in prose and run in their own shells.
+          echo "upstream_branch=$upstream_branch" >>"$GITHUB_OUTPUT"
+          echo "Upstream default branch: $upstream_branch (via origin/HEAD)"
+
+          # THE LIKELIEST GENUINELY-WRONG PIN is one that names no commit here
+          # at all -- a mistyped SHA, a commit force-pushed away, one that only
+          # ever existed on a fork. `merge-base --is-ancestor` reports that as
+          # exit 128, a HARD ERROR, which the branch below deliberately treats
+          # as probably-transient and files nothing for. So this permanent,
+          # deterministic breakage would redden the scheduled run every day in
+          # silence. Separate it first: a missing object is a verdict about the
+          # pin, not a fault in reading it.
+          # Existence is asked WITHOUT `^{commit}`: peeling a name that resolves
+          # to nothing is a FATAL (128, "Not a valid object name"), which is the
+          # same code a genuine repository fault raises, so the peeling form
+          # cannot tell the two apart. Bare `cat-file -e` answers only the
+          # question being asked.
+          #
+          # `GIT_NO_LAZY_FETCH=1` is what makes its EXIT CODE mean only what it
+          # says. This is a `--filter=blob:none` clone, so `remote.origin.promisor`
+          # is set and a MISSING object makes git spawn a lazy `git fetch` that
+          # inherits stderr -- so the likeliest genuinely-wrong pin, a SHA in no
+          # upstream ref, arrives as exit 1 carrying a server-relayed
+          # `fatal: remote error: upload-pack: not our ref <sha>`. An
+          # empty-stderr discriminator therefore routed the ONE case this branch
+          # exists to catch back to the no-verdict fault path. Measured against
+          # git 2.43 on a real blobless clone of github-workflows:
+          #   lazy fetch ON  -- absent:          rc 1, `fatal: remote error: ...`
+          #   lazy fetch OFF -- absent:          rc 1, `warning: lazy fetching disabled ...`
+          #                     present:         rc 0, empty
+          #                     unreadable repo: rc 128, `fatal: ...`
+          # stderr is NON-EMPTY on the missing-object path either way, so it
+          # cannot be part of the test; with lazy fetching off the exit code
+          # alone separates them cleanly -- 1 is a verdict about the pin, any
+          # other non-zero is a fault. `$pin` is already proven 40-hex above, so
+          # the 128 that a malformed name raises is only ever a real repository
+          # fault here. stderr is still captured, for that fault's annotation.
+          exists_rc=0
+          GIT_NO_LAZY_FETCH=1 git -C "$gwtmp/gw" cat-file -e "$pin" 2>"$gwtmp/cat-exists.err" \
+            || exists_rc=$?
+          if [ "$exists_rc" -ne 0 ] && [ "$exists_rc" -ne 1 ]; then
+            # Flattened like every other captured diagnostic in this step: this
+            # one can hold a multi-line, server-controlled promisor `fetch`
+            # failure, and only its FIRST line would become the `::error::`
+            # annotation -- the rest would be emitted as raw log lines, where a
+            # relayed line beginning with `::` is parsed as a workflow command
+            # rather than as text.
+            exists_err="$(tr '\r\n' '  ' <"$gwtmp/cat-exists.err")"
+            echo "::error::could not determine whether $pin exists in github-workflows -- git exited $exists_rc: ${exists_err:-(no output)}"
+            exit 1
+          fi
+
+          pin_type=""
+          if [ "$exists_rc" -eq 0 ]; then
+            # Present, so confirm it is a COMMIT and not a tag or blob that
+            # happens to share the SHA space -- the assertion `^{commit}` used
+            # to fold into the existence check. A fault reading the type is
+            # still a fault.
+            type_rc=0
+            pin_type="$(git -C "$gwtmp/gw" cat-file -t "$pin" 2>"$gwtmp/cat-type.err")" || type_rc=$?
+            if [ "$type_rc" -ne 0 ]; then
+              type_err="$(tr '\r\n' '  ' <"$gwtmp/cat-type.err")"
+              echo "::error::could not read the object type of $pin in github-workflows -- git exited $type_rc: ${type_err:-(no output)}"
+              exit 1
+            fi
+          fi
+
+          if [ "$exists_rc" -eq 1 ] || [ "$pin_type" != "commit" ]; then
+            if [ "$exists_rc" -eq 1 ]; then
+              detail="does not exist in \`Comfy-Org/github-workflows\` at all -- a mistyped SHA, a commit that was force-pushed away, or one that only ever existed on a fork"
+            else
+              detail="exists in \`Comfy-Org/github-workflows\` but names a \`$pin_type\`, not a commit"
+            fi
+            reason="The pinned commit \`$pin\` $detail. Re-pin \`uses:\` and \`workflows_ref:\` in \`.github/workflows/ci-cursor-review.yml\` to a commit that is on \`$upstream_branch\`, then run \`node scripts/check-workflow-pins.mjs\`."
+            {
+              echo "state=broken"
+              echo "broken_reason=$reason"
+            } >>"$GITHUB_OUTPUT"
+            echo "::error::$reason"
+            exit 1
+          fi
+
+          # With the object known to be present, `merge-base --is-ancestor`
+          # exits 1 for "not an ancestor" and 2+ for a hard error -- an
+          # unreadable object, a partial-clone fetch failure. Discarding
+          # stderr and folding the two together reports an infrastructure fault
+          # as "re-pin both pins" against a pin that is in fact correct. Only
+          # exit 1 is a verdict about the pin, and only a verdict files an issue.
+          ancestry_rc=0
+          git -C "$gwtmp/gw" merge-base --is-ancestor "$pin" "$default_ref" 2>"$gwtmp/ancestry.err" \
+            || ancestry_rc=$?
+          # Flattened for the same reason as `exists_err` above.
+          ancestry_err="$(tr '\r\n' '  ' <"$gwtmp/ancestry.err")"
+
+          if [ "$ancestry_rc" -eq 1 ]; then
+            reason="The pinned commit \`$pin\` exists in \`Comfy-Org/github-workflows\` but is not an ancestor of \`$upstream_branch\` (upstream's default branch) -- both pins were moved to a side branch, or \`$upstream_branch\` was rewritten. Re-pin \`uses:\` and \`workflows_ref:\` in \`.github/workflows/ci-cursor-review.yml\` to a commit that is on \`$upstream_branch\`, then run \`node scripts/check-workflow-pins.mjs\`."
+            {
+              echo "state=broken"
+              echo "broken_reason=$reason"
+            } >>"$GITHUB_OUTPUT"
+            echo "::error::$reason"
+            exit 1
+          elif [ "$ancestry_rc" -ne 0 ]; then
+            # The non-transient fault that used to be separated out here -- an
+            # upstream default-branch rename leaving `origin/main` gone -- can
+            # no longer reach this branch: the ref is now resolved from
+            # `origin/HEAD` right after the clone, and a default that cannot be
+            # resolved is a `broken` verdict there rather than a daily red run
+            # here. What is left really is transient.
+            #
+            # NO verdict written: nothing here established anything about the
+            # pin, so the issue steps below must stay out of it. The red run
+            # and this annotation are the whole record, which is right for the
+            # faults that genuinely are transient -- an unreadable object, a
+            # partial-clone fetch failure.
+            echo "::error::could not determine whether $pin is an ancestor of github-workflows $upstream_branch -- git exited $ancestry_rc: ${ancestry_err:-(no output)}"
+            exit 1
+          fi
+
+          # `WATCHED_PATHSPECS` is upstream's own definition of
+          # "consumer-visible", exclusions included. It is READ from upstream
+          # here rather than mirrored, because a hand-copy held in sync by a
+          # comment WILL drift -- and this one already HAD: the copy this job
+          # shipped carried one of upstream's four `:(exclude)` entries, so
+          # commits touching only `.github/cursor-review/tests`, its
+          # `README.md` or `catalog-drift.py` counted as staleness that
+          # upstream deliberately says they are not.
+          #
+          # Probing a list we already hold cannot fix that, because it cannot
+          # see drift by ADDITION: a fourth watched path added upstream is
+          # simply invisible to us, `behind` comes back empty, `state=current`
+          # is written, and this job reports "pin is current" and closes its own
+          # issue every day however stale the pin really is. That is the same
+          # degrade-to-invisible that hid the original three-week outage. Blobs
+          # are lazily fetchable even in a `--filter=blob:none` clone, so the
+          # real list is one `git show` away and there is no reason to guess.
+          bump_yaml=.github/workflows/bump-cursor-review-callers.yml
+          upstream_rc=0
+          # stderr goes to a FILE, never into `upstream_src`: this value is
+          # parsed as YAML below, and `git show` of a blob in a blobless clone
+          # can print promisor-fetch chatter on stderr while SUCCEEDING. Folded
+          # in with `2>&1` that chatter becomes parser input -- an unindented
+          # line landing mid-block ends the watched list early and silently
+          # narrows what counts as staleness. Same reason the pin read above
+          # routes stderr to a file.
+          upstream_src="$(git -C "$gwtmp/gw" show "$default_ref:$bump_yaml" 2>"$gwtmp/upstream-show.err")" || upstream_rc=$?
+          if [ "$upstream_rc" -ne 0 ]; then
+            # A path that is simply GONE upstream is permanent and
+            # deterministic, so it is a VERDICT about the pin's watchability,
+            # not a fault in reading it. The distinction has teeth: the issue
+            # steps below fire only on `broken` or `stale`, and there is no
+            # generic failure handler, so leaving a rename on the fault path
+            # burns this job red every single day and never opens the sticky
+            # issue that would say why. `ls-tree` reads trees only, which the
+            # blobless clone already has, so it settles "is the path there?"
+            # without the lazy blob fetch `git show` just failed at. Status and
+            # output are captured SEPARATELY, for the reason spelled out at the
+            # `ls-tree` probe below.
+            # stderr to a FILE, not `2>&1`: `probe_out` being EMPTY is the
+            # "path is gone upstream" signal, so any advice or warning git
+            # prints on a SUCCESSFUL `ls-tree` would make a vanished path read
+            # as present and drop a permanent upstream rename onto the fault
+            # path, which writes no `state` and files no issue.
+            probe_rc=0
+            probe_out="$(git -C "$gwtmp/gw" ls-tree "$default_ref" -- "$bump_yaml" 2>"$gwtmp/bump-probe.err")" || probe_rc=$?
+            if [ "$probe_rc" -eq 0 ] && [ -z "$probe_out" ]; then
+              reason="\`$bump_yaml\` does not exist in \`Comfy-Org/github-workflows@$upstream_branch\` any more, so this job cannot read \`WATCHED_PATHSPECS\` and cannot judge staleness at all. That will not clear on its own: upstream renamed or removed the bump workflow. Re-point the extractor in the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\` at upstream's new file."
+              {
+                echo "state=broken"
+                echo "broken_reason=$reason"
+              } >>"$GITHUB_OUTPUT"
+              echo "::error::$reason"
+              exit 1
+            fi
+            # A FAULT, not a verdict: a lazy-fetch failure or a vanished
+            # `$default_ref` says nothing about the pin. No `state` is written.
+            show_err="$(tr '\r\n' '  ' <"$gwtmp/upstream-show.err")"
+            echo "::error::could not read $bump_yaml from github-workflows $upstream_branch -- git exited $upstream_rc: ${show_err:-(no output)}"
+            exit 1
+          fi
+
+          # The entries of a `WATCHED_PATHSPECS: |` literal block scalar are the
+          # lines indented deeper than its key.
+          #
+          # The scan is BLOCK-SCALAR AWARE, which a plain textual match for the
+          # key is not: upstream's own `run: |` bodies quote this key while
+          # documenting it, and the first textual hit would consume that quoted
+          # copy instead of the real key. The real block that follows would then
+          # be ignored entirely and the staleness query would run against the
+          # wrong surface. So any `foo: |`/`>` key opens a block whose deeper
+          # lines are CONTENT and are never read as keys, and only a
+          # `WATCHED_PATHSPECS:` seen outside a block counts.
+          #
+          # Once the real block ends, the scan is FINISHED -- a later textual
+          # copy cannot reopen or extend it.
+          #
+          # A literal block scalar cannot contain YAML comments, so a `#` line
+          # inside it would be a pathspec that literally starts with `#`, which
+          # no path does; dropping those keeps one from being probed and pinning
+          # this job into a permanent `broken` verdict blaming upstream for a
+          # rename that never happened.
+          #
+          # No early `exit` and no pipe into awk: a pipeline that closes early
+          # under `set -o pipefail` is its own failure mode (see `newest` below).
+          mapfile -t watched < <(awk '
+            BEGIN { blk = -1 }
+            function indent_of(line) { match(line, /^[[:space:]]*/); return RLENGTH }
+            # The column of the KEY on a line, spanning any `- ` sequence
+            # marker. Block content is indented deeper than the KEY, which for
+            # `- run: |` is NOT the same as deeper than the dash: keying the
+            # block off the dash column leaves every sibling key of that `run:`
+            # -- a step-level `env:`, `if:`, `with:` -- satisfying `ind > blk`
+            # and swallowed as scalar content, so a `WATCHED_PATHSPECS:` nested
+            # under such an `env:` is never seen and this job writes a
+            # permanent daily `broken` blaming upstream for a rename that never
+            # happened. The JS sibling spans the marker for exactly this case
+            # (`BLOCK_SCALAR_RE` group 1 is `\s*(?:-\s+)?`); this is the port.
+            function key_col(line) { match(line, /^[[:space:]]*(-[[:space:]]+)?/); return RLENGTH }
+            finished { next }
+            {
+              ind = indent_of($0)
+              blank = ($0 ~ /^[[:space:]]*$/)
+            }
+            # Inside some block scalar: content only, until a line at or above
+            # the owning key column.
+            blk != -1 {
+              if (blank || ind > blk) {
+                if (found && !blank && ind > key) {
+                  entry = $0
+                  sub(/^[[:space:]]+/, "", entry)
+                  sub(/[[:space:]]+$/, "", entry)
+                  if (entry !~ /^#/) print entry
+                }
+                next
+              }
+              if (found) { finished = 1; next }
+              blk = -1
+            }
+            blank { next }
+            /^[[:space:]]*(-[[:space:]]+)?WATCHED_PATHSPECS:[[:space:]]*\|/ {
+              key = key_col($0); blk = key; found = 1; next
+            }
+            # Any other block-scalar key opens a block we must skip over.
+            #
+            # The trailing `(#.*)?` is load-bearing, not tidiness: YAML permits
+            # a COMMENT after a block-scalar header, so anchoring `$` straight
+            # after the indicator means `run: | # write the issue body` opens no
+            # block here. That body is then scanned as STRUCTURE, and a
+            # `WATCHED_PATHSPECS: |` quoted inside it is consumed as the real
+            # key -- with `finished` then suppressing the genuine block below.
+            # The JS sibling already tolerates it (`BLOCK_SCALAR_RE` ends
+            # `\s*(?:#.*)?$`); the two extractors must not disagree about what
+            # opens a block.
+            /^[[:space:]]*[^[:space:]#][^:]*:[[:space:]]*[|>][0-9+-]*[[:space:]]*(#.*)?$/ {
+              blk = key_col($0); next
+            }
+          ' <<<"$upstream_src")
+
+          # A CR anywhere in an entry is its OWN `broken` verdict, decided
+          # HERE, at extraction, before any consumer sees the array.
+          #
+          # This used to STRIP the CR instead, and the fail-closed argument for
+          # doing so only covered the entries that are actually PROBED: a
+          # mangled path would stop resolving, land on the `missing` branch and
+          # file a loud verdict. But the probe below `continue`s before
+          # `ls-tree` for wildcard entries, for magic it cannot reproduce, and
+          # for an empty remainder -- and upstream's list is glob- and
+          # `:(exclude)`-heavy, so those unprobed shapes are the COMMON ones.
+          # A stripped entry of that kind went straight to `git log`, matched
+          # nothing, and silently shrank the backlog toward `state=current` on
+          # a pin that is in fact frozen: the exact fail-open this whole job
+          # exists to prevent, reintroduced by the sanitiser. For the entries
+          # that WERE probed the report was wrong in the other direction --
+          # the `missing` sticky issue quoted the STRIPPED path and told a
+          # human upstream had renamed a path upstream never wrote.
+          #
+          # Rejecting outright removes both, and needs no per-consumer
+          # reasoning about who is CR-safe: a CR is never legitimate inside a
+          # pathspec, so an entry carrying one means this job can no longer
+          # trust the list it is reading, which is a `broken` verdict by the
+          # same standard as a list it cannot parse at all.
+          #
+          # ANY control character, not just CR. The awk extractor trims only
+          # leading and trailing `[[:space:]]`, so an entry carrying an
+          # interior ESC, BEL, VT or DEL survived a CR-only check -- and by
+          # this block's own standard those are no more legitimate in a
+          # pathspec than a CR is. The consequence is identical for the
+          # UNPROBED shapes (wildcard, unreproducible magic, empty remainder),
+          # which are the common ones in upstream's glob-heavy list: the entry
+          # skips `ls-tree`, goes straight to `git log`, matches nothing, and
+          # shrinks the backlog toward `state=current` on a frozen pin. It was
+          # also echoed raw into the run log and embedded into
+          # `broken_reason`. The class test is what fails closed: a locale
+          # whose `[[:cntrl:]]` covers more than C0+DEL can only reject MORE,
+          # never less.
+          #
+          # That direction is not free of false positives, and the bound is
+          # worth stating exactly rather than claiming there are none. Under a
+          # UTF-8 locale glibc's `iswcntrl` is also true for the C1 range
+          # U+0080-U+009F, which are legal in a filename, so a pathspec
+          # carrying e.g. U+0085 is rejected here. The outcome is a spurious
+          # `broken` verdict -- the watchdog says it cannot read the list and
+          # asks a human to look -- not a missed stale pin, which is the
+          # trade this whole block is built around. Ordinary non-ASCII paths
+          # are unaffected: every other code point above U+007F is not
+          # `cntrl` under either a UTF-8 or a C locale.
+          #
+          # NUL is the one control byte this test structurally cannot see, and
+          # it does not reach here to be seen: `upstream_src` is captured with
+          # `$(git show ...)` and bash drops NUL in command substitution, so
+          # the byte is gone before `mapfile` builds `watched`. Catching it
+          # would mean probing the blob on disk before the substitution. That
+          # is deliberately not done, because a NUL cannot occur in the input
+          # this job reads: NUL is outside YAML's `c-printable`, so a
+          # `bump-cursor-review-callers.yml` carrying one is not loadable by
+          # upstream's OWN Actions runner and upstream's workflow is broken
+          # before this watchdog ever clones it.
+          #
+          # The entry is reported with each control character rendered as
+          # visible text -- `<CR>`, `<TAB>`, or `<0xNN>` for the ones with no
+          # conventional short name, where `NN` is the CODE POINT and not the
+          # UTF-8 bytes upstream wrote (U+0085 renders `<0x85>`, not
+          # `<0xC2><0x85>`). That keeps the RAW entry visible to whoever reads
+          # the sticky issue -- they need to see what upstream
+          # actually wrote, and WHICH character it was -- while guaranteeing the
+          # value embedded in `$GITHUB_OUTPUT` is single-line, so it cannot
+          # split `broken_reason=` into a forged `state=` record or a record
+          # with no `=` that makes the runner reject the whole file.
+          render_ctl() {
+            local str="$1" out="" ch idx
+            for (( idx = 0; idx < ${#str}; idx++ )); do
+              ch="${str:idx:1}"
+              case "$ch" in
+                $'\r') out="$out<CR>" ;;
+                $'\t') out="$out<TAB>" ;;
+                [[:cntrl:]]) out="$out$(printf '<0x%02X>' "'$ch")" ;;
+                *) out="$out$ch" ;;
+              esac
+            done
+            printf '%s' "$out"
+          }
+          ctl_entries=""
+          for i in "${!watched[@]}"; do
+            case "${watched[i]}" in
+              *[[:cntrl:]]*) ctl_entries="$ctl_entries \`$(render_ctl "${watched[i]}")\`" ;;
+            esac
+          done
+          if [ -n "$ctl_entries" ]; then
+            reason="\`WATCHED_PATHSPECS\` in \`Comfy-Org/github-workflows@$upstream_branch:$bump_yaml\` contains a control character inside ${ctl_entries# } (each control byte shown as \`<CR>\`, \`<TAB>\` or \`<0xNN>\`). A control character is never valid inside a pathspec: \`git log\` would match nothing for that entry and this job would report the pin current however stale it is, so it is failing closed instead. This is upstream's list to fix -- the entry was written with a stray control byte, or the block scalar picked one up."
+            {
+              echo "state=broken"
+              echo "broken_reason=$reason"
+            } >>"$GITHUB_OUTPUT"
+            echo "::error::$reason"
+            exit 1
+          fi
+          # Fail CLOSED on an unreadable list, for the same reason as above: no
+          # pathspecs means `git log` matches nothing, which reads as "current".
+          if [ "${#watched[@]}" -eq 0 ]; then
+            reason="This job could not read \`WATCHED_PATHSPECS\` out of \`Comfy-Org/github-workflows@$upstream_branch:$bump_yaml\` -- the key is gone, or it is no longer written as a \`|\` block scalar. Without that list the staleness query has no pathspecs, matches nothing, and would report the pin current however stale it is, so it is failing closed instead. Re-check upstream's file and update the extractor in the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\`."
+            {
+              echo "state=broken"
+              echo "broken_reason=$reason"
+            } >>"$GITHUB_OUTPUT"
+            echo "::error::$reason"
+            exit 1
+          fi
+          # `watched` is read VERBATIM from a list this repo does not control,
+          # and the runner strips leading whitespace before looking for a
+          # workflow command -- so an upstream entry spelled `::stop-commands::<token>`
+          # or `::error::...` would be EXECUTED by echoing it here, letting
+          # upstream suppress or forge this job's own verdict annotations. That
+          # is the same `::`-at-line-start hazard the captured-stderr flattening
+          # already guards against. A leading `::` (after any leading blanks) is
+          # rewritten to the runner's own percent-escape for a colon, so the
+          # entry still prints readably and cannot open a command.
+          #
+          # The ESCAPE alone is not sufficient, because the two sides disagree
+          # about what a leading blank is. The runner trims with .NET
+          # `TrimStart()`, which strips every `char.IsWhiteSpace` code point --
+          # U+00A0, U+202F, U+2028 among them -- while glibc's POSIX
+          # `[[:space:]]` in a UTF-8 locale deliberately excludes the
+          # non-breaking ones. Verified here: an entry spelled
+          # `<U+00A0>::stop-commands::<token>` passes through the expression
+          # below untouched, and prepending ASCII spaces does not help because
+          # the runner trims those too -- so the command still reaches column 0
+          # and executes.
+          #
+          # Prefixing each line with a NON-WHITESPACE marker closes that
+          # unconditionally, without enumerating whitespace classes the two
+          # implementations will keep disagreeing about: whatever the runner
+          # trims, it stops at the `-`. The escape is kept as well, so the
+          # common ASCII case still prints as `%3A%3A`.
+          #
+          # Both defences above are newline-scoped, so neither one sees an
+          # interior CR. That is why no `tr -d '\r'` is needed here: an entry
+          # carrying one never reaches this line at all -- the CR check after
+          # the `mapfile` has already exited with a `broken` verdict -- so the
+          # marker below covers each entry whole.
+          echo "Watched pathspecs, read from upstream $bump_yaml:"
+          printf '%s\n' "${watched[@]}" | sed -e 's/^[[:space:]]*::/%3A%3A/' -e 's/^/  - /'
+
+          # Upstream's list can itself name a path that no longer resolves --
+          # a rename landed in its `paths:` filter but not here. `git log` over
+          # a vanished path matches nothing, so this stays a fail-closed probe.
+          # `ls-tree` reads trees only, which the blobless clone already has.
+          #
+          # Only POSITIVE entries are probed -- `:(exclude)` is a filter, and one
+          # naming a since-deleted path is not a defect -- so only EXCLUSIONS are
+          # skipped. `:*` used to skip every entry carrying
+          # pathspec magic, but `:(glob)p`, `:(icase)p`, `:(top)p`, `:(literal)p`
+          # and `:/p` are all POSITIVE pathspecs -- skipping them meant an
+          # upstream rename of one degraded silently-healthy, the exact hole
+          # this fail-closed probe exists to shut.
+          #
+          # The magic prefix is STRIPPED before probing rather than passed
+          # through, because `ls-tree` rejects most of it outright ("pathspec
+          # magic not supported by this command" for `glob`, `icase` and
+          # `exclude`, verified against git in this repo) -- handing it the raw
+          # entry would exit 128 and turn every magic entry into a daily fault.
+          # `git log` below DOES support the full syntax, so it still receives
+          # the entries verbatim.
+          missing=""
+          positive=0
+          for path in "${watched[@]}"; do
+            case "$path" in
+              :\(*)
+                magic="${path#:\(}"
+                magic="${magic%%)*}"
+                case ",$magic," in
+                  *,exclude,*) continue ;;
+                esac
+                probe="${path#*)}"
+                # STRIPPING THE MAGIC DISCARDS ITS MATCHING SEMANTICS, and for
+                # most keywords the bare remainder no longer means what upstream
+                # wrote: `:(icase)Foo/Bar` handed to `ls-tree` is probed
+                # case-SENSITIVELY, which is the one thing that entry exists to
+                # relax, and `:(attr:...)` is probed as a plain path. Either
+                # reads as MISSING and files a permanent daily `broken` sticky
+                # issue blaming upstream for a rename that never happened --
+                # loud, wrong, and aimed at the wrong repo.
+                #
+                # Only `top` and `literal` leave the remainder naming the same
+                # fixed path: `top` means root-relative, which `ls-tree <ref> --
+                # <path>` already is, and `literal` only disables the wildcards
+                # that the wildcard skip below drops anyway. Every other
+                # keyword is skipped the way a wildcard entry is -- COUNTED as
+                # a positive for the fail-closed guard, not probed, and said
+                # out loud in the log so the gap is visible rather than silent.
+                #
+                # Only a properly TERMINATED prefix is classified here.
+                # `${path#*)}` returns the entry unchanged when there is no
+                # `)`, so an unterminated `:(glob` still falls through to the
+                # still-carrying-magic check below and stays a `broken` verdict.
+                if [ "$probe" != "$path" ]; then
+                  unprobeable=""
+                  IFS=',' read -r -a magic_words <<<"$magic"
+                  for magic_word in "${magic_words[@]}"; do
+                    case "$magic_word" in
+                      top|literal|"") ;;
+                      *) unprobeable=yes ;;
+                    esac
+                  done
+                  if [ -n "$unprobeable" ]; then
+                    echo "  not probed: \`$path\` carries pathspec magic \`$magic\`, whose matching semantics ls-tree cannot reproduce; counted as a positive pathspec and passed to git log verbatim."
+                    positive=$((positive + 1))
+                    continue
+                  fi
+                fi
+                ;;
+              :*)
+                # SHORT MAGIC. Parsed one signature letter at a time rather
+                # than by prefix patterns, because the letters COMBINE and the
+                # run may be TERMINATED BY A SECOND COLON -- gitglossary says
+                # the signature letters are "optionally ... terminated by
+                # another colon". Neither spelling of that terminator used to
+                # be handled: `:/:some/path` is a legal positive entry, but
+                # stripping only the `:/` left `:some/path`, which tripped the
+                # still-carrying-magic branch below and filed a `broken` sticky
+                # issue blaming upstream for a list that is perfectly valid;
+                # `::some/path` fell into the unrecognised-magic arm, counted
+                # toward the `positive` guard but never probed.
+                rest="${path#:}"
+                excluded=""
+                consumed=0
+                while [ -n "$rest" ]; do
+                  c="${rest:0:1}"
+                  case "$c" in
+                    # `^` is git's DOCUMENTED synonym for `!` in short magic
+                    # (gitglossary, "exclude"). Matching only `!` let a `:^`
+                    # entry fall through to the unrecognised arm, where it was
+                    # COUNTED as a positive and never probed -- so an upstream
+                    # list spelling its exclusions with `^` sailed past the
+                    # `positive -eq 0` fail-closed guard carrying no real
+                    # positive at all, and the `git log` below then either
+                    # matched nothing (writing `state=current` over a frozen
+                    # pin) or died with "There is nothing to exclude from by
+                    # :(exclude) patterns" -- a message containing no
+                    # "pathspec", so the classifier there missed it too and it
+                    # landed on the silent fault path.
+                    '!'|'^') excluded=yes; rest="${rest:1}"; consumed=$((consumed + 1)) ;;
+                    /) rest="${rest:1}"; consumed=$((consumed + 1)) ;;
+                    # The optional terminating colon. It ends the signature,
+                    # so stop consuming letters after it.
+                    :) rest="${rest:1}"; consumed=$((consumed + 1)); break ;;
+                    *) break ;;
+                  esac
+                done
+                if [ -n "$excluded" ]; then
+                  continue
+                fi
+                if [ "$consumed" -eq 0 ]; then
+                  # Unrecognised short magic: not something this probe can turn
+                  # into a path, and not demonstrably positive either. Counted,
+                  # never probed.
+                  positive=$((positive + 1))
+                  continue
+                fi
+                probe="$rest"
+                ;;
+              *) probe="$path" ;;
+            esac
+
+            # Stripping the magic can leave `probe` unusable, and `ls-tree`
+            # must not be handed it either way.
+            #
+            # STILL CARRYING MAGIC means the strip did not happen: an
+            # unterminated `:(glob`, where `${path#*)}` finds no `)` and
+            # returns the entry unchanged. `ls-tree` exits 128 on it, which
+            # lands on the fault branch that writes no `state` -- reddening
+            # the schedule daily in silence. It is permanent, deterministic
+            # and a defect in a list this repo does not control, so it is a
+            # `broken` VERDICT with a sticky issue instead.
+            if [ "${probe#:}" != "$probe" ]; then
+              reason="\`Comfy-Org/github-workflows@$upstream_branch:$bump_yaml\` lists \`$path\` in \`WATCHED_PATHSPECS\`, and this job cannot parse its pathspec magic, so it cannot check that the entry still resolves -- and an unchecked entry is exactly the silent drift this probe exists to catch. Re-check upstream's list and the extractor in the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\`."
+              {
+                echo "state=broken"
+                echo "broken_reason=$reason"
+              } >>"$GITHUB_OUTPUT"
+              echo "::error::$reason"
+              exit 1
+            fi
+
+            positive=$((positive + 1))
+
+            # An EMPTY probe is NOT a defect, so it must not take that branch:
+            # `:/` and `:(top)` alone are the documented spellings for the
+            # repository ROOT, a positive pathspec that always resolves. It is
+            # simply not one `ls-tree` can be asked about -- `git ls-tree
+            # <ref> -- ""` is fatal with "empty string is not a valid
+            # pathspec" -- so, exactly like a wildcard entry, it counts toward
+            # the fail-closed guard above and skips the probe.
+            if [ -z "$probe" ]; then
+              continue
+            fi
+
+            case "$probe" in
+              # A wildcard entry does not name one fixed path, so "does it still
+              # exist" is not a question `ls-tree` can answer about it. It still
+              # counts as a positive pathspec for the guard below.
+              *[*?[]*) continue ;;
+            esac
+            # Status and OUTPUT are captured separately, and stderr goes to a
+            # FILE. Emptiness of `ls_out` is the "path is gone upstream" signal,
+            # so folding stderr in with `2>&1` would let any advice or warning
+            # git prints on a SUCCESSFUL `ls-tree` read as "still present" --
+            # fail-open, the direction this probe exists to close. A non-zero
+            # status stays a fault: an unreadable tree or a partial-clone fetch
+            # failure must not file a confident `broken` issue about drift that
+            # did not happen.
+            ls_rc=0
+            ls_out="$(git -C "$gwtmp/gw" ls-tree "$default_ref" -- "$probe" 2>"$gwtmp/ls-probe.err")" || ls_rc=$?
+            if [ "$ls_rc" -ne 0 ]; then
+              ls_err="$(tr '\r\n' '  ' <"$gwtmp/ls-probe.err")"
+              echo "::error::could not list \`$probe\` in github-workflows $upstream_branch -- git exited $ls_rc: ${ls_err:-(no output)}"
+              exit 1
+            fi
+            [ -n "$ls_out" ] || missing="$missing \`$path\`"
+          done
+
+          if [ "$positive" -eq 0 ]; then
+            reason="\`WATCHED_PATHSPECS\` in \`Comfy-Org/github-workflows@$upstream_branch:$bump_yaml\` parsed to ${#watched[@]} entry/entries, none of them a positive pathspec -- they are all \`:(exclude)\`/\`:!\` filters. A staleness check with no positive pathspec matches nothing and would report the pin current however stale it is, so it is failing closed. Re-check upstream's file and the extractor in \`.github/workflows/ci.yml\`."
+            {
+              echo "state=broken"
+              echo "broken_reason=$reason"
+            } >>"$GITHUB_OUTPUT"
+            echo "::error::$reason"
+            exit 1
+          fi
+
+          if [ -n "$missing" ]; then
+            reason="\`WATCHED_PATHSPECS\` in \`Comfy-Org/github-workflows@$upstream_branch:$bump_yaml\` names ${missing# }, which does not exist on \`$upstream_branch\` any more. A staleness check over a path that resolves to nothing matches nothing and would report the pin current however stale it is, so it is failing closed instead. This is upstream's list to fix: the path was renamed or removed without its \`WATCHED_PATHSPECS\` entry following."
+            {
+              echo "state=broken"
+              echo "broken_reason=$reason"
+            } >>"$GITHUB_OUTPUT"
+            echo "::error::$reason"
+            exit 1
+          fi
+
+          # `--first-parent` anchors the clock to when work LANDED on main.
+          # Without it the range includes commits from merged side branches,
+          # which keep their pre-merge committer dates -- so a long-lived branch
+          # merged today can contribute an "oldest unpicked commit" that is
+          # already weeks old, blowing the grace window on day one and filing an
+          # issue saying nothing is moving the pin when the fleet has had a day.
+          # A merge commit is still reported when it changes a watched path, so
+          # nothing consumer-visible is lost; only its date changes, to the one
+          # that answers the question being asked.
+          # The `:(exclude)` entries come from upstream's list now, so nothing
+          # is appended here -- an extra hand-written exclusion would be exactly
+          # the drift this stopped mirroring the list to avoid.
+          # The ONLY git call in this step that used to run with no captured
+          # status -- and it is fed pathspecs this repo does not control, read
+          # verbatim from upstream's `WATCHED_PATHSPECS`. A bare
+          # `var="$(cmd)"` assignment DOES trip `set -e`: an assignment-only
+          # simple command takes the exit status of its command substitution
+          # (only `local`/`export`/`declare` mask it, which is why ShellCheck
+          # SC2155 exists -- `bash -c 'set -e; x=$(false); echo hi'` prints
+          # nothing). So an unsupported or malformed pathspec upstream killed
+          # the STEP outright, before any `state=` was written -- the no-verdict
+          # fault path, where the sticky-issue step below is gated on the
+          # verdict rather than on `failure()` and therefore files nothing. The
+          # pin stays frozen and the schedule reddens daily in silence.
+          # Capturing the status is what turns that into the `broken` VERDICT
+          # below, which names upstream's list and opens an issue.
+          #
+          # A pathspec git refuses to parse is PERMANENT and deterministic, so
+          # it is a verdict (`broken`, sticky issue) rather than a fault -- left
+          # on the fault path it would simply redden the schedule daily and say
+          # nothing. Every other failure stays a fault.
+          #
+          # The trailer field is read HERE, in the same walk, because the
+          # fleet does not owe a bump for every commit on the watched surface:
+          # upstream's `preflight.sh` honours a `Skip-caller-bump: true`
+          # trailer for comment/docs-only edits inside those paths and
+          # deliberately opens no bump PR for them (`.github/bump-callers/`,
+          # and AGENTS.md tells authors to use it). Counting such a commit as
+          # owed means that once it ages past the grace window this job
+          # reaches `stale` and files the "nothing is moving it" issue while
+          # the fleet behaved exactly as designed -- and the false alert
+          # persists until some later real change advances the pin. It can
+          # also burn the grace window ahead of a genuine commit.
+          #
+          # `%(trailers:...)` is git's OWN parser, which is the point: the
+          # trailing-trailer-block and paragraph-boundary semantics upstream
+          # spells out are its emulation of `git interpret-trailers --parse`,
+          # so asking git directly is the one reading that cannot drift from
+          # it. Re-implementing the jq here is precisely the second copy
+          # upstream's own comment says that directory exists to prevent.
+          #
+          # KNOWN LIMIT, stated rather than papered over: `--first-parent` still
+          # SHOWS merge commits, and `%(trailers:...)` reads only the merge
+          # commit's OWN message. A change landed through a real merge commit
+          # therefore carries no `Skip-caller-bump` trailer here even when every
+          # branch commit has one, so upstream's gate declines the bump while
+          # this walk counts the merge as owed. The filter below covers
+          # squash and rebase landings, which is how github-workflows lands its
+          # PRs; a non-squash landing falls back to the pre-filter behaviour
+          # (counted as owed), which is the LOUD direction and self-clears on
+          # the next real bump.
+          #
+          # `unfold` is load-bearing, not tidiness: without it a FOLDED trailer
+          # (`Skip-caller-bump: true` continued on an indented line) keeps its
+          # continuation newlines, so ONE commit's record spans several lines
+          # and the awk below reads each continuation as its own record --
+          # printing a bogus `<sha> <date>` pair built from the continuation
+          # text. That pair then either becomes `oldest`, where
+          # `date -u -d "$oldest_date"` fails inside an arithmetic expansion and
+          # kills the step on the no-verdict fault path, or becomes `newest`,
+          # where a garbage SHA is published in the stale-pin issue body.
+          #
+          # Fields are separated by ASCII US/RS (`%x1F`/`%x1E`) rather than
+          # spaces, and the trailer goes LAST. A trailer VALUE may contain
+          # spaces and commas -- `Skip-caller-bump: true (docs only)` is the
+          # shape that motivated this -- so a space-split read only the first
+          # token and matched a bare `true` against a value upstream's gate
+          # would NOT have honoured. git cannot emit a control character from
+          # `%H`/`%cI`, and no commit message carries one, so these delimit
+          # unambiguously where whitespace cannot.
+          log_rc=0
+          behind_raw="$(git -C "$gwtmp/gw" log --first-parent \
+            --format='%H %cI%x1E%(trailers:key=Skip-caller-bump,separator=%x1F,unfold)' \
+            "$pin..$default_ref" -- "${watched[@]}" 2>"$gwtmp/behind.err")" || log_rc=$?
+          if [ "$log_rc" -ne 0 ]; then
+            log_err="$(tr '\r\n' '  ' <"$gwtmp/behind.err")"
+            # Here-string rather than `printf | grep -q`: the pipe form puts a
+            # writer in front of a reader that exits at its first match, which
+            # is a SIGPIPE/141 question under the `set -o pipefail` in force
+            # here. (Measured on bash 5 + GNU grep with a 10 MB value and the
+            # match at offset 0, the pipeline still exited 0 -- and a git
+            # pathspec error is a few hundred bytes, nowhere near the 64 KiB
+            # pipe buffer -- so this is not a live fault. It is removed anyway:
+            # this branch is the one permanent, deterministic failure the step
+            # turns into a `broken` verdict, and it should not rest on the
+            # buffering behaviour of whichever grep the runner ships.)
+            if grep -qi 'pathspec' <<<"$log_err"; then
+              reason="\`git log\` could not use the pathspecs read from \`Comfy-Org/github-workflows@$upstream_branch:$bump_yaml\`, so this job cannot judge staleness at all. git exited $log_rc saying: ${log_err:-(no output)}. That will not clear on its own -- upstream's \`WATCHED_PATHSPECS\` carries a pathspec this check cannot use. Re-check upstream's list and the extractor in the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\`."
+              {
+                echo "state=broken"
+                echo "broken_reason=$reason"
+              } >>"$GITHUB_OUTPUT"
+              echo "::error::$reason"
+              exit 1
+            fi
+            echo "::error::could not list upstream commits since $pin -- git exited $log_rc: ${log_err:-(no output)}"
+            exit 1
+          fi
+
+          # Drop the commits that declared themselves bump-irrelevant, and put
+          # the line back into the `<sha> <date>` shape the arithmetic below
+          # parses positionally. `any`, not `all`, matches upstream's gate:
+          # one `true` among repeated trailers is a declaration.
+          #
+          # The test is upstream's OWN regex, key included, applied to the whole
+          # trailer LINE -- `.github/bump-callers/preflight.sh` recognises
+          # exactly `^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$`.
+          # Matching anything wider than that fails OPEN, in three ways this
+          # job has now hit all of:
+          #
+          #  - Value. Testing only the first whitespace-delimited token accepts
+          #    `true (docs only)`, `true please` and `no,true`, none of which
+          #    upstream honours.
+          #  - KEY. `%(trailers:key=...)` matches the key CASE-INSENSITIVELY
+          #    (verified against git 2.43), so `SKIP-CALLER-BUMP: true` was
+          #    selected here while upstream's first-letter-only alternation
+          #    does NOT match it and still owes a bump. `valueonly` hid the
+          #    spelling that made the difference, so the key is no longer
+          #    stripped: the whole line is emitted and matched.
+          #  - SEPARATOR. git accepts whitespace between the token and the
+          #    colon and normalises it away, so `Skip-caller-bump : true`
+          #    reaches this test looking canonical. That one cannot be fixed by
+          #    widening or narrowing the regex applied HERE, because the
+          #    offending spelling is gone by the time git hands the line over;
+          #    it takes the raw-line confirmation pass below.
+          #
+          # Either way the commit vanished from `behind`, `state=current` was
+          # written over a frozen pin and the job closed its own stale-pin
+          # issue. Field 1 is `<sha> <date>` and field 2 is the US-joined
+          # trailer list, so both splits use separators that cannot occur
+          # inside a value.
+          #
+          # `rc` is captured here for the same reason as the `git log` above:
+          # `set -e` DOES act on a bare `var="$(cmd)"` assignment, so an awk
+          # failure would kill the step on the no-verdict path that files
+          # nothing.
+          # PASS 1 -- git's trailer parse decides WHERE a declaration may live.
+          # `%(trailers:key=...)` applies git's trailer-BLOCK rules, and
+          # upstream's gate requires the line "IN ITS TRAILING TRAILER BLOCK"
+          # for a reason it spells out: a body-wide line search reads the token
+          # as a DECLARATION when it is only being QUOTED, so a commit that
+          # merely documents this feature would suppress its own bump. Keeping
+          # git's block selection is what rules that out -- it must not be
+          # traded for a plain scan of `%B`.
+          #
+          # The character class is upstream's `[[:space:]]`, not `[ \t]`, so
+          # the two spellings cannot drift apart on some whitespace git chooses
+          # to preserve.
+          awk_rc=0
+          candidates="$(printf '%s' "$behind_raw" | awk '
+            BEGIN { FS = "\036" }
+            NF {
+              n = split($2, vals, "\037")
+              for (i = 1; i <= n; i++) {
+                if (vals[i] ~ /^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$/) {
+                  split($1, f, " "); print f[1]; break
+                }
+              }
+            }')" || awk_rc=$?
+          if [ "$awk_rc" -ne 0 ]; then
+            echo "::error::could not parse the upstream commit list -- awk exited $awk_rc"
+            exit 1
+          fi
+
+          # PASS 2 -- RAW-LINE CONFIRMATION, and the reason this is not one
+          # pass. Pass 1 tests git's RECONSTRUCTION of the trailer, not the
+          # line upstream's `preflight.sh` reads: `%(trailers)` emits the
+          # TRIMMED token plus a hardcoded `": "`, and git's separator search
+          # accepts whitespace BEFORE the colon. So a commit trailered
+          #
+          #   Skip-caller-bump : true
+          #
+          # renders here as `Skip-caller-bump: true` and matched -- while
+          # upstream's anchored regex rejects the raw line and still owes a
+          # bump. (Verified against git 2.43.) That is the same fail-open
+          # direction, and the same consequence, as the key-case bug above: the
+          # commit vanishes from `behind` and `state=current` is written over a
+          # frozen pin.
+          #
+          # So a candidate must ALSO carry the literal line, in the message's
+          # trailing paragraph, spelled exactly as upstream matches it. The two
+          # tests are an AND: git decides the line is in the trailer block,
+          # upstream's own regex decides the line is spelled like a
+          # declaration. Neither alone is upstream's rule.
+          #
+          # A `git show` that fails leaves the candidate unconfirmed, which
+          # counts the commit as OWING a bump -- the closed direction, a
+          # spurious issue rather than a silently frozen pin.
+          : >"$gwtmp/confirmed"
+          while read -r sha; do
+            [ -n "$sha" ] || continue
+            # The match runs inside awk rather than `| grep -q` so nothing
+            # exits before the writer is done: `set -o pipefail` is in force.
+            if git -C "$gwtmp/gw" show -s --format=%B "$sha" | awk '
+                { lines[n++] = $0 }
+                END {
+                  # TRAILING BLANKS COME OFF FIRST, and this is load-bearing
+                  # rather than tidiness. `--format=%B` contains a `%`, so git
+                  # reads it as `tformat:` and appends a TERMINATOR newline
+                  # after the message body -- which already ends in one. awk
+                  # therefore always sees a final EMPTY record, the backward
+                  # scan below matches it on its first iteration, `start` is
+                  # set to `n`, and the forward loop never executes: every
+                  # candidate fell through to `exit 1`. That made this whole
+                  # pass inert in the fail-CLOSED direction -- each trailered
+                  # commit was logged as "upstream gate does not match
+                  # literally" and counted as owing a bump, so a surface the
+                  # fleet had deliberately declined to bump for would age past
+                  # the grace window and file the "nothing is moving this pin"
+                  # issue. Blank lines at the end are not part of the trailing
+                  # paragraph in any case, so dropping them is also what the
+                  # block rule means.
+                  while (n > 0 && lines[n - 1] ~ /^[[:space:]]*$/) n--
+                  start = 0
+                  for (i = n - 1; i >= 0; i--)
+                    if (lines[i] ~ /^[[:space:]]*$/) { start = i + 1; break }
+                  for (i = start; i < n; i++)
+                    if (lines[i] ~ /^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$/) exit 0
+                  exit 1
+                }'; then
+              printf '%s\n' "$sha" >>"$gwtmp/confirmed"
+            else
+              echo "::notice::upstream commit $sha carries a Skip-caller-bump trailer that git accepts but upstream's own gate does not match literally -- counting it as owing a bump"
+            fi
+          done <<<"$candidates"
+
+          # PASS 3 -- the owed list, rebuilt over the ORIGINAL input so the
+          # newest-first order the arithmetic below reads positionally is
+          # preserved.
+          behind="$(printf '%s' "$behind_raw" | awk -v cf="$gwtmp/confirmed" '
+            BEGIN {
+              FS = "\036"
+              while ((getline line < cf) > 0) confirmed[line] = 1
+            }
+            NF {
+              split($1, f, " ")
+              if (!(f[1] in confirmed)) print $1
+            }')" || awk_rc=$?
+          if [ "$awk_rc" -ne 0 ]; then
+            echo "::error::could not parse the upstream commit list -- awk exited $awk_rc"
+            exit 1
+          fi
+
+          if [ -z "$behind" ]; then
+            echo "state=current" >>"$GITHUB_OUTPUT"
+            if [ -n "$behind_raw" ]; then
+              # Worth distinguishing in the log: upstream DID move the watched
+              # surface, and this job is agreeing with the fleet's own
+              # decision not to bump for it rather than failing to see it.
+              echo "Every upstream commit on the watched surface since $pin carries \`Skip-caller-bump: true\`, so the fleet owes no bump for them. Pin is current."
+            else
+              echo "Nothing consumer-visible has landed upstream since $pin. Pin is current."
+            fi
+            exit 0
+          fi
+
+          # NEWEST is what a bump would move the pin TO, so it is what the issue
+          # body quotes. OLDEST is what the clock runs on, and that split is NOT
+          # interchangeable: the fleet delivers the whole backlog in one bump, so
+          # the question is "how long has the FIRST thing this repo owes been
+          # sitting there", not "how recently did upstream commit". Timing the
+          # newest commit would restart the grace window on every upstream push
+          # -- measured 2026-09-19 over the last 25 consumer-visible commits, the
+          # median gap between them is 0.39 days and only 4 of 24 gaps reach 3
+          # days -- so a frozen caller would be silently re-forgiven roughly
+          # every nine hours and this watchdog would almost never fire, which is
+          # the exact three-week invisibility it exists to end.
+          # Taken with parameter expansion rather than `| head -n 1`. `head`
+          # closes the pipe as soon as it has its line, so once `$behind`
+          # outgrows the pipe buffer `printf` dies of SIGPIPE and the
+          # substitution returns 141 under `set -o pipefail` -- measured here at
+          # 5000+ commits. That 141 is NOT harmless: `set -e` DOES act on a bare
+          # `var="$(cmd)"` assignment -- an assignment-only simple command takes
+          # the exit status of its command substitution -- so under
+          # `set -o pipefail` it would have killed the step on a CORRECT
+          # backlog, on the no-verdict fault path that writes no `state` and
+          # files no issue. A real watchdog outage, triggered by nothing worse
+          # than a large backlog. Removing the pipe removes the SIGPIPE
+          # entirely. `wc -l` reads to EOF, so it never closes early and is safe
+          # as a pipeline.
+          newest="${behind%%$'\n'*}"
+          oldest="${behind##*$'\n'}"
+          behind_count="$(printf '%s\n' "$behind" | wc -l | tr -d ' ')"
+
+          newest_sha="${newest%% *}"
+          newest_date="${newest##* }"
+          oldest_sha="${oldest%% *}"
+          oldest_date="${oldest##* }"
+          {
+            echo "newest_sha=$newest_sha"
+            echo "newest_date=$newest_date"
+            echo "oldest_sha=$oldest_sha"
+            echo "oldest_date=$oldest_date"
+            echo "behind_count=$behind_count"
+          } >>"$GITHUB_OUTPUT"
+          echo "$behind_count consumer-visible upstream commit(s) not picked up."
+          echo "  oldest unpicked: $oldest_sha ($oldest_date)"
+          echo "  newest upstream: $newest_sha ($newest_date)"
+
+          # A committer date in the FUTURE (clock skew upstream, or a
+          # deliberately dated commit) makes `age` negative, which is trivially
+          # `-lt $GRACE_SECONDS` -- so the watchdog would write `state=grace`
+          # and close any open stale-pin issue however frozen the pin is.
+          #
+          # CLAMPING TO 0 DOES NOT BOUND THAT, which an earlier round of this
+          # file claimed it did. `age` is recomputed from the same FIXED
+          # `oldest_date` on every run, so a commit dated a year ahead clamps to
+          # 0 on every daily run for that whole year: `state=grace` written
+          # every time, the stale-pin issue closed every time, the pin frozen
+          # throughout. "Just landed" is a bounded reading only for a date that
+          # advances toward the window's edge, and this one never does -- so the
+          # clamp reproduced exactly the unbounded silencing it was added to
+          # remove.
+          #
+          # A future date is therefore taken the LOUD way: out of grace, and
+          # judged on the evidence below like any other stale pin (an open bump
+          # PR still mutes it, on its own separate clock). Real upstream clock
+          # skew is seconds to minutes against a three-day window, so this
+          # cannot fire on ordinary skew; a date far enough ahead to matter is
+          # itself the anomaly worth reporting.
+          age="$(( $(date -u +%s) - $(date -u -d "$oldest_date" +%s) ))"
+          future_dated=""
+          if [ "$age" -lt 0 ]; then
+            skew="$(( -age ))"
+            if [ "$skew" -le "$SKEW_TOLERANCE_SECONDS" ]; then
+              # ORDINARY forward skew between upstream's committer clock and
+              # this runner's. The paragraph above is right that it is seconds
+              # to minutes against a three-day window -- but the boundary
+              # actually tested is `age < 0`, not `age < -GRACE_SECONDS`, so
+              # without this arm the window absorbs NOTHING at that edge and a
+              # commit dated one second ahead jumped straight to `stale` and
+              # filed the "nothing is moving this pin" issue. A commit this
+              # fresh is exactly what "just landed" means, so it belongs in
+              # grace like any other.
+              echo "The oldest unpicked commit $oldest_sha is dated ${skew}s in the future ($oldest_date), within the ${SKEW_TOLERANCE_SECONDS}s clock-skew tolerance; reading it as just-landed."
+              age=0
+            else
+              future_dated=yes
+              echo "::warning::the oldest unpicked commit $oldest_sha is dated ${skew}s in the future ($oldest_date), beyond the ${SKEW_TOLERANCE_SECONDS}s clock-skew tolerance; refusing to read that as just-landed, and judging the pin as out of grace."
+              # Carried into the VERDICT, not left in this transient warning:
+              # `age` is clamped to 0 below, so without it the annotation and
+              # the issue body say the commit landed 0 days ago while asserting
+              # it sat past the 3-day window -- a self-contradictory durable
+              # record for the one case where the date is the whole story.
+              echo "future_dated=$oldest_date" >>"$GITHUB_OUTPUT"
+              age=0
+            fi
+          fi
+          if [ -z "$future_dated" ] && [ "$age" -lt "$GRACE_SECONDS" ]; then
+            echo "state=grace" >>"$GITHUB_OUTPUT"
+            # `fmt_days`, not `GRACE_SECONDS / 86400`: bash integer division
+            # truncates, so at a non-whole-day knob (129600) this log line said
+            # "1-day" while the durable `grace_days` output said "1.5-day" --
+            # the same value-vs-text divergence `fmt_days` was added to remove.
+            echo "The oldest unpicked commit is $((age / 3600))h old, inside the $(fmt_days "$GRACE_SECONDS")-day grace window. Passing."
+            exit 0
+          fi
+
+          # Past the grace window, so the question is no longer "is it stale"
+          # but "is anything moving it". The fleet pushes a STABLE branch, so
+          # an open PR from it means delivery happened and only the merge is
+          # owed -- a different problem, with a different owner, and not this
+          # watchdog's to redden.
+          #
+          # `set -e` makes an API failure here kill the step rather than read
+          # as an empty result. That direction matters: a blip that looked like
+          # "no bump PR" would file a stale-pin issue naming a cause nobody
+          # established, and the sticky-issue step below is gated on the
+          # verdict, not on `failure()`, so a red step files nothing.
+          #
+          # `--head` filters by branch NAME only -- `--repo` picks the base
+          # repo, not the head one -- so an unrelated fork PR whose branch
+          # happens to be called `ci/bump-cursor-review` would read as a
+          # delivered bump and mute the watchdog. Only a same-repo branch can
+          # be the fleet's, so cross-repository PRs are dropped.
+          #
+          # The BASE side is constrained too, and for the same reason. `--head`
+          # says nothing about where a PR is going: one opened from the fleet's
+          # branch onto a release or throwaway branch passes the ancestry test
+          # below and sets `state=delivered`, muting this watchdog for a full
+          # seven days even though merging it cannot move the caller on the
+          # default branch at all. Only a PR that actually lands on the branch
+          # this job judges is evidence about that branch.
+
+          # Asserted, not assumed: `env:` always DEFINES the name, so `set -u`
+          # would not catch an empty one, and an empty `--base` would silently
+          # stop matching every bump PR -- the watchdog would then file "nothing
+          # is moving this pin" while a perfectly good bump sat open. Loud is
+          # the only safe direction for a value this job's verdict depends on.
+          if [ -z "$DEFAULT_BRANCH" ]; then
+            # A `broken` VERDICT, not a bare red run. Whether the event payload
+            # carries `repository.default_branch` is a fixed property of the
+            # event, not a blip: if it is ever empty here it is empty every
+            # day. The issue steps are gated on the verdict rather than on
+            # `failure()`, so exiting without writing `state=` reddens the
+            # daily run forever in silence -- nobody is told the pin stopped
+            # being watched. That is exactly why the clone, `origin/HEAD`,
+            # pathspec and `git log` branches all write `state=broken` plus a
+            # `broken_reason` for their permanent faults; this one is the same
+            # class and gets the same treatment.
+            reason="This job could not read the repository's default branch from the scheduled event payload (\`github.event.repository.default_branch\` was empty), so it cannot tell whether an open bump PR on \`$BUMP_BRANCH\` would land on the branch it judges. It will not guess: matching a bump PR against the wrong base would mute this watchdog for a PR that cannot move the caller. This will not clear on its own -- investigate the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\`."
+            {
+              echo "state=broken"
+              echo "broken_reason=$reason"
+            } >>"$GITHUB_OUTPUT"
+            echo "::error::$reason"
+            exit 1
+          fi
+          # STATUS CAPTURED, like every other upstream-facing call in this step.
+          # Left to bare `set -e` this was the last one that could exit writing
+          # no `state=` at all: the issue steps are gated on the verdict rather
+          # than on `failure()`, so a permanent failure here -- `pull-requests:
+          # read` dropped from this job's `permissions:`, or a token scope
+          # narrowed -- reddens the scheduled run identically every day while
+          # nobody is told the pin stopped being watched. That is the same
+          # fault/verdict conflation the clone, `origin/HEAD`, pathspec,
+          # `git log` and `DEFAULT_BRANCH` branches each got a `broken` verdict
+          # for; this one is the same class.
+          #
+          # Anchored on the shapes that really are PERMANENT, for the same
+          # reason the clone branch is: this arm asserts as fact that the job's
+          # own token can no longer read pull requests. A 5xx, a timeout or a
+          # DNS blip says nothing about the pin and stays on the no-verdict
+          # path, where it reddens the run without filing a sticky issue
+          # claiming a cause nobody established.
+          #
+          # RATE LIMITING IS TESTED FIRST, and it has to be: GitHub answers a
+          # primary or secondary rate limit with **HTTP 403**, the same status
+          # as a genuine permission loss. Keying the permanent arm on the status
+          # alone would file a sticky issue swearing `pull-requests: read` had
+          # been revoked every time this scheduled job happened to run into a
+          # busy hour -- a fault reported as a verdict, which is the one
+          # direction the rest of this step is built to avoid. A rate limit
+          # clears on its own, so it belongs on the no-verdict path with the
+          # 5xxs.
+          #
+          # NOT-FOUND IS PERMANENT TOO, and it was the shape this arm was
+          # missing. A repository the token can no longer SEE -- made private,
+          # renamed, or access withdrawn -- is not reported as 403: `gh` goes
+          # through GraphQL and answers `Could not resolve to a Repository with
+          # the name '<owner>/<repo>'`, while a REST path answers `HTTP 404`.
+          # Both are deterministic and permanent, yet neither matched the
+          # transient alternation nor the permanent one, so they fell through
+          # to the no-verdict `exit 1` and reddened the scheduled run
+          # identically every day while filing nothing -- the exact
+          # fault/verdict conflation this arm was added to remove, just from
+          # the other end. (`Could not resolve to a User` is the same answer
+          # for an owner that has gone away, and is included for the same
+          # reason.) A 404 cannot be confused with a rate limit, which is
+          # matched first and answers 403.
+          pr_rc=0
+          bump="$(gh pr list --repo "$GH_REPO" --state open \
+            --head "$BUMP_BRANCH" --base "$DEFAULT_BRANCH" \
+            --json number,isCrossRepository,createdAt,headRefOid,baseRefName \
+            --jq '[.[] | select(.isCrossRepository == false
+                                and .baseRefName == env.DEFAULT_BRANCH)][0] // empty' \
+            2>"$gwtmp/gh-pr-list.err")" || pr_rc=$?
+          if [ "$pr_rc" -ne 0 ]; then
+            # Flattened for the same reason as `broken_reason` above.
+            pr_err="$(tr '\r\n' '  ' <"$gwtmp/gh-pr-list.err")"
+            if grep -qiE "rate limit|abuse detection|retry your request again later" <<<"$pr_err"; then
+              # Transient by definition -- fall through to the no-verdict path.
+              :
+            elif grep -qiE "HTTP 401|bad credentials|resource not accessible by integration|must have admin rights|needs the .+ scope|requires the .+ scope|GH_TOKEN environment variable|gh auth login|HTTP 403|HTTP 404|could not resolve to a repository|could not resolve to a user" <<<"$pr_err"; then
+              reason="This job can no longer list pull requests in \`$GH_REPO\` -- \`gh pr list\` exited $pr_rc saying: ${pr_err:-(no output)}. That will not clear on its own: either the \`pull-requests: read\` permission or the token's scope has been taken away, or the repository itself is gone from this token's view (renamed, made private, or access withdrawn). Without that read the watchdog cannot tell whether a bump PR is already open, so it can neither confirm nor deny that the pin is being moved. Restore the permission -- or correct the repository -- on the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\`."
+              {
+                echo "state=broken"
+                echo "broken_reason=$reason"
+              } >>"$GITHUB_OUTPUT"
+              echo "::error::$reason"
+              exit 1
+            fi
+            # NO verdict written: a transient API fault says nothing about the pin.
+            echo "::error::could not list open bump PRs in $GH_REPO -- gh exited $pr_rc: ${pr_err:-(no output)}"
+            exit 1
+          fi
+
+          bump_pr=""
+          bump_age_days=""
+          bump_delivers=""
+          if [ -n "$bump" ]; then
+            bump_pr="$(printf '%s' "$bump" | jq -r '.number')"
+            bump_created="$(printf '%s' "$bump" | jq -r '.createdAt')"
+            bump_age="$(( $(date -u +%s) - $(date -u -d "$bump_created" +%s) ))"
+            bump_age_days="$(( bump_age / 86400 ))"
+            bump_head="$(printf '%s' "$bump" | jq -r '.headRefOid')"
+
+            # EXISTENCE of a PR on that branch is not evidence about THIS
+            # backlog. The fleet reuses one stable branch across bumps, so a PR
+            # opened for an older upstream SHA would keep `delivered` -- and
+            # with it the whole watchdog -- muted for its full window while
+            # being unable to move the caller to what is owed now.
+            #
+            # Delivery is measured against the OLDEST owed commit, not the
+            # newest. `newest_sha` is recomputed from upstream's tip on EVERY
+            # run, so demanding the PR cover it made delivery a moving target:
+            # any watched commit landing after the fleet's last push to
+            # `ci/bump-cursor-review` flipped a genuinely-delivering PR back to
+            # "does not deliver". With a measured 0.39-day median gap between
+            # consumer-visible upstream commits (see above) and a 3-day grace
+            # window that must elapse before this code is reached at all, that
+            # made `delivered` effectively unreachable unless the fleet
+            # re-pushed for every single commit -- so the job would file a
+            # sticky issue saying a fresh bump is owed while the fleet had in
+            # fact delivered.
+            #
+            # `oldest_sha` is the right bar because it is the same commit the
+            # grace window is timed from: this job complains that the oldest
+            # owed commit has sat unpicked too long, so a PR whose pin CARRIES
+            # that commit has answered exactly the complaint being made. It also
+            # proves forward motion on its own -- `oldest_sha` is by
+            # construction inside `pin..<default>`, so a pin descended from it
+            # cannot be the current pin or anything behind it.
+            #
+            # Tested by ANCESTRY rather than equality: the fleet pins callers to
+            # upstream's main TIP, which legitimately sits ahead of any commit
+            # on the watched surface whenever an unwatched commit landed after
+            # it, and demanding equality there would call a perfectly good bump
+            # undelivered.
+            #
+            # The pin is read through the SAME `--print-pin` parser the top of
+            # this job uses, against a scratch root holding the PR's version of
+            # the caller, so this can never disagree with `workflow-pins` about
+            # which line is the pin.
+            #
+            # `bump_delivers` is TRI-state -- `yes`, `no`, `unknown` -- because
+            # "read the PR's pin, it does not deliver" and "could not read the
+            # PR's pin" are different facts and only one of them is a claim
+            # about the fleet. Both still read as UNDELIVERED for the mute
+            # decision (muting on an unreadable head would reinstate exactly the
+            # silent freeze this check exists to remove), but only `no` gets the
+            # asserting verdict text. Any of these is transient and lands on
+            # `unknown`: a network blip in the fetch, a `--print-pin` that
+            # cannot parse the PR's caller, or the race where the PR pins an
+            # upstream commit that landed AFTER the `$gwtmp/gw` clone was
+            # taken, which `GIT_NO_LAZY_FETCH=1 cat-file -e` then rejects.
+            # Reporting any of
+            # those as "the fleet owes a fresh bump" is the fault-as-verdict
+            # conflation the rest of this step exists to remove.
+            bump_delivers=unknown
+            scratch="$(mktemp -d)"
+            mkdir -p "$scratch/scripts" "$scratch/.github/workflows"
+            cp scripts/check-workflow-pins.mjs "$scratch/scripts/"
+            # Fetched by BRANCH, then matched against the SHA the API reported:
+            # fetching a bare SHA needs a server-side allowance this cannot
+            # assume, and the re-check catches the branch moving under us
+            # between the two calls.
+            if git fetch --quiet --depth=1 origin \
+                 "+refs/heads/$BUMP_BRANCH:refs/bump-head" 2>/dev/null \
+              && [ "$(git rev-parse refs/bump-head 2>/dev/null)" = "$bump_head" ] \
+              && git show "refs/bump-head:.github/workflows/ci-cursor-review.yml" \
+                   >"$scratch/.github/workflows/ci-cursor-review.yml" 2>/dev/null
+            then
+              head_pin="$(node "$scratch/scripts/check-workflow-pins.mjs" \
+                --print-pin cursor-review.yml 2>/dev/null)" || head_pin=""
+              # Whole-value, not per-line -- see the `pin_out` assertion above.
+              if ! [[ "$head_pin" =~ ^[0-9a-f]{40}$ ]]; then
+                bump_delivers=unknown
+                echo "Bump PR #$bump_pr: its caller pin did not read as a 40-hex SHA (got \"${head_pin:-(empty)}\"), so delivery could not be verified."
+              elif ! GIT_NO_LAZY_FETCH=1 git -C "$gwtmp/gw" cat-file -e "$head_pin" 2>/dev/null; then
+                bump_delivers=unknown
+                echo "Bump PR #$bump_pr pins $head_pin, which is not present in the upstream clone (it may have landed after that clone was taken), so delivery could not be verified."
+              else
+                # `--is-ancestor` exits 1 for "not an ancestor" and 128 for a
+                # git-level failure. Only the 1 is a finding about the PR.
+                anc_rc=0
+                git -C "$gwtmp/gw" merge-base --is-ancestor \
+                  "$oldest_sha" "$head_pin" 2>/dev/null || anc_rc=$?
+                case "$anc_rc" in
+                  0) bump_delivers=yes ;;
+                  1) bump_delivers=no ;;
+                  *) bump_delivers=unknown ;;
+                esac
+                echo "Bump PR #$bump_pr pins the caller to $head_pin; oldest owed is $oldest_sha -- delivers: $bump_delivers (ancestry check exited $anc_rc)"
+              fi
+            else
+              bump_delivers=unknown
+              echo "Bump PR #$bump_pr: could not read its caller pin, so delivery could not be verified and this job is not treating it as delivered."
+            fi
+            rm -rf "$scratch"
+
+            {
+              echo "bump_pr=$bump_pr"
+              echo "bump_age_days=$bump_age_days"
+              echo "bump_delivers=$bump_delivers"
+            } >>"$GITHUB_OUTPUT"
+          fi
+
+          # `delivered` SUSPENDS this watchdog, so it needs an upper bound of
+          # its own. Without one, a single abandoned or permanently-red PR on
+          # that branch makes this job exit 0 every day forever while the pin
+          # stays frozen -- the exact silent freeze this exists to end, only now
+          # with an alibi. Worse, if the pin first went stale while that PR was
+          # open no sticky issue was ever opened, so the `[ -n "$existing" ]`
+          # guard on the note step below leaves a `::notice::` on a scheduled
+          # run as the only record. Past the bump-PR window the verdict
+          # escalates to `stale`, which files the issue and names the stuck PR
+          # as the thing to chase.
+          if [ -n "$bump_pr" ] && [ "$bump_delivers" = yes ] \
+            && [ "$bump_age" -lt "$BUMP_PR_GRACE_SECONDS" ]; then
+            echo "state=delivered" >>"$GITHUB_OUTPUT"
+            echo "::notice::the github-workflows pin is stale, but bump PR #$bump_pr is open on $BUMP_BRANCH ($bump_age_days day(s) old) -- the fleet delivered and only the merge is owed."
+            exit 0
+          fi
+
+          echo "state=stale" >>"$GITHUB_OUTPUT"
+          # `age` is clamped to 0 for a future-dated commit, so quoting it as
+          # "landed 0 days ago" next to a stale verdict reads as nonsense.
+          # Name the real reason instead.
+          if [ -n "$future_dated" ]; then
+            landed="is dated $oldest_date -- implausibly far ahead of this runner's clock, so it is judged out of grace on that date rather than on elapsed time"
+          else
+            landed="landed $((age / 86400)) days ago"
+          fi
+          if [ -n "$bump_pr" ] && [ "$bump_delivers" = no ]; then
+            echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) $landed. PR #$bump_pr is open on $BUMP_BRANCH, but its own caller pin does not carry the oldest owed commit ($oldest_sha) -- the fleet reuses that branch, so this is an older bump, not a delivery of this backlog."
+          elif [ -n "$bump_pr" ] && [ "$bump_delivers" = unknown ]; then
+            echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) $landed. PR #$bump_pr is open on $BUMP_BRANCH, but this job could NOT VERIFY which commit its caller pin carries, so it is not being counted as a delivery of this backlog. Check that PR before assuming a fresh bump is owed."
+          elif [ -n "$bump_pr" ]; then
+            echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) $landed. Bump PR #$bump_pr is open on $BUMP_BRANCH but has been unmerged for $bump_age_days days, so delivery is not what is missing -- the merge is."
+          else
+            echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) $landed -- and no open PR exists on $BUMP_BRANCH. Nothing is moving this pin."
+          fi
+          exit 1
+
+      # --- Sticky-issue bookkeeping -------------------------------------
+      #
+      # Two issues, one per failure MODE, because they have different owners
+      # and different fixes: the pin is stale (chase the bump), or this job
+      # cannot answer the question at all (fix the job or the pin's target).
+      #
+      # Each mode is identified by its OWN label -- `cursor-review-pin-stale`
+      # and `cursor-review-pin-blocked` -- and every lookup below filters on
+      # that label ALONE. Two reasons, and the first is why listing issues and
+      # matching titles off the first page is not an option: `gh issue list
+      # --limit 100` returns only the 100 newest-created open issues, so on a
+      # busier repo a title match silently misses -- and a miss is not benign
+      # in either direction. On the stale path it takes `gh issue create`
+      # instead of `gh issue comment`, filing a fresh duplicate every day the
+      # pin stays stale; on the note and close paths it skips the comment and
+      # the close, leaving alerts open forever. At most one issue carries a
+      # mode label, so a label lookup cannot truncate.
+      #
+      # The second reason is that the title is a HUMAN-EDITABLE field. These
+      # lookups used to AND the mode label with exact title equality, because
+      # one shared `cursor-review-pin` label could not tell the two modes
+      # apart -- which meant a maintainer who validly retitled the open issue,
+      # even just to add context, made every subsequent lookup miss: the next
+      # stale run filed a second issue and the renamed one was never closed on
+      # recovery. A label is not something a reader edits in passing, so it
+      # identifies the thread across a retitle. The shared
+      # `cursor-review-pin` label stays on both as the grouping label a human
+      # browses by; it is no longer what finds them.
+      #
+      # Both labels are created idempotently before each lookup so the first
+      # run on a fresh repo does not have to be the one that remembered.
+      #
+      # ONE ordering rule, on every path that picks a single issue: the
+      # LOWEST-numbered match -- the original sticky thread, the one carrying
+      # the history. That governs the open/update lookups AND the `--state
+      # closed` reopen lookups, which is the whole point of stating it once.
+      # The reopen lookups used to take `max_by`, which is the newest match --
+      # so a mode that had ever accumulated a duplicate revived the DUPLICATE
+      # on the next cycle and orphaned the thread the rest of this block calls
+      # canonical. Picking a single issue and picking the oldest are now the
+      # same decision everywhere.
+      #
+      # The close paths are the deliberate exception, and they do not pick:
+      # they close EVERY open match, so a duplicate that somehow exists is
+      # reconciled rather than left falsely open. That asymmetry is intended.
+      # Commenting on one thread while a stale duplicate sits open is a
+      # cosmetic wart; leaving a duplicate open after recovery is a false
+      # alert, so the close side is the one that must be exhaustive.
+      - name: Open or update the watchdog-blocked issue
+        if: failure() && steps.assess.outputs.state == 'broken'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE_LABEL: cursor-review-pin
+          MODE_LABEL: cursor-review-pin-blocked
+          TITLE: "cursor-review: the pin-freshness watchdog cannot run"
+          REASON: ${{ steps.assess.outputs.broken_reason }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh label create "$ISSUE_LABEL" --force --color ededed \
+            --description "cursor-review pin freshness watchdog" >/dev/null
+          gh label create "$MODE_LABEL" --force --color ededed \
+            --description "cursor-review pin freshness watchdog: cannot run" >/dev/null
+          existing="$(gh issue list --state open --label "$MODE_LABEL" --limit 100 \
+            --json number --jq 'min_by(.number).number // empty')"
+          body="$(printf '%s\n' \
+            "The daily \`cursor-review-pin-freshness\` job stopped before it could judge whether" \
+            "the \`Comfy-Org/github-workflows\` pin is current, so **the pin is not being watched**" \
+            "until this is fixed. This is not a staleness report -- it is the watchdog saying it" \
+            "cannot answer the question." \
+            "" \
+            "$REASON" \
+            "" \
+            "This issue closes itself on the first daily run that reaches a verdict again." \
+            "" \
+            "Run: $RUN_URL")"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+            exit 0
+          fi
+
+          # REOPEN rather than start a second thread, exactly as the stale path
+          # below does. Without this, every broken -> recovered -> broken cycle
+          # files a fresh issue instead of reviving the previous one, splitting
+          # the history the sticky-issue design is built around -- and the
+          # accumulating closed issues under this mode's own label erode the
+          # `--state closed --limit 100` lookup on the line below. The stale
+          # mode carries a DIFFERENT label, so neither mode's closed pile can
+          # crowd the other's lookup any more.
+          #
+          # `min_by`, matching the open lookup above -- the oldest match is the
+          # original sticky thread. See the ordering note on this job's issue
+          # bookkeeping above.
+          closed="$(gh issue list --state closed --label "$MODE_LABEL" --limit 100 \
+            --json number --jq 'min_by(.number).number // empty')"
+          if [ -n "$closed" ]; then
+            gh issue reopen "$closed"
+            gh issue comment "$closed" --body "$body"
+          else
+            gh issue create --title "$TITLE" \
+              --label "$ISSUE_LABEL" --label "$MODE_LABEL" --body "$body"
+          fi
+
+      # Gated on the VERDICT rather than on `failure()`: a clone or API failure
+      # reddens the scheduled run (visible as a step annotation) but must not
+      # file an issue claiming the pin is stale when nothing established that.
+      - name: Open or update the stale-pin issue
+        # `id:` so the watchdog-blocked close below can require this step to
+        # have SUCCEEDED before it closes its own alert on a `stale` verdict.
+        id: stale_issue
+        if: failure() && steps.assess.outputs.state == 'stale'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE_LABEL: cursor-review-pin
+          MODE_LABEL: cursor-review-pin-stale
+          TITLE: "cursor-review: the github-workflows pin is stale and nothing is moving it"
+          BUMP_BRANCH: ci/bump-cursor-review
+          PIN: ${{ steps.assess.outputs.pin }}
+          NEWEST_SHA: ${{ steps.assess.outputs.newest_sha }}
+          NEWEST_DATE: ${{ steps.assess.outputs.newest_date }}
+          OLDEST_SHA: ${{ steps.assess.outputs.oldest_sha }}
+          OLDEST_DATE: ${{ steps.assess.outputs.oldest_date }}
+          BEHIND_COUNT: ${{ steps.assess.outputs.behind_count }}
+          UPSTREAM_BRANCH: ${{ steps.assess.outputs.upstream_branch }}
+          # The enforced window lengths, derived by `assess` from the same
+          # variables its arithmetic uses, so this durable issue cannot assert
+          # a window the verdict was not reached under.
+          GRACE_DAYS: ${{ steps.assess.outputs.grace_days }}
+          # Set only when the oldest owed commit is dated implausibly far
+          # ahead of the runner's clock, which is why this verdict says "past
+          # the grace window" for a commit whose age reads as 0.
+          FUTURE_DATED: ${{ steps.assess.outputs.future_dated }}
+          # Empty unless a bump PR is open but has itself gone past the
+          # bump-PR window, which is the other way this verdict is reached.
+          BUMP_PR: ${{ steps.assess.outputs.bump_pr }}
+          BUMP_AGE_DAYS: ${{ steps.assess.outputs.bump_age_days }}
+          BUMP_DELIVERS: ${{ steps.assess.outputs.bump_delivers }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh label create "$ISSUE_LABEL" --force --color ededed \
+            --description "cursor-review pin freshness watchdog" >/dev/null
+          gh label create "$MODE_LABEL" --force --color ededed \
+            --description "cursor-review pin freshness watchdog: the pin is stale" >/dev/null
+
+          if [ -n "$BUMP_PR" ] && [ "$BUMP_DELIVERS" = no ]; then
+            cause="$(printf '%s ' \
+              "PR #$BUMP_PR is open on \`$BUMP_BRANCH\`, but its own caller pin does not carry" \
+              "the oldest owed commit -- the fleet reuses that branch, so this is an older bump" \
+              "rather than a delivery of this backlog. A fresh bump is owed.")"
+          elif [ -n "$BUMP_PR" ] && [ "$BUMP_DELIVERS" = unknown ]; then
+            cause="$(printf '%s ' \
+              "PR #$BUMP_PR is open on \`$BUMP_BRANCH\`, but this job could not verify which" \
+              "commit its caller pin carries, so it is not counted as a delivery of this" \
+              "backlog. That is a limit of this check, NOT a finding about the fleet -- read" \
+              "that PR before assuming a fresh bump is owed.")"
+          elif [ -n "$BUMP_PR" ]; then
+            cause="$(printf '%s ' \
+              "PR #$BUMP_PR is open on \`$BUMP_BRANCH\` but has been unmerged for" \
+              "$BUMP_AGE_DAYS days, so delivery is not what is missing -- the merge is.")"
+          else
+            cause="$(printf '%s ' \
+              "No PR is open on the \`$BUMP_BRANCH\` branch, so nothing is moving the pin.")"
+          fi
+          cause="${cause% }"
+
+          # The grace window is normally judged on elapsed time, but a commit
+          # dated implausibly far ahead of the runner's clock is judged out of
+          # grace on the DATE instead. Say so, or the table above (which shows
+          # that future date) silently contradicts the sentence below it.
+          if [ -n "$FUTURE_DATED" ]; then
+            overdue="$(printf '%s ' \
+              "The oldest one is dated **$FUTURE_DATED**, which is implausibly far ahead of this" \
+              "runner's clock -- so its true age cannot be measured and it is judged out of the" \
+              "$GRACE_DAYS-day grace window on that basis rather than on elapsed time. Check the committer" \
+              "clock upstream; a date far enough ahead would otherwise hold this pin in grace" \
+              "indefinitely.")"
+            overdue="${overdue% }"
+          else
+            overdue="The oldest one has been sitting there past the $GRACE_DAYS-day grace window."
+          fi
+
+          # Step 1's remediation has to agree with the `cause` paragraph built
+          # above. A single fixed wording -- "if one is named above, it has
+          # already delivered both pins and only the merge is owed" -- was
+          # emitted for EVERY verdict that names a PR, including the two that
+          # say the opposite: `no`, where the PR's own pin does not carry the
+          # oldest owed commit and a fresh bump is owed, and `unknown`, where
+          # delivery could not be verified at all. It contradicted the
+          # diagnosis in the same issue body and pointed the reader at a merge
+          # that cannot clear the reported backlog.
+          if [ -z "$BUMP_PR" ]; then
+            step1="$(printf '%s\n' \
+              "1. **Is there a bump PR waiting on a human?** None is open on \`$BUMP_BRANCH\`, so" \
+              "   nothing is currently moving the pin -- go on to step 2 and step 3.")"
+          elif [ "$BUMP_DELIVERS" = yes ]; then
+            step1="$(printf '%s\n' \
+              "1. **Is there a bump PR waiting on a human?** PR #$BUMP_PR has already delivered" \
+              "   both pins and only the merge is owed -- review and land it, or close it so this" \
+              "   job stops counting it as delivery.")"
+          elif [ "$BUMP_DELIVERS" = no ]; then
+            step1="$(printf '%s\n' \
+              "1. **Is there a bump PR waiting on a human?** PR #$BUMP_PR is open, but its caller" \
+              "   pin does not carry the oldest owed commit, so merging it will NOT clear this" \
+              "   backlog. A fresh bump is owed -- re-dispatch the fleet (step 2), or hand-bump" \
+              "   (step 3).")"
+          else
+            # The bar named here is `$OLDEST_SHA`, matching the `no` branch
+            # above and this job's OWN delivery test
+            # (`merge-base --is-ancestor "$oldest_sha" "$head_pin"`). Naming
+            # `$NEWEST_SHA` made the advice STRICTER than the criterion it
+            # stands in for -- upstream's tip is recomputed every run, so a
+            # reader who found the PR pinned to anything older would
+            # re-dispatch or close a PR this job would itself have counted as
+            # delivering, which is the same moving-target bar the delivery
+            # test above deliberately rejected.
+            step1="$(printf '%s\n' \
+              "1. **Is there a bump PR waiting on a human?** PR #$BUMP_PR is open, but this job" \
+              "   could not verify which commit its caller pin carries. Read that PR first: if its" \
+              "   pin already carries the oldest owed commit \`$OLDEST_SHA\`, only the merge is" \
+              "   owed; if it does not, a fresh bump is owed and steps 2 and 3 apply.")"
+          fi
+
+          body="$(printf '%s\n' \
+            "\`.github/workflows/ci-cursor-review.yml\` is pinned to \`$PIN\`, which is" \
+            "**$BEHIND_COUNT consumer-visible commit(s) behind \`Comfy-Org/github-workflows@$UPSTREAM_BRANCH\`**." \
+            "" \
+            "| | commit | landed |" \
+            "| --- | --- | --- |" \
+            "| oldest not picked up | \`$OLDEST_SHA\` | $OLDEST_DATE |" \
+            "| newest upstream (what a bump moves to) | \`$NEWEST_SHA\` | $NEWEST_DATE |" \
+            "" \
+            "$overdue $cause" \
+            "" \
+            "Things to check, in this order:" \
+            "" \
+            "$step1" \
+            "2. **Is this repo still on the bump fleet's roster?** The fleet only visits repos" \
+            "   listed in the \`CURSOR_REVIEW_CALLERS\` secret on \`Comfy-Org/github-workflows\`," \
+            "   whose canonical copy lives in the private ops repo (deliberately not named here --" \
+            "   this repo is public). A fleet run logs a \`roster: N caller(s)\` audit line; if" \
+            "   this repo is missing, add it there and re-dispatch the fleet. That was the" \
+            "   original failure -- a silently dropped roster entry, for three weeks." \
+            "3. **Or hand-bump.** Move BOTH pins in \`.github/workflows/ci-cursor-review.yml\`" \
+            "   (the \`uses:\` SHA and the \`workflows_ref:\` input) to \`$NEWEST_SHA\`, update the" \
+            "   trailing \`# github-workflows $UPSTREAM_BRANCH (short)\` comment, and verify with:" \
+            "" \
+            "       node scripts/check-workflow-pins.mjs" \
+            "" \
+            "This issue closes itself on the first daily run that finds the pin moving again." \
+            "" \
+            "Run: $RUN_URL")"
+
+          existing="$(gh issue list --state open --label "$MODE_LABEL" --limit 100 \
+            --json number --jq 'min_by(.number).number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+            exit 0
+          fi
+
+          # REOPEN rather than open a second thread. The close step below tells
+          # the reader this issue "reopens if the pin freezes again", and the
+          # sticky-issue design is built on one thread carrying the history --
+          # both of which are false if every stale cycle starts a fresh issue.
+          # `min_by`, matching the open lookup above: same ordering rule, same
+          # canonical thread. See the ordering note on this job's issue
+          # bookkeeping above.
+          closed="$(gh issue list --state closed --label "$MODE_LABEL" --limit 100 \
+            --json number --jq 'min_by(.number).number // empty')"
+          if [ -n "$closed" ]; then
+            gh issue reopen "$closed"
+            gh issue comment "$closed" --body "$body"
+          else
+            gh issue create --title "$TITLE" \
+              --label "$ISSUE_LABEL" --label "$MODE_LABEL" --body "$body"
+          fi
+
+      # Delivered-but-unmerged is a pass, so it never reaches the step above --
+      # but if the issue is already open it should say why it is still open.
+      # When no issue is open the `::notice::` from `assess` is the whole
+      # record, which is right: an owed merge is already visible as a PR, and
+      # the bump-PR window above means this cannot stay quiet indefinitely.
+      - name: Note the open bump PR on the stale-pin issue
+        if: success() && steps.assess.outputs.state == 'delivered'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE_LABEL: cursor-review-pin
+          MODE_LABEL: cursor-review-pin-stale
+          BUMP_BRANCH: ci/bump-cursor-review
+          BUMP_PR: ${{ steps.assess.outputs.bump_pr }}
+          BUMP_AGE_DAYS: ${{ steps.assess.outputs.bump_age_days }}
+          # See the note on `GRACE_DAYS` in the stale-pin issue step.
+          BUMP_PR_GRACE_DAYS: ${{ steps.assess.outputs.bump_pr_grace_days }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh label create "$ISSUE_LABEL" --force --color ededed \
+            --description "cursor-review pin freshness watchdog" >/dev/null
+          gh label create "$MODE_LABEL" --force --color ededed \
+            --description "cursor-review pin freshness watchdog: the pin is stale" >/dev/null
+          existing="$(gh issue list --state open --label "$MODE_LABEL" --limit 100 \
+            --json number --jq 'min_by(.number).number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$(printf '%s\n' \
+              "The bump fleet has delivered: #$BUMP_PR is open on \`$BUMP_BRANCH\` and is" \
+              "$BUMP_AGE_DAYS day(s) old. Only the merge is owed now, so this issue stays open --" \
+              "and closes itself -- on the first daily run after that PR lands. If it goes" \
+              "unmerged past $BUMP_PR_GRACE_DAYS day(s) this job stops treating it as delivery and reports the pin" \
+              "stale again, naming the PR as the thing to chase." \
+              "" \
+              "Run: $RUN_URL")"
+          fi
+
+      # Any verdict at all means the job got past the pin, ancestry and
+      # pathspec checks, which is exactly what the watchdog-blocked issue is
+      # about -- and that INCLUDES `stale`, which is a verdict the watchdog
+      # reached and then failed the job on. Gating this on `success()` would
+      # skip it in the one non-broken state that exits 1, so a blocked issue
+      # opened by an earlier `broken` run would stay open indefinitely once the
+      # job recovered into a stale pin, claiming the pin is not being watched
+      # while the stale-pin issue alongside it says otherwise. `!cancelled()`
+      # plus an explicit `!= 'broken'` is what actually expresses "reached a
+      # verdict": a hard fault writes no `state` and is excluded by `!= ''`.
+      #
+      # But a `stale` verdict ALSO requires the stale-pin issue step above to
+      # have SUCCEEDED. That step is the one alert a reader is left with on a
+      # `broken -> stale` transition, and because this gate is deliberately
+      # not `success()`, a transient `gh` failure up there used to close the
+      # watchdog-blocked issue anyway: the run went red with NO sticky issue
+      # open in EITHER mode until the next daily run re-filed one, which is
+      # the both-alerts-gone window the two issues exist to prevent. Requiring
+      # `steps.stale_issue.outcome == 'success'` keeps the deliberate "a stale
+      # verdict still closes the blocked issue" behaviour and drops only the
+      # case where the replacement alert was never filed. On every other state
+      # that step is SKIPPED, not failed, so the clause is scoped to `stale`
+      # rather than asserting success unconditionally.
+      #
+      # `!cancelled()` and NOT `always()`, which is true for a CANCELLED run as
+      # well -- and a cancellation is the one outcome that is not a verdict.
+      # This job is under `cancel-in-progress` and a 10-minute timeout, so a run
+      # killed after `assess` wrote its `state` but before this step would,
+      # under `always()`, close the watchdog-blocked issue on the strength of a
+      # walk that never finished. `!cancelled()` keeps every real outcome --
+      # success and failure alike, so a `stale` verdict still closes this issue
+      # -- and drops only that one.
+      - name: Close the watchdog-blocked issue once the job can run again
+        if: >-
+          !cancelled() && steps.assess.outputs.state != ''
+          && steps.assess.outputs.state != 'broken'
+          && (steps.assess.outputs.state != 'stale'
+          || steps.stale_issue.outcome == 'success')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE_LABEL: cursor-review-pin
+          MODE_LABEL: cursor-review-pin-blocked
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh label create "$ISSUE_LABEL" --force --color ededed \
+            --description "cursor-review pin freshness watchdog" >/dev/null
+          gh label create "$MODE_LABEL" --force --color ededed \
+            --description "cursor-review pin freshness watchdog: cannot run" >/dev/null
+          comment="$(printf '%s\n' \
+            "The watchdog reached a verdict again, so the pin is being watched." \
+            "" \
+            "Run: $RUN_URL")"
+          # Every open match the lookup returns, not just the first. The mode
+          # label is meant to carry exactly one thread, but if a duplicate ever
+          # does exist -- filed by a run that predates this bookkeeping, or by
+          # a human -- closing one and leaving the other open leaves a false
+          # "the pin is not being watched" alert standing, which is the
+          # specific outcome this step exists to clear. Reading from a
+          # here-string rather than a pipe keeps the loop in THIS shell; an
+          # empty list yields one empty line, which the guard drops.
+          #
+          # "Every match the lookup returns" is the honest claim, not "every
+          # match": `--limit 100` returns the 100 newest-created open issues,
+          # so a mode label carrying more than 100 open duplicates would leave
+          # the oldest ones standing. Not worth looping to exhaustion for --
+          # reaching that state needs 100+ duplicate alerts under one machine
+          # label, which is a far louder problem than the one this reconciles.
+          open_issues="$(gh issue list --state open --label "$MODE_LABEL" --limit 100 \
+            --json number --jq '.[].number')"
+          while IFS= read -r issue_number; do
+            [ -n "$issue_number" ] || continue
+            gh issue close "$issue_number" --comment "$comment"
+          done <<<"$open_issues"
+
+      # Closes on `current` AND on `grace`, and the two are not the same
+      # sentence. `grace` is in fact the NORMAL state to land in after a bump:
+      # the oldest unpicked commit is under 3 days old, which -- at the 0.39-day
+      # median gap between consumer-visible upstream commits measured above --
+      # is what a bump produces almost every time, because upstream keeps
+      # committing while the PR is in review. Closing only on `current` would
+      # therefore leave this issue open through most successful bumps, so
+      # `grace` closes it too -- but the comment is written per state, because
+      # saying "current again" there would be false.
+      #
+      # What the `grace` comment must NOT do is assert the pin MOVED. Nothing
+      # on this path establishes that: `age` is derived purely from the oldest
+      # currently-owed commit, and that commit can drop out of the query with
+      # the pin untouched -- upstream narrowing a glob or adding an
+      # `:(exclude)` to `WATCHED_PATHSPECS`, which `assess` re-reads live every
+      # run, is enough to shrink the backlog on a completely frozen pin. So the
+      # comment states the BACKLOG fact it actually has and quotes the current
+      # pin for the reader to compare, rather than concluding a bump landed.
+      # Proving movement needs the pin recorded at filing time compared against
+      # the pin now, which means persisting it across runs -- tracked
+      # separately rather than bolted on here.
+      - name: Close the stale-pin issue once the pin is moving again
+        # `success()` is the JOB's cumulative status, not this step's
+        # precondition -- so a transient `gh` failure in the verdict-gated
+        # watchdog-blocked close directly above would skip this step and leave a
+        # stale-pin issue open on a run where the pin is demonstrably moving.
+        # The states are named explicitly rather than filtered with
+        # `!= 'delivered'`, because under a gate this permissive that spelling
+        # would also match `stale`, `broken` and the empty no-verdict fault --
+        # and closing the stale-pin issue on a `stale` verdict is precisely
+        # backwards.
+        #
+        # `!cancelled()` rather than `always()` for the reason given on the step
+        # above: a cancelled run reached no verdict, and a `current`/`grace`
+        # output read off a walk that was killed part-way must not close this
+        # issue.
+        if: >-
+          !cancelled() && (steps.assess.outputs.state == 'current'
+          || steps.assess.outputs.state == 'grace')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE_LABEL: cursor-review-pin
+          MODE_LABEL: cursor-review-pin-stale
+          STATE: ${{ steps.assess.outputs.state }}
+          # Unset on `current` -- `assess` exits before writing them -- and
+          # unread on that branch. `env:` always defines the name, so `set -u`
+          # is satisfied either way.
+          BEHIND_COUNT: ${{ steps.assess.outputs.behind_count }}
+          UPSTREAM_BRANCH: ${{ steps.assess.outputs.upstream_branch }}
+          OLDEST_SHA: ${{ steps.assess.outputs.oldest_sha }}
+          # Quoted on the `grace` comment so the reader can compare it against
+          # the pin this issue was filed on; always written by `assess`.
+          PIN: ${{ steps.assess.outputs.pin }}
+          # See the note on `GRACE_DAYS` in the stale-pin issue step.
+          GRACE_DAYS: ${{ steps.assess.outputs.grace_days }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh label create "$ISSUE_LABEL" --force --color ededed \
+            --description "cursor-review pin freshness watchdog" >/dev/null
+          gh label create "$MODE_LABEL" --force --color ededed \
+            --description "cursor-review pin freshness watchdog: the pin is stale" >/dev/null
+          # The verdict text is built unconditionally -- it reads only `env:`
+          # values, and the `current` branch deliberately reads none of the
+          # ones `assess` leaves unset on that path -- so the close loop below
+          # can stay a plain loop over every open match.
+          if [ "$STATE" = "current" ]; then
+            verdict="The \`Comfy-Org/github-workflows\` pin is current again."
+          else
+            # TWO paragraphs, built and joined separately. A `""` element in
+            # the middle of a single `printf '%s '` list does NOT make a
+            # paragraph break -- it is joined with a space like every other
+            # element, emitting one extra SPACE -- so the backlog fact and
+            # the "this is not proof the pin moved" caveat rendered as one
+            # run-on paragraph, blunting exactly the distinction they draw.
+            # A blank LINE is what markdown needs, so join with `%s\n`, as
+            # the `body=` blocks above do.
+            para1="$(printf '%s ' \
+              "Nothing is overdue any more. The pin is still $BEHIND_COUNT consumer-visible" \
+              "commit(s) behind \`Comfy-Org/github-workflows@$UPSTREAM_BRANCH\`, but the oldest one it has" \
+              "not picked up (\`$OLDEST_SHA\`) landed inside the $GRACE_DAYS-day grace window, so this" \
+              "issue's premise -- a pin sitting frozen PAST that window -- no longer holds.")"
+            para2="$(printf '%s ' \
+              "That is a fact about the BACKLOG, not proof that the pin itself moved: the" \
+              "backlog also shrinks if upstream narrows \`WATCHED_PATHSPECS\`. The pin is" \
+              "currently \`$PIN\` -- compare it with the one quoted when this issue was filed" \
+              "before concluding a bump landed. It reopens on the first daily run that finds" \
+              "the pin frozen past the grace window again.")"
+            # `printf '%s '` leaves one trailing space on each; drop it so
+            # the join below is not double-spaced.
+            verdict="$(printf '%s\n' "${para1% }" "" "${para2% }")"
+          fi
+          comment="$(printf '%s\n' \
+            "$verdict" \
+            "" \
+            "Run: $RUN_URL")"
+          # Every open match the lookup returns -- same loop, same `--limit
+          # 100` bound, see the note on the watchdog-blocked close above.
+          # Leaving a duplicate stale-pin issue open is worse here than
+          # there: it asserts the pin is frozen on a run that just proved it is
+          # not, which is how a sticky alert loses its credibility.
+          open_issues="$(gh issue list --state open --label "$MODE_LABEL" --limit 100 \
+            --json number --jq '.[].number')"
+          while IFS= read -r issue_number; do
+            [ -n "$issue_number" ] || continue
+            gh issue close "$issue_number" --comment "$comment"
+          done <<<"$open_issues"
