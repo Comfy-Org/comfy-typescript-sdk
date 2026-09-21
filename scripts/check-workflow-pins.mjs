@@ -121,9 +121,16 @@ const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 const USES_RE = new RegExp(
   String.raw`^(\s*)(["']?)uses\2\s*:\s*(["']?)` +
     REUSABLE_OWNER_REPO.replace("/", "\\/") +
-    String.raw`\/(\S+?)@([^\s"']+?)\3\s*(?:#(.*))?$`,
+    String.raw`\/(\S+?)@([^\s"']+?)\3(?:\s+#(.*))?\s*$`,
 );
-const WORKFLOWS_REF_RE = /^\s*workflows_ref:\s*(["']?)([^\s"']+?)\1\s*(?:#.*)?$/;
+// The `#` must be preceded by WHITESPACE in both patterns: YAML starts a comment
+// only at a `#` that follows a space (or opens the line), so
+// `workflows_ref: <40-hex>#oops` is the single scalar `<40-hex>#oops`, not a pin
+// carrying a comment. Allowing a bare `#` let that line lint CLEAN as a 40-hex
+// pin while GitHub received the literal `<sha>#oops` -- and handed the same
+// wrong value to the `cursor-review-pin-freshness` watchdog via `--print-pin`.
+// The closing `\s*` still tolerates trailing whitespace.
+const WORKFLOWS_REF_RE = /^\s*workflows_ref:\s*(["']?)([^\s"']+?)\1(?:\s+#.*)?\s*$/;
 // A line that opens a BLOCK SCALAR (`run: |`, `body: >-`). Group 1 spans the
 // indent AND any `- ` sequence marker, so its length is the KEY's column --
 // block content is indented deeper than the key, which for `- run: |` is not
@@ -136,9 +143,8 @@ const BLOCK_SCALAR_RE = /^(\s*(?:-\s+)?)[^\s#][^:]*:\s*[|>][0-9+-]*\s*(?:#.*)?$/
 const PAREN_SHA_RE = /\(([0-9a-f]{7,40})\)/g;
 // Fallback for a comment written without parentheses: 7-40 hex characters as a
 // whole word. 7 is git's minimum abbreviation, so shorter tokens (`# v7`) are
-// version spellings. All-DIGIT runs are dropped: `20260919` is a date, and a
-// real abbreviated SHA that happens to be all digits is a 1-in-1.7-million
-// coincidence that costs only a comment reworded to the parenthesised form.
+// version spellings. DATE-shaped runs are dropped -- see `commentShaCandidates`
+// for why that test is a LENGTH one rather than "contains no a-f".
 const BARE_SHA_RE = /\b[0-9a-f]{7,40}\b/g;
 // A `<job id>:` key -- a bare key with no value, optionally quoted. GitHub
 // restricts job ids to `[A-Za-z_][A-Za-z0-9_-]*`.
@@ -148,12 +154,24 @@ const JOBS_KEY_RE = /^(["']?)jobs\1\s*:\s*(?:#.*)?$/;
 /**
  * Commit abbreviations the trailing comment claims, most precise form first.
  *
- * The all-digit filter applies to BOTH branches. It used to sit only on the
+ * The date filter applies to BOTH branches. It used to sit only on the
  * fallback, so the parenthesised branch returned every token raw and
  * short-circuited past it -- and since the caller requires every candidate to
  * prefix the ref, a perfectly correct
  * `# github-workflows main (425c154) -- bumped (20260919)` reddened CI over the
- * date. That is the same false positive the digit filter was added to remove.
+ * date. That is the same false positive the filter was added to remove.
+ *
+ * The test is LENGTH, not "contains an a-f". Dropping every ALL-DIGIT token was
+ * far too broad: a hex abbreviation is all digits with probability (10/16)^n,
+ * which at git's 7-character minimum is ~3.7% -- about 1 in 27, not the
+ * 1-in-1.7-million a "digits are never a SHA" reading assumes. That silently
+ * skipped assertion (3) for roughly one caller in 27, and a check that silently
+ * verifies nothing is the direction this script's header promises never to fail
+ * in. A date written for humans is 8 digits (`20260919`), so only 8-digit runs
+ * are dropped; 7-digit and 9-plus-digit runs are kept and checked like any
+ * other abbreviation. An 8-character all-digit SHA abbreviation is still
+ * skipped -- ~2.3%, and unlike the old filter it costs only the one caller that
+ * writes its abbreviation to 8 characters instead of the documented 7.
  *
  * ALL surviving candidates are returned, not just the first. A comment naming a
  * second commit is ambiguous either way, and honouring only the first would
@@ -162,10 +180,10 @@ const JOBS_KEY_RE = /^(["']?)jobs\1\s*:\s*(?:#.*)?$/;
  * allowed to be wrong in.
  */
 function commentShaCandidates(comment) {
-  const looksHex = (c) => /[a-f]/.test(c);
-  const parenthesised = [...comment.matchAll(PAREN_SHA_RE)].map((m) => m[1]).filter(looksHex);
+  const notADate = (c) => !/^[0-9]{8}$/.test(c);
+  const parenthesised = [...comment.matchAll(PAREN_SHA_RE)].map((m) => m[1]).filter(notADate);
   if (parenthesised.length > 0) return parenthesised;
-  return (comment.match(BARE_SHA_RE) ?? []).filter(looksHex);
+  return (comment.match(BARE_SHA_RE) ?? []).filter(notADate);
 }
 
 /**
