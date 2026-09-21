@@ -66,8 +66,20 @@ function run(root: string, ...args: string[]) {
   const result = spawnSync(
     process.execPath,
     [join(root, "scripts", "check-workflow-pins.mjs"), ...args],
-    { encoding: "utf8" },
+    // `spawnSync` BLOCKS the worker's event loop, so vitest's per-test timeout
+    // can never fire on a wedged child -- the cap has to be spawnSync's own.
+    { encoding: "utf8", timeout: 30_000, killSignal: "SIGKILL" },
   );
+  // A child that failed to START (ENOENT, EAGAIN) or that was KILLED (the
+  // timeout above, or any signal) reports that out of band: `status`, `stdout`
+  // and `stderr` all come back null, and every assertion downstream would
+  // degrade to "expected null to be 0" with the real cause lost. Surface it.
+  if (result.error) throw result.error;
+  if (result.signal !== null) {
+    throw new Error(
+      `check-workflow-pins.mjs was killed by ${result.signal} (args: ${args.join(" ") || "<none>"})`,
+    );
+  }
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
@@ -101,11 +113,19 @@ function pinnedCaller(usesRef = SHA, withRef = SHA, comment = ""): string[] {
 }
 
 /**
- * An earlier job whose `run: |` body quotes a `uses:` line naming a DIFFERENT
+ * An earlier job whose `run: |` body carries a `uses:` line naming a DIFFERENT
  * commit -- the shape this repo's own ci.yml writes when it explains the pin
  * pair inside an issue body. A parser that read block-scalar content would
  * find a phantom second caller here: a red build over a pin that does not
  * exist, and an ambiguous `--print-pin`.
+ *
+ * The decoy is a HEREDOC body line, not an `echo "uses: ..."` argument, and
+ * that spelling is load-bearing. The caller regex anchors `uses` as the first
+ * token after the indent (`^(\s*)(["']?)uses\2\s*:`), so an `echo`-prefixed
+ * line is rejected on spelling alone and never reaches the block-scalar skip
+ * -- a decoy written that way would still pass with the skip DELETED from the
+ * script, pinning nothing. Here `uses:` is the first non-space token of the
+ * body, so only the block-scalar skip keeps it from reading as a caller.
  */
 const DECOY_USES_LINE = `    uses: ${REUSABLE}@${SHA}`;
 const DECOY_LINES = [
@@ -115,8 +135,10 @@ const DECOY_LINES = [
   "    steps:",
   "      - name: Explain the pin pair",
   "        run: |",
-  `          echo "uses: ${REUSABLE}@${OTHER}"`,
-  `          echo "workflows_ref: ${OTHER}"`,
+  "          cat <<'EOF'",
+  `          uses: ${REUSABLE}@${OTHER}`,
+  `          workflows_ref: ${OTHER}`,
+  "          EOF",
   "  cursor-review:",
   DECOY_USES_LINE,
   "    with:",
@@ -320,19 +342,28 @@ describe("shapes that must NOT read as a caller", () => {
   });
 
   it("ends a `- run: |` block at its sibling key, not at the next job", () => {
-    // Two things at once. The block scalar's owning key is `run`, whose column
-    // includes the `- ` sequence marker; measuring from the dash instead would
-    // swallow `shell:` and everything after it, including the real caller
-    // below. And this is the dash-carrying spelling of the decoy -- the case
-    // above writes it under a `- name:` step, where `run:` has no dash of its
-    // own -- so both block-scalar shapes are proven to hide a `uses:` line.
+    // The dash-carrying spelling of the decoy: here `run:` carries its own
+    // `- `, where the case above writes it under a `- name:` step. Group 1 of
+    // the script's BLOCK_SCALAR_RE spans that `- `, so the block's column is
+    // `run`'s (8) -- and the sibling `shell:` at that same column ENDS it, so
+    // the block must not run on and swallow the real caller two lines down.
+    //
+    // This fixture deliberately does NOT claim to distinguish measuring the
+    // column from the dash (6) instead of from `run` (8): `  cursor-review:`
+    // sits at column 2 and terminates the block under either reading, so
+    // stdout is byte-identical. The two columns diverge only for a line at
+    // column 7-8, which in this shape is a step-sibling mapping key, not a
+    // caller. What IS pinned here is the skip itself -- as above, the decoy is
+    // a heredoc body line so that `uses` is the first token after the indent.
     const lines = [
       ...HEADER,
       "  earlier:",
       "    runs-on: ubuntu-latest",
       "    steps:",
       "      - run: |",
-      `          echo "uses: ${REUSABLE}@${OTHER}"`,
+      "          cat <<'EOF'",
+      `          uses: ${REUSABLE}@${OTHER}`,
+      "          EOF",
       "        shell: bash",
       "  cursor-review:",
       `    uses: ${REUSABLE}@${SHA}`,
