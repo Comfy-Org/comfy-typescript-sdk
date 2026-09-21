@@ -964,15 +964,37 @@ jobs:
           # also echoed raw into the run log and embedded into
           # `broken_reason`. The class test is what fails closed: a locale
           # whose `[[:cntrl:]]` covers more than C0+DEL can only reject MORE,
-          # never less, and a valid multi-byte UTF-8 path is not `cntrl` under
-          # either a UTF-8 or a C locale, so this cannot false-positive on a
-          # legitimate non-ASCII pathspec.
+          # never less.
           #
-          # The entry is reported with each control byte rendered as visible
-          # text -- `<CR>`, `<TAB>`, or `<0xNN>` for the ones with no
-          # conventional short name. That keeps the RAW entry visible to
-          # whoever reads the sticky issue -- they need to see what upstream
-          # actually wrote, and WHICH byte it was -- while guaranteeing the
+          # That direction is not free of false positives, and the bound is
+          # worth stating exactly rather than claiming there are none. Under a
+          # UTF-8 locale glibc's `iswcntrl` is also true for the C1 range
+          # U+0080-U+009F, which are legal in a filename, so a pathspec
+          # carrying e.g. U+0085 is rejected here. The outcome is a spurious
+          # `broken` verdict -- the watchdog says it cannot read the list and
+          # asks a human to look -- not a missed stale pin, which is the
+          # trade this whole block is built around. Ordinary non-ASCII paths
+          # are unaffected: every other code point above U+007F is not
+          # `cntrl` under either a UTF-8 or a C locale.
+          #
+          # NUL is the one control byte this test structurally cannot see, and
+          # it does not reach here to be seen: `upstream_src` is captured with
+          # `$(git show ...)` and bash drops NUL in command substitution, so
+          # the byte is gone before `mapfile` builds `watched`. Catching it
+          # would mean probing the blob on disk before the substitution. That
+          # is deliberately not done, because a NUL cannot occur in the input
+          # this job reads: NUL is outside YAML's `c-printable`, so a
+          # `bump-cursor-review-callers.yml` carrying one is not loadable by
+          # upstream's OWN Actions runner and upstream's workflow is broken
+          # before this watchdog ever clones it.
+          #
+          # The entry is reported with each control character rendered as
+          # visible text -- `<CR>`, `<TAB>`, or `<0xNN>` for the ones with no
+          # conventional short name, where `NN` is the CODE POINT and not the
+          # UTF-8 bytes upstream wrote (U+0085 renders `<0x85>`, not
+          # `<0xC2><0x85>`). That keeps the RAW entry visible to whoever reads
+          # the sticky issue -- they need to see what upstream
+          # actually wrote, and WHICH character it was -- while guaranteeing the
           # value embedded in `$GITHUB_OUTPUT` is single-line, so it cannot
           # split `broken_reason=` into a forged `state=` record or a record
           # with no `=` that makes the runner reject the whole file.
@@ -1608,7 +1630,11 @@ jobs:
           fi
           if [ -z "$future_dated" ] && [ "$age" -lt "$GRACE_SECONDS" ]; then
             echo "state=grace" >>"$GITHUB_OUTPUT"
-            echo "The oldest unpicked commit is $((age / 3600))h old, inside the $((GRACE_SECONDS / 86400))-day grace window. Passing."
+            # `fmt_days`, not `GRACE_SECONDS / 86400`: bash integer division
+            # truncates, so at a non-whole-day knob (129600) this log line said
+            # "1-day" while the durable `grace_days` output said "1.5-day" --
+            # the same value-vs-text divergence `fmt_days` was added to remove.
+            echo "The oldest unpicked commit is $((age / 3600))h old, inside the $(fmt_days "$GRACE_SECONDS")-day grace window. Passing."
             exit 0
           fi
 
@@ -1909,11 +1935,24 @@ jobs:
       # browses by; it is no longer what finds them.
       #
       # Both labels are created idempotently before each lookup so the first
-      # run on a fresh repo does not have to be the one that remembered. The
-      # open/update paths take the LOWEST-numbered open match -- the original
-      # sticky thread, the one carrying the history -- and the close paths
-      # close EVERY open match, so a duplicate that somehow exists is
-      # reconciled rather than left falsely open.
+      # run on a fresh repo does not have to be the one that remembered.
+      #
+      # ONE ordering rule, on every path that picks a single issue: the
+      # LOWEST-numbered match -- the original sticky thread, the one carrying
+      # the history. That governs the open/update lookups AND the `--state
+      # closed` reopen lookups, which is the whole point of stating it once.
+      # The reopen lookups used to take `max_by`, which is the newest match --
+      # so a mode that had ever accumulated a duplicate revived the DUPLICATE
+      # on the next cycle and orphaned the thread the rest of this block calls
+      # canonical. Picking a single issue and picking the oldest are now the
+      # same decision everywhere.
+      #
+      # The close paths are the deliberate exception, and they do not pick:
+      # they close EVERY open match, so a duplicate that somehow exists is
+      # reconciled rather than left falsely open. That asymmetry is intended.
+      # Commenting on one thread while a stale duplicate sits open is a
+      # cosmetic wart; leaving a duplicate open after recovery is a false
+      # alert, so the close side is the one that must be exhaustive.
       - name: Open or update the watchdog-blocked issue
         if: failure() && steps.assess.outputs.state == 'broken'
         env:
@@ -1956,8 +1995,12 @@ jobs:
           # `--state closed --limit 100` lookup on the line below. The stale
           # mode carries a DIFFERENT label, so neither mode's closed pile can
           # crowd the other's lookup any more.
+          #
+          # `min_by`, matching the open lookup above -- the oldest match is the
+          # original sticky thread. See the ordering note on this job's issue
+          # bookkeeping above.
           closed="$(gh issue list --state closed --label "$MODE_LABEL" --limit 100 \
-            --json number --jq 'max_by(.number).number // empty')"
+            --json number --jq 'min_by(.number).number // empty')"
           if [ -n "$closed" ]; then
             gh issue reopen "$closed"
             gh issue comment "$closed" --body "$body"
@@ -2236,8 +2279,11 @@ jobs:
           # the reader this issue "reopens if the pin freezes again", and the
           # sticky-issue design is built on one thread carrying the history --
           # both of which are false if every stale cycle starts a fresh issue.
+          # `min_by`, matching the open lookup above: same ordering rule, same
+          # canonical thread. See the ordering note on this job's issue
+          # bookkeeping above.
           closed="$(gh issue list --state closed --label "$MODE_LABEL" --limit 100 \
-            --json number --jq 'max_by(.number).number // empty')"
+            --json number --jq 'min_by(.number).number // empty')"
           if [ -n "$closed" ]; then
             # COMMENT FIRST, THEN REOPEN. The order is load-bearing here, and
             # is the reverse of the broken-watchdog step above, whose body
@@ -2361,14 +2407,21 @@ jobs:
             "The watchdog reached a verdict again, so the pin is being watched." \
             "" \
             "Run: $RUN_URL")"
-          # EVERY open match, not just the first. The mode label is meant to
-          # carry exactly one thread, but if a duplicate ever does exist --
-          # filed by a run that predates this bookkeeping, or by a human --
-          # closing one and leaving the other open leaves a false "the pin is
-          # not being watched" alert standing, which is the specific outcome
-          # this step exists to clear. Reading from a here-string rather than a
-          # pipe keeps the loop in THIS shell; an empty list yields one empty
-          # line, which the guard drops.
+          # Every open match the lookup returns, not just the first. The mode
+          # label is meant to carry exactly one thread, but if a duplicate ever
+          # does exist -- filed by a run that predates this bookkeeping, or by
+          # a human -- closing one and leaving the other open leaves a false
+          # "the pin is not being watched" alert standing, which is the
+          # specific outcome this step exists to clear. Reading from a
+          # here-string rather than a pipe keeps the loop in THIS shell; an
+          # empty list yields one empty line, which the guard drops.
+          #
+          # "Every match the lookup returns" is the honest claim, not "every
+          # match": `--limit 100` returns the 100 newest-created open issues,
+          # so a mode label carrying more than 100 open duplicates would leave
+          # the oldest ones standing. Not worth looping to exhaustion for --
+          # reaching that state needs 100+ duplicate alerts under one machine
+          # label, which is a far louder problem than the one this reconciles.
           open_issues="$(gh issue list --state open --label "$MODE_LABEL" --limit 100 \
             --json number --jq '.[].number')"
           while IFS= read -r issue_number; do
@@ -2773,8 +2826,9 @@ jobs:
             "$verdict" \
             "" \
             "Run: $RUN_URL")"
-          # EVERY open match -- see the note on the watchdog-blocked close
-          # above. Leaving a duplicate stale-pin issue open is worse here than
+          # Every open match the lookup returns -- same loop, same `--limit
+          # 100` bound, see the note on the watchdog-blocked close above.
+          # Leaving a duplicate stale-pin issue open is worse here than
           # there: it asserts the pin is frozen on a run that just proved it is
           # not, which is how a sticky alert loses its credibility.
           open_issues="$(gh issue list --state open --label "$MODE_LABEL" --limit 100 \
