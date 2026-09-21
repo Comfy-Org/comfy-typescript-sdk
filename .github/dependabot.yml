@@ -55,6 +55,16 @@ updates:
       # split the pair exactly like a routine one. The upstream bump-*-callers
       # fleet is what moves these pins, and scripts/check-workflow-pins.mjs
       # fails CI if the pair is ever split again -- by Dependabot, or by hand.
+      #
+      # Both entries are spelled in CANONICAL case, and that is load-bearing:
+      # Dependabot matches `dependency-name` against the name exactly as it is
+      # written in `uses:`, while GitHub itself resolves owner/repo
+      # case-insensitively. A caller spelled `comfy-org/github-workflows` would
+      # therefore run fine and slip straight past these two ignores. What keeps
+      # that from happening is the other half of the defence: lint (4) in
+      # scripts/check-workflow-pins.mjs rejects any non-canonical spelling, so
+      # the only callers that can exist are ones these entries cover. Do not
+      # relax that lint without widening the spellings here to match.
       - dependency-name: "Comfy-Org/github-workflows"
       - dependency-name: "Comfy-Org/github-workflows/*"
     groups:

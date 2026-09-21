@@ -147,10 +147,20 @@ const caseInsensitiveOwnerRepo = (s) =>
 // a silent skip is the one direction this lint must never fail in.
 // Matched only as a job-level mapping KEY, never as a step's `- uses:` (see
 // the header). The key and the value may each be quoted.
+// The owner/repo is CAPTURED as well as matched, because the two halves of the
+// split-pin defence have to agree about spelling. `.github/dependabot.yml`
+// ignores this dependency by name, and Dependabot matches `dependency-name`
+// against the name exactly as written in `uses:` -- so a caller spelled
+// `comfy-org/github-workflows` is matched here (deliberately: an unseen caller
+// is the one failure this lint must never have) but is NOT covered by that
+// ignore, and Dependabot would rewrite its `uses:` while leaving
+// `workflows_ref:` behind. That is precisely the split pin both files exist to
+// prevent. Seeing it is therefore not enough; lint (4) below requires the
+// canonical spelling so the ignore entries can cover every caller that exists.
 const USES_RE = new RegExp(
-  String.raw`^(\s*)(["']?)uses\2\s*:\s*(["']?)` +
+  String.raw`^(\s*)(["']?)uses\2\s*:\s*(["']?)(` +
     caseInsensitiveOwnerRepo(REUSABLE_OWNER_REPO) +
-    String.raw`\/(\S+?)@([^\s"']+?)\3(?:\s+#(.*))?\s*$`,
+    String.raw`)\/(\S+?)@([^\s"']+?)\3(?:\s+#(.*))?\s*$`,
 );
 // The `#` must be preceded by WHITESPACE in both patterns: YAML starts a comment
 // only at a `#` that follows a space (or opens the line), so
@@ -186,6 +196,18 @@ const BARE_SHA_RE = /\b[0-9a-fA-F]{7,40}\b/g;
 // so carries its value on the following lines. Same key shapes `USES_RE`
 // tolerates; only the value differs.
 const USES_BLOCK_SCALAR_RE = /^(\s*)(["']?)uses\2\s*:\s*[|>][0-9+-]*\s*(?:#.*)?$/;
+// The OTHER way a `uses:` value can sit on the following line: a plain
+// multi-line scalar, with no `|`/`>` indicator at all and the value simply
+// indented beneath the key. It is valid YAML that GitHub accepts, and it
+// evades the scan even more completely than the block-scalar form --
+// `USES_RE` sees no value, `USES_BLOCK_SCALAR_RE` sees no indicator, and
+// `blockScalarMask` does not mark the continuation lines either (there is no
+// indicator for it to key on), so nothing hides them and nothing reads them.
+// Same consequence as the block-scalar shape: the caller is dropped in
+// silence, free to carry a branch ref or a split pin, while the repo-wide
+// zero-caller guard stays quiet because other callers keep the count
+// non-zero.
+const USES_EMPTY_VALUE_RE = /^(\s*)(["']?)uses\2\s*:\s*(?:#.*)?$/;
 // The same owner/repo, for testing a block scalar's folded VALUE rather than a
 // whole `uses:` line.
 const OWNER_REPO_RE = new RegExp(caseInsensitiveOwnerRepo(REUSABLE_OWNER_REPO));
@@ -276,6 +298,14 @@ function owningKey(lines, index, indent, inBlock) {
     if (inBlock[i]) continue;
     const trimmed = lines[i].trim();
     if (trimmed === "" || trimmed.startsWith("#")) continue;
+    // A document marker (`---`, `...`) or a `%YAML`/`%TAG` directive is not a
+    // mapping key and owns nothing, but both sit at column 0 -- so against an
+    // INDENTED root mapping (legal YAML that GitHub accepts, and the case
+    // `isJobLevelUses` asks this question structurally to support) one would be
+    // returned as the owner of `jobs:`. `jobs:` would then read as non-root,
+    // every caller in the file would be dropped, and the file would pass with
+    // no output: the silent skip this file's header promises never happens.
+    if (trimmed === "---" || trimmed === "..." || trimmed.startsWith("%")) continue;
     const ownIndent = lines[i].length - lines[i].trimStart().length;
     if (ownIndent < indent) return { trimmed, indent: ownIndent, index: i };
   }
@@ -374,7 +404,11 @@ function workflowsRefInput(lines, usesIndex, usesIndent, inBlock) {
 
     // A sibling of `uses:`: opens the `with:` block, or closes it.
     if (indent === usesIndent) {
-      inWith = /^with:\s*(?:#.*)?$/.test(trimmed);
+      // Quoted key tolerated for the same reason `USES_RE` tolerates one: a
+      // `"with":` block is valid YAML that GitHub accepts and that genuinely
+      // passes `workflows_ref`, so reading it as absent would report a caller
+      // as passing no pin when it passes one.
+      inWith = /^(["']?)with\1\s*:\s*(?:#.*)?$/.test(trimmed);
       withChildIndent = null;
       continue;
     }
@@ -451,10 +485,42 @@ function findCallers() {
         continue;
       }
 
+      // The indicator-less sibling of the shape above. The continuation is
+      // gathered here rather than read off `inBlock`, because a plain
+      // multi-line scalar has no indicator for `blockScalarMask` to key on:
+      // its value is every following line indented DEEPER than the key, up to
+      // the first line that is not.
+      const ev = USES_EMPTY_VALUE_RE.exec(lines[i]);
+      if (ev) {
+        const keyIndent = ev[1].length;
+        let folded = "";
+        for (let j = i + 1; j < lines.length; j++) {
+          const cont = lines[j];
+          const contTrimmed = cont.trim();
+          if (contTrimmed === "") continue;
+          if (cont.length - cont.trimStart().length <= keyIndent) break;
+          if (contTrimmed.startsWith("#")) continue;
+          folded += ` ${contTrimmed}`;
+        }
+        // Only a call to OUR reusable is this lint's business -- an unrelated
+        // `uses:` written this way is left alone rather than reddened, exactly
+        // as for the block-scalar form.
+        if (OWNER_REPO_RE.test(folded) && isJobLevelUses(lines, i, keyIndent, inBlock)) {
+          fail(
+            `${rel}:${i + 1}: this job calls \`${REUSABLE_OWNER_REPO}\` through a ` +
+              `\`uses:\` whose value sits on a continuation line, where this ` +
+              `text-level scanner cannot read the pin -- and an unreadable caller is ` +
+              `skipped in silence rather than checked. Write the call as a plain ` +
+              `one-line scalar: \`uses: ${REUSABLE_OWNER_REPO}/.github/workflows/<name>.yml@<40-hex>\`.`,
+          );
+        }
+        continue;
+      }
+
       const m = USES_RE.exec(lines[i]);
       if (!m) continue;
 
-      const [, indentStr, , , workflowPath, ref, comment] = m;
+      const [, indentStr, , , ownerRepo, workflowPath, ref, comment] = m;
 
       // `jobs.<id>.uses` only -- see `isJobLevelUses`. A composite-action step
       // is not a reusable-workflow call and has no second pin to disagree.
@@ -462,6 +528,7 @@ function findCallers() {
 
       callers.push({
         rel,
+        ownerRepo,
         reusable: workflowPath.split("/").pop(),
         usesLineNo: i + 1,
         ref,
@@ -474,12 +541,36 @@ function findCallers() {
   return callers;
 }
 
-/** The three pin assertions, as a list of human-readable problems. */
+/** The four pin assertions, as a list of human-readable problems. */
 function lint(callers) {
   const errors = [];
 
-  for (const { rel, reusable, usesLineNo, ref, comment, workflowsRef } of callers) {
+  for (const { rel, ownerRepo, reusable, usesLineNo, ref, comment, workflowsRef } of callers) {
     const at = `${rel}:${usesLineNo}`;
+
+    // (4) The owner/repo must be spelled CANONICALLY. Checked FIRST, and it
+    // does not `continue`: unlike (1) the spelling is independent of the ref,
+    // so a caller can be both misspelled and badly pinned and deserves to hear
+    // about both in one run.
+    //
+    // GitHub resolves owner/repo
+    // case-insensitively, so a non-canonical spelling runs fine -- but
+    // `.github/dependabot.yml` ignores this dependency by literal name, and an
+    // ignore written in canonical case does not cover `comfy-org/...`. Left
+    // alone, that caller is the one Dependabot is still free to half-bump,
+    // rewriting `uses:` and leaving `workflows_ref:` behind. Requiring the
+    // canonical spelling here is what lets those two ignore entries be a
+    // complete defence rather than a partial one.
+    if (ownerRepo !== REUSABLE_OWNER_REPO) {
+      errors.push(
+        `${at}: \`uses:\` names \`${ownerRepo}\`, but this repository pins that ` +
+          `dependency as \`${REUSABLE_OWNER_REPO}\`. GitHub accepts either, ` +
+          `Dependabot does not: \`.github/dependabot.yml\` ignores this dependency ` +
+          `by literal name, so a non-canonical spelling escapes the ignore and gets ` +
+          `its \`uses:\` bumped while \`workflows_ref:\` is left behind -- the split ` +
+          `pin this check exists to prevent. Spell it \`${REUSABLE_OWNER_REPO}\`.`,
+      );
+    }
 
     // (1) The `uses:` ref must be immutable.
     if (!FULL_SHA_RE.test(ref)) {

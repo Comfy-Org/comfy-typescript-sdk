@@ -304,10 +304,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           BUMP_BRANCH: ci/bump-cursor-review
+          # The branch this job's verdict is ABOUT: a bump PR only counts as
+          # delivering if it lands here. Read from the event payload rather
+          # than hardcoded, so a rename of this repo's own default branch
+          # cannot quietly turn every bump PR into "does not deliver".
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           # The fleet's queue is serialised and a bump PR still needs a human
           # to merge it, so an upstream commit this repo has not picked up yet
           # is not evidence of anything being stuck until it has had a few days.
           GRACE_SECONDS: "259200" # 3 days
+          # How far ahead of this runner's clock an upstream commit date may
+          # sit and still read as "just landed" rather than as an anomaly.
+          # Ordinary committer-clock skew is seconds to minutes; 15 minutes is
+          # well clear of that and still far short of the grace window, so a
+          # date far enough ahead to actually silence the watchdog is still
+          # caught.
+          SKEW_TOLERANCE_SECONDS: "900" # 15 minutes
           # A SECOND, longer clock, on the bump PR itself. `delivered` suspends
           # this watchdog on the strength of an open PR, so without an upper
           # bound one abandoned or permanently-red PR on that branch mutes the
@@ -479,10 +491,26 @@ jobs:
             echo "::error::$reason"
             exit 1
           elif [ "$ancestry_rc" -ne 0 ]; then
+            # One of the faults folded in here is NOT transient: if upstream
+            # renames its default branch, `origin/main` is simply gone and
+            # stays gone. Every later step resolves that same ref, so the job
+            # would redden daily, write no verdict and file nothing -- the
+            # silent failure the rest of this step exists to convert into a
+            # sticky issue. Separate it out before falling through.
+            if ! git -C "$gwtmp/gw" rev-parse --verify --quiet origin/main >/dev/null; then
+              reason="\`origin/main\` does not resolve in the \`Comfy-Org/github-workflows\` clone -- upstream has most likely renamed its default branch. This job reads that ref for the ancestry check, the \`WATCHED_PATHSPECS\` read and the staleness walk, so it cannot judge the pin at all until the ref it follows is updated. Update the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\` to follow upstream's new default branch."
+              {
+                echo "state=broken"
+                echo "broken_reason=$reason"
+              } >>"$GITHUB_OUTPUT"
+              echo "::error::$reason"
+              exit 1
+            fi
             # NO verdict written: nothing here established anything about the
             # pin, so the issue steps below must stay out of it. The red run
-            # and this annotation are the whole record, which is right for a
-            # fault that is very likely transient.
+            # and this annotation are the whole record, which is right for the
+            # faults that genuinely are transient -- an unreadable object, a
+            # partial-clone fetch failure.
             echo "::error::could not determine whether $pin is an ancestor of github-workflows main -- git exited $ancestry_rc: ${ancestry_err:-(no output)}"
             exit 1
           fi
@@ -929,11 +957,21 @@ jobs:
           # unambiguously where whitespace cannot.
           log_rc=0
           behind_raw="$(git -C "$gwtmp/gw" log --first-parent \
-            --format='%H %cI%x1E%(trailers:key=Skip-caller-bump,valueonly,separator=%x1F,unfold)' \
+            --format='%H %cI%x1E%(trailers:key=Skip-caller-bump,separator=%x1F,unfold)' \
             "$pin..origin/main" -- "${watched[@]}" 2>"$gwtmp/behind.err")" || log_rc=$?
           if [ "$log_rc" -ne 0 ]; then
             log_err="$(tr '\n' ' ' <"$gwtmp/behind.err")"
-            if printf '%s' "$log_err" | grep -qi 'pathspec'; then
+            # Here-string rather than `printf | grep -q`: the pipe form puts a
+            # writer in front of a reader that exits at its first match, which
+            # is a SIGPIPE/141 question under the `set -o pipefail` in force
+            # here. (Measured on bash 5 + GNU grep with a 10 MB value and the
+            # match at offset 0, the pipeline still exited 0 -- and a git
+            # pathspec error is a few hundred bytes, nowhere near the 64 KiB
+            # pipe buffer -- so this is not a live fault. It is removed anyway:
+            # this branch is the one permanent, deterministic failure the step
+            # turns into a `broken` verdict, and it should not rest on the
+            # buffering behaviour of whichever grep the runner ships.)
+            if grep -qi 'pathspec' <<<"$log_err"; then
               reason="\`git log\` could not use the pathspecs read from \`Comfy-Org/github-workflows@main:$bump_yaml\`, so this job cannot judge staleness at all. git exited $log_rc saying: ${log_err:-(no output)}. That will not clear on its own -- upstream's \`WATCHED_PATHSPECS\` carries a pathspec this check cannot use. Re-check upstream's list and the extractor in the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\`."
               {
                 echo "state=broken"
@@ -951,14 +989,27 @@ jobs:
           # parses positionally. `any`, not `all`, matches upstream's gate:
           # one `true` among repeated trailers is a declaration.
           #
-          # The comparison is against the WHOLE trailer value, which is what
-          # upstream's `preflight.sh` gate matches on. Testing only the first
-          # whitespace-delimited token fails OPEN: `true (docs only)`,
-          # `true please` and `no,true` all yield a `true` token, so the commit
-          # vanished from `behind`, `state=current` was written over a frozen
-          # pin and the job closed its own stale-pin issue. Field 1 is
-          # `<sha> <date>` and field 2 is the US-joined trailer list, so both
-          # splits now use separators that cannot occur inside a value.
+          # The test is upstream's OWN regex, key included, applied to the whole
+          # trailer LINE -- `.github/bump-callers/preflight.sh` recognises
+          # exactly `^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$`.
+          # Matching anything wider than that fails OPEN, in two ways this job
+          # has now hit both of:
+          #
+          #  - Value. Testing only the first whitespace-delimited token accepts
+          #    `true (docs only)`, `true please` and `no,true`, none of which
+          #    upstream honours.
+          #  - KEY. `%(trailers:key=...)` matches the key CASE-INSENSITIVELY
+          #    (verified against git 2.43), so `SKIP-CALLER-BUMP: true` was
+          #    selected here while upstream's first-letter-only alternation
+          #    does NOT match it and still owes a bump. `valueonly` hid the
+          #    spelling that made the difference, so the key is no longer
+          #    stripped: the whole line is emitted and matched.
+          #
+          # Either way the commit vanished from `behind`, `state=current` was
+          # written over a frozen pin and the job closed its own stale-pin
+          # issue. Field 1 is `<sha> <date>` and field 2 is the US-joined
+          # trailer list, so both splits use separators that cannot occur
+          # inside a value.
           #
           # `rc` is captured here for the same reason as the `git log` above:
           # `set -e` DOES act on a bare `var="$(cmd)"` assignment, so an awk
@@ -970,7 +1021,9 @@ jobs:
             NF {
               skip = 0
               n = split($2, vals, "\037")
-              for (i = 1; i <= n; i++) if (vals[i] == "true") skip = 1
+              for (i = 1; i <= n; i++) {
+                if (vals[i] ~ /^[Ss]kip-[Cc]aller-[Bb]ump:[ \t]*true[ \t]*$/) skip = 1
+              }
               if (!skip) print $1
             }')" || awk_rc=$?
           if [ "$awk_rc" -ne 0 ]; then
@@ -1058,9 +1111,30 @@ jobs:
           age="$(( $(date -u +%s) - $(date -u -d "$oldest_date" +%s) ))"
           future_dated=""
           if [ "$age" -lt 0 ]; then
-            future_dated=yes
-            echo "::warning::the oldest unpicked commit $oldest_sha is dated in the future ($oldest_date); refusing to read that as just-landed, and judging the pin as out of grace."
-            age=0
+            skew="$(( -age ))"
+            if [ "$skew" -le "$SKEW_TOLERANCE_SECONDS" ]; then
+              # ORDINARY forward skew between upstream's committer clock and
+              # this runner's. The paragraph above is right that it is seconds
+              # to minutes against a three-day window -- but the boundary
+              # actually tested is `age < 0`, not `age < -GRACE_SECONDS`, so
+              # without this arm the window absorbs NOTHING at that edge and a
+              # commit dated one second ahead jumped straight to `stale` and
+              # filed the "nothing is moving this pin" issue. A commit this
+              # fresh is exactly what "just landed" means, so it belongs in
+              # grace like any other.
+              echo "The oldest unpicked commit $oldest_sha is dated ${skew}s in the future ($oldest_date), within the ${SKEW_TOLERANCE_SECONDS}s clock-skew tolerance; reading it as just-landed."
+              age=0
+            else
+              future_dated=yes
+              echo "::warning::the oldest unpicked commit $oldest_sha is dated ${skew}s in the future ($oldest_date), beyond the ${SKEW_TOLERANCE_SECONDS}s clock-skew tolerance; refusing to read that as just-landed, and judging the pin as out of grace."
+              # Carried into the VERDICT, not left in this transient warning:
+              # `age` is clamped to 0 below, so without it the annotation and
+              # the issue body say the commit landed 0 days ago while asserting
+              # it sat past the 3-day window -- a self-contradictory durable
+              # record for the one case where the date is the whole story.
+              echo "future_dated=$oldest_date" >>"$GITHUB_OUTPUT"
+              age=0
+            fi
           fi
           if [ -z "$future_dated" ] && [ "$age" -lt "$GRACE_SECONDS" ]; then
             echo "state=grace" >>"$GITHUB_OUTPUT"
@@ -1085,9 +1159,29 @@ jobs:
           # happens to be called `ci/bump-cursor-review` would read as a
           # delivered bump and mute the watchdog. Only a same-repo branch can
           # be the fleet's, so cross-repository PRs are dropped.
+          #
+          # The BASE side is constrained too, and for the same reason. `--head`
+          # says nothing about where a PR is going: one opened from the fleet's
+          # branch onto a release or throwaway branch passes the ancestry test
+          # below and sets `state=delivered`, muting this watchdog for a full
+          # seven days even though merging it cannot move the caller on the
+          # default branch at all. Only a PR that actually lands on the branch
+          # this job judges is evidence about that branch.
+
+          # Asserted, not assumed: `env:` always DEFINES the name, so `set -u`
+          # would not catch an empty one, and an empty `--base` would silently
+          # stop matching every bump PR -- the watchdog would then file "nothing
+          # is moving this pin" while a perfectly good bump sat open. Loud is
+          # the only safe direction for a value this job's verdict depends on.
+          if [ -z "$DEFAULT_BRANCH" ]; then
+            echo "::error::this job could not read the repository's default branch from the event payload, so it cannot tell whether an open bump PR would land on the branch it judges. Refusing to guess."
+            exit 1
+          fi
           bump="$(gh pr list --repo "$GH_REPO" --state open \
-            --head "$BUMP_BRANCH" --json number,isCrossRepository,createdAt,headRefOid \
-            --jq '[.[] | select(.isCrossRepository == false)][0] // empty')"
+            --head "$BUMP_BRANCH" --base "$DEFAULT_BRANCH" \
+            --json number,isCrossRepository,createdAt,headRefOid,baseRefName \
+            --jq '[.[] | select(.isCrossRepository == false
+                                and .baseRefName == env.DEFAULT_BRANCH)][0] // empty')"
 
           bump_pr=""
           bump_age_days=""
@@ -1218,14 +1312,22 @@ jobs:
           fi
 
           echo "state=stale" >>"$GITHUB_OUTPUT"
-          if [ -n "$bump_pr" ] && [ "$bump_delivers" = no ]; then
-            echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) landed $((age / 86400)) days ago. PR #$bump_pr is open on $BUMP_BRANCH, but its own caller pin does not carry the oldest owed commit ($oldest_sha) -- the fleet reuses that branch, so this is an older bump, not a delivery of this backlog."
-          elif [ -n "$bump_pr" ] && [ "$bump_delivers" = unknown ]; then
-            echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) landed $((age / 86400)) days ago. PR #$bump_pr is open on $BUMP_BRANCH, but this job could NOT VERIFY which commit its caller pin carries, so it is not being counted as a delivery of this backlog. Check that PR before assuming a fresh bump is owed."
-          elif [ -n "$bump_pr" ]; then
-            echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) landed $((age / 86400)) days ago. Bump PR #$bump_pr is open on $BUMP_BRANCH but has been unmerged for $bump_age_days days, so delivery is not what is missing -- the merge is."
+          # `age` is clamped to 0 for a future-dated commit, so quoting it as
+          # "landed 0 days ago" next to a stale verdict reads as nonsense.
+          # Name the real reason instead.
+          if [ -n "$future_dated" ]; then
+            landed="is dated $oldest_date -- implausibly far ahead of this runner's clock, so it is judged out of grace on that date rather than on elapsed time"
           else
-            echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) landed $((age / 86400)) days ago -- and no open PR exists on $BUMP_BRANCH. Nothing is moving this pin."
+            landed="landed $((age / 86400)) days ago"
+          fi
+          if [ -n "$bump_pr" ] && [ "$bump_delivers" = no ]; then
+            echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) $landed. PR #$bump_pr is open on $BUMP_BRANCH, but its own caller pin does not carry the oldest owed commit ($oldest_sha) -- the fleet reuses that branch, so this is an older bump, not a delivery of this backlog."
+          elif [ -n "$bump_pr" ] && [ "$bump_delivers" = unknown ]; then
+            echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) $landed. PR #$bump_pr is open on $BUMP_BRANCH, but this job could NOT VERIFY which commit its caller pin carries, so it is not being counted as a delivery of this backlog. Check that PR before assuming a fresh bump is owed."
+          elif [ -n "$bump_pr" ]; then
+            echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) $landed. Bump PR #$bump_pr is open on $BUMP_BRANCH but has been unmerged for $bump_age_days days, so delivery is not what is missing -- the merge is."
+          else
+            echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) $landed -- and no open PR exists on $BUMP_BRANCH. Nothing is moving this pin."
           fi
           exit 1
 
@@ -1307,6 +1409,10 @@ jobs:
           OLDEST_SHA: ${{ steps.assess.outputs.oldest_sha }}
           OLDEST_DATE: ${{ steps.assess.outputs.oldest_date }}
           BEHIND_COUNT: ${{ steps.assess.outputs.behind_count }}
+          # Set only when the oldest owed commit is dated implausibly far
+          # ahead of the runner's clock, which is why this verdict says "past
+          # the grace window" for a commit whose age reads as 0.
+          FUTURE_DATED: ${{ steps.assess.outputs.future_dated }}
           # Empty unless a bump PR is open but has itself gone past the
           # bump-PR window, which is the other way this verdict is reached.
           BUMP_PR: ${{ steps.assess.outputs.bump_pr }}
@@ -1339,6 +1445,22 @@ jobs:
           fi
           cause="${cause% }"
 
+          # The grace window is normally judged on elapsed time, but a commit
+          # dated implausibly far ahead of the runner's clock is judged out of
+          # grace on the DATE instead. Say so, or the table above (which shows
+          # that future date) silently contradicts the sentence below it.
+          if [ -n "$FUTURE_DATED" ]; then
+            overdue="$(printf '%s ' \
+              "The oldest one is dated **$FUTURE_DATED**, which is implausibly far ahead of this" \
+              "runner's clock -- so its true age cannot be measured and it is judged out of the" \
+              "3-day grace window on that basis rather than on elapsed time. Check the committer" \
+              "clock upstream; a date far enough ahead would otherwise hold this pin in grace" \
+              "indefinitely.")"
+            overdue="${overdue% }"
+          else
+            overdue="The oldest one has been sitting there past the 3-day grace window."
+          fi
+
           body="$(printf '%s\n' \
             "\`.github/workflows/ci-cursor-review.yml\` is pinned to \`$PIN\`, which is" \
             "**$BEHIND_COUNT consumer-visible commit(s) behind \`Comfy-Org/github-workflows@main\`**." \
@@ -1348,7 +1470,7 @@ jobs:
             "| oldest not picked up | \`$OLDEST_SHA\` | $OLDEST_DATE |" \
             "| newest upstream (what a bump moves to) | \`$NEWEST_SHA\` | $NEWEST_DATE |" \
             "" \
-            "The oldest one has been sitting there past the 3-day grace window. $cause" \
+            "$overdue $cause" \
             "" \
             "Things to check, in this order:" \
             "" \
@@ -1471,10 +1593,22 @@ jobs:
       # the oldest unpicked commit is under 3 days old, which -- at the 0.39-day
       # median gap between consumer-visible upstream commits measured above --
       # is what a bump produces almost every time, because upstream keeps
-      # committing while the PR is in review. Closing on it is right (this
-      # issue's premise is that NOTHING is moving the pin, and something just
-      # did), but saying "current again" there would be false, so the comment is
-      # written per state.
+      # committing while the PR is in review. Closing only on `current` would
+      # therefore leave this issue open through most successful bumps, so
+      # `grace` closes it too -- but the comment is written per state, because
+      # saying "current again" there would be false.
+      #
+      # What the `grace` comment must NOT do is assert the pin MOVED. Nothing
+      # on this path establishes that: `age` is derived purely from the oldest
+      # currently-owed commit, and that commit can drop out of the query with
+      # the pin untouched -- upstream narrowing a glob or adding an
+      # `:(exclude)` to `WATCHED_PATHSPECS`, which `assess` re-reads live every
+      # run, is enough to shrink the backlog on a completely frozen pin. So the
+      # comment states the BACKLOG fact it actually has and quotes the current
+      # pin for the reader to compare, rather than concluding a bump landed.
+      # Proving movement needs the pin recorded at filing time compared against
+      # the pin now, which means persisting it across runs -- tracked
+      # separately rather than bolted on here.
       - name: Close the stale-pin issue once the pin is moving again
         # `success()` is the JOB's cumulative status, not this step's
         # precondition -- so a transient `gh` failure in the verdict-gated
@@ -1504,6 +1638,9 @@ jobs:
           # is satisfied either way.
           BEHIND_COUNT: ${{ steps.assess.outputs.behind_count }}
           OLDEST_SHA: ${{ steps.assess.outputs.oldest_sha }}
+          # Quoted on the `grace` comment so the reader can compare it against
+          # the pin this issue was filed on; always written by `assess`.
+          PIN: ${{ steps.assess.outputs.pin }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -1516,11 +1653,16 @@ jobs:
               verdict="The \`Comfy-Org/github-workflows\` pin is current again."
             else
               verdict="$(printf '%s ' \
-                "The pin has moved. It is still $BEHIND_COUNT consumer-visible commit(s) behind" \
-                "\`Comfy-Org/github-workflows@main\`, but the oldest one it has not picked up" \
-                "(\`$OLDEST_SHA\`) landed inside the 3-day grace window -- so something is moving" \
-                "this pin again, which is what this issue was open about. It reopens on the first" \
-                "daily run that finds the pin frozen past the grace window again.")"
+                "Nothing is overdue any more. The pin is still $BEHIND_COUNT consumer-visible" \
+                "commit(s) behind \`Comfy-Org/github-workflows@main\`, but the oldest one it has" \
+                "not picked up (\`$OLDEST_SHA\`) landed inside the 3-day grace window, so this" \
+                "issue's premise -- a pin sitting frozen PAST that window -- no longer holds." \
+                "" \
+                "That is a fact about the BACKLOG, not proof that the pin itself moved: the" \
+                "backlog also shrinks if upstream narrows \`WATCHED_PATHSPECS\`. The pin is" \
+                "currently \`$PIN\` -- compare it with the one quoted when this issue was filed" \
+                "before concluding a bump landed. It reopens on the first daily run that finds" \
+                "the pin frozen past the grace window again.")"
               # `printf '%s '` joins the lines with a space and leaves one
               # trailing; drop it so the `Run:` line below is not double-spaced.
               verdict="${verdict% }"
