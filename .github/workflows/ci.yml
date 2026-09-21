@@ -1013,6 +1013,15 @@ jobs:
           bump_pr=""
           bump_age_days=""
           bump_delivers=""
+          # WHY `bump_delivers=no` is not self-explaining any more: it now has
+          # two causes with different owners and different fixes -- the PR's pin
+          # is internally inconsistent (`lint`), or it is consistent but behind
+          # the oldest owed commit (`ancestry`). Both message sites below read
+          # this, and both are reached with NO bump PR open, so these are
+          # initialised out here rather than inside the `if` -- `set -u` would
+          # otherwise kill the step on the commonest path of all.
+          bump_no_reason=""
+          lint_first=""
           if [ -n "$bump" ]; then
             bump_pr="$(printf '%s' "$bump" | jq -r '.number')"
             bump_created="$(printf '%s' "$bump" | jq -r '.createdAt')"
@@ -1056,7 +1065,15 @@ jobs:
             # The pin is read through the SAME `--print-pin` parser the top of
             # this job uses, against a scratch root holding the PR's version of
             # the caller, so this can never disagree with `workflow-pins` about
-            # which line is the pin.
+            # which line is the pin. That scratch root is then ALSO run through
+            # the script's default LINT mode, because `--print-pin` answers only
+            # "what does `workflows_ref` say" and by design never compares it
+            # with the `uses:` SHA -- so a bump PR carrying the oldest owed
+            # commit in `workflows_ref` while `uses:` stayed behind would pass
+            # the ancestry test below and mute this watchdog for a week on a pin
+            # that cannot work. The two modes together are what make `yes` mean
+            # "a caller that would also be GREEN on `workflow-pins`", which is
+            # the only kind of delivery a merge actually delivers.
             #
             # `bump_delivers` is TRI-state -- `yes`, `no`, `unknown` -- because
             # "read the PR's pin, it does not deliver" and "could not read the
@@ -1094,17 +1111,79 @@ jobs:
                 bump_delivers=unknown
                 echo "Bump PR #$bump_pr pins $head_pin, which is not present in the upstream clone (it may have landed after that clone was taken), so delivery could not be verified."
               else
-                # `--is-ancestor` exits 1 for "not an ancestor" and 128 for a
-                # git-level failure. Only the 1 is a finding about the PR.
-                anc_rc=0
-                git -C /tmp/gw merge-base --is-ancestor \
-                  "$oldest_sha" "$head_pin" 2>/dev/null || anc_rc=$?
-                case "$anc_rc" in
-                  0) bump_delivers=yes ;;
-                  1) bump_delivers=no ;;
-                  *) bump_delivers=unknown ;;
-                esac
-                echo "Bump PR #$bump_pr pins the caller to $head_pin; oldest owed is $oldest_sha -- delivers: $bump_delivers (ancestry check exited $anc_rc)"
+                # The PAIR check `--print-pin` deliberately skips. `ROOT` in
+                # the script comes from `import.meta.url`, so the copy in
+                # `$scratch/scripts` scans `$scratch/.github/workflows`, which
+                # holds the PR's `ci-cursor-review.yml` and nothing else -- the
+                # lint therefore judges the bump PR's caller, not this branch's.
+                #
+                # Exit 1 is the script's VERDICT (a caller it read and rejected)
+                # and anything else is a FAULT in running it -- which says
+                # nothing about the fleet and must not be reported as one. Same
+                # split as every other probe in this step.
+                #
+                # The exit code ALONE does not draw that line, which is why the
+                # `check-workflow-pins:` marker is part of the test. node exits
+                # 1 for an uncaught throw and for a missing module too (measured
+                # against node 22: `node /nonexistent.mjs` -> 1, `throw` -> 1;
+                # only a bad CLI flag gives 9), so a keyed-on-1 classifier would
+                # publish a stack-trace line as "the lint says your caller is
+                # broken" and open a sticky issue blaming the fleet for this
+                # job's own crash. Every one of the script's three exit-1 paths
+                # -- `fail()`, `reportUnreadable()` and the lint-error report --
+                # opens its stderr with `check-workflow-pins: `, and nothing
+                # node emits on its own does; requiring it is what keeps a fault
+                # on the `unknown` path where it belongs.
+                lint_rc=0
+                node "$scratch/scripts/check-workflow-pins.mjs" \
+                  >/dev/null 2>/tmp/bump-lint.err || lint_rc=$?
+                if [ "$lint_rc" -eq 1 ] && grep -q '^check-workflow-pins: ' /tmp/bump-lint.err; then
+                  bump_delivers=no
+                  bump_no_reason=lint
+                  # QUOTE the lint rather than paraphrase it. Exit 1 covers
+                  # several distinct defects -- a `uses:` that is not 40-hex, a
+                  # stale trailing version comment, a missing `workflows_ref`, a
+                  # `workflows_ref` that disagrees with `uses:`, a caller
+                  # spelling the scanner cannot read at all -- and only one of
+                  # them is literally a split pair, so asserting "split pin"
+                  # here would be wrong most of the time.
+                  #
+                  # `|| lint_first=""` is not decoration: `grep -m1` exits 1
+                  # when it matches nothing, and under `set -e` a bare
+                  # `var="$(pipeline)"` assignment takes that status and kills
+                  # the step on the no-verdict fault path. The no-match case is
+                  # real -- the script's `fail()` paths (no caller found, a
+                  # caller spelling it cannot read) print a header and no `  - `
+                  # bullet -- so fall back to its first line instead.
+                  #
+                  # The result is ONE line by construction, which is what makes
+                  # it safe to cross the line-oriented `$GITHUB_OUTPUT`: the
+                  # bullets are written one per `console.error` and no field
+                  # this lint interpolates can contain a newline.
+                  lint_first="$(grep -m1 '^  - ' /tmp/bump-lint.err | sed 's/^  - //')" \
+                    || lint_first=""
+                  if [ -z "$lint_first" ]; then
+                    lint_first="$(grep -m1 . /tmp/bump-lint.err)" || lint_first=""
+                  fi
+                  lint_first="${lint_first:-(the lint exited 1 but printed nothing)}"
+                  echo "Bump PR #$bump_pr pins the caller to $head_pin, but its caller does not pass \`node scripts/check-workflow-pins.mjs\`: $lint_first"
+                elif [ "$lint_rc" -ne 0 ]; then
+                  bump_delivers=unknown
+                  lint_err="$(tr '\n' ' ' </tmp/bump-lint.err)"
+                  echo "Bump PR #$bump_pr: the workflow-pins lint could not be run against its caller -- node exited $lint_rc: ${lint_err:-(no output)}. Delivery could not be verified."
+                else
+                  # `--is-ancestor` exits 1 for "not an ancestor" and 128 for a
+                  # git-level failure. Only the 1 is a finding about the PR.
+                  anc_rc=0
+                  git -C /tmp/gw merge-base --is-ancestor \
+                    "$oldest_sha" "$head_pin" 2>/dev/null || anc_rc=$?
+                  case "$anc_rc" in
+                    0) bump_delivers=yes ;;
+                    1) bump_delivers=no; bump_no_reason=ancestry ;;
+                    *) bump_delivers=unknown ;;
+                  esac
+                  echo "Bump PR #$bump_pr pins the caller to $head_pin; oldest owed is $oldest_sha -- delivers: $bump_delivers (ancestry check exited $anc_rc)"
+                fi
               fi
             else
               bump_delivers=unknown
@@ -1116,6 +1195,12 @@ jobs:
               echo "bump_pr=$bump_pr"
               echo "bump_age_days=$bump_age_days"
               echo "bump_delivers=$bump_delivers"
+              echo "bump_no_reason=$bump_no_reason"
+              # Already stripped of its `  - ` bullet and guaranteed single-line
+              # above, so it crosses this line-oriented file intact and the
+              # issue step below can quote the lint verbatim instead of
+              # re-deriving a paraphrase of it.
+              echo "bump_lint_first=$lint_first"
             } >>"$GITHUB_OUTPUT"
           fi
 
@@ -1137,7 +1222,14 @@ jobs:
           fi
 
           echo "state=stale" >>"$GITHUB_OUTPUT"
-          if [ -n "$bump_pr" ] && [ "$bump_delivers" = no ]; then
+          if [ -n "$bump_pr" ] && [ "$bump_delivers" = no ] && [ "$bump_no_reason" = lint ]; then
+            # A DIFFERENT complaint from the one below, with a different fix:
+            # the PR may well carry the oldest owed commit, but its two pins do
+            # not agree with each other, so merging it delivers a caller that
+            # `workflow-pins` reddens. The lint's own line is quoted rather than
+            # summarised -- see the `bump_no_reason=lint` branch above.
+            echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) landed $((age / 86400)) days ago. PR #$bump_pr is open on $BUMP_BRANCH, but its caller fails the repo's own workflow-pins lint ($lint_first), so merging it cannot deliver a consistent pin -- it is not counted as a delivery of this backlog."
+          elif [ -n "$bump_pr" ] && [ "$bump_delivers" = no ]; then
             echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) landed $((age / 86400)) days ago. PR #$bump_pr is open on $BUMP_BRANCH, but its own caller pin does not carry the oldest owed commit ($oldest_sha) -- the fleet reuses that branch, so this is an older bump, not a delivery of this backlog."
           elif [ -n "$bump_pr" ] && [ "$bump_delivers" = unknown ]; then
             echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) landed $((age / 86400)) days ago. PR #$bump_pr is open on $BUMP_BRANCH, but this job could NOT VERIFY which commit its caller pin carries, so it is not being counted as a delivery of this backlog. Check that PR before assuming a fresh bump is owed."
@@ -1231,13 +1323,28 @@ jobs:
           BUMP_PR: ${{ steps.assess.outputs.bump_pr }}
           BUMP_AGE_DAYS: ${{ steps.assess.outputs.bump_age_days }}
           BUMP_DELIVERS: ${{ steps.assess.outputs.bump_delivers }}
+          # Which of the two `no` causes was found, and the lint's own first
+          # problem line to quote for the `lint` one. Both are empty on every
+          # other path, so the branch order below is what selects them.
+          BUMP_NO_REASON: ${{ steps.assess.outputs.bump_no_reason }}
+          BUMP_LINT_FIRST: ${{ steps.assess.outputs.bump_lint_first }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           gh label create "$ISSUE_LABEL" --force --color ededed \
             --description "cursor-review pin freshness watchdog" >/dev/null
 
-          if [ -n "$BUMP_PR" ] && [ "$BUMP_DELIVERS" = no ]; then
+          if [ -n "$BUMP_PR" ] && [ "$BUMP_DELIVERS" = no ] && [ "$BUMP_NO_REASON" = lint ]; then
+            # `$BUMP_LINT_FIRST` is an ARGUMENT to `printf`, never part of its
+            # format string. It is plain text from this repo's own script, but
+            # the one thing that would turn it into a bug is a `%` in a path or
+            # a SHA-like token reaching the format position, and keeping it an
+            # argument costs nothing.
+            cause="$(printf '%s ' \
+              "PR #$BUMP_PR is open on \`$BUMP_BRANCH\`, but its caller fails the repo's own" \
+              "workflow-pins lint ($BUMP_LINT_FIRST), so merging it cannot deliver a consistent" \
+              "pin -- it is not counted as a delivery of this backlog.")"
+          elif [ -n "$BUMP_PR" ] && [ "$BUMP_DELIVERS" = no ]; then
             cause="$(printf '%s ' \
               "PR #$BUMP_PR is open on \`$BUMP_BRANCH\`, but its own caller pin does not carry" \
               "the oldest owed commit -- the fleet reuses that branch, so this is an older bump" \
