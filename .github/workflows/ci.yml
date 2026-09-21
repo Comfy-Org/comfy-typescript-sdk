@@ -2924,21 +2924,38 @@ jobs:
               # `::warning::` after this block fires on EVERY held run, so
               # nothing goes unreported by commenting once.
               #
-              # WHAT the record was matters as much as its value. A `-held`
-              # marker was written by this branch against a real predecessor,
-              # so the pin is known not to have moved across a full cycle. An
-              # `-unknown` marker was written by the no-marker branch above at
-              # the moment it had NO baseline, so all an equal pin proves is
-              # that nothing moved SINCE that first sighting -- a bump that
-              # landed BEFORE it reads exactly the same. Asserting the
-              # WATCHED_PATHSPECS cause off an `-unknown` baseline stated as
-              # fact something this job cannot know, so that case gets its own
-              # wording. A prefix `case`, matched against the marker's SHA
-              # too, so a record for a DIFFERENT pin cannot select it (it
-              # cannot reach here anyway -- `recorded` equals `$PIN`).
-              case "$last_marker" in
-                "<!-- cursor-review-pin-unknown: $PIN -->") baseline=unproven ;;
-                *) baseline=proven ;;
+              # WHAT the record was matters as much as its value, and the
+              # question is narrower than "is the pin unchanged". The strong
+              # wording below asserts the backlog shrank WITHOUT THE PIN
+              # MOVING, and the shrink happened before the first `grace` run of
+              # this cycle. So it needs a record of this pin taken while the
+              # backlog was still overdue -- and the only marker written in
+              # that state is the PLAIN `cursor-review-pin:` one, which the
+              # stale step writes with its report. `-held` and `-unknown` are
+              # both written from `grace`, i.e. after the shrink.
+              #
+              # Hence the test is over the WHOLE cycle's records rather than
+              # the newest marker's form: proven iff a plain marker for THIS
+              # pin was filed in this cycle. Keying it on the newest form
+              # instead let the unprovenness be laundered after one cycle --
+              # the no-marker branch records `-unknown`, the next run confirms
+              # the pin is unchanged and writes `-held`, and the run after that
+              # saw a `-held` marker and asserted the WATCHED_PATHSPECS cause
+              # off a chain whose only root was a sighting with no baseline. On
+              # the case that branch exists for (the pre-marker alarm open the
+              # day this ships) a bump that landed and reached `grace` is
+              # exactly the input, so the assertion was wrong about a bump that
+              # really had landed -- one cycle later than before, not fixed.
+              # A `-held` marker is still an honest record that the pin has not
+              # moved since it; what it cannot do is vouch for a predecessor it
+              # never had.
+              #
+              # Matched against the marker's SHA too, so a plain record for a
+              # DIFFERENT pin cannot select `proven`: that would be a report
+              # filed on some other pin, which proves nothing about this one.
+              case "$reports" in
+                *"<!-- cursor-review-pin: $PIN -->"*) baseline=proven ;;
+                *) baseline=unproven ;;
               esac
 
               # "Already reported" is: the newest marker on the thread is a
@@ -2980,10 +2997,13 @@ jobs:
                     "per pin rather than once a day; every run that holds the issue open also" \
                     "annotates its own log.")"
                 fi
-                # A `-held` marker either way, and accurately so: whatever the
-                # PREVIOUS record meant, the pin is now confirmed unchanged
-                # against a record this issue really carries. The `-unknown`
-                # state is a property of that first sighting, not a sticky one.
+                # A `-held` marker either way: whichever wording went out, the
+                # pin IS now confirmed unchanged against a record this issue
+                # really carries, and that is all this form claims. It does not
+                # upgrade the baseline -- `baseline` is computed above from
+                # whether a plain report marker exists in this cycle, not from
+                # this marker's form, so writing `-held` here cannot turn an
+                # unproven chain into a proven one on the next run.
                 gh issue comment "$existing" --body "$(printf '%s\n' \
                   "$premise" \
                   "" \
