@@ -35,9 +35,16 @@ const DEFAULT_429_RECONNECT_PAUSE_MS = 2_000;
 // otherwise stall reconnection indefinitely.
 const MAX_RECONNECT_PAUSE_MS = 60_000;
 
-/** A nullable wire timestamp as a `Date`, keeping `null` as `null`. */
-function toDate(value: string | null): Date | null {
-  return value === null ? null : new Date(value);
+/**
+ * A nullable wire timestamp as a `Date`, keeping "no timestamp" as `null`.
+ *
+ * Absent counts as none: the field is required-but-nullable on the wire, so a
+ * server that omits it rather than sending `null` must not read as
+ * `new Date(undefined)`, which is an `Invalid Date` that compares false
+ * against everything instead of announcing itself.
+ */
+function toDate(value: string | null | undefined): Date | null {
+  return value == null ? null : new Date(value);
 }
 
 /**
@@ -121,7 +128,11 @@ export class Job {
    * {@link Job.events} yields.
    */
   get progress(): LowJob["progress"] {
-    return this.model.progress === null ? null : { ...this.model.progress };
+    const progress = this.model.progress;
+    // Absent reads as none, not as an empty snapshot: spreading `undefined`
+    // would hand back a `{}` typed as a `Progress` whose `value` and
+    // `nodes_total` are missing, and a percentage computed off those is `NaN`.
+    return progress == null ? null : { ...progress };
   }
 
   /** Place in the queue as of the state this handle holds, or `null` when the server reports none. */
@@ -131,7 +142,11 @@ export class Job {
 
   /** Per-run measurements keyed by name (e.g. `queue_ms`, `execution_ms`), or `undefined` on a surface that reports none. A value is `null` until that metric is available. */
   get metrics(): LowJob["metrics"] {
-    return this.model.metrics === undefined ? undefined : { ...this.model.metrics };
+    const metrics = this.model.metrics;
+    // `undefined` is how this SDK says "this surface measures nothing"; a
+    // server that says so with `null` means the same thing and must not read
+    // as an empty-but-present `{}`.
+    return metrics == null ? undefined : { ...metrics };
   }
 
   /** The job's own links — `self`, `events`, `cancel`, and `logs` on a surface that captures logs. Follow these rather than building paths from {@link Job.id}. */

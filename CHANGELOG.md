@@ -32,9 +32,6 @@ entry. See CONTRIBUTING.md.
   own links. Note that Comfy Cloud's poll response carries `progress: null`
   even for a running job today, so `job.events()` remains the live-progress
   source there.
-
-### Added
-
 - **Comfy Router alt-provider controls on `comfy.models.run` —
   `modelProvider`, `strictMode` and `fallbackProvider`.** Three optional
   `RunOptions` fields, sent as the `model_provider`, `strict_mode` and

@@ -372,6 +372,24 @@ describe("Job", () => {
       expect(job.metrics).toBeUndefined();
     });
 
+    it("reads a field the server omitted as none, not as an empty snapshot", async () => {
+      // Required-but-nullable on the wire, so a server that drops the key
+      // instead of sending `null` still means "none" — not an `Invalid Date`
+      // and not a `Progress` missing every field it is typed to carry.
+      server.state.jobFieldOverrides = {
+        started_at: undefined,
+        completed_at: undefined,
+        progress: undefined,
+        metrics: null,
+      };
+      const job = await jobs.get("job_01");
+
+      expect(job.startedAt).toBeNull();
+      expect(job.completedAt).toBeNull();
+      expect(job.progress).toBeNull();
+      expect(job.metrics).toBeUndefined();
+    });
+
     it("exposes the job's own links, including the optional logs one", async () => {
       const job = await jobs.get("job_01");
       expect(job.urls.self).toBe("/api/v2/jobs/job_01");
