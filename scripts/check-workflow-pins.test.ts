@@ -579,3 +579,116 @@ describe("--print-pin", () => {
     expect(stdout).toBe(`${SHA}\n`);
   });
 });
+
+describe("spellings the scanner cannot read fail closed", () => {
+  const CANNOT_READ = "job-level `uses:` is written in a spelling this checker cannot read";
+
+  /**
+   * Both modes must refuse, and for the SAME reason at the SAME line.
+   *
+   * Each fixture here puts the unreadable job beside a plain, correctly-pinned
+   * sibling on purpose: that sibling is what used to make the silence
+   * survivable. With it present the lint reported "all pins agree" over a
+   * split pair, and `--print-pin` returned the sibling's SHA as though it were
+   * the only pin in the repo -- so a case with the unreadable job ALONE would
+   * have been caught by the zero-caller guard and proved nothing about this
+   * one.
+   */
+  function expectBothModesRefuse(lines: string[], at: number, reason: string) {
+    const root = fixtureRoot({ [WORKFLOW]: yaml(lines) });
+    const expected = `${REL}:${at}: ${CANNOT_READ} (${reason})`;
+
+    const lintResult = run(root);
+    expect(lintResult.status).toBe(1);
+    expect(lintResult.stderr).toContain(expected);
+    expect(lintResult.stdout).not.toContain("all pins agree");
+
+    const pinResult = run(root, "--print-pin", "cursor-review.yml");
+    expect(pinResult.status).toBe(1);
+    // EXACTLY empty, not merely "not a SHA": ci.yml captures this mode with
+    // `$(...)`, so anything written to stdout becomes the "pin" it hands to
+    // `git cat-file` and `git merge-base --is-ancestor`.
+    expect(pinResult.stdout).toBe("");
+    expect(pinResult.stderr).toContain(expected);
+  }
+
+  it("reports a FOLDED `uses: >-` whose value sits on the next line", () => {
+    const opener = "    uses: >-";
+    const lines = [
+      ...pinnedCaller(),
+      "  folded:",
+      opener,
+      `      ${REUSABLE}@${OTHER}`,
+      "    with:",
+      `      workflows_ref: ${OTHER}`,
+    ];
+    // The OPENER is the reported line, not the value line beneath it: the
+    // value line is block-scalar content, which the scanner masks out.
+    expectBothModesRefuse(lines, lineNo(lines, opener), "folded/literal block scalar");
+  });
+
+  it("reports a job written as a FLOW mapping, whose `uses:` never starts a line", () => {
+    const flowJob = `  flow: { uses: "${REUSABLE}@${OTHER}", with: { workflows_ref: "${OTHER}" } }`;
+    const lines = [...pinnedCaller(), flowJob];
+    expectBothModesRefuse(lines, lineNo(lines, flowJob), "job written as a flow mapping");
+  });
+
+  it("reports a bare `uses:` whose value sits on a CONTINUATION line", () => {
+    const bareKey = "    uses:";
+    const lines = [
+      ...pinnedCaller(),
+      "  bare:",
+      bareKey,
+      `      ${REUSABLE}@${OTHER}`,
+      "    with:",
+      `      workflows_ref: ${OTHER}`,
+    ];
+    expectBothModesRefuse(lines, lineNo(lines, bareKey), "value on a continuation line");
+  });
+
+  it("names the SPELLING even when the unreadable job is the only one in the file", () => {
+    // Without the plain sibling this file parses to zero callers, which the
+    // lint already reddens on. The point of this case is WHICH message it
+    // reddens with: "the lint checked nothing, maybe the callers were removed"
+    // sends the reader looking for a deletion that never happened, when the
+    // caller is right there on the line named here.
+    const opener = "    uses: >-";
+    const lines = [
+      ...HEADER,
+      "  folded:",
+      opener,
+      `      ${REUSABLE}@${SHA}`,
+      "    with:",
+      `      workflows_ref: ${SHA}`,
+    ];
+    const root = fixtureRoot({ [WORKFLOW]: yaml(lines) });
+    const { status, stderr } = run(root);
+    expect(status).toBe(1);
+    expect(stderr).toContain(`${REL}:${lineNo(lines, opener)}: ${CANNOT_READ}`);
+    expect(stderr).not.toContain("lint checked nothing");
+  });
+
+  it("stays silent about a job-level `uses:` that names some OTHER owner", () => {
+    // A local reusable and a third party's both pin ONCE and have no
+    // `workflows_ref` to disagree with, so they are read fine and are
+    // genuinely not this lint's business. Reporting them would turn a
+    // fail-closed guard into a lint against calling anything else.
+    const lines = [
+      ...pinnedCaller(),
+      "  local:",
+      "    uses: ./.github/workflows/local.yml",
+      "  third-party:",
+      "    uses: other-org/repo/.github/workflows/x.yml@v3",
+    ];
+    const root = fixtureRoot({ [WORKFLOW]: yaml(lines) });
+
+    const { status, stdout, stderr } = run(root);
+    expect(stderr).toBe("");
+    expect(status).toBe(0);
+    expect(stdout).toContain("1 Comfy-Org/github-workflows caller(s)");
+
+    const pinResult = run(root, "--print-pin", "cursor-review.yml");
+    expect(pinResult.status).toBe(0);
+    expect(pinResult.stdout).toBe(`${SHA}\n`);
+  });
+});

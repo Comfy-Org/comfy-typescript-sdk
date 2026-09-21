@@ -33,8 +33,8 @@
  * buried deeper (inside a block scalar, or under a nested mapping) are both
  * ignored, so neither can stand in for a pin the job does not actually pass.
  *
- * The scan is structure-aware in the two places text matching would otherwise
- * be wrong in the SILENT direction:
+ * The scan is structure-aware in the three places text matching would
+ * otherwise be wrong in the SILENT direction:
  *
  * - Block scalars (`run: |`) are skipped, so a `uses:` line quoted inside a
  *   shell script body is not mistaken for a caller. This file's own sibling
@@ -44,6 +44,19 @@
  *   and take the daily `cursor-review-pin-freshness` watchdog down with it.
  * - The `uses` KEY may be quoted (`"uses":`), which YAML allows and which must
  *   not read as "no uses: here".
+ * - A job-level `uses:` whose VALUE this scanner cannot read is REPORTED by
+ *   file and line, not skipped: a block scalar (`uses: >-`), a value pushed
+ *   onto a continuation line, an unterminated quoted scalar, or any other
+ *   spelling that still names a Comfy-Org/github-workflows reusable. So is a
+ *   job written as a FLOW mapping (`review: { uses: ..., with: { ... } }`),
+ *   whose `uses:` never starts a line for the scan to match. Each of those
+ *   used to read as "no caller here", so a split pin written that way next to
+ *   one plain sibling caller passed the lint, and `--print-pin` answered with
+ *   the sibling's SHA instead of refusing. Both modes now exit 1 naming the
+ *   line -- and the message names the spelling to write instead, so the fix is
+ *   a reword, not a call the author can no longer make. A single-line `uses:`
+ *   naming some OTHER owner -- a local reusable, or a third party's -- is read
+ *   fine and is genuinely not this lint's business, so it stays a silent skip.
  *
  * A STEP's `uses:` is deliberately NOT matched, and that is enforced by
  * POSITION rather than by spelling: the matched `uses:` must be a direct child
@@ -57,15 +70,17 @@
  * demand a pin that cannot exist.
  *
  * Finding NO caller at all is an ERROR. This repo calls these reusables, so an
- * empty scan means the lint checked nothing -- far more likely a caller in a
- * shape this scanner cannot see than a real removal, and the same edit would
- * silence `--print-pin` and the daily watchdog with it.
+ * empty scan means the lint checked nothing, and the same edit would silence
+ * `--print-pin` and the daily watchdog with it.
  *
- * One documented limit, which reads as "input absent": a `with:` written as a
- * FLOW mapping (`with: { ... }`) is not parsed. That fails LOUDLY as a missing
- * input rather than passing silently, which is the direction this lint is
- * allowed to be wrong in -- so it does not justify carrying a YAML parser into
- * a job that deliberately runs without `pnpm install`.
+ * One documented limit, which reads as "input absent": on a job whose `uses:`
+ * IS readable, a `with:` written as a FLOW mapping (`with: { ... }`) is not
+ * parsed. That fails LOUDLY as a missing input rather than passing silently,
+ * which is the direction this lint is allowed to be wrong in -- so it does not
+ * justify carrying a YAML parser into a job that deliberately runs without
+ * `pnpm install`. (A job whose WHOLE body is a flow mapping is a different
+ * case and is reported by name, above: there the `uses:` is unreadable too, so
+ * nothing is left to fail loudly about.)
  *
  * Block-mapping key ORDER is not a limit: `with:` may sit above or below its
  * job's `uses:`, because the scan covers the whole job body rather than only
@@ -144,6 +159,27 @@ const BARE_SHA_RE = /\b[0-9a-f]{7,40}\b/g;
 // restricts job ids to `[A-Za-z_][A-Za-z0-9_-]*`.
 const JOB_ID_KEY_RE = /^(["']?)[A-Za-z_][A-Za-z0-9_-]*\1\s*:\s*(?:#.*)?$/;
 const JOBS_KEY_RE = /^(["']?)jobs\1\s*:\s*(?:#.*)?$/;
+// A `uses` KEY with ANY value at all, including none on this line. `USES_RE`
+// above matches only the value spellings this scanner can READ, so the gap
+// between the two is exactly the set of `uses:` lines that would otherwise be
+// skipped in silence -- which is what `unreadableUsesReason` classifies.
+const USES_KEY_RE = /^(\s*)(["']?)uses\2\s*:(.*)$/;
+// A `<job id>:` whose value opens a FLOW mapping (`review: { uses: ... }`).
+// Being a job rather than some other flow-mapped key is decided by POSITION at
+// the call site (its owning key must be the column-0 `jobs:`), not by
+// hardcoding the two-space indent every workflow in this repo happens to use.
+//
+// EVERY such job is reported, including one that calls no reusable at all: a
+// flow mapping nests to any depth on one line, so "does this contain a
+// `uses:`" is precisely the question a line-anchored scanner cannot answer,
+// and guessing at it would put the silent skip straight back. No workflow in
+// this repo is written that way, and the remedy the message asks for -- spell
+// the job as a block mapping -- costs a reformat.
+const FLOW_JOB_RE = /^(["']?)[A-Za-z_][A-Za-z0-9_-]*\1\s*:\s*\{/;
+// A value that is nothing but a block-scalar header: `|`, `>-`, `|2`, `>2-`.
+// Same indicator class as `BLOCK_SCALAR_RE`, which is deliberately loose about
+// the order of the chomping and indentation indicators.
+const BLOCK_SCALAR_VALUE_RE = /^[|>][0-9+-]*$/;
 
 /**
  * Commit abbreviations the trailing comment claims, most precise form first.
@@ -243,6 +279,49 @@ function isJobLevelUses(lines, usesIndex, usesIndent, inBlock) {
 }
 
 /**
+ * A YAML value with its trailing `# ...` comment removed.
+ *
+ * A comment opens at a `#` that begins the value or follows whitespace, which
+ * is YAML's own rule -- `@sha#1` is part of the ref, not a comment.
+ */
+function stripTrailingComment(value) {
+  const at = value.search(/(?:^|\s)#/);
+  return at === -1 ? value : value.slice(0, at).trim();
+}
+
+/**
+ * Why a job-level `uses:` value cannot be read, or `null` when it reads fine
+ * and simply names something that is not this lint's business.
+ *
+ * Reached only for a `uses:` that `USES_RE` did NOT match, so "reads fine" here
+ * means a single-line value naming some other owner -- a local reusable
+ * (`./.github/workflows/x.yml`) or a third party's
+ * (`octo/repo/.github/workflows/x.yml@v1`). Those pin once, have no
+ * `workflows_ref` to disagree with, and are correctly skipped in silence.
+ *
+ * Everything else is a spelling this text-level scanner cannot see THROUGH,
+ * and every one of them used to be indistinguishable from "no caller on this
+ * line". The quoted-scalar check runs on the RAW value, before the comment is
+ * stripped, so a `#` inside an unterminated quote is read as part of the
+ * scalar rather than as the comment that would make the quote look closed.
+ */
+function unreadableUsesReason(rawValue) {
+  const raw = rawValue.trim();
+
+  const quote = raw[0];
+  if ((quote === '"' || quote === "'") && !raw.slice(1).includes(quote)) {
+    return "multi-line quoted scalar";
+  }
+
+  const value = stripTrailingComment(raw);
+  if (value === "") return "value on a continuation line";
+  if (BLOCK_SCALAR_VALUE_RE.test(value)) return "folded/literal block scalar";
+  if (value.includes(REUSABLE_OWNER_REPO)) return "owner/path/ref did not parse";
+
+  return null;
+}
+
+/**
  * The `workflows_ref` INPUT of the job that owns the `uses:` on `usesIndex`,
  * or `null` if that job passes none.
  *
@@ -325,14 +404,23 @@ function workflowsRefInput(lines, usesIndex, usesIndent, inBlock) {
 }
 
 /**
- * Every `Comfy-Org/github-workflows` caller in `.github/workflows`, parsed.
+ * Every `Comfy-Org/github-workflows` caller in `.github/workflows`, parsed,
+ * plus every job-level `uses:` written in a spelling this scanner cannot read.
  *
  * PARSING ONLY -- it asserts nothing at all. Both modes read these records, so
  * neither can drift from the other about what counts as a caller, which line
  * holds its `uses:` ref, or where its `workflows_ref` input lives.
+ *
+ * `unreadable` is the fail-closed half, and both modes must read it. A caller
+ * the scanner cannot see is not the same thing as a caller that is not there:
+ * with one plain sibling caller in the file, an unreadable second job left the
+ * lint reporting "all pins agree" over a split pair, and left `--print-pin`
+ * returning the sibling's SHA to the daily watchdog as though it were the only
+ * pin in the repo.
  */
 function findCallers() {
   const callers = [];
+  const unreadable = [];
 
   for (const file of readdirSync(WORKFLOWS_DIR).sort()) {
     if (!file.endsWith(".yml") && !file.endsWith(".yaml")) continue;
@@ -353,8 +441,32 @@ function findCallers() {
       // header of ci-cursor-review.yml does exactly that.
       if (trimmed.startsWith("#")) continue;
 
+      // A job whose whole body is a FLOW mapping hides its `uses:` mid-line,
+      // where no line-anchored match can reach it. Position is what makes this
+      // a job rather than some other flow-mapped key -- `on: { push: { ... } }`
+      // is owned by `on:`, not by `jobs:`, and must not be reported.
+      if (FLOW_JOB_RE.test(trimmed)) {
+        const indent = lines[i].length - trimmed.length;
+        const jobs = owningKey(lines, i, indent, inBlock);
+        if (jobs !== null && jobs.indent === 0 && JOBS_KEY_RE.test(jobs.trimmed)) {
+          unreadable.push({ rel, lineNo: i + 1, reason: "job written as a flow mapping" });
+          continue;
+        }
+      }
+
       const m = USES_RE.exec(lines[i]);
-      if (!m) continue;
+      if (!m) {
+        // Not a value this scanner can read -- but the KEY may still be a
+        // job-level `uses:`, in which case failing closed on it is the whole
+        // point. `unreadableUsesReason` returns null for the one shape that is
+        // legitimately none of this lint's business.
+        const km = USES_KEY_RE.exec(lines[i]);
+        if (km !== null && isJobLevelUses(lines, i, km[1].length, inBlock)) {
+          const reason = unreadableUsesReason(km[3]);
+          if (reason !== null) unreadable.push({ rel, lineNo: i + 1, reason });
+        }
+        continue;
+      }
 
       const [, indentStr, , , workflowPath, ref, comment] = m;
 
@@ -373,7 +485,7 @@ function findCallers() {
     }
   }
 
-  return callers;
+  return { callers, unreadable };
 }
 
 /** The three pin assertions, as a list of human-readable problems. */
@@ -444,6 +556,37 @@ function fail(message) {
 }
 
 /**
+ * Report every unreadable job-level `uses:` on STDERR and exit 1.
+ *
+ * Runs in BOTH modes, and before either mode's own checks, because neither can
+ * say anything true while a caller is invisible to it: the lint would compare
+ * the pins it can see and call them agreed, and `--print-pin` would hand the
+ * watchdog one SHA as if it were the only pin in the repo. Nothing goes to
+ * STDOUT -- `cursor-review-pin-freshness` captures this script's stdout with
+ * `$(...)`, so a diagnostic written there becomes the "pin" it feeds to git.
+ */
+function reportUnreadable(unreadable) {
+  console.error(
+    `check-workflow-pins: ${unreadable.length} job-level \`uses:\` line(s) this ` +
+      `checker cannot read:\n`,
+  );
+  for (const { rel, lineNo, reason } of unreadable) {
+    console.error(
+      `  - ${rel}:${lineNo}: job-level \`uses:\` is written in a spelling this checker ` +
+        `cannot read (${reason}); write ` +
+        `\`uses: ${REUSABLE_OWNER_REPO}/.github/workflows/<name>.yml@<sha>\` on one line`,
+    );
+  }
+  console.error(
+    `\nThis is a fail-CLOSED report, not a style rule: a caller this scanner ` +
+      `cannot see reads exactly like no caller at all, so a pin split inside ` +
+      `one would pass the lint and \`--print-pin\` would answer with some other ` +
+      `job's SHA.`,
+  );
+  process.exit(1);
+}
+
+/**
  * Print ONE caller's `workflows_ref` SHA on stdout, and nothing else.
  *
  * Deliberately does NOT assert that `workflows_ref` equals the `uses:` ref:
@@ -500,25 +643,30 @@ if (printPinArg !== null) {
   if (printPinArg === "") {
     fail("--print-pin needs a reusable workflow file name, e.g. `--print-pin cursor-review.yml`.");
   }
-  printPin(findCallers(), printPinArg);
+  const { callers, unreadable } = findCallers();
+  if (unreadable.length > 0) reportUnreadable(unreadable);
+  printPin(callers, printPinArg);
 } else {
-  const callers = findCallers();
+  const { callers, unreadable } = findCallers();
+
+  // Checked BEFORE the zero-caller guard below, so a file whose only caller is
+  // unreadable is reported as the spelling it is rather than as an empty repo.
+  if (unreadable.length > 0) reportUnreadable(unreadable);
 
   // ZERO CALLERS IS AN ERROR, not a notice. This repo does call these
-  // reusables, so an empty result means this lint checked NOTHING -- and the
-  // likeliest cause is a caller spelled in a shape the scanner cannot see (a
-  // folded `uses: >-`, a flow mapping) rather than a real removal. That edit
-  // would take `--print-pin` down with it and silence the daily
+  // reusables, so an empty result means this lint checked NOTHING. The
+  // spellings that used to be the likeliest cause -- a folded `uses: >-`, a
+  // flow-mapping job -- are reported by name above, so reaching here means the
+  // scanner found no job-level `uses:` at all. That edit would take
+  // `--print-pin` down with it and silence the daily
   // `cursor-review-pin-freshness` watchdog in the same change, so the lint and
   // its watchdog would go quiet together. Fail loudly instead.
   if (callers.length === 0) {
     fail(
       `no ${REUSABLE_OWNER_REPO} caller found under .github/workflows, so this ` +
-        `lint checked nothing. Either a caller is written in a shape this ` +
-        `text-level scanner cannot see -- a folded \`uses: >-\`, a flow mapping -- ` +
-        `or the callers really were removed, in which case delete this script ` +
-        `along with its \`workflow-pins\` job and the \`cursor-review-pin-freshness\` ` +
-        `watchdog that depends on \`--print-pin\`.`,
+        `lint checked nothing. If the callers really were removed, delete this ` +
+        `script along with its \`workflow-pins\` job and the ` +
+        `\`cursor-review-pin-freshness\` watchdog that depends on \`--print-pin\`.`,
     );
   }
 
