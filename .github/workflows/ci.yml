@@ -179,6 +179,17 @@ jobs:
   sdk-parity:
     name: sdk-parity (python surface freshness)
     runs-on: ubuntu-latest
+    # Bounds how long one run can hold the `sdk-parity-schedule` group below.
+    # That group does NOT cancel in progress, so a wedged run is no longer
+    # superseded by the next one the way it used to be -- and the parity step
+    # here is the one that reaches the network. `scripts/sync-python-surface.mjs`
+    # fetches with no `AbortSignal`, and undici's `headersTimeout`/`bodyTimeout`
+    # are INACTIVITY-based, so a trickling or wedged response is not a timeout
+    # to them: without this the job would sit on the group for the 6-hour
+    # default and block every later scheduled run behind it. Same "must not
+    # hold a runner" reasoning as `cursor-review-pin-freshness`, which pins 10;
+    # the extra headroom here is for the checkout and the pnpm install.
+    timeout-minutes: 15
     # The workflow-level `cancel-in-progress` above deliberately stops
     # superseding `schedule` runs, so that a re-run cannot cancel an in-flight
     # cron run mid-mutation. That removes the single-instance guarantee this
@@ -2052,7 +2063,7 @@ jobs:
           gh label create "$MODE_LABEL" --force --color ededed \
             --description "cursor-review pin freshness watchdog: the pin is stale" >/dev/null
 
-          # Dedup key for the once-per-pin suppression further down. The report
+          # Dedup key for the once-per-REPORT suppression further down. The report
           # body is NOT a function of the pin alone: both the `cause` premise
           # built just below and the `step1` remediation built after it branch
           # on $BUMP_PR and $BUMP_DELIVERS, so the SAME frozen pin produces a
@@ -2065,16 +2076,38 @@ jobs:
           # thing to chase is an open PR that has stopped counting as delivery.
           # So key on the pin AND the bump state that selects those branches.
           #
-          # Deliberately NOT keyed on the bump PR's AGE, which appears in one
-          # premise and changes every day: that would defeat the suppression
-          # entirely on exactly the long-frozen pins it exists for.
+          # $FUTURE_DATED is in the key for the same reason as the bump state:
+          # it selects the `overdue` paragraph below, and it flips rarely (an
+          # upstream committer clock, corrected). Without it a frozen pin whose
+          # oldest owed commit turns out to be future-dated kept a durable
+          # report saying that commit simply sat past the grace window -- a
+          # different diagnosis, pointing at a different thing to go fix.
+          #
+          # Deliberately NOT keyed on the values that change every day on a pin
+          # that is doing nothing: the bump PR's AGE, and $NEWEST_SHA /
+          # $NEWEST_DATE / $BEHIND_COUNT, which move whenever UPSTREAM lands a
+          # watched commit, pin or no pin. Keying on those would defeat the
+          # suppression entirely on exactly the long-frozen pins it exists for.
+          # They are handled in the BODY instead, which labels them a snapshot
+          # and sends the reader to the newest run's log for current values, so
+          # a suppressed report cannot be misread as today's numbers. That
+          # matters most in step 3: naming a weeks-old $NEWEST_SHA as the exact
+          # SHA to hand-bump to would have a maintainer move the pin to
+          # something still far behind -- and the close step reads any movement
+          # off the recorded marker, so it would then close this alarm
+          # asserting a bump landed.
           report_pr="$(printf '%s' "${BUMP_PR:-}" | tr -cd '0-9')"
           report_pr="${report_pr:-none}"
           case "${BUMP_DELIVERS:-}" in
             yes|no|unknown) report_delivers="$BUMP_DELIVERS" ;;
             *) report_delivers=none ;;
           esac
-          REPORT_KEY="$PIN $report_pr $report_delivers"
+          if [ -n "${FUTURE_DATED:-}" ]; then
+            report_dated=future
+          else
+            report_dated=onclock
+          fi
+          REPORT_KEY="$PIN $report_pr $report_delivers $report_dated"
 
           if [ -n "$BUMP_PR" ] && [ "$BUMP_DELIVERS" = no ]; then
             cause="$(printf '%s ' \
@@ -2167,13 +2200,20 @@ jobs:
           # 40-hex before writing it to `$GITHUB_OUTPUT`, so it cannot contain
           # a `-->` or anything else that would break out of the comment.
           body="$(printf '%s\n' \
-            "\`.github/workflows/ci-cursor-review.yml\` is pinned to \`$PIN\`, which is" \
-            "**$BEHIND_COUNT consumer-visible commit(s) behind \`Comfy-Org/github-workflows@$UPSTREAM_BRANCH\`**." \
+            "\`.github/workflows/ci-cursor-review.yml\` is pinned to \`$PIN\`, which was" \
+            "**$BEHIND_COUNT consumer-visible commit(s) behind \`Comfy-Org/github-workflows@$UPSTREAM_BRANCH\`**" \
+            "as of the run linked at the bottom." \
             "" \
             "| | commit | landed |" \
             "| --- | --- | --- |" \
             "| oldest not picked up | \`$OLDEST_SHA\` | $OLDEST_DATE |" \
-            "| newest upstream (what a bump moves to) | \`$NEWEST_SHA\` | $NEWEST_DATE |" \
+            "| newest upstream *at that time* | \`$NEWEST_SHA\` | $NEWEST_DATE |" \
+            "" \
+            "Those two are a snapshot from that one run. This report is re-posted only when" \
+            "the pin or the bump state changes, so on a long-frozen pin upstream keeps landing" \
+            "commits underneath it and both go out of date. The oldest-owed row and the verdict" \
+            "do not -- they are what this alarm is about. The newest daily run's log always" \
+            "carries the current values." \
             "" \
             "$overdue $cause" \
             "" \
@@ -2187,7 +2227,10 @@ jobs:
             "   this repo is missing, add it there and re-dispatch the fleet. That was the" \
             "   original failure -- a silently dropped roster entry, for three weeks." \
             "3. **Or hand-bump.** Move BOTH pins in \`.github/workflows/ci-cursor-review.yml\`" \
-            "   (the \`uses:\` SHA and the \`workflows_ref:\` input) to \`$NEWEST_SHA\`, update the" \
+            "   (the \`uses:\` SHA and the \`workflows_ref:\` input) to the CURRENT tip of" \
+            "   \`Comfy-Org/github-workflows@$UPSTREAM_BRANCH\`. Take that from the newest daily" \
+            "   run's log, NOT from \`$NEWEST_SHA\` above -- that is only the tip as of this" \
+            "   report, and bumping to it would leave the pin behind again. Then update the" \
             "   trailing \`# github-workflows $UPSTREAM_BRANCH (short)\` comment, and verify with:" \
             "" \
             "       node scripts/check-workflow-pins.mjs" \
@@ -2226,8 +2269,9 @@ jobs:
             #     `-held` marker for this same pin cannot suppress a report.
             #   * the newest `cursor-review-pin-report:` marker carries this
             #     run's $REPORT_KEY, i.e. the same pin AND the same bump-PR
-            #     state. The pin alone does not determine the report: see the
-            #     note where REPORT_KEY is built.
+            #     state AND the same date basis for the grace verdict. The pin
+            #     alone does not determine the report: see the note where
+            #     REPORT_KEY is built.
             #
             # Requiring both only ever makes this step SAY MORE, never less, so
             # it cannot re-open the unbounded-thread problem above: the bump
@@ -2237,26 +2281,90 @@ jobs:
             # the close step's choice, because the conservative direction is the
             # opposite here: this step's job is to REPORT, so a duplicate report
             # costs a line on a thread, whereas suppressing one on a bad read
-            # could drop the only durable record that the pin is stale. Every
-            # run annotates its own log either way.
+            # could drop the only durable record that the pin is stale. The
+            # `::warning::` below says so, rather than leaving a silently
+            # broken dedup to look like a working one.
+            #
+            # SCOPED TO THIS ALARM CYCLE -- markers at or after the moment the
+            # issue was last CLOSED -- exactly the way the close step below
+            # scopes its movement-proof read. Reading the whole thread made the
+            # two steps disagree about which markers exist, on the very inputs
+            # the close step's scoping was added for: a maintainer reopening a
+            # wrongly-closed alarm by hand, or a run dying between the report
+            # and the reopen. There the PREVIOUS cycle's two markers are still
+            # the thread's newest, so an unchanged pin and bump state matched
+            # here and suppressed -- leaving the reopened alarm with no
+            # current-cycle report (a stale Run URL and backlog count) while
+            # the `::notice::` claimed it already carried one, and leaving the
+            # close step to find zero markers in the cycle and hold the issue
+            # open an extra day. Scoped, this step re-reports once on reopen,
+            # which is the direction it already errs in.
+            scratch="$(mktemp -d)"
+            trap 'rm -rf "$scratch"' EXIT
+
             reported=0
-            if thread="$( { gh api "repos/$GH_REPO/issues/$existing" --jq '.body' \
-                 && gh api --paginate "repos/$GH_REPO/issues/$existing/comments?per_page=100" \
-                      --jq '.[] | select(.user.login == "github-actions[bot]") | .body'; } 2>/dev/null)"; then
+            read_rc=0
+            thread=""
+            # `closed` is the anchor rather than `reopened` for the same reason
+            # the close step gives: the reopen path posts its report BEFORE
+            # reopening, so anchoring on the reopen would exclude the marker
+            # the reopen just wrote.
+            last_closed="$(gh api --paginate \
+              "repos/$GH_REPO/issues/$existing/timeline?per_page=100" \
+              --jq '.[] | select(.event == "closed") | .created_at' \
+              2>"$scratch/read.err" | tail -n 1 )" || read_rc=$?
+
+            if [ "$read_rc" -eq 0 ]; then
+              # Exported so the jq filter can read it; `gh --jq` has no `--arg`.
+              # ISO-8601 UTC timestamps sort correctly as plain strings.
+              export MARKER_SINCE="$last_closed"
+              if [ -z "$MARKER_SINCE" ]; then
+                # Never closed, so the whole thread is this cycle -- including
+                # the filing BODY, which carries the first report's markers and
+                # is not a comment. This is the only branch that reads it.
+                thread="$( { gh api "repos/$GH_REPO/issues/$existing" --jq '.body' \
+                  && gh api --paginate "repos/$GH_REPO/issues/$existing/comments?per_page=100" \
+                       --jq '.[] | select(.user.login == "github-actions[bot]") | .body'; } \
+                  2>"$scratch/read.err" )" || read_rc=$?
+              else
+                # Reopened at least once. The body predates the last close by
+                # definition, so it is a previous cycle's record; comments only.
+                thread="$(gh api --paginate \
+                  "repos/$GH_REPO/issues/$existing/comments?per_page=100" \
+                  --jq '.[] | select(.user.login == "github-actions[bot]")
+                            | select(.created_at >= env.MARKER_SINCE) | .body' \
+                  2>"$scratch/read.err" )" || read_rc=$?
+              fi
+            fi
+
+            if [ "$read_rc" -ne 0 ]; then
+              # Say WHY. Swallowing this with `2>/dev/null` meant a PERSISTENT
+              # failure -- a secondary rate limit on a long thread, a
+              # pagination error -- silently reverted this step to commenting
+              # once per run, which is the unbounded thread growth the
+              # suppression exists to stop, with nothing in the log saying the
+              # dedup was broken. (The assess step's verdict annotation says
+              # nothing about this read.) `%` is escaped FIRST and only then
+              # are line breaks flattened, same as the close step: the runner
+              # percent-decodes workflow commands and they are line-oriented.
+              read_err="$(sed -e 's/%/%25/g' <"$scratch/read.err" | tr '\r\n' '  ')"
+              echo "::warning::could not read issue #$existing to check whether it already carries this report (gh exited $read_rc saying: ${read_err:-(no output)}), so the once-per-report dedup is not working on this run. Commenting anyway -- a duplicate report costs a line on the thread, whereas suppressing one on a bad read could drop the only durable record that the pin is stale."
+            else
               # One fetch, two reads. The `-report` marker is a SEPARATE marker
               # rather than extra fields on the pin marker, because the pin
               # marker is the close step's movement proof and that step matches
               # it as an exact 40-hex string; `cursor-review-pin-report:` does
-              # not match `cursor-review-pin(-held)?:`, so it is invisible
-              # there and the movement proof is unchanged.
+              # not match `cursor-review-pin(-held|-unknown)?:`, so it is
+              # invisible there and the movement proof is unchanged.
               newest_marker="$(printf '%s\n' "$thread" \
-                | grep -oE '<!-- cursor-review-pin(-held)?: [0-9a-f]{40} -->' \
+                | grep -oE '<!-- cursor-review-pin(-held|-unknown)?: [0-9a-f]{40} -->' \
                 | tail -n 1)" || true
               newest_report="$(printf '%s\n' "$thread" \
-                | grep -oE '<!-- cursor-review-pin-report: [0-9a-f]{40} ([0-9]+|none) (yes|no|unknown|none) -->' \
+                | grep -oE '<!-- cursor-review-pin-report: [0-9a-f]{40} ([0-9]+|none) (yes|no|unknown|none) (future|onclock) -->' \
                 | tail -n 1)" || true
               # BOTH must match. The pin test is what a `-held` marker resets
-              # (a fresh entry into the stale state is worth saying again); the
+              # (a fresh entry into the stale state is worth saying again --
+              # `-unknown` counts as one too); the
               # report test is what a CHANGED bump state resets. A report
               # written before this key existed carries no `-report` marker, so
               # it reads empty and the next run re-reports once, which is the
@@ -2270,7 +2378,7 @@ jobs:
             if [ "$reported" -eq 0 ]; then
               gh issue comment "$existing" --body "$body"
             else
-              echo "::notice::issue #$existing already carries the stale-pin report for [$REPORT_KEY] (pin, bump PR, delivery) as its newest record, so this run is not repeating it. The verdict is still stale -- see the annotation from the assess step."
+              echo "::notice::issue #$existing already carries the stale-pin report for [$REPORT_KEY] (pin, bump PR, delivery, date basis) as its newest record, so this run is not repeating it. The verdict is still stale -- see the annotation from the assess step."
             fi
             exit 0
           fi
@@ -2376,10 +2484,11 @@ jobs:
       #
       # `!cancelled()` and NOT `always()`, which is true for a CANCELLED run as
       # well -- and a cancellation is the one outcome that is not a verdict.
-      # This job remains cancellable -- `schedule` still carries run-level
-      # `cancel-in-progress`, the workflow-level exclusion above covers only
-      # `workflow_dispatch`, and a human can cancel any run from the UI -- and
-      # it has a 10-minute timeout besides, so a run
+      # This job remains cancellable. Not through run-level supersession --
+      # the workflow-level exclusion above covers `schedule` AND
+      # `workflow_dispatch`, so neither event's runs cancel each other any
+      # more -- but a human can cancel any run from the UI, and it has a
+      # 10-minute timeout besides, so a run
       # killed after `assess` wrote its `state` but before this step would,
       # under `always()`, close the watchdog-blocked issue on the strength of a
       # walk that never finished. `!cancelled()` keeps every real outcome --
@@ -2450,19 +2559,29 @@ jobs:
       #
       # The proof is the pin recorded on this issue. The stale step above ends
       # every body it writes with a `<!-- cursor-review-pin: <sha> -->` marker
-      # and re-comments that body ONCE PER PIN, and both the held-open and the
-      # no-marker branch below record the pin they declined to close on as
-      # `<!-- cursor-review-pin-held: <sha> -->`, so the LAST marker of either
-      # kind is the pin as of the most recent record. This step reads it back
-      # and branches four ways:
+      # and re-comments that body ONCE PER REPORT -- keyed on the pin AND the
+      # bump state that selects the body's branches, so strictly more often
+      # than once per pin; see `REPORT_KEY` in that step. The held-open branch
+      # below records the pin it declined to close on as
+      # `<!-- cursor-review-pin-held: <sha> -->`, and the no-marker branch
+      # records its first sighting as
+      # `<!-- cursor-review-pin-unknown: <sha> -->`, so the LAST marker of any
+      # of the three kinds is the pin as of the most recent record. This step
+      # reads it back and branches four ways:
       #
       #   recorded != pin  -> the pin genuinely moved; close, saying so.
-      #   recorded == pin  -> the backlog shrank on a frozen pin; do NOT close,
-      #                       comment why ONCE PER PIN, and `::warning::` every
-      #                       run.
+      #   recorded == pin  -> the pin has not moved since that record; do NOT
+      #                       close, comment why ONCE PER PIN, and
+      #                       `::warning::` every run. What that record WAS
+      #                       decides what can be claimed: against a `-held`
+      #                       one the backlog demonstrably shrank on a frozen
+      #                       pin, while against an `-unknown` one only "not
+      #                       moved since the first sighting" holds, so the
+      #                       cause is not asserted.
       #   no marker found  -> nothing to compare against, so the two cases
       #                       above cannot be told apart. Do NOT close: RECORD
-      #                       the current pin as a `-held` marker, `::warning::`
+      #                       the current pin as an `-unknown` marker,
+      #                       `::warning::`
       #                       and leave the issue open one more cycle, which
       #                       gives tomorrow's run a real comparison. Closing
       #                       here instead -- on the backlog alone -- was the
@@ -2697,12 +2816,14 @@ jobs:
             # made hold-open, empty CLOSED the issue, and folding a failed read
             # into it was a live false close.
             #
-            # `-held` markers count as records too, so the newest marker of
-            # either kind is the pin as of the most recent record on this issue.
-            # The two patterns cannot cross-match: the plain form requires
-            # `pin: ` where the held form has `pin-held: `.
+            # `-held` and `-unknown` markers count as records too, so the
+            # newest marker of any of the three kinds is the pin as of the most
+            # recent record on this issue. They cannot cross-match: the plain
+            # form requires `pin: ` exactly where the other two have `pin-held: `
+            # and `pin-unknown: `. `cursor-review-pin-report:` is likewise
+            # invisible here, so the report key cannot be read as a pin.
             last_marker="$(printf '%s\n' "$reports" \
-              | grep -oE '<!-- cursor-review-pin(-held)?: [0-9a-f]{40} -->' \
+              | grep -oE '<!-- cursor-review-pin(-held|-unknown)?: [0-9a-f]{40} -->' \
               | tail -n 1)" || last_marker=""
             recorded="$(printf '%s\n' "$last_marker" \
               | grep -oE '[0-9a-f]{40}')" || recorded=""
@@ -2743,11 +2864,26 @@ jobs:
               # run something real to compare against. It cannot stick open
               # forever: the marker written here is read by tomorrow's run,
               # which either finds the pin moved (closes, with proof) or finds
-              # it unchanged (the held branch below, which annotates and stays
-              # quiet). A `-held` marker rather than the plain form because
+              # it unchanged (the held branch below).
+              #
+              # The marker is a THIRD form, `-unknown`, not the `-held` one the
+              # held branch writes. Byte-identical markers would mean two
+              # different things: `-held` means "confirmed unchanged against a
+              # real prior record", while this one is written at the moment the
+              # code says it has NO baseline. On the case this branch exists
+              # for -- the pre-marker alarm open the day this ships -- a bump
+              # that lands and reaches `grace` gets its post-bump pin recorded
+              # HERE, and with a `-held` marker tomorrow's run read
+              # `recorded == $PIN`, took the held branch, and asserted as fact
+              # that "the backlog shrank without the pin moving ... the
+              # likeliest cause is upstream narrowing `WATCHED_PATHSPECS`" --
+              # a cause it had no baseline to know, on a bump that had in fact
+              # landed. The distinct form lets tomorrow's run say "no baseline
+              # before this, so only that the pin has not moved SINCE" instead.
+              # Neither form is the plain `cursor-review-pin:` one, because
               # nothing was reported stale here -- this is a record, not a
-              # staleness report, and the stale step's once-per-pin check keys
-              # on the plain form.
+              # staleness report, and the stale step's suppression requires the
+              # newest marker to be the plain form.
               para2="$(printf '%s ' \
                 "That is a fact about the BACKLOG, not proof that the pin itself moved: the" \
                 "backlog also shrinks if upstream narrows \`WATCHED_PATHSPECS\`. No pin has been" \
@@ -2755,8 +2891,9 @@ jobs:
                 "\`$PIN\` against and no way to tell those two cases apart. Rather than close on" \
                 "the backlog alone, this run RECORDS the pin and leaves the issue open. The next" \
                 "daily run has something to compare against: if the pin has moved by then it" \
-                "closes and says so, and if it has not it stays open and says that instead. That" \
-                "costs one extra day, once.")"
+                "closes and says so, and if it has not it stays open and says so -- noting that" \
+                "it still has no baseline from BEFORE this record. That costs one extra day," \
+                "once.")"
               gh issue comment "$existing" --body "$(printf '%s\n' \
                 "$premise" \
                 "" \
@@ -2764,7 +2901,7 @@ jobs:
                 "" \
                 "Run: $RUN_URL" \
                 "" \
-                "<!-- cursor-review-pin-held: $PIN -->")"
+                "<!-- cursor-review-pin-unknown: $PIN -->")"
               echo "::warning::nothing is overdue any more, but no pin has been recorded on issue #$existing since it was last opened, so this run cannot tell a real bump from upstream narrowing WATCHED_PATHSPECS. Recorded $PIN and left the issue open; the next run compares against it."
               exit 0
             elif [ "$recorded" != "$PIN" ]; then
@@ -2787,28 +2924,66 @@ jobs:
               # `::warning::` after this block fires on EVERY held run, so
               # nothing goes unreported by commenting once.
               #
+              # WHAT the record was matters as much as its value. A `-held`
+              # marker was written by this branch against a real predecessor,
+              # so the pin is known not to have moved across a full cycle. An
+              # `-unknown` marker was written by the no-marker branch above at
+              # the moment it had NO baseline, so all an equal pin proves is
+              # that nothing moved SINCE that first sighting -- a bump that
+              # landed BEFORE it reads exactly the same. Asserting the
+              # WATCHED_PATHSPECS cause off an `-unknown` baseline stated as
+              # fact something this job cannot know, so that case gets its own
+              # wording. A prefix `case`, matched against the marker's SHA
+              # too, so a record for a DIFFERENT pin cannot select it (it
+              # cannot reach here anyway -- `recorded` equals `$PIN`).
+              case "$last_marker" in
+                "<!-- cursor-review-pin-unknown: $PIN -->") baseline=unproven ;;
+                *) baseline=proven ;;
+              esac
+
               # "Already reported" is: the newest marker on the thread is a
               # `-held` one carrying THIS pin. If a stale report has been filed
               # since, its marker is the plain `cursor-review-pin:` form and is
               # newer, so this is a fresh entry into the state and worth saying
-              # again. An exact-string `case` rather than a prefix test, so a
-              # `-held` marker for a DIFFERENT pin cannot suppress this.
+              # again. An `-unknown` marker is likewise not a report of THIS
+              # state -- the paragraph below is the first time the hold is
+              # explained -- so it does not suppress either. An exact-string
+              # `case` rather than a prefix test, so a `-held` marker for a
+              # DIFFERENT pin cannot suppress this.
               case "$last_marker" in
                 "<!-- cursor-review-pin-held: $PIN -->") held_reported=1 ;;
                 *) held_reported=0 ;;
               esac
 
               if [ "$held_reported" -eq 0 ]; then
-                para2="$(printf '%s ' \
-                  "But the pin is still \`$PIN\` -- the same value last recorded on this issue --" \
-                  "so the backlog shrank without the pin moving. The likeliest cause is upstream" \
-                  "narrowing \`WATCHED_PATHSPECS\` in" \
-                  "\`Comfy-Org/github-workflows@$UPSTREAM_BRANCH:.github/workflows/bump-cursor-review-callers.yml\`," \
-                  "which this job re-reads live on every run: fewer watched paths means fewer owed" \
-                  "commits, on a pin nothing has touched. So this issue stays OPEN -- it closes" \
-                  "when the pin actually moves, or when nothing is owed at all. This is said once" \
-                  "per pin rather than once a day; every run that holds the issue open also" \
-                  "annotates its own log.")"
+                if [ "$baseline" = unproven ]; then
+                  para2="$(printf '%s ' \
+                    "But the pin is still \`$PIN\` -- the same value the run before this one recorded" \
+                    "when it had no baseline at all. So this run can say the pin has not moved SINCE" \
+                    "that first sighting, and nothing more: a bump that landed BEFORE it reads" \
+                    "exactly like upstream narrowing \`WATCHED_PATHSPECS\` in" \
+                    "\`Comfy-Org/github-workflows@$UPSTREAM_BRANCH:.github/workflows/bump-cursor-review-callers.yml\`," \
+                    "which this job re-reads live on every run. Both shrink the backlog on a pin" \
+                    "this issue has only ever seen at one value, so neither is asserted here. The" \
+                    "issue stays OPEN -- it closes when the pin actually moves, or when nothing is" \
+                    "owed at all. There IS a baseline from here on, so this is said once; every run" \
+                    "that holds the issue open also annotates its own log.")"
+                else
+                  para2="$(printf '%s ' \
+                    "But the pin is still \`$PIN\` -- the same value last recorded on this issue --" \
+                    "so the backlog shrank without the pin moving. The likeliest cause is upstream" \
+                    "narrowing \`WATCHED_PATHSPECS\` in" \
+                    "\`Comfy-Org/github-workflows@$UPSTREAM_BRANCH:.github/workflows/bump-cursor-review-callers.yml\`," \
+                    "which this job re-reads live on every run: fewer watched paths means fewer owed" \
+                    "commits, on a pin nothing has touched. So this issue stays OPEN -- it closes" \
+                    "when the pin actually moves, or when nothing is owed at all. This is said once" \
+                    "per pin rather than once a day; every run that holds the issue open also" \
+                    "annotates its own log.")"
+                fi
+                # A `-held` marker either way, and accurately so: whatever the
+                # PREVIOUS record meant, the pin is now confirmed unchanged
+                # against a record this issue really carries. The `-unknown`
+                # state is a property of that first sighting, not a sticky one.
                 gh issue comment "$existing" --body "$(printf '%s\n' \
                   "$premise" \
                   "" \
@@ -2818,7 +2993,11 @@ jobs:
                   "" \
                   "<!-- cursor-review-pin-held: $PIN -->")"
               fi
-              echo "::warning::nothing is overdue any more, but the pin is still $PIN -- the same value last recorded on issue #$existing -- so the backlog shrank without the pin moving, most likely because upstream narrowed WATCHED_PATHSPECS. Leaving issue #$existing open until the pin moves or nothing is owed."
+              if [ "$baseline" = unproven ]; then
+                echo "::warning::nothing is overdue any more, and the pin is still $PIN -- the same value issue #$existing recorded when it had no baseline at all -- so the pin has not moved since that first sighting, but a bump that landed before it cannot be told from upstream narrowing WATCHED_PATHSPECS. Leaving issue #$existing open until the pin moves or nothing is owed."
+              else
+                echo "::warning::nothing is overdue any more, but the pin is still $PIN -- the same value last recorded on issue #$existing -- so the backlog shrank without the pin moving, most likely because upstream narrowed WATCHED_PATHSPECS. Leaving issue #$existing open until the pin moves or nothing is owed."
+              fi
               exit 0
             fi
           fi
