@@ -66,19 +66,42 @@ function run(root: string, ...args: string[]) {
   const result = spawnSync(
     process.execPath,
     [join(root, "scripts", "check-workflow-pins.mjs"), ...args],
-    // `spawnSync` BLOCKS the worker's event loop, so vitest's per-test timeout
-    // can never fire on a wedged child -- the cap has to be spawnSync's own.
-    { encoding: "utf8", timeout: 30_000, killSignal: "SIGKILL" },
+    {
+      encoding: "utf8",
+      // `spawnSync` BLOCKS the worker's event loop, so vitest's per-test
+      // timeout can never fire on a wedged child -- the cap has to be
+      // spawnSync's own.
+      timeout: 30_000,
+      killSignal: "SIGKILL",
+      // Hermetic env, NOT the parent's: several cases below assert `stderr` is
+      // EXACTLY "", so an inherited `NODE_OPTIONS` (an `--experimental-*` flag
+      // warning) or a future Node's deprecation notice would red them for a
+      // reason that has nothing to do with the pin parser, pointing the reader
+      // at the fixture instead of at the environment. PATH is kept because the
+      // child is a node process; nothing else here needs the parent's.
+      env: { PATH: process.env.PATH ?? "" },
+    },
   );
   // A child that failed to START (ENOENT, EAGAIN) or that was KILLED (the
   // timeout above, or any signal) reports that out of band: `status`, `stdout`
   // and `stderr` all come back null, and every assertion downstream would
   // degrade to "expected null to be 0" with the real cause lost. Surface it.
-  if (result.error) throw result.error;
+  //
+  // `signal` is read BEFORE `error`, and both messages name the args: on the
+  // timeout path -- the wedged child this cap exists for -- spawnSync sets
+  // BOTH, so testing `error` first would always win and the signal would never
+  // be named on precisely the path where it is the diagnosis.
+  const where = `args: ${args.join(" ") || "<none>"}`;
   if (result.signal !== null) {
     throw new Error(
-      `check-workflow-pins.mjs was killed by ${result.signal} (args: ${args.join(" ") || "<none>"})`,
+      `check-workflow-pins.mjs was killed by ${result.signal} (${where})` +
+        (result.error ? `: ${result.error.message}` : ""),
     );
+  }
+  if (result.error) {
+    throw new Error(`check-workflow-pins.mjs failed to run (${where}): ${result.error.message}`, {
+      cause: result.error,
+    });
   }
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
@@ -444,18 +467,29 @@ describe("shapes that must NOT read as a caller", () => {
   });
 
   it("ignores a composite-ACTION step, which pins once and has no input to split", () => {
+    // A real job-level caller sits BESIDE the step on purpose. With the step
+    // alone this case asserted only the zero-caller notice, which "the step
+    // was correctly ignored" and "the file parsed to nothing at all" both
+    // produce -- so it leaned on the rest of the suite to notice the second
+    // one. Counting callers pins the distinction here: a regression that read
+    // the step as a caller reports 2, and one that read neither reports 0.
     const root = fixtureRoot({
       [WORKFLOW]: yaml([
-        ...HEADER,
+        ...pinnedCaller(),
         "  build:",
         "    runs-on: ubuntu-latest",
         "    steps:",
         `      - uses: Comfy-Org/github-workflows/actions/setup@${SHA}`,
       ]),
     });
-    const { status, stdout } = run(root);
+    const { status, stdout, stderr } = run(root);
+    expect(stderr).toBe("");
     expect(status).toBe(0);
-    expect(stdout).toContain("no Comfy-Org/github-workflows callers found");
+    expect(stdout).toContain("1 Comfy-Org/github-workflows caller(s)");
+    // ... and it is the job, not the step: only the `cursor-review` reusable
+    // is listed back.
+    expect(stdout).toContain("-> cursor-review.yml");
+    expect(stdout).not.toContain("setup");
   });
 });
 
@@ -487,18 +521,48 @@ describe("--print-pin", () => {
   });
 
   it("fails when no caller of the named reusable exists", () => {
+    // The fixture holds a real job-level caller of a DIFFERENT reusable, so
+    // what rejects it is `printPin`'s `c.reusable === wanted` filter -- the
+    // thing this case is named for -- rather than the file parsing to nothing.
     const root = fixtureRoot({
       [WORKFLOW]: yaml([
         ...HEADER,
-        "  build:",
-        "    runs-on: ubuntu-latest",
-        "    steps:",
-        `      - uses: Comfy-Org/github-workflows/actions/setup@${SHA}`,
+        "  release:",
+        `    uses: Comfy-Org/github-workflows/.github/workflows/release.yml@${SHA}`,
+        "    with:",
+        `      workflows_ref: ${SHA}`,
       ]),
     });
     const { status, stderr } = run(root, "--print-pin", "cursor-review.yml");
     expect(status).toBe(1);
-    expect(stderr).toContain("no Comfy-Org/github-workflows caller");
+    // The MODE-SPECIFIC wording. `no Comfy-Org/github-workflows caller` alone
+    // is a prefix of the lint's zero-caller notice too, so asserting only that
+    // much would also pass if `--print-pin` parsing regressed and the script
+    // fell through to lint mode.
+    expect(stderr).toContain(
+      "--print-pin cursor-review.yml: no Comfy-Org/github-workflows caller of " +
+        "`cursor-review.yml` found",
+    );
+  });
+
+  it("refuses a `workflows_ref` that is a tag or branch rather than a commit", () => {
+    // `printPin`'s own `FULL_SHA_RE` guard, which the lint's identical check
+    // does not stand in for: ci.yml interpolates this value straight into
+    // `git cat-file -e "$pin^{commit}"` and `git merge-base --is-ancestor`,
+    // where a branch name would silently resolve to a MOVING target. Without
+    // this case only ci.yml's duplicated `grep -Eq '^[0-9a-f]{40}$'` would
+    // catch a regression here, and this suite would stay green.
+    const lines = pinnedCaller(SHA, "main");
+    const root = fixtureRoot({ [WORKFLOW]: yaml(lines) });
+    const { status, stdout, stderr } = run(root, "--print-pin", "cursor-review.yml");
+    expect(status).toBe(1);
+    // Nothing on stdout: a caller that captured this would otherwise feed the
+    // branch name to git as if it were a pin.
+    expect(stdout).toBe("");
+    expect(stderr).toContain(
+      `${REL}:${lineNo(lines, "      workflows_ref: main")}: \`workflows_ref\` is \`main\`, ` +
+        `not a full 40-hex commit SHA`,
+    );
   });
 
   it("fails when given no reusable name", () => {
