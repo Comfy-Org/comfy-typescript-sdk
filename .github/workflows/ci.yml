@@ -645,19 +645,6 @@ jobs:
           positive=0
           for path in "${watched[@]}"; do
             case "$path" in
-              # `^` is git's DOCUMENTED synonym for `!` in short magic
-              # (gitglossary, "exclude": magic signature `!` or its synonym
-              # `^`). Matching only `!` let a `:^` entry fall through to the
-              # unrecognised-short-magic arm below, where it was COUNTED as a
-              # positive and never probed -- so an upstream list spelling its
-              # exclusions with `^` sailed past the `positive -eq 0`
-              # fail-closed guard carrying no real positive at all, and the
-              # `git log` below then either matched nothing (writing
-              # `state=current` over a frozen pin) or died with "There is
-              # nothing to exclude from by :(exclude) patterns" -- a message
-              # containing no "pathspec", so the classifier there missed it
-              # too and it landed on the silent fault path.
-              :!*|:^*) continue ;;
               :\(*)
                 magic="${path#:\(}"
                 magic="${magic%%)*}"
@@ -666,18 +653,55 @@ jobs:
                 esac
                 probe="${path#*)}"
                 ;;
-              # Short magic COMBINES, so `:/` can be followed by more of it.
-              # `:/!p` and `:/^p` are exclusions wearing a `:/` prefix; the
-              # arm below would strip only the `:/` and probe a literal `!p`
-              # or `^p`, reporting a path that never existed as missing.
-              :/!*|:/^*) continue ;;
-              :/*) probe="${path#:/}" ;;
               :*)
-                # Unrecognised short magic: not something this probe can turn
-                # into a path, and not demonstrably positive either. Counted,
-                # never probed.
-                positive=$((positive + 1))
-                continue
+                # SHORT MAGIC. Parsed one signature letter at a time rather
+                # than by prefix patterns, because the letters COMBINE and the
+                # run may be TERMINATED BY A SECOND COLON -- gitglossary says
+                # the signature letters are "optionally ... terminated by
+                # another colon". Neither spelling of that terminator used to
+                # be handled: `:/:some/path` is a legal positive entry, but
+                # stripping only the `:/` left `:some/path`, which tripped the
+                # still-carrying-magic branch below and filed a `broken` sticky
+                # issue blaming upstream for a list that is perfectly valid;
+                # `::some/path` fell into the unrecognised-magic arm, counted
+                # toward the `positive` guard but never probed.
+                rest="${path#:}"
+                excluded=""
+                consumed=0
+                while [ -n "$rest" ]; do
+                  c="${rest:0:1}"
+                  case "$c" in
+                    # `^` is git's DOCUMENTED synonym for `!` in short magic
+                    # (gitglossary, "exclude"). Matching only `!` let a `:^`
+                    # entry fall through to the unrecognised arm, where it was
+                    # COUNTED as a positive and never probed -- so an upstream
+                    # list spelling its exclusions with `^` sailed past the
+                    # `positive -eq 0` fail-closed guard carrying no real
+                    # positive at all, and the `git log` below then either
+                    # matched nothing (writing `state=current` over a frozen
+                    # pin) or died with "There is nothing to exclude from by
+                    # :(exclude) patterns" -- a message containing no
+                    # "pathspec", so the classifier there missed it too and it
+                    # landed on the silent fault path.
+                    '!'|'^') excluded=yes; rest="${rest:1}"; consumed=$((consumed + 1)) ;;
+                    /) rest="${rest:1}"; consumed=$((consumed + 1)) ;;
+                    # The optional terminating colon. It ends the signature,
+                    # so stop consuming letters after it.
+                    :) rest="${rest:1}"; consumed=$((consumed + 1)); break ;;
+                    *) break ;;
+                  esac
+                done
+                if [ -n "$excluded" ]; then
+                  continue
+                fi
+                if [ "$consumed" -eq 0 ]; then
+                  # Unrecognised short magic: not something this probe can turn
+                  # into a path, and not demonstrably positive either. Counted,
+                  # never probed.
+                  positive=$((positive + 1))
+                  continue
+                fi
+                probe="$rest"
                 ;;
               *) probe="$path" ;;
             esac
@@ -774,11 +798,17 @@ jobs:
           # The ONLY git call in this step that used to run with no captured
           # status -- and it is fed pathspecs this repo does not control, read
           # verbatim from upstream's `WATCHED_PATHSPECS`. A bare
-          # `var="$(cmd)"` assignment does NOT trip `set -e` on failure, so an
-          # unsupported or malformed pathspec upstream returned an EMPTY
-          # `behind`, which reads exactly like "nothing landed": `state=current`
-          # is written and the job closes its own stale-pin issue while the pin
-          # is frozen. That is the fail-open this whole step is built to avoid.
+          # `var="$(cmd)"` assignment DOES trip `set -e`: an assignment-only
+          # simple command takes the exit status of its command substitution
+          # (only `local`/`export`/`declare` mask it, which is why ShellCheck
+          # SC2155 exists -- `bash -c 'set -e; x=$(false); echo hi'` prints
+          # nothing). So an unsupported or malformed pathspec upstream killed
+          # the STEP outright, before any `state=` was written -- the no-verdict
+          # fault path, where the sticky-issue step below is gated on the
+          # verdict rather than on `failure()` and therefore files nothing. The
+          # pin stays frozen and the schedule reddens daily in silence.
+          # Capturing the status is what turns that into the `broken` VERDICT
+          # below, which names upstream's list and opens an issue.
           #
           # A pathspec git refuses to parse is PERMANENT and deterministic, so
           # it is a verdict (`broken`, sticky issue) rather than a fault -- left
@@ -803,9 +833,39 @@ jobs:
           # so asking git directly is the one reading that cannot drift from
           # it. Re-implementing the jq here is precisely the second copy
           # upstream's own comment says that directory exists to prevent.
+          #
+          # KNOWN LIMIT, stated rather than papered over: `--first-parent` still
+          # SHOWS merge commits, and `%(trailers:...)` reads only the merge
+          # commit's OWN message. A change landed through a real merge commit
+          # therefore carries no `Skip-caller-bump` trailer here even when every
+          # branch commit has one, so upstream's gate declines the bump while
+          # this walk counts the merge as owed. The filter below covers
+          # squash and rebase landings, which is how github-workflows lands its
+          # PRs; a non-squash landing falls back to the pre-filter behaviour
+          # (counted as owed), which is the LOUD direction and self-clears on
+          # the next real bump.
+          #
+          # `unfold` is load-bearing, not tidiness: without it a FOLDED trailer
+          # (`Skip-caller-bump: true` continued on an indented line) keeps its
+          # continuation newlines, so ONE commit's record spans several lines
+          # and the awk below reads each continuation as its own record --
+          # printing a bogus `<sha> <date>` pair built from the continuation
+          # text. That pair then either becomes `oldest`, where
+          # `date -u -d "$oldest_date"` fails inside an arithmetic expansion and
+          # kills the step on the no-verdict fault path, or becomes `newest`,
+          # where a garbage SHA is published in the stale-pin issue body.
+          #
+          # Fields are separated by ASCII US/RS (`%x1F`/`%x1E`) rather than
+          # spaces, and the trailer goes LAST. A trailer VALUE may contain
+          # spaces and commas -- `Skip-caller-bump: true (docs only)` is the
+          # shape that motivated this -- so a space-split read only the first
+          # token and matched a bare `true` against a value upstream's gate
+          # would NOT have honoured. git cannot emit a control character from
+          # `%H`/`%cI`, and no commit message carries one, so these delimit
+          # unambiguously where whitespace cannot.
           log_rc=0
           behind_raw="$(git -C /tmp/gw log --first-parent \
-            --format='%H %cI %(trailers:key=Skip-caller-bump,valueonly,separator=%x2C)' \
+            --format='%H %cI%x1E%(trailers:key=Skip-caller-bump,valueonly,separator=%x1F,unfold)' \
             "$pin..origin/main" -- "${watched[@]}" 2>/tmp/behind.err)" || log_rc=$?
           if [ "$log_rc" -ne 0 ]; then
             log_err="$(tr '\n' ' ' </tmp/behind.err)"
@@ -826,12 +886,33 @@ jobs:
           # the line back into the `<sha> <date>` shape the arithmetic below
           # parses positionally. `any`, not `all`, matches upstream's gate:
           # one `true` among repeated trailers is a declaration.
-          behind="$(printf '%s' "$behind_raw" | awk 'NF {
-            skip = 0
-            n = split($3, vals, ",")
-            for (i = 1; i <= n; i++) if (vals[i] == "true") skip = 1
-            if (!skip) print $1, $2
-          }')"
+          #
+          # The comparison is against the WHOLE trailer value, which is what
+          # upstream's `preflight.sh` gate matches on. Testing only the first
+          # whitespace-delimited token fails OPEN: `true (docs only)`,
+          # `true please` and `no,true` all yield a `true` token, so the commit
+          # vanished from `behind`, `state=current` was written over a frozen
+          # pin and the job closed its own stale-pin issue. Field 1 is
+          # `<sha> <date>` and field 2 is the US-joined trailer list, so both
+          # splits now use separators that cannot occur inside a value.
+          #
+          # `rc` is captured here for the same reason as the `git log` above:
+          # `set -e` DOES act on a bare `var="$(cmd)"` assignment, so an awk
+          # failure would kill the step on the no-verdict path that files
+          # nothing.
+          awk_rc=0
+          behind="$(printf '%s' "$behind_raw" | awk '
+            BEGIN { FS = "\036" }
+            NF {
+              skip = 0
+              n = split($2, vals, "\037")
+              for (i = 1; i <= n; i++) if (vals[i] == "true") skip = 1
+              if (!skip) print $1
+            }')" || awk_rc=$?
+          if [ "$awk_rc" -ne 0 ]; then
+            echo "::error::could not parse the upstream commit list -- awk exited $awk_rc"
+            exit 1
+          fi
 
           if [ -z "$behind" ]; then
             echo "state=current" >>"$GITHUB_OUTPUT"
@@ -861,14 +942,15 @@ jobs:
           # closes the pipe as soon as it has its line, so once `$behind`
           # outgrows the pipe buffer `printf` dies of SIGPIPE and the
           # substitution returns 141 under `set -o pipefail` -- measured here at
-          # 5000+ commits. That 141 does NOT abort the step: bash does not apply
-          # `set -e` to a failing command substitution in a plain assignment,
-          # and the value still arrives intact (verified to 20000 commits), so
-          # this is a latent spurious failure status rather than the live
-          # watchdog outage it looks like. Removing the pipe costs nothing and
-          # stops a correct backlog from carrying a 141 that any future
-          # `set -e`-sensitive position would act on. `wc -l` reads to EOF, so
-          # it never closes early and is safe as a pipeline.
+          # 5000+ commits. That 141 is NOT harmless: `set -e` DOES act on a bare
+          # `var="$(cmd)"` assignment -- an assignment-only simple command takes
+          # the exit status of its command substitution -- so under
+          # `set -o pipefail` it would have killed the step on a CORRECT
+          # backlog, on the no-verdict fault path that writes no `state` and
+          # files no issue. A real watchdog outage, triggered by nothing worse
+          # than a large backlog. Removing the pipe removes the SIGPIPE
+          # entirely. `wc -l` reads to EOF, so it never closes early and is safe
+          # as a pipeline.
           newest="${behind%%$'\n'*}"
           oldest="${behind##*$'\n'}"
           behind_count="$(printf '%s\n' "$behind" | wc -l | tr -d ' ')"
@@ -944,22 +1026,52 @@ jobs:
             # with it the whole watchdog -- muted for its full window while
             # being unable to move the caller to what is owed now.
             #
-            # Delivery means the pin this PR would LAND is at or past the
-            # newest owed commit. Tested by ANCESTRY rather than equality: the
-            # fleet pins callers to upstream's main TIP, which legitimately
-            # sits ahead of the newest commit on the watched surface whenever
-            # an unwatched commit landed after it, and demanding equality there
-            # would call a perfectly good bump undelivered.
+            # Delivery is measured against the OLDEST owed commit, not the
+            # newest. `newest_sha` is recomputed from upstream's tip on EVERY
+            # run, so demanding the PR cover it made delivery a moving target:
+            # any watched commit landing after the fleet's last push to
+            # `ci/bump-cursor-review` flipped a genuinely-delivering PR back to
+            # "does not deliver". With a measured 0.39-day median gap between
+            # consumer-visible upstream commits (see above) and a 3-day grace
+            # window that must elapse before this code is reached at all, that
+            # made `delivered` effectively unreachable unless the fleet
+            # re-pushed for every single commit -- so the job would file a
+            # sticky issue saying a fresh bump is owed while the fleet had in
+            # fact delivered.
+            #
+            # `oldest_sha` is the right bar because it is the same commit the
+            # grace window is timed from: this job complains that the oldest
+            # owed commit has sat unpicked too long, so a PR whose pin CARRIES
+            # that commit has answered exactly the complaint being made. It also
+            # proves forward motion on its own -- `oldest_sha` is by
+            # construction inside `pin..origin/main`, so a pin descended from it
+            # cannot be the current pin or anything behind it.
+            #
+            # Tested by ANCESTRY rather than equality: the fleet pins callers to
+            # upstream's main TIP, which legitimately sits ahead of any commit
+            # on the watched surface whenever an unwatched commit landed after
+            # it, and demanding equality there would call a perfectly good bump
+            # undelivered.
             #
             # The pin is read through the SAME `--print-pin` parser the top of
             # this job uses, against a scratch root holding the PR's version of
             # the caller, so this can never disagree with `workflow-pins` about
             # which line is the pin.
             #
-            # Every failure below leaves `bump_delivers` empty, and unprovable
-            # delivery reads as UNDELIVERED -- the watchdog stays loud. Muting
-            # on an unreadable head would reinstate exactly the silent freeze
-            # this check exists to remove.
+            # `bump_delivers` is TRI-state -- `yes`, `no`, `unknown` -- because
+            # "read the PR's pin, it does not deliver" and "could not read the
+            # PR's pin" are different facts and only one of them is a claim
+            # about the fleet. Both still read as UNDELIVERED for the mute
+            # decision (muting on an unreadable head would reinstate exactly the
+            # silent freeze this check exists to remove), but only `no` gets the
+            # asserting verdict text. Any of these is transient and lands on
+            # `unknown`: a network blip in the fetch, a `--print-pin` that
+            # cannot parse the PR's caller, or the race where the PR pins an
+            # upstream commit that landed AFTER `/tmp/gw` was cloned, which
+            # `GIT_NO_LAZY_FETCH=1 cat-file -e` then rejects. Reporting any of
+            # those as "the fleet owes a fresh bump" is the fault-as-verdict
+            # conflation the rest of this step exists to remove.
+            bump_delivers=unknown
             scratch="$(mktemp -d)"
             mkdir -p "$scratch/scripts" "$scratch/.github/workflows"
             cp scripts/check-workflow-pins.mjs "$scratch/scripts/"
@@ -975,16 +1087,28 @@ jobs:
             then
               head_pin="$(node "$scratch/scripts/check-workflow-pins.mjs" \
                 --print-pin cursor-review.yml 2>/dev/null)" || head_pin=""
-              if printf '%s' "$head_pin" | grep -Eq '^[0-9a-f]{40}$' \
-                && GIT_NO_LAZY_FETCH=1 git -C /tmp/gw cat-file -e "$head_pin" 2>/dev/null \
-                && git -C /tmp/gw merge-base --is-ancestor \
-                     "$newest_sha" "$head_pin" 2>/dev/null
-              then
-                bump_delivers=yes
+              if ! printf '%s' "$head_pin" | grep -Eq '^[0-9a-f]{40}$'; then
+                bump_delivers=unknown
+                echo "Bump PR #$bump_pr: its caller pin did not read as a 40-hex SHA (got \"${head_pin:-(empty)}\"), so delivery could not be verified."
+              elif ! GIT_NO_LAZY_FETCH=1 git -C /tmp/gw cat-file -e "$head_pin" 2>/dev/null; then
+                bump_delivers=unknown
+                echo "Bump PR #$bump_pr pins $head_pin, which is not present in the upstream clone (it may have landed after that clone was taken), so delivery could not be verified."
+              else
+                # `--is-ancestor` exits 1 for "not an ancestor" and 128 for a
+                # git-level failure. Only the 1 is a finding about the PR.
+                anc_rc=0
+                git -C /tmp/gw merge-base --is-ancestor \
+                  "$oldest_sha" "$head_pin" 2>/dev/null || anc_rc=$?
+                case "$anc_rc" in
+                  0) bump_delivers=yes ;;
+                  1) bump_delivers=no ;;
+                  *) bump_delivers=unknown ;;
+                esac
+                echo "Bump PR #$bump_pr pins the caller to $head_pin; oldest owed is $oldest_sha -- delivers: $bump_delivers (ancestry check exited $anc_rc)"
               fi
-              echo "Bump PR #$bump_pr pins the caller to ${head_pin:-(unreadable)}; newest owed is $newest_sha -- delivers: ${bump_delivers:-no}"
             else
-              echo "Bump PR #$bump_pr: could not read its caller pin, so delivery is unproven and this job is not treating it as delivered."
+              bump_delivers=unknown
+              echo "Bump PR #$bump_pr: could not read its caller pin, so delivery could not be verified and this job is not treating it as delivered."
             fi
             rm -rf "$scratch"
 
@@ -1005,7 +1129,7 @@ jobs:
           # run as the only record. Past the bump-PR window the verdict
           # escalates to `stale`, which files the issue and names the stuck PR
           # as the thing to chase.
-          if [ -n "$bump_pr" ] && [ -n "$bump_delivers" ] \
+          if [ -n "$bump_pr" ] && [ "$bump_delivers" = yes ] \
             && [ "$bump_age" -lt "$BUMP_PR_GRACE_SECONDS" ]; then
             echo "state=delivered" >>"$GITHUB_OUTPUT"
             echo "::notice::the github-workflows pin is stale, but bump PR #$bump_pr is open on $BUMP_BRANCH ($bump_age_days day(s) old) -- the fleet delivered and only the merge is owed."
@@ -1013,8 +1137,10 @@ jobs:
           fi
 
           echo "state=stale" >>"$GITHUB_OUTPUT"
-          if [ -n "$bump_pr" ] && [ -z "$bump_delivers" ]; then
-            echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) landed $((age / 86400)) days ago. PR #$bump_pr is open on $BUMP_BRANCH, but its own caller pin does not carry the newest owed commit ($newest_sha) -- the fleet reuses that branch, so this is an older or unreadable bump, not a delivery of this backlog."
+          if [ -n "$bump_pr" ] && [ "$bump_delivers" = no ]; then
+            echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) landed $((age / 86400)) days ago. PR #$bump_pr is open on $BUMP_BRANCH, but its own caller pin does not carry the oldest owed commit ($oldest_sha) -- the fleet reuses that branch, so this is an older bump, not a delivery of this backlog."
+          elif [ -n "$bump_pr" ] && [ "$bump_delivers" = unknown ]; then
+            echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) landed $((age / 86400)) days ago. PR #$bump_pr is open on $BUMP_BRANCH, but this job could NOT VERIFY which commit its caller pin carries, so it is not being counted as a delivery of this backlog. Check that PR before assuming a fresh bump is owed."
           elif [ -n "$bump_pr" ]; then
             echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) landed $((age / 86400)) days ago. Bump PR #$bump_pr is open on $BUMP_BRANCH but has been unmerged for $bump_age_days days, so delivery is not what is missing -- the merge is."
           else
@@ -1111,11 +1237,17 @@ jobs:
           gh label create "$ISSUE_LABEL" --force --color ededed \
             --description "cursor-review pin freshness watchdog" >/dev/null
 
-          if [ -n "$BUMP_PR" ] && [ -z "$BUMP_DELIVERS" ]; then
+          if [ -n "$BUMP_PR" ] && [ "$BUMP_DELIVERS" = no ]; then
             cause="$(printf '%s ' \
               "PR #$BUMP_PR is open on \`$BUMP_BRANCH\`, but its own caller pin does not carry" \
-              "the newest owed commit -- the fleet reuses that branch, so this is an older or" \
-              "unreadable bump rather than a delivery of this backlog. A fresh bump is owed.")"
+              "the oldest owed commit -- the fleet reuses that branch, so this is an older bump" \
+              "rather than a delivery of this backlog. A fresh bump is owed.")"
+          elif [ -n "$BUMP_PR" ] && [ "$BUMP_DELIVERS" = unknown ]; then
+            cause="$(printf '%s ' \
+              "PR #$BUMP_PR is open on \`$BUMP_BRANCH\`, but this job could not verify which" \
+              "commit its caller pin carries, so it is not counted as a delivery of this" \
+              "backlog. That is a limit of this check, NOT a finding about the fleet -- read" \
+              "that PR before assuming a fresh bump is owed.")"
           elif [ -n "$BUMP_PR" ]; then
             cause="$(printf '%s ' \
               "PR #$BUMP_PR is open on \`$BUMP_BRANCH\` but has been unmerged for" \
