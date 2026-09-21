@@ -219,19 +219,18 @@ export const DROPPED_PARAMS_HEADER = "X-Comfy-Router-Dropped-Params";
 /**
  * Parse the `X-Comfy-Router-Dropped-Params` header value.
  *
- * The spec describes this header as "a JSON array of strings" in prose while
- * declaring `schema: {type: array, items: {type: string}}`, which in OpenAPI
- * means the SIMPLE comma-delimited form instead. The two disagree, and the
- * spec's own example settles it: its single entry reads `moderation (fal
- * applies its own, non-configurable safety filtering)` — which contains a
- * comma, so a comma split would tear one entry into two meaningless fragments.
- * The prose is right and the declared schema is the part that is wrong.
+ * The spec (`spec/router-openapi.yaml`, `RouterDroppedParamsHeader`) declares
+ * this header as `type: string`: ONE JSON-encoded string holding an array of
+ * strings. It says to decode it with a JSON parser rather than splitting it on
+ * commas, because each entry is a sentence that carries commas of its own —
+ * the spec's own example entry reads `moderation (fal applies its own,
+ * non-configurable safety filtering)`, which a comma split would tear into two
+ * meaningless fragments.
  *
- * So: parse JSON, and on anything else keep the raw value as ONE entry rather
- * than guessing at delimiters — a single entry a human can read beats two
- * confident fragments. (The spec defect is filed against the server's own
- * openapi.yml; this vendored copy is synced from it, so fixing it here would be
- * reverted by the next sync.)
+ * So: `JSON.parse`, and accept the result only when it is an array of strings.
+ * On anything that is not JSON — or is JSON but not an array of strings — keep
+ * the raw value as ONE entry rather than guessing at delimiters: a single entry
+ * a human can read beats two confident fragments.
  */
 export function parseDroppedParams(raw: string | null): readonly string[] | null {
   if (raw === null) return null;
@@ -281,12 +280,35 @@ export interface RunJsonResult<TData = unknown> {
    */
   servingProvider: string | null;
   /**
-   * `X-Comfy-Router-Dropped-Params`: native fields the translation could not carry.
+   * `X-Comfy-Router-Dropped-Params`: native fields the translation that produced
+   * this call's request body could not express exactly on the provider that
+   * served it. Each entry normally names the field and why — but not
+   * guaranteed: {@link parseDroppedParams} keeps a header that is not a JSON
+   * array of strings as ONE entry holding the raw wire value, so an entry can
+   * be that raw value rather than a field-plus-reason disclosure.
    *
-   * Present only when `modelProvider` translated the body (`strictMode: false`,
-   * the default) and one or more native fields could not be expressed exactly
-   * on the alternate provider's schema; each entry names the field and why.
-   * `null` when no translation ran, or it ran and dropped nothing.
+   * TWO things produce such a translation: an explicit
+   * {@link RunOptions.modelProvider} under the default `strictMode: false`, and
+   * an automatic `fallback_provider` retry — which is ON by default and
+   * independent of `modelProvider` (see {@link RunOptions.fallbackProvider}).
+   * So a call that never set `modelProvider` can still come back with a
+   * non-null value here: the primary attempt failed, and the retry translated
+   * the native body into the other provider's schema to re-send it.
+   *
+   * On a fallback retry the list names what THAT retry's translation dropped,
+   * never the primary attempt's — pair it with
+   * {@link RunJsonResult.servingProvider} to see which provider it refers to.
+   *
+   * `null` when no translation ran, and when one ran and dropped nothing — the
+   * server omits the header in both cases. `strictMode: true` is NOT on its own
+   * a guarantee of `null`: the spec scopes `strict_mode` to `modelProvider`
+   * ("only meaningful together with `model_provider`"), so it suppresses that
+   * translation only and does not govern the automatic fallback retry. Turn
+   * {@link RunOptions.fallbackProvider} off too if you need that guarantee.
+   *
+   * Prefer an explicit `!== null` check over a truthiness test: the server
+   * omitting the header gives `null`, but a present-but-empty header (`"[]"`)
+   * parses to an empty array, which is a non-null empty disclosure.
    */
   droppedParams: readonly string[] | null;
 }
