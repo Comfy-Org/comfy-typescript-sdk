@@ -29,14 +29,18 @@
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  extractCredentialResolution,
   extractErrorTypeByStatus,
   extractRetryPolicyFields,
   extractRouterErrors,
 } from "../../scripts/python-surface.mjs";
 import * as sdk from "../index.js";
+import { BASE_URL_ENV_VAR, COMFY_CLOUD_BASE_URL, Comfy } from "./client.js";
+import { CREDENTIALS_ENV_VAR } from "./credentials.js";
+import { MissingCredentials } from "./exceptions.js";
 import { models } from "./models.js";
 import { DEFAULT_COLLECT_BUDGET_MS, DEFAULT_RETRY_BUDGET_MS, resolveRetry } from "./retry.js";
 import * as routerErrors from "./routerErrors.js";
@@ -97,6 +101,18 @@ interface Asymmetry {
    * deliberate divergence belongs in `why` with no field at all.
    */
   readonly modelsMethodsAheadOfPython?: readonly string[];
+  /**
+   * Credential sources the CLASS client tries, in order, when nothing was
+   * configured — the half of credential resolution the two SDKs share.
+   *
+   * Declared on the asymmetry that used to describe the whole of it, because
+   * the two things pull in opposite directions and a reader needs both: the
+   * class client resolves exactly as `comfy_sdk`'s `_resolve_api_key` does,
+   * while the module-level `comfy.config` namespace beside it has no Python
+   * counterpart at all. Derived from real constructions below rather than read
+   * off a constant, so the entry cannot outlive the behaviour it describes.
+   */
+  readonly sharedCredentialOrder?: readonly ("explicit" | "environment")[];
 }
 
 const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
@@ -114,12 +130,18 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
   {
     id: "credential-resolution",
     why:
-      "Python resolves credentials per client instance (`Comfy(api_key=...)`); TypeScript " +
-      "configures them once at module level (`comfy.config({ credentials })`). The one name " +
-      "this changes is the error raised when none is configured: Python's `MissingApiKey` " +
-      "names the per-instance argument, and TypeScript's `MissingCredentials` names the " +
-      "module-level one. Same failure, and each name is right for its own SDK.",
+      "The CLASS clients agree: `new Comfy({ apiKey })` resolves per instance in the same " +
+      "order `comfy_sdk`'s `_resolve_api_key` does — explicit argument, then `COMFY_API_KEY`, " +
+      "then a local error against Comfy Cloud and no credential at all against a deployment " +
+      "`COMFY_BASE_URL` names. What TypeScript has and Python does not is an ADDITIONAL " +
+      "module-level namespace (`comfy.config({ credentials })`) for apps that configure once " +
+      "at startup; it is a second surface rather than a different answer, and it deliberately " +
+      "does not configure a class client. The one name any of this changes is the error " +
+      "raised when nothing resolves: Python's `MissingApiKey` names the per-instance " +
+      "argument, and TypeScript's `MissingCredentials` names both surfaces at once. Same " +
+      "failure, and each name is right for its own SDK.",
     renamedErrorClasses: { MissingApiKey: "MissingCredentials" },
+    sharedCredentialOrder: ["explicit", "environment"],
   },
   {
     id: "no-sync-variant",
@@ -187,6 +209,8 @@ const AHEAD_MODELS_METHODS = new Set(
   INTENTIONAL_ASYMMETRIES.flatMap((a) => a.modelsMethodsAheadOfPython ?? []),
 );
 const AHEAD_ERROR_TYPES = new Set(AHEAD_OF_PYTHON.map(([, errorType]) => errorType));
+const SHARED_CREDENTIAL_ORDER: readonly ("explicit" | "environment")[] =
+  INTENTIONAL_ASYMMETRIES.flatMap((a) => a.sharedCredentialOrder ?? []);
 
 interface PythonSurface {
   source: { repo: string; ref: string; files: string[] };
@@ -548,6 +572,78 @@ describe("cross-SDK surface parity", () => {
   });
 });
 
+describe("credential resolution", () => {
+  // Both variables are stubbed in every test here for the reason
+  // `apiKeyEnv.test.ts` states: an ambient developer key would otherwise
+  // answer the question this block is asking.
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  /** The credential a class client actually sends, captured off its `fetch`. */
+  async function credentialSent(apiKey?: string): Promise<string | null> {
+    let seen: string | null = null;
+    const client = new Comfy({
+      apiKey,
+      fetch: (_input, init) => {
+        seen = new Headers(init?.headers).get("Authorization");
+        return Promise.reject(new Error("captured"));
+      },
+    });
+    await client.jobs.get("j1").catch(() => {});
+    return seen === null ? null : seen.replace(/^Bearer /, "");
+  }
+
+  it("tries the sources the allowlist declares, in that order", async () => {
+    // Derived by CONSTRUCTING clients rather than by reading the resolver,
+    // for the same reason the status fallback table is derived by CALLING
+    // `toRouterError`: the table and the answer can part company.
+    expect(SHARED_CREDENTIAL_ORDER, "the shared order is not declared").toEqual([
+      "explicit",
+      "environment",
+    ]);
+
+    vi.stubEnv(BASE_URL_ENV_VAR, undefined);
+    vi.stubEnv(CREDENTIALS_ENV_VAR, "comfyui-from-environment");
+    // Both sources available: the earlier one in the declared order wins.
+    expect(await credentialSent("comfyui-explicit")).toBe("comfyui-explicit");
+    // Only the later one: it is reached rather than ignored. This is the half
+    // the class client used to skip, which is what let the two SDKs disagree
+    // about the most common first line of code an integrator writes.
+    expect(await credentialSent()).toBe("comfyui-from-environment");
+  });
+
+  it("reads the environment variable the Python client names", () => {
+    // `comfy.models.*` resolves through this same constant, so the two
+    // TypeScript surfaces cannot drift from each other either.
+    expect(CREDENTIALS_ENV_VAR).toBe("COMFY_API_KEY");
+  });
+
+  it("raises the renamed error against Comfy Cloud, and nothing off it", async () => {
+    // The Python side raises `MissingApiKey` here; the rename is declared in
+    // INTENTIONAL_ASYMMETRIES and its liveness is guarded above. What this
+    // adds is WHEN: Comfy Cloud only, and with no network call.
+    expect(RENAMES.MissingApiKey).toBe("MissingCredentials");
+
+    vi.stubEnv(BASE_URL_ENV_VAR, undefined);
+    vi.stubEnv(CREDENTIALS_ENV_VAR, undefined);
+    expect(() => new Comfy({ fetch: () => Promise.reject(new Error("unreachable")) })).toThrow(
+      MissingCredentials,
+    );
+
+    // A deployment that may legitimately have no auth: keyless, not an error.
+    vi.stubEnv(BASE_URL_ENV_VAR, "http://127.0.0.1:8189");
+    expect(await credentialSent()).toBeNull();
+  });
+
+  it("agrees with the Python client on where Comfy Cloud is", () => {
+    // The constant the cloud carve-out is keyed on. If the two SDKs disagreed
+    // about it, one of them would hand back a keyless client for the host the
+    // other guards.
+    expect(COMFY_CLOUD_BASE_URL).toBe("https://cloud.comfy.org");
+  });
+});
+
 describe("python surface extraction", () => {
   it("refuses to yield an empty router error set", () => {
     // The failure mode this whole check has to avoid is a broken extraction
@@ -567,6 +663,72 @@ describe("python surface extraction", () => {
     expect(() =>
       extractErrorTypeByStatus("_ERROR_TYPE_BY_STATUS: dict[int, str] = {\n    # empty\n}\n"),
     ).toThrow(/zero/);
+  });
+
+  it("reads the Python client's credential resolution off its resolver", () => {
+    // The order comes out of the candidate TUPLE, because that tuple IS the
+    // documented precedence — a hardcoded ["explicit", "environment"] here
+    // would keep agreeing after the Python side swapped them.
+    expect(
+      extractCredentialResolution(
+        [
+          'COMFY_CLOUD_BASE_URL = "https://cloud.comfy.org"',
+          'BASE_URL_ENV_VAR = "COMFY_BASE_URL"',
+          'API_KEY_ENV_VAR = "COMFY_API_KEY"',
+          "",
+          "def _resolve_api_key(explicit: str | None, base_url: str) -> str | None:",
+          "    for candidate in (explicit, os.environ.get(API_KEY_ENV_VAR)):",
+          "        if candidate and candidate.strip():",
+          "            return candidate.strip()",
+          "    if _same_deployment(base_url, COMFY_CLOUD_BASE_URL):",
+          '        raise MissingApiKey("no API key", code="missing_api_key")',
+          "    return None",
+          "",
+        ].join("\n"),
+      ),
+    ).toEqual({
+      resolver: "_resolve_api_key",
+      apiKeyEnvVar: "COMFY_API_KEY",
+      baseUrlEnvVar: "COMFY_BASE_URL",
+      cloudBaseUrl: "https://cloud.comfy.org",
+      order: ["explicit", "environment"],
+      missingKeyError: "MissingApiKey",
+    });
+  });
+
+  it("refuses a resolver it cannot read, rather than reporting a shorter order", () => {
+    // Same rule as every other extractor here: a shape it cannot read is a
+    // hard failure. A resolution order read as EMPTY would agree with a
+    // TypeScript client that resolved nothing at all.
+    expect(() => extractCredentialResolution("# nothing here\n")).toThrow(/_resolve_api_key/);
+    expect(() =>
+      extractCredentialResolution(
+        'API_KEY_ENV_VAR = "COMFY_API_KEY"\ndef _resolve_api_key(explicit, base_url):\n    return None\n',
+      ),
+    ).toThrow(/candidate sequence/);
+  });
+
+  it("refuses a resolver whose cloud-guarded local error went missing", () => {
+    const withoutGuard = [
+      'COMFY_CLOUD_BASE_URL = "https://cloud.comfy.org"',
+      'BASE_URL_ENV_VAR = "COMFY_BASE_URL"',
+      'API_KEY_ENV_VAR = "COMFY_API_KEY"',
+      "def _resolve_api_key(explicit: str | None, base_url: str) -> str | None:",
+      "    for candidate in (explicit, os.environ.get(API_KEY_ENV_VAR)):",
+      "        if candidate and candidate.strip():",
+      "            return candidate.strip()",
+      "    return None",
+    ].join("\n");
+    expect(() => extractCredentialResolution(withoutGuard)).toThrow(/raises nothing/);
+
+    // A raise that is no longer guarded by the Comfy Cloud check would make a
+    // keyless self-hosted deployment an error — the flow both SDKs promise to
+    // keep working — so an unguarded one must not read as agreement either.
+    const unguarded = withoutGuard.replace(
+      "    return None",
+      '    raise MissingApiKey("no API key")\n    return None',
+    );
+    expect(() => extractCredentialResolution(unguarded)).toThrow(/Comfy Cloud check/);
   });
 
   it("reads every entry of the status fallback table", () => {

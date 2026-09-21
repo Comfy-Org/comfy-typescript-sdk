@@ -20,9 +20,10 @@ describe("public surface", () => {
   });
 
   it("constructs a client and exposes assets/workflows/jobs namespaces", () => {
-    // An invalid COMFY_BASE_URL in the ambient shell would otherwise throw here.
+    // An invalid COMFY_BASE_URL in the ambient shell would otherwise throw
+    // here; the key is explicit so the ambient COMFY_API_KEY is never read.
     vi.stubEnv(BASE_URL_ENV_VAR, undefined);
-    const client = new Comfy();
+    const client = new Comfy({ apiKey: "comfyui-surface-test" });
     expect(client).toBeInstanceOf(Comfy);
     expect(client.assets).toBeDefined();
     expect(client.workflows).toBeDefined();
