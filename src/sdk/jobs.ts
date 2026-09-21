@@ -21,7 +21,7 @@ import type {
 import { abortableSleep } from "./abortable-sleep.js";
 import { backoffSchedule, isTerminal, SUCCESS } from "./core.js";
 import { eventFromRaw, type ComfyEvent, type StatusChange } from "./events.js";
-import { JobFailed, toSdkError, translate } from "./exceptions.js";
+import { ComfyError, JobFailed, toSdkError, translate } from "./exceptions.js";
 import { Output } from "./outputs.js";
 
 // Pause before reconnecting an SSE stream that dropped mid-job, without a
@@ -42,9 +42,41 @@ const MAX_RECONNECT_PAUSE_MS = 60_000;
  * server that omits it rather than sending `null` must not read as
  * `new Date(undefined)`, which is an `Invalid Date` that compares false
  * against everything instead of announcing itself.
+ *
+ * Unusable counts as none too. The transport hands responses back as
+ * `JSON.parse(text) as T` with no runtime validation, so a non-string or an
+ * unparseable string can reach here — and an `Invalid Date` built from one is
+ * truthy, so it would pass the `if (job.startedAt && job.completedAt)` guard
+ * the README documents and turn the subtraction behind it into `NaN`. That is
+ * the same silent-false failure the nullish branch exists to prevent, so it
+ * gets the same answer.
  */
-function toDate(value: string | null | undefined): Date | null {
-  return value == null ? null : new Date(value);
+function toDate(value: unknown): Date | null {
+  if (typeof value !== "string") return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+/**
+ * A required, non-nullable wire timestamp as a `Date`.
+ *
+ * `created_at` and `expires_at` are required AND non-nullable in the
+ * contract, so unlike {@link toDate}'s fields there is no "none" for them to
+ * mean — absent, `null`, or unparseable is a response that breaks the
+ * contract, and nothing validates it on the way in. Say so instead of
+ * handing back a `Date` that lies: `new Date(undefined)` is an `Invalid Date`
+ * whose every comparison is false, and `new Date(null)` is the Unix epoch, so
+ * a retention check against one reads a live job as having expired in 1970.
+ */
+function requireDate(value: unknown, field: string, jobId: string): Date {
+  const date = toDate(value);
+  if (date === null) {
+    throw new ComfyError(
+      `job ${jobId} returned ${field}=${JSON.stringify(value) ?? "undefined"} where the contract requires a timestamp`,
+      { code: "unexpected_response" },
+    );
+  }
+  return date;
 }
 
 /**
@@ -54,10 +86,13 @@ function toDate(value: string | null | undefined): Date | null {
  * Every accessor reads the state currently on the handle; nothing re-fetches
  * implicitly. {@link Job.wait} or {@link Job.result} advances it to a
  * terminal state, {@link Job.refresh} pulls fresh state once, and
- * {@link Job.events} streams live progress. The object-valued accessors
+ * {@link Job.events} streams live progress. Three object-valued accessors
  * ({@link Job.progress}, {@link Job.metrics}, {@link Job.urls}) hand back a
  * snapshot copy, so editing what you get back cannot rewrite the handle's own
- * state — notably the links it polls and cancels through.
+ * state — notably the links it polls and cancels through. {@link Job.error}
+ * is the exception: it hands back the handle's own object by reference, which
+ * is also the one {@link Job.result} embeds in the {@link JobFailed} it
+ * throws, so treat it as read-only.
  */
 export class Job {
   private readonly low: ComfyLow;
@@ -90,7 +125,7 @@ export class Job {
 
   /** When the server accepted this job. Set for every job, from submit onwards. */
   get createdAt(): Date {
-    return new Date(this.model.created_at);
+    return requireDate(this.model.created_at, "created_at", this.model.id);
   }
 
   /** When the job started executing, or `null` while it is still queued. */
@@ -110,7 +145,7 @@ export class Job {
 
   /** Retention deadline — after this the job and its outputs are gone. A platform property, not an API constant. */
   get expiresAt(): Date {
-    return new Date(this.model.expires_at);
+    return requireDate(this.model.expires_at, "expires_at", this.model.id);
   }
 
   /**
@@ -137,7 +172,12 @@ export class Job {
 
   /** Place in the queue as of the state this handle holds, or `null` when the server reports none. */
   get queuePosition(): number | null {
-    return this.model.queue_position;
+    // Required-but-nullable, so a server that drops the key rather than
+    // sending `null` still means "none". Returning it verbatim would hand
+    // back `undefined` through a declared `number | null`, so a caller's
+    // `job.queuePosition !== null` guard passes and the value goes on into
+    // arithmetic as `NaN`.
+    return this.model.queue_position ?? null;
   }
 
   /** Per-run measurements keyed by name (e.g. `queue_ms`, `execution_ms`), or `undefined` on a surface that reports none. A value is `null` until that metric is available. */
@@ -151,7 +191,19 @@ export class Job {
 
   /** The job's own links — `self`, `events`, `cancel`, and `logs` on a surface that captures logs. Follow these rather than building paths from {@link Job.id}. */
   get urls(): LowJob["urls"] {
-    return { ...this.model.urls };
+    const urls = this.model.urls;
+    // Required and non-nullable, and the one accessor whose absence cannot be
+    // softened into "none": spreading an absent one yields a `{}` typed as a
+    // full `JobUrls`, so `job.urls.self` would be `undefined` while the type
+    // promises a string — and a caller told to follow these rather than build
+    // paths would fetch that `undefined`.
+    if (urls == null) {
+      throw new ComfyError(
+        `job ${this.model.id} returned no urls where the contract requires them`,
+        { code: "unexpected_response" },
+      );
+    }
+    return { ...urls };
   }
 
   /**

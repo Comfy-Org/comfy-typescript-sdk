@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StubServer } from "../../test/support/stub-server.js";
 import { ComfyLow } from "../low/index.js";
 import { abortableSleep } from "./abortable-sleep.js";
-import { Forbidden, JobFailed, NotFound } from "./exceptions.js";
+import { ComfyError, Forbidden, JobFailed, NotFound } from "./exceptions.js";
 import { JobFactory } from "./jobs.js";
 
 // Spies on (not replaces) abortableSleep by default, so every other test
@@ -380,6 +380,7 @@ describe("Job", () => {
         started_at: undefined,
         completed_at: undefined,
         progress: undefined,
+        queue_position: undefined,
         metrics: null,
       };
       const job = await jobs.get("job_01");
@@ -387,7 +388,51 @@ describe("Job", () => {
       expect(job.startedAt).toBeNull();
       expect(job.completedAt).toBeNull();
       expect(job.progress).toBeNull();
+      expect(job.queuePosition).toBeNull();
       expect(job.metrics).toBeUndefined();
+    });
+
+    it("reads an unparseable nullable timestamp as none, not as an Invalid Date", async () => {
+      // `Invalid Date` is truthy, so letting one through would pass the
+      // `if (job.startedAt && job.completedAt)` guard the README documents
+      // and make the duration behind it `NaN`.
+      server.state.jobFieldOverrides = { started_at: "soon", completed_at: 1_752_171_600 };
+      const job = await jobs.get("job_01");
+
+      expect(job.startedAt).toBeNull();
+      expect(job.completedAt).toBeNull();
+    });
+
+    it.each([
+      ["omitted", undefined],
+      ["null", null],
+      ["unparseable", "whenever"],
+    ])("announces a %s created_at rather than handing back a Date that lies", async (_l, bad) => {
+      // Required AND non-nullable in the contract: there is no "none" for it
+      // to mean, and a `null` would become the Unix epoch rather than even an
+      // `Invalid Date`.
+      server.state.jobFieldOverrides = { created_at: bad };
+      const job = await jobs.get("job_01");
+
+      expect(() => job.createdAt).toThrowError(ComfyError);
+      expect(() => job.createdAt).toThrowError(/created_at/);
+    });
+
+    it("announces a null expires_at instead of reading a live job as expired in 1970", async () => {
+      server.state.jobFieldOverrides = { expires_at: null };
+      const job = await jobs.get("job_01");
+
+      expect(() => job.expiresAt).toThrowError(ComfyError);
+      expect(() => job.expiresAt).toThrowError(/expires_at/);
+    });
+
+    it("announces missing urls rather than a {} typed as the full set of links", async () => {
+      // `{ ...undefined }` would be a `{}` typed as a complete `JobUrls`, so
+      // `job.urls.self` would be `undefined` while the type promises a string.
+      server.state.jobFieldOverrides = { urls: undefined };
+      const job = await jobs.get("job_01");
+
+      expect(() => job.urls).toThrowError(ComfyError);
     });
 
     it("exposes the job's own links, including the optional logs one", async () => {

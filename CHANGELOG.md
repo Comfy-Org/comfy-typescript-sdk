@@ -31,7 +31,12 @@ entry. See CONTRIBUTING.md.
   hand back a snapshot copy so editing the result cannot rewrite the handle's
   own links. Note that Comfy Cloud's poll response carries `progress: null`
   even for a running job today, so `job.events()` remains the live-progress
-  source there.
+  source there. Where the wire field is nullable, an absent or unusable value
+  reads as "none" rather than as an `Invalid Date` or an empty snapshot; where
+  it is required and non-nullable (`createdAt`, `expiresAt`, `urls`) a
+  response that omits it raises `ComfyError` (`unexpected_response`) instead
+  of handing back a `Date` that silently compares false against everything, or
+  a `{}` typed as a full set of links.
 - **Comfy Router alt-provider controls on `comfy.models.run` —
   `modelProvider`, `strictMode` and `fallbackProvider`.** Three optional
   `RunOptions` fields, sent as the `model_provider`, `strict_mode` and
