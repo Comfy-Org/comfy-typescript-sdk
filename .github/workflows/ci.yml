@@ -743,6 +743,43 @@ jobs:
             }
           ' <<<"$upstream_src")
 
+          # CR is stripped from every entry ONCE, HERE, at extraction -- before
+          # any consumer sees the array -- rather than at each site that prints
+          # or embeds one.
+          #
+          # An interior CR survives the awk above: it trims only leading and
+          # trailing `[[:space:]]`, so a TRAILING CR (upstream's file stored
+          # CRLF) is already gone, but `foo<CR>bar` arrives intact. Every
+          # downstream defence in this job is `\n`-scoped and each one is
+          # therefore blind to it:
+          #
+          #   - the `%3A%3A` rewrite and the `  - ` marker below anchor `^` per
+          #     `\n`-delimited line, so the half of an entry after a CR gets
+          #     neither, while the runner's own line reader DOES break on CR and
+          #     sees `::stop-commands::<token>` at column 0 -- the exact hazard
+          #     the marker was written for, reached around it;
+          #   - `broken_reason=$reason` embeds `$path` and `${missing# }` into a
+          #     `$GITHUB_OUTPUT` record. A CR splits that record in two, and the
+          #     tail either forges a `key=value` -- a `state=` that last-write-
+          #     wins over the `state=broken` written one line earlier, firing
+          #     the close step instead of the broken-issue step -- or carries no
+          #     `=` at all and makes the runner reject the whole file, dropping
+          #     every `steps.assess.outputs.*` the issue steps are gated on;
+          #   - the bare `echo`s -- `not probed:`, `could not list`, and the
+          #     `::error::$reason` pair -- have the same column-0 gap as the
+          #     display loop.
+          #
+          # Sanitising once at the source closes all of them together and leaves
+          # no site to forget. This is NOT display-only any more: the pathspecs
+          # handed to `ls-tree` and `git log` are the stripped entries too. That
+          # is deliberate and safe in the fail-closed direction -- a CR is never
+          # legitimate inside a pathspec, and if upstream ever ships one the
+          # stripped path simply stops resolving, which lands on the `missing`
+          # branch and files a loud `broken` verdict naming the entry.
+          for i in "${!watched[@]}"; do
+            watched[i]="${watched[i]//$'\r'/}"
+          done
+
           # Fail CLOSED on an unreadable list, for the same reason as above: no
           # pathspecs means `git log` matches nothing, which reads as "current".
           if [ "${#watched[@]}" -eq 0 ]; then
@@ -781,19 +818,13 @@ jobs:
           # trims, it stops at the `-`. The escape is kept as well, so the
           # common ASCII case still prints as `%3A%3A`.
           #
-          # CR is stripped FIRST, because both defences above are
-          # newline-scoped and an embedded CR slips past them. `sed` anchors
-          # `^` per `\n`-delimited line and the awk extractor only trims
-          # leading/trailing whitespace, so an interior CR survives into
-          # `watched`: an entry spelled `foo<CR>::stop-commands::<token>` would
-          # get neither the `%3A%3A` rewrite nor the `  - ` marker on its
-          # second half, while the runner's own line splitter breaks on CR and
-          # sees the command at column 0. Deleting CR here folds the entry back
-          # onto one line, so the marker below covers all of it. Display only --
-          # the pathspecs handed to `ls-tree` and `git log` are still the
-          # verbatim upstream entries.
+          # Both defences above are newline-scoped, so neither one sees an
+          # interior CR. That is handled once at extraction (see the strip loop
+          # after the `mapfile`), which is why no `tr -d '\r'` is needed here:
+          # `watched` carries no CR by the time it reaches this line, and the
+          # marker below therefore covers each entry whole.
           echo "Watched pathspecs, read from upstream $bump_yaml:"
-          printf '%s\n' "${watched[@]}" | tr -d '\r' | sed -e 's/^[[:space:]]*::/%3A%3A/' -e 's/^/  - /'
+          printf '%s\n' "${watched[@]}" | sed -e 's/^[[:space:]]*::/%3A%3A/' -e 's/^/  - /'
 
           # Upstream's list can itself name a path that no longer resolves --
           # a rename landed in its `paths:` filter but not here. `git log` over
@@ -1407,11 +1438,59 @@ jobs:
             echo "::error::$reason"
             exit 1
           fi
+          # STATUS CAPTURED, like every other upstream-facing call in this step.
+          # Left to bare `set -e` this was the last one that could exit writing
+          # no `state=` at all: the issue steps are gated on the verdict rather
+          # than on `failure()`, so a permanent failure here -- `pull-requests:
+          # read` dropped from this job's `permissions:`, or a token scope
+          # narrowed -- reddens the scheduled run identically every day while
+          # nobody is told the pin stopped being watched. That is the same
+          # fault/verdict conflation the clone, `origin/HEAD`, pathspec,
+          # `git log` and `DEFAULT_BRANCH` branches each got a `broken` verdict
+          # for; this one is the same class.
+          #
+          # Anchored on the shapes that really are PERMANENT, for the same
+          # reason the clone branch is: this arm asserts as fact that the job's
+          # own token can no longer read pull requests. A 5xx, a timeout or a
+          # DNS blip says nothing about the pin and stays on the no-verdict
+          # path, where it reddens the run without filing a sticky issue
+          # claiming a cause nobody established.
+          #
+          # RATE LIMITING IS TESTED FIRST, and it has to be: GitHub answers a
+          # primary or secondary rate limit with **HTTP 403**, the same status
+          # as a genuine permission loss. Keying the permanent arm on the status
+          # alone would file a sticky issue swearing `pull-requests: read` had
+          # been revoked every time this scheduled job happened to run into a
+          # busy hour -- a fault reported as a verdict, which is the one
+          # direction the rest of this step is built to avoid. A rate limit
+          # clears on its own, so it belongs on the no-verdict path with the
+          # 5xxs.
+          pr_rc=0
           bump="$(gh pr list --repo "$GH_REPO" --state open \
             --head "$BUMP_BRANCH" --base "$DEFAULT_BRANCH" \
             --json number,isCrossRepository,createdAt,headRefOid,baseRefName \
             --jq '[.[] | select(.isCrossRepository == false
-                                and .baseRefName == env.DEFAULT_BRANCH)][0] // empty')"
+                                and .baseRefName == env.DEFAULT_BRANCH)][0] // empty' \
+            2>"$gwtmp/gh-pr-list.err")" || pr_rc=$?
+          if [ "$pr_rc" -ne 0 ]; then
+            # Flattened for the same reason as `broken_reason` above.
+            pr_err="$(tr '\r\n' '  ' <"$gwtmp/gh-pr-list.err")"
+            if grep -qiE "rate limit|abuse detection|retry your request again later" <<<"$pr_err"; then
+              # Transient by definition -- fall through to the no-verdict path.
+              :
+            elif grep -qiE "HTTP 401|bad credentials|resource not accessible by integration|must have admin rights|needs the .+ scope|requires the .+ scope|GH_TOKEN environment variable|gh auth login|HTTP 403" <<<"$pr_err"; then
+              reason="This job's token can no longer list pull requests in \`$GH_REPO\` -- \`gh pr list\` exited $pr_rc saying: ${pr_err:-(no output)}. That will not clear on its own: the \`pull-requests: read\` permission or the token's scope has been taken away, and without that read the watchdog cannot tell whether a bump PR is already open, so it can neither confirm nor deny that the pin is being moved. Restore the permission on the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\`."
+              {
+                echo "state=broken"
+                echo "broken_reason=$reason"
+              } >>"$GITHUB_OUTPUT"
+              echo "::error::$reason"
+              exit 1
+            fi
+            # NO verdict written: a transient API fault says nothing about the pin.
+            echo "::error::could not list open bump PRs in $GH_REPO -- gh exited $pr_rc: ${pr_err:-(no output)}"
+            exit 1
+          fi
 
           bump_pr=""
           bump_age_days=""

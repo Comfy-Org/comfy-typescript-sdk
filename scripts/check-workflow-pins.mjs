@@ -147,16 +147,20 @@ const caseInsensitiveOwnerRepo = (s) =>
 // a silent skip is the one direction this lint must never fail in.
 // Matched only as a job-level mapping KEY, never as a step's `- uses:` (see
 // the header). The key and the value may each be quoted.
-// The owner/repo is CAPTURED as well as matched, because the two halves of the
-// split-pin defence have to agree about spelling. `.github/dependabot.yml`
-// ignores this dependency by name, and Dependabot matches `dependency-name`
-// against the name exactly as written in `uses:` -- so a caller spelled
-// `comfy-org/github-workflows` is matched here (deliberately: an unseen caller
-// is the one failure this lint must never have) but is NOT covered by that
-// ignore, and Dependabot would rewrite its `uses:` while leaving
-// `workflows_ref:` behind. That is precisely the split pin both files exist to
-// prevent. Seeing it is therefore not enough; lint (4) below requires the
-// canonical spelling so the ignore entries can cover every caller that exists.
+// The owner/repo is CAPTURED as well as matched, so lint (4) below can hold
+// every caller to ONE spelling. A non-canonical caller is still MATCHED here --
+// deliberately, since an unseen caller is the one failure this lint must never
+// have -- and is then reported rather than skipped.
+//
+// That lint is HYGIENE, not the other half of the ignore: Dependabot compares
+// `dependency-name` with `Dependabot::Config::UpdateConfig.wildcard_match?`,
+// which LOWERCASES both pattern and candidate, so a caller spelled
+// `comfy-org/github-workflows` is already covered by the canonical-case entry
+// in `.github/dependabot.yml`. (An earlier draft of this comment claimed the
+// match was case-SENSITIVE and that a lowercase caller escaped the ignore --
+// it does not; see the same correction in that file.) What one spelling buys
+// is that the caller, that ignore entry and the pin `--print-pin` hands the
+// freshness watchdog all name the dependency identically.
 // The path segment is `[^@\s"']+`, NOT a lazy `\S+?`. Two nested lazy
 // quantifiers over overlapping character sets backtrack quadratically on a
 // line that does not match: `uses: Comfy-Org/github-workflows/` followed by
@@ -393,9 +397,18 @@ function isJobLevelUses(lines, usesIndex, usesIndent, inBlock) {
  *
  * Blank lines and whole-line comments carry no structure and never end a block
  * (a comment is often written flush-left).
+ *
+ * Returns `null` when the job passes no `workflows_ref`, else
+ * `{ value, lineNo, duplicateLineNo }` describing the FIRST one. The scan keeps
+ * going after that first hit purely to set `duplicateLineNo`: a job that passes
+ * the key twice is an ambiguity neither caller of this function may resolve
+ * silently, so both report it instead. See the note at the match itself.
  */
 function workflowsRefInput(lines, usesIndex, usesIndent, inBlock) {
   let inWith = false;
+  // The first `workflows_ref:` seen, and where a second one was seen if there
+  // was one. See the duplicate note at the match below.
+  let found = null;
   // The indent shared by `with:`'s direct children, learned from the first one.
   let withChildIndent = null;
 
@@ -447,10 +460,25 @@ function workflowsRefInput(lines, usesIndex, usesIndent, inBlock) {
     const rm = WORKFLOWS_REF_RE.exec(line);
     // Group 1 is the key's optional quote and group 2 the value's, so the
     // VALUE is group 3.
-    if (rm) return { value: rm[3], lineNo: i + 1 };
+    //
+    // The scan does NOT stop at the first hit. Returning it immediately meant
+    // this lint and `--print-pin` both read the FIRST `workflows_ref:` while
+    // the value GitHub actually passes is whichever one its own YAML parser
+    // keeps -- so a caller carrying two, the first agreeing with `uses:` and
+    // the second stale, would SPLIT the pin while passing the very check that
+    // exists to catch a split. A duplicate key is never legitimate here, so
+    // rather than reason about which side wins, the second occurrence is
+    // recorded and reported as its own error.
+    if (rm) {
+      if (found) {
+        found.duplicateLineNo = i + 1;
+        break;
+      }
+      found = { value: rm[3], lineNo: i + 1, duplicateLineNo: null };
+    }
   }
 
-  return null;
+  return found;
 }
 
 /**
@@ -594,15 +622,15 @@ function lint(callers) {
     // `Dependabot::Config::UpdateConfig.wildcard_match?`, which LOWERCASES
     // both the pattern and the candidate before comparing, so a caller spelled
     // `comfy-org/github-workflows` is already covered by the canonical-case
-    // entries over there; this lint is not the other half of that defence and
+    // entry over there; this lint is not the other half of that defence and
     // relaxing it would not open a hole in it. What one spelling does buy is
-    // that the caller, those ignore entries and the pin `--print-pin` hands
+    // that the caller, that ignore entry and the pin `--print-pin` hands
     // the freshness watchdog all name the dependency identically, so whoever
     // greps for one finds the rest.
     if (ownerRepo !== REUSABLE_OWNER_REPO) {
       errors.push(
         `${at}: \`uses:\` names \`${ownerRepo}\`, but this repository spells that ` +
-          `dependency \`${REUSABLE_OWNER_REPO}\` everywhere else -- the ignore entries ` +
+          `dependency \`${REUSABLE_OWNER_REPO}\` everywhere else -- the ignore entry ` +
           `in \`.github/dependabot.yml\` and the pin this script prints for the ` +
           `freshness watchdog. GitHub and Dependabot both resolve the name ` +
           `case-insensitively, so the mismatch does not by itself break anything; ` +
@@ -656,6 +684,25 @@ function lint(callers) {
       continue;
     }
 
+    // (5) A DUPLICATE `workflows_ref:` under the same `with:`. Reported on its
+    // own, before the value comparison, because the comparison below can only
+    // read one of them: whichever this scan saw first. GitHub's parser decides
+    // which one is really passed, and if it keeps the other, a caller whose
+    // second entry is stale would pass (2) while shipping a split pin -- the
+    // exact failure this script exists to prevent. Duplicate mapping keys are
+    // never legitimate, so the fix is always to delete one, never to work out
+    // which side wins.
+    if (workflowsRef.duplicateLineNo) {
+      errors.push(
+        `${rel}:${workflowsRef.duplicateLineNo}: a second \`workflows_ref\` input ` +
+          `(the first is on line ${workflowsRef.lineNo}) -- this job passes the key ` +
+          `twice under one \`with:\`. Which value reaches the reusable is up to ` +
+          `GitHub's YAML parser, so the pair below cannot be checked reliably and ` +
+          `a stale duplicate could split the pin unnoticed. Delete the entry that ` +
+          `is not \`${ref}\`.`,
+      );
+    }
+
     if (workflowsRef.value !== ref) {
       errors.push(
         `${rel}:${workflowsRef.lineNo}: \`workflows_ref\` is \`${workflowsRef.value}\` but ` +
@@ -704,6 +751,21 @@ function printPin(callers, wanted) {
   const at = `${caller.rel}:${caller.usesLineNo}`;
   if (!caller.workflowsRef) {
     fail(`--print-pin ${wanted}: ${at} sets no \`workflows_ref\`; there is no pin to print.`);
+  }
+
+  // A DUPLICATE `workflows_ref:` is an ambiguity about which value is the pin,
+  // so this mode fails for the same reason it refuses two callers above: it
+  // returns one pin and cannot choose. Unlike the pair equality -- left to the
+  // lint on purpose, so one split pin does not redden two jobs -- there is no
+  // single answer to print here, and printing the first silently hands the
+  // freshness watchdog a SHA that GitHub's parser may not be passing at all.
+  if (caller.workflowsRef.duplicateLineNo) {
+    fail(
+      `--print-pin ${wanted}: ${caller.rel} passes \`workflows_ref\` twice under one ` +
+        `\`with:\` (lines ${caller.workflowsRef.lineNo} and ` +
+        `${caller.workflowsRef.duplicateLineNo}); which one GitHub passes is up to its ` +
+        `YAML parser, so there is no single pin to print. Delete the stale entry.`,
+    );
   }
 
   const pin = caller.workflowsRef.value;
