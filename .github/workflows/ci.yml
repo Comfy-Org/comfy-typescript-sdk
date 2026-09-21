@@ -330,6 +330,27 @@ jobs:
         run: |
           set -euo pipefail
 
+          # The two windows, in DAYS, published for the issue steps.
+          #
+          # Those steps write the durable text a human acts on, and they used
+          # to spell the lengths out by hand -- "3-day grace window", "past 7
+          # days" -- while the values actually enforced are `GRACE_SECONDS`
+          # and `BUMP_PR_GRACE_SECONDS`, which live on this step's `env:`.
+          # Tuning either knob therefore left the sticky issue asserting a
+          # window the verdict was not reached under, and the issue is the
+          # part that outlives the run. They are derived HERE, from the same
+          # variables the arithmetic uses, rather than added to each issue
+          # step's `env:` -- a second copy of the constant is the same
+          # staleness bug one level up. This is the form the log line below
+          # already uses.
+          #
+          # Written FIRST, before any `exit`, so every path that can reach an
+          # issue step has them.
+          {
+            echo "grace_days=$((GRACE_SECONDS / 86400))"
+            echo "bump_pr_grace_days=$((BUMP_PR_GRACE_SECONDS / 86400))"
+          } >>"$GITHUB_OUTPUT"
+
           # Reuse the pin parser rather than grepping the YAML again, so this
           # job and `workflow-pins` can never disagree about which line is the
           # pin. `--print-pin` writes the SHA and nothing else; it enforces
@@ -743,43 +764,52 @@ jobs:
             }
           ' <<<"$upstream_src")
 
-          # CR is stripped from every entry ONCE, HERE, at extraction -- before
-          # any consumer sees the array -- rather than at each site that prints
-          # or embeds one.
+          # A CR anywhere in an entry is its OWN `broken` verdict, decided
+          # HERE, at extraction, before any consumer sees the array.
           #
-          # An interior CR survives the awk above: it trims only leading and
-          # trailing `[[:space:]]`, so a TRAILING CR (upstream's file stored
-          # CRLF) is already gone, but `foo<CR>bar` arrives intact. Every
-          # downstream defence in this job is `\n`-scoped and each one is
-          # therefore blind to it:
+          # This used to STRIP the CR instead, and the fail-closed argument for
+          # doing so only covered the entries that are actually PROBED: a
+          # mangled path would stop resolving, land on the `missing` branch and
+          # file a loud verdict. But the probe below `continue`s before
+          # `ls-tree` for wildcard entries, for magic it cannot reproduce, and
+          # for an empty remainder -- and upstream's list is glob- and
+          # `:(exclude)`-heavy, so those unprobed shapes are the COMMON ones.
+          # A stripped entry of that kind went straight to `git log`, matched
+          # nothing, and silently shrank the backlog toward `state=current` on
+          # a pin that is in fact frozen: the exact fail-open this whole job
+          # exists to prevent, reintroduced by the sanitiser. For the entries
+          # that WERE probed the report was wrong in the other direction --
+          # the `missing` sticky issue quoted the STRIPPED path and told a
+          # human upstream had renamed a path upstream never wrote.
           #
-          #   - the `%3A%3A` rewrite and the `  - ` marker below anchor `^` per
-          #     `\n`-delimited line, so the half of an entry after a CR gets
-          #     neither, while the runner's own line reader DOES break on CR and
-          #     sees `::stop-commands::<token>` at column 0 -- the exact hazard
-          #     the marker was written for, reached around it;
-          #   - `broken_reason=$reason` embeds `$path` and `${missing# }` into a
-          #     `$GITHUB_OUTPUT` record. A CR splits that record in two, and the
-          #     tail either forges a `key=value` -- a `state=` that last-write-
-          #     wins over the `state=broken` written one line earlier, firing
-          #     the close step instead of the broken-issue step -- or carries no
-          #     `=` at all and makes the runner reject the whole file, dropping
-          #     every `steps.assess.outputs.*` the issue steps are gated on;
-          #   - the bare `echo`s -- `not probed:`, `could not list`, and the
-          #     `::error::$reason` pair -- have the same column-0 gap as the
-          #     display loop.
+          # Rejecting outright removes both, and needs no per-consumer
+          # reasoning about who is CR-safe: a CR is never legitimate inside a
+          # pathspec, so an entry carrying one means this job can no longer
+          # trust the list it is reading, which is a `broken` verdict by the
+          # same standard as a list it cannot parse at all.
           #
-          # Sanitising once at the source closes all of them together and leaves
-          # no site to forget. This is NOT display-only any more: the pathspecs
-          # handed to `ls-tree` and `git log` are the stripped entries too. That
-          # is deliberate and safe in the fail-closed direction -- a CR is never
-          # legitimate inside a pathspec, and if upstream ever ships one the
-          # stripped path simply stops resolving, which lands on the `missing`
-          # branch and files a loud `broken` verdict naming the entry.
+          # The entry is reported with each CR rendered as the literal text
+          # `<CR>`. That keeps the RAW entry visible to whoever reads the
+          # sticky issue -- they need to see what upstream actually wrote --
+          # while guaranteeing the value embedded in `$GITHUB_OUTPUT` is
+          # single-line, so it cannot split `broken_reason=` into a forged
+          # `state=` record or a record with no `=` that makes the runner
+          # reject the whole file.
+          cr_entries=""
           for i in "${!watched[@]}"; do
-            watched[i]="${watched[i]//$'\r'/}"
+            case "${watched[i]}" in
+              *$'\r'*) cr_entries="$cr_entries \`${watched[i]//$'\r'/<CR>}\`" ;;
+            esac
           done
-
+          if [ -n "$cr_entries" ]; then
+            reason="\`WATCHED_PATHSPECS\` in \`Comfy-Org/github-workflows@$upstream_branch:$bump_yaml\` contains a carriage return inside${cr_entries# } (each CR shown as \`<CR>\`). A CR is never valid inside a pathspec: \`git log\` would match nothing for that entry and this job would report the pin current however stale it is, so it is failing closed instead. This is upstream's list to fix -- the entry was written with a stray CR, or the block scalar picked one up."
+            {
+              echo "state=broken"
+              echo "broken_reason=$reason"
+            } >>"$GITHUB_OUTPUT"
+            echo "::error::$reason"
+            exit 1
+          fi
           # Fail CLOSED on an unreadable list, for the same reason as above: no
           # pathspecs means `git log` matches nothing, which reads as "current".
           if [ "${#watched[@]}" -eq 0 ]; then
@@ -819,10 +849,10 @@ jobs:
           # common ASCII case still prints as `%3A%3A`.
           #
           # Both defences above are newline-scoped, so neither one sees an
-          # interior CR. That is handled once at extraction (see the strip loop
-          # after the `mapfile`), which is why no `tr -d '\r'` is needed here:
-          # `watched` carries no CR by the time it reaches this line, and the
-          # marker below therefore covers each entry whole.
+          # interior CR. That is why no `tr -d '\r'` is needed here: an entry
+          # carrying one never reaches this line at all -- the CR check after
+          # the `mapfile` has already exited with a `broken` verdict -- so the
+          # marker below covers each entry whole.
           echo "Watched pathspecs, read from upstream $bump_yaml:"
           printf '%s\n' "${watched[@]}" | sed -e 's/^[[:space:]]*::/%3A%3A/' -e 's/^/  - /'
 
@@ -1465,6 +1495,21 @@ jobs:
           # direction the rest of this step is built to avoid. A rate limit
           # clears on its own, so it belongs on the no-verdict path with the
           # 5xxs.
+          #
+          # NOT-FOUND IS PERMANENT TOO, and it was the shape this arm was
+          # missing. A repository the token can no longer SEE -- made private,
+          # renamed, or access withdrawn -- is not reported as 403: `gh` goes
+          # through GraphQL and answers `Could not resolve to a Repository with
+          # the name '<owner>/<repo>'`, while a REST path answers `HTTP 404`.
+          # Both are deterministic and permanent, yet neither matched the
+          # transient alternation nor the permanent one, so they fell through
+          # to the no-verdict `exit 1` and reddened the scheduled run
+          # identically every day while filing nothing -- the exact
+          # fault/verdict conflation this arm was added to remove, just from
+          # the other end. (`Could not resolve to a User` is the same answer
+          # for an owner that has gone away, and is included for the same
+          # reason.) A 404 cannot be confused with a rate limit, which is
+          # matched first and answers 403.
           pr_rc=0
           bump="$(gh pr list --repo "$GH_REPO" --state open \
             --head "$BUMP_BRANCH" --base "$DEFAULT_BRANCH" \
@@ -1478,8 +1523,8 @@ jobs:
             if grep -qiE "rate limit|abuse detection|retry your request again later" <<<"$pr_err"; then
               # Transient by definition -- fall through to the no-verdict path.
               :
-            elif grep -qiE "HTTP 401|bad credentials|resource not accessible by integration|must have admin rights|needs the .+ scope|requires the .+ scope|GH_TOKEN environment variable|gh auth login|HTTP 403" <<<"$pr_err"; then
-              reason="This job's token can no longer list pull requests in \`$GH_REPO\` -- \`gh pr list\` exited $pr_rc saying: ${pr_err:-(no output)}. That will not clear on its own: the \`pull-requests: read\` permission or the token's scope has been taken away, and without that read the watchdog cannot tell whether a bump PR is already open, so it can neither confirm nor deny that the pin is being moved. Restore the permission on the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\`."
+            elif grep -qiE "HTTP 401|bad credentials|resource not accessible by integration|must have admin rights|needs the .+ scope|requires the .+ scope|GH_TOKEN environment variable|gh auth login|HTTP 403|HTTP 404|could not resolve to a repository|could not resolve to a user" <<<"$pr_err"; then
+              reason="This job can no longer list pull requests in \`$GH_REPO\` -- \`gh pr list\` exited $pr_rc saying: ${pr_err:-(no output)}. That will not clear on its own: either the \`pull-requests: read\` permission or the token's scope has been taken away, or the repository itself is gone from this token's view (renamed, made private, or access withdrawn). Without that read the watchdog cannot tell whether a bump PR is already open, so it can neither confirm nor deny that the pin is being moved. Restore the permission -- or correct the repository -- on the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\`."
               {
                 echo "state=broken"
                 echo "broken_reason=$reason"
@@ -1719,6 +1764,10 @@ jobs:
           OLDEST_DATE: ${{ steps.assess.outputs.oldest_date }}
           BEHIND_COUNT: ${{ steps.assess.outputs.behind_count }}
           UPSTREAM_BRANCH: ${{ steps.assess.outputs.upstream_branch }}
+          # The enforced window lengths, derived by `assess` from the same
+          # variables its arithmetic uses, so this durable issue cannot assert
+          # a window the verdict was not reached under.
+          GRACE_DAYS: ${{ steps.assess.outputs.grace_days }}
           # Set only when the oldest owed commit is dated implausibly far
           # ahead of the runner's clock, which is why this verdict says "past
           # the grace window" for a commit whose age reads as 0.
@@ -1763,12 +1812,12 @@ jobs:
             overdue="$(printf '%s ' \
               "The oldest one is dated **$FUTURE_DATED**, which is implausibly far ahead of this" \
               "runner's clock -- so its true age cannot be measured and it is judged out of the" \
-              "3-day grace window on that basis rather than on elapsed time. Check the committer" \
+              "$GRACE_DAYS-day grace window on that basis rather than on elapsed time. Check the committer" \
               "clock upstream; a date far enough ahead would otherwise hold this pin in grace" \
               "indefinitely.")"
             overdue="${overdue% }"
           else
-            overdue="The oldest one has been sitting there past the 3-day grace window."
+            overdue="The oldest one has been sitting there past the $GRACE_DAYS-day grace window."
           fi
 
           # Step 1's remediation has to agree with the `cause` paragraph built
@@ -1877,6 +1926,8 @@ jobs:
           BUMP_BRANCH: ci/bump-cursor-review
           BUMP_PR: ${{ steps.assess.outputs.bump_pr }}
           BUMP_AGE_DAYS: ${{ steps.assess.outputs.bump_age_days }}
+          # See the note on `GRACE_DAYS` in the stale-pin issue step.
+          BUMP_PR_GRACE_DAYS: ${{ steps.assess.outputs.bump_pr_grace_days }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -1889,7 +1940,7 @@ jobs:
               "The bump fleet has delivered: #$BUMP_PR is open on \`$BUMP_BRANCH\` and is" \
               "$BUMP_AGE_DAYS day(s) old. Only the merge is owed now, so this issue stays open --" \
               "and closes itself -- on the first daily run after that PR lands. If it goes" \
-              "unmerged past 7 days this job stops treating it as delivery and reports the pin" \
+              "unmerged past $BUMP_PR_GRACE_DAYS day(s) this job stops treating it as delivery and reports the pin" \
               "stale again, naming the PR as the thing to chase." \
               "" \
               "Run: $RUN_URL")"
@@ -1991,6 +2042,8 @@ jobs:
           # Quoted on the `grace` comment so the reader can compare it against
           # the pin this issue was filed on; always written by `assess`.
           PIN: ${{ steps.assess.outputs.pin }}
+          # See the note on `GRACE_DAYS` in the stale-pin issue step.
+          GRACE_DAYS: ${{ steps.assess.outputs.grace_days }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -2013,7 +2066,7 @@ jobs:
               para1="$(printf '%s ' \
                 "Nothing is overdue any more. The pin is still $BEHIND_COUNT consumer-visible" \
                 "commit(s) behind \`Comfy-Org/github-workflows@$UPSTREAM_BRANCH\`, but the oldest one it has" \
-                "not picked up (\`$OLDEST_SHA\`) landed inside the 3-day grace window, so this" \
+                "not picked up (\`$OLDEST_SHA\`) landed inside the $GRACE_DAYS-day grace window, so this" \
                 "issue's premise -- a pin sitting frozen PAST that window -- no longer holds.")"
               para2="$(printf '%s ' \
                 "That is a fact about the BACKLOG, not proof that the pin itself moved: the" \
