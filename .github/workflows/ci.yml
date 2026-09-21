@@ -1431,12 +1431,21 @@ jobs:
       # skip it in the one non-broken state that exits 1, so a blocked issue
       # opened by an earlier `broken` run would stay open indefinitely once the
       # job recovered into a stale pin, claiming the pin is not being watched
-      # while the stale-pin issue alongside it says otherwise. `always()` plus
-      # an explicit `!= 'broken'` is what actually expresses "reached a
+      # while the stale-pin issue alongside it says otherwise. `!cancelled()`
+      # plus an explicit `!= 'broken'` is what actually expresses "reached a
       # verdict": a hard fault writes no `state` and is excluded by `!= ''`.
+      #
+      # `!cancelled()` and NOT `always()`, which is true for a CANCELLED run as
+      # well -- and a cancellation is the one outcome that is not a verdict.
+      # This job is under `cancel-in-progress` and a 10-minute timeout, so a run
+      # killed after `assess` wrote its `state` but before this step would,
+      # under `always()`, close the watchdog-blocked issue on the strength of a
+      # walk that never finished. `!cancelled()` keeps every real outcome --
+      # success and failure alike, so a `stale` verdict still closes this issue
+      # -- and drops only that one.
       - name: Close the watchdog-blocked issue once the job can run again
         if: >-
-          always() && steps.assess.outputs.state != ''
+          !cancelled() && steps.assess.outputs.state != ''
           && steps.assess.outputs.state != 'broken'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1468,15 +1477,21 @@ jobs:
       # written per state.
       - name: Close the stale-pin issue once the pin is moving again
         # `success()` is the JOB's cumulative status, not this step's
-        # precondition -- so a transient `gh` failure in the now-unconditional
+        # precondition -- so a transient `gh` failure in the verdict-gated
         # watchdog-blocked close directly above would skip this step and leave a
         # stale-pin issue open on a run where the pin is demonstrably moving.
         # The states are named explicitly rather than filtered with
-        # `!= 'delivered'`, because under `always()` that spelling would also
-        # match `stale`, `broken` and the empty no-verdict fault -- and closing
-        # the stale-pin issue on a `stale` verdict is precisely backwards.
+        # `!= 'delivered'`, because under a gate this permissive that spelling
+        # would also match `stale`, `broken` and the empty no-verdict fault --
+        # and closing the stale-pin issue on a `stale` verdict is precisely
+        # backwards.
+        #
+        # `!cancelled()` rather than `always()` for the reason given on the step
+        # above: a cancelled run reached no verdict, and a `current`/`grace`
+        # output read off a walk that was killed part-way must not close this
+        # issue.
         if: >-
-          always() && (steps.assess.outputs.state == 'current'
+          !cancelled() && (steps.assess.outputs.state == 'current'
           || steps.assess.outputs.state == 'grace')
         env:
           GH_TOKEN: ${{ github.token }}
