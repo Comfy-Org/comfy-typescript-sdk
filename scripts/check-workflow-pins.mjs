@@ -157,10 +157,21 @@ const caseInsensitiveOwnerRepo = (s) =>
 // `workflows_ref:` behind. That is precisely the split pin both files exist to
 // prevent. Seeing it is therefore not enough; lint (4) below requires the
 // canonical spelling so the ignore entries can cover every caller that exists.
+// The path segment is `[^@\s"']+`, NOT a lazy `\S+?`. Two nested lazy
+// quantifiers over overlapping character sets backtrack quadratically on a
+// line that does not match: `uses: Comfy-Org/github-workflows/` followed by
+// many `@` and a trailing quote gives the outer group one start position per
+// `@`, and forces the inner group to grow to the quote from each of them.
+// Measured at 4x per doubling of the `@` run. This job runs on `pull_request`
+// and checks out the MERGE COMMIT, so a fork PR could add such a
+// `.github/workflows/*.yml` and burn the job to its timeout. Excluding `@`
+// from the path leaves exactly one split point per line, which is linear --
+// and matches identically, since the separator is the FIRST `@` either way
+// (a ref may still contain `@`, and still does: group 6 is unchanged).
 const USES_RE = new RegExp(
   String.raw`^(\s*)(["']?)uses\2\s*:\s*(["']?)(` +
     caseInsensitiveOwnerRepo(REUSABLE_OWNER_REPO) +
-    String.raw`)\/(\S+?)@([^\s"']+?)\3(?:\s+#(.*))?\s*$`,
+    String.raw`)\/([^@\s"']+)@([^\s"']+?)\3(?:\s+#(.*))?\s*$`,
 );
 // The `#` must be preceded by WHITESPACE in both patterns: YAML starts a comment
 // only at a `#` that follows a space (or opens the line), so
@@ -512,8 +523,18 @@ function findCallers() {
           const cont = lines[j];
           const contTrimmed = cont.trim();
           if (contTrimmed === "") continue;
-          if (cont.length - cont.trimStart().length <= keyIndent) break;
+          // The comment skip is tested BEFORE the dedent break, not after.
+          // A YAML comment carries no indentation semantics -- it is not
+          // content and cannot close a multi-line plain scalar -- so a
+          // full-line comment written at or below the key column is legal in
+          // the middle of this fold and GitHub accepts it. Tested after the
+          // break, such a line ended the fold instead: `folded` stayed empty,
+          // `OWNER_REPO_RE` failed, and the caller was dropped in SILENCE,
+          // free to carry a branch ref or a split pin with the repo-wide
+          // zero-caller guard kept quiet by any other caller. Silence is the
+          // one direction this lint must never fail in.
           if (contTrimmed.startsWith("#")) continue;
+          if (cont.length - cont.trimStart().length <= keyIndent) break;
           folded += ` ${contTrimmed}`;
         }
         // Only a call to OUR reusable is this lint's business -- an unrelated
