@@ -19,6 +19,17 @@ on:
   # that pile onto :00.
   schedule:
     - cron: "17 7 * * *"
+  # The only on-demand re-run path for `cursor-review-pin-freshness`. That job
+  # is otherwise reachable only on the daily cron, so the whole of it -- the
+  # staleness verdict AND the sticky-issue open/comment/close behaviour it
+  # drives -- is unexercisable by any PR run, and a change to it could only be
+  # validated by waiting a day. This is permanent, not a debugging aid: when
+  # the watchdog does fire, the first thing anyone wants is to re-run it after
+  # a bump lands rather than wait for tomorrow. `sdk-parity`'s issue steps gate
+  # on `github.event_name == 'schedule'` themselves, so a manual run does its
+  # network check and touches no issue; and `concurrency` keys on
+  # `github.event_name`, so a manual run cannot cancel the scheduled one.
+  workflow_dispatch:
 
 concurrency:
   # `github.event_name` is in the key so the daily scheduled run and a push to
@@ -279,7 +290,12 @@ jobs:
   cursor-review-pin-freshness:
     name: cursor-review-pin-freshness (upstream pin staleness)
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule'
+    # `workflow_dispatch` as well as the cron, so this job can be re-run on
+    # demand -- after a bump lands, or to check a change to the job itself,
+    # neither of which any PR run can do (see the `on:` block). A manual run
+    # does exactly what the scheduled one does, sticky issue included, which is
+    # the point: there is no other way to exercise it.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     # A stalled clone or API call must not hold a runner -- and this job's
     # token can write issues -- for the six-hour default.
     timeout-minutes: 10
@@ -1478,6 +1494,15 @@ jobs:
             overdue="The oldest one has been sitting there past the 3-day grace window."
           fi
 
+          # The last line of the body is an HTML comment recording the pin as
+          # of THIS report -- invisible to a reader, read by the close step
+          # below, which refuses to close on `grace` unless the pin it sees now
+          # differs from the last one recorded. This same body is commented on
+          # the issue on every later stale run and on reopen, so the LAST
+          # marker across body + comments is always the pin as of the most
+          # recent report. `$PIN` needs no escaping: `assess` asserts it is
+          # 40-hex before writing it to `$GITHUB_OUTPUT`, so it cannot contain
+          # a `-->` or anything else that would break out of the comment.
           body="$(printf '%s\n' \
             "\`.github/workflows/ci-cursor-review.yml\` is pinned to \`$PIN\`, which is" \
             "**$BEHIND_COUNT consumer-visible commit(s) behind \`Comfy-Org/github-workflows@main\`**." \
@@ -1506,9 +1531,12 @@ jobs:
             "" \
             "       node scripts/check-workflow-pins.mjs" \
             "" \
-            "This issue closes itself on the first daily run that finds the pin moving again." \
+            "This issue closes itself on the first daily run that finds the pin moved, or" \
+            "nothing owed." \
             "" \
-            "Run: $RUN_URL")"
+            "Run: $RUN_URL" \
+            "" \
+            "<!-- cursor-review-pin: $PIN -->")"
 
           existing="$(gh issue list --state open --label "$ISSUE_LABEL" --limit 100 \
             --json number,title --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
@@ -1612,20 +1640,38 @@ jobs:
       # is what a bump produces almost every time, because upstream keeps
       # committing while the PR is in review. Closing only on `current` would
       # therefore leave this issue open through most successful bumps, so
-      # `grace` closes it too -- but the comment is written per state, because
-      # saying "current again" there would be false.
+      # `grace` closes it too -- but only once it can PROVE the pin moved, and
+      # the comment is written per state, because saying "current again" there
+      # would be false.
       #
-      # What the `grace` comment must NOT do is assert the pin MOVED. Nothing
-      # on this path establishes that: `age` is derived purely from the oldest
-      # currently-owed commit, and that commit can drop out of the query with
-      # the pin untouched -- upstream narrowing a glob or adding an
-      # `:(exclude)` to `WATCHED_PATHSPECS`, which `assess` re-reads live every
-      # run, is enough to shrink the backlog on a completely frozen pin. So the
-      # comment states the BACKLOG fact it actually has and quotes the current
-      # pin for the reader to compare, rather than concluding a bump landed.
-      # Proving movement needs the pin recorded at filing time compared against
-      # the pin now, which means persisting it across runs -- tracked
-      # separately rather than bolted on here.
+      # `grace` on its own is not that proof, which is why closing on it alone
+      # was a bug: `age` is derived purely from the oldest currently-owed
+      # commit, and that commit drops out of the `"$pin..origin/main" --
+      # "${watched[@]}"` walk with the pin untouched whenever upstream narrows
+      # `WATCHED_PATHSPECS` -- which `assess` re-reads live on every run, and
+      # which upstream has done twice in the last few days. A completely frozen
+      # pin could therefore close this watchdog's own issue.
+      #
+      # The proof is the pin recorded on the last stale report. The stale step
+      # above ends every body it writes with a
+      # `<!-- cursor-review-pin: <sha> -->` marker, and comments that same body
+      # on every later stale run, so the LAST marker across the body and all
+      # comments is the pin as of the most recent report. This step reads it
+      # back and branches four ways:
+      #
+      #   recorded != pin  -> the pin genuinely moved; close, saying so.
+      #   recorded == pin  -> the backlog shrank on a frozen pin; do NOT close,
+      #                       comment why, and `::warning::` it.
+      #   no marker found  -> the issue predates the marker; close as before,
+      #                       saying there was nothing to compare against, so
+      #                       pre-marker issues cannot stick open forever.
+      #   read failed      -> unknown, which is NOT "moved"; same as no marker,
+      #                       plus a `::warning::`.
+      #
+      # `gh issue view --json comments` is deliberately NOT how that read is
+      # done: it returns only the first 100 comments, which a sticky issue
+      # commented on daily passes inside three months -- after which the newest
+      # marker falls off the end and this step compares against a stale one.
       - name: Close the stale-pin issue once the pin is moving again
         # `success()` is the JOB's cumulative status, not this step's
         # precondition -- so a transient `gh` failure in the verdict-gated
@@ -1655,8 +1701,9 @@ jobs:
           # is satisfied either way.
           BEHIND_COUNT: ${{ steps.assess.outputs.behind_count }}
           OLDEST_SHA: ${{ steps.assess.outputs.oldest_sha }}
-          # Quoted on the `grace` comment so the reader can compare it against
-          # the pin this issue was filed on; always written by `assess`.
+          # On `grace`, compared against the pin recorded on the last stale
+          # report to decide whether a bump actually landed, and quoted on the
+          # resulting comment either way; always written by `assess`.
           PIN: ${{ steps.assess.outputs.pin }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -1667,23 +1714,114 @@ jobs:
             --json number,title --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')"
           if [ -n "$existing" ]; then
             if [ "$STATE" = "current" ]; then
-              verdict="The \`Comfy-Org/github-workflows\` pin is current again."
+              gh issue close "$existing" --comment "$(printf '%s\n' \
+                "The \`Comfy-Org/github-workflows\` pin is current again." \
+                "" \
+                "Run: $RUN_URL")"
+              exit 0
+            fi
+
+            # `grace` from here down: the backlog is inside the window, which
+            # is only half of what closing this issue claims. Read the pin
+            # recorded on the most recent stale report back off the thread and
+            # compare, per the four branches in the comment above.
+            #
+            # The body first, then the comments oldest-first, so `tail -n 1`
+            # takes the NEWEST marker. `--paginate` rather than
+            # `gh issue view --json comments`, which caps at 100. The two
+            # reads are joined with `&&` rather than `;` so that a failure of
+            # EITHER surfaces as a non-zero status here instead of being
+            # masked by the other succeeding.
+            #
+            # Comments are filtered to bot authors. Anyone can comment on an
+            # issue in a public repo, and this marker is the movement proof --
+            # an unfiltered read would let a drive-by comment carrying a
+            # different 40-hex value close the very issue this check exists to
+            # hold open. The body needs no such filter: this job opened it.
+            # If the workflow token ever stops being a bot identity the filter
+            # simply finds nothing, which lands on the no-marker branch (close
+            # as before) rather than on a false "the pin moved".
+            scratch="$(mktemp -d)"
+            trap 'rm -rf "$scratch"' EXIT
+
+            read_rc=0
+            reports="$( { gh api "repos/$GH_REPO/issues/$existing" --jq '.body' \
+              && gh api --paginate "repos/$GH_REPO/issues/$existing/comments?per_page=100" \
+                   --jq '.[] | select(.user.type == "Bot") | .body'; } \
+              2>"$scratch/read.err" )" || read_rc=$?
+
+            recorded=""
+            if [ "$read_rc" -ne 0 ]; then
+              # Flattened onto one line: it carries another program's stderr
+              # into a workflow command, which is line-oriented.
+              read_err="$(tr '\n' ' ' <"$scratch/read.err")"
+              echo "::warning::could not read this issue's body and comments to find the pin recorded on the last stale report (gh exited $read_rc saying: ${read_err:-(no output)}). Treating the recorded pin as UNKNOWN, which is not the same as moved."
             else
+              # Two greps, not one: the first proves the marker's shape, the
+              # second extracts the SHA out of the one `tail` kept. No match
+              # (and a broken grep) both leave `recorded` empty, which is the
+              # no-marker branch -- the conservative direction, since it only
+              # ever costs the reader a sentence saying there was nothing to
+              # compare against.
+              recorded="$(printf '%s\n' "$reports" \
+                | grep -oE '<!-- cursor-review-pin: [0-9a-f]{40} -->' \
+                | tail -n 1 \
+                | grep -oE '[0-9a-f]{40}')" || recorded=""
+            fi
+
+            # Shared opening sentence: the one thing every `grace` branch
+            # below genuinely knows. `printf '%s '` joins the lines with a
+            # space and leaves one trailing; drop it so the sentence that
+            # follows is not double-spaced.
+            premise="$(printf '%s ' \
+              "Nothing is overdue any more. The pin is still $BEHIND_COUNT consumer-visible" \
+              "commit(s) behind \`Comfy-Org/github-workflows@main\`, but the oldest one it has" \
+              "not picked up (\`$OLDEST_SHA\`) landed inside the 3-day grace window, so this" \
+              "issue's premise -- a pin sitting frozen PAST that window -- no longer holds.")"
+            premise="${premise% }"
+
+            if [ -z "$recorded" ]; then
               verdict="$(printf '%s ' \
-                "Nothing is overdue any more. The pin is still $BEHIND_COUNT consumer-visible" \
-                "commit(s) behind \`Comfy-Org/github-workflows@main\`, but the oldest one it has" \
-                "not picked up (\`$OLDEST_SHA\`) landed inside the 3-day grace window, so this" \
-                "issue's premise -- a pin sitting frozen PAST that window -- no longer holds." \
+                "$premise" \
                 "" \
                 "That is a fact about the BACKLOG, not proof that the pin itself moved: the" \
                 "backlog also shrinks if upstream narrows \`WATCHED_PATHSPECS\`. The pin is" \
                 "currently \`$PIN\` -- compare it with the one quoted when this issue was filed" \
-                "before concluding a bump landed. It reopens on the first daily run that finds" \
-                "the pin frozen past the grace window again.")"
-              # `printf '%s '` joins the lines with a space and leaves one
-              # trailing; drop it so the `Run:` line below is not double-spaced.
+                "before concluding a bump landed. This run found no recorded pin on this issue" \
+                "to compare against, because the issue predates that record or the read failed," \
+                "so it is closing on the backlog alone. It reopens on the first daily run that" \
+                "finds the pin frozen past the grace window again.")"
               verdict="${verdict% }"
+            elif [ "$recorded" != "$PIN" ]; then
+              verdict="$(printf '%s ' \
+                "$premise" \
+                "" \
+                "The pin moved from \`$recorded\` to \`$PIN\` since the last stale report, so a" \
+                "bump landed. It reopens on the first daily run that finds the pin frozen past" \
+                "the grace window again.")"
+              verdict="${verdict% }"
+            else
+              # The pin has NOT moved. Comment and leave the issue open; the
+              # job's verdict is still `grace`, so this step exits 0.
+              held="$(printf '%s ' \
+                "$premise" \
+                "" \
+                "But the pin is still \`$PIN\` -- the same value recorded on the last stale" \
+                "report -- so the backlog shrank without the pin moving. The likeliest cause is" \
+                "upstream narrowing \`WATCHED_PATHSPECS\` in" \
+                "\`Comfy-Org/github-workflows@main:.github/workflows/bump-cursor-review-callers.yml\`," \
+                "which this job re-reads live on every run: fewer watched paths means fewer owed" \
+                "commits, on a pin nothing has touched. So this issue stays OPEN -- it closes" \
+                "when the pin actually moves, or when nothing is owed at all.")"
+              held="${held% }"
+              gh issue comment "$existing" --body "$(printf '%s\n' \
+                "$held" \
+                "" \
+                "Run: $RUN_URL")"
+              echo "::warning::nothing is overdue any more, but the pin is still $PIN -- the same value recorded on the last stale report -- so the backlog shrank without the pin moving, most likely because upstream narrowed WATCHED_PATHSPECS. Leaving issue #$existing open until the pin moves or nothing is owed."
+              exit 0
             fi
+
             gh issue close "$existing" --comment "$(printf '%s\n' \
               "$verdict" \
               "" \
