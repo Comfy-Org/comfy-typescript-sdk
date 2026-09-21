@@ -103,7 +103,11 @@ function run(root: string, ...args: string[]) {
       cause: result.error,
     });
   }
-  return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+  return {
+    status: result.status,
+    stdout: result.stdout,
+    stderr: result.stderr,
+  };
 }
 
 /**
@@ -184,7 +188,9 @@ describe("check-workflow-pins.mjs against the real repo", () => {
 
 describe("the historical split this lint was written for", () => {
   it("reports BOTH halves of the pin pair it shipped between two releases", () => {
-    const root = fixtureRoot({ [WORKFLOW]: readFileSync(HISTORICAL_FIXTURE, "utf8") });
+    const root = fixtureRoot({
+      [WORKFLOW]: readFileSync(HISTORICAL_FIXTURE, "utf8"),
+    });
     const { status, stderr } = run(root);
     expect(status).toBe(1);
     expect(stderr).toContain("2 problem(s)");
@@ -205,14 +211,18 @@ describe("the three pin assertions", () => {
 
   it("fails on a stale parenthesised trailing comment", () => {
     const comment = `# github-workflows main (${STALE_SHORT})`;
-    const root = fixtureRoot({ [WORKFLOW]: yaml(pinnedCaller(SHA, SHA, comment)) });
+    const root = fixtureRoot({
+      [WORKFLOW]: yaml(pinnedCaller(SHA, SHA, comment)),
+    });
     const { status, stderr } = run(root);
     expect(status).toBe(1);
     expect(stderr).toContain(`names commit \`${STALE_SHORT}\``);
   });
 
   it("fails on a stale BARE trailing comment, with no parentheses to key on", () => {
-    const root = fixtureRoot({ [WORKFLOW]: yaml(pinnedCaller(SHA, SHA, `# ${STALE_SHORT}`)) });
+    const root = fixtureRoot({
+      [WORKFLOW]: yaml(pinnedCaller(SHA, SHA, `# ${STALE_SHORT}`)),
+    });
     const { status, stderr } = run(root);
     expect(status).toBe(1);
     expect(stderr).toContain(`names commit \`${STALE_SHORT}\``);
@@ -220,7 +230,9 @@ describe("the three pin assertions", () => {
 
   it("accepts a date in the trailing comment beside the parenthesised short SHA", () => {
     const comment = "# github-workflows main (425c154) - bumped 20260919";
-    const root = fixtureRoot({ [WORKFLOW]: yaml(pinnedCaller(SHA, SHA, comment)) });
+    const root = fixtureRoot({
+      [WORKFLOW]: yaml(pinnedCaller(SHA, SHA, comment)),
+    });
     const { status, stderr } = run(root);
     expect(stderr).toBe("");
     expect(status).toBe(0);
@@ -666,6 +678,24 @@ describe("spellings the scanner cannot read fail closed", () => {
     expect(status).toBe(1);
     expect(stderr).toContain(`${REL}:${lineNo(lines, opener)}: ${CANNOT_READ}`);
     expect(stderr).not.toContain("lint checked nothing");
+  });
+
+  it("reports a caller whose owner/repo differs only in LETTER CASE", () => {
+    // GitHub resolves owner and repository names case-insensitively, so this
+    // job really does call the same reusable as the sibling above it -- but
+    // `USES_RE` is case-sensitive and does not read it as a caller. Skipping it
+    // in silence would leave a second, genuinely split pin invisible, which is
+    // precisely the hole this guard exists to close, so it fails closed and
+    // names the spelling instead.
+    const lowerCased = `    uses: ${REUSABLE.toLowerCase()}@${OTHER}`;
+    const lines = [
+      ...pinnedCaller(),
+      "  lower-case-owner:",
+      lowerCased,
+      "    with:",
+      `      workflows_ref: ${OTHER}`,
+    ];
+    expectBothModesRefuse(lines, lineNo(lines, lowerCased), "owner/path/ref did not parse");
   });
 
   it("stays silent about a job-level `uses:` that names some OTHER owner", () => {

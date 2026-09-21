@@ -316,7 +316,17 @@ function unreadableUsesReason(rawValue) {
   const value = stripTrailingComment(raw);
   if (value === "") return "value on a continuation line";
   if (BLOCK_SCALAR_VALUE_RE.test(value)) return "folded/literal block scalar";
-  if (value.includes(REUSABLE_OWNER_REPO)) return "owner/path/ref did not parse";
+  // GitHub resolves owner and repository names CASE-INSENSITIVELY, so
+  // `comfy-org/github-workflows/...` names the very same reusable as the
+  // canonical spelling and calls it successfully. `USES_RE` is case-sensitive
+  // and does not read such a line as a caller, so a case-sensitive test HERE
+  // would return null and skip it in silence -- reinstating, over nothing but
+  // letter case, the invisible-caller hole this function exists to close: the
+  // lint would report "all pins agree" across a genuinely split pair and
+  // `--print-pin` would hand the watchdog the other job's SHA.
+  if (value.toLowerCase().includes(REUSABLE_OWNER_REPO.toLowerCase())) {
+    return "owner/path/ref did not parse";
+  }
 
   return null;
 }
@@ -449,7 +459,11 @@ function findCallers() {
         const indent = lines[i].length - trimmed.length;
         const jobs = owningKey(lines, i, indent, inBlock);
         if (jobs !== null && jobs.indent === 0 && JOBS_KEY_RE.test(jobs.trimmed)) {
-          unreadable.push({ rel, lineNo: i + 1, reason: "job written as a flow mapping" });
+          unreadable.push({
+            rel,
+            lineNo: i + 1,
+            reason: "job written as a flow mapping",
+          });
           continue;
         }
       }
