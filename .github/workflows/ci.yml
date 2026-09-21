@@ -427,6 +427,28 @@ jobs:
           upstream_rc=0
           upstream_src="$(git -C /tmp/gw show "origin/main:$bump_yaml" 2>&1)" || upstream_rc=$?
           if [ "$upstream_rc" -ne 0 ]; then
+            # A path that is simply GONE upstream is permanent and
+            # deterministic, so it is a VERDICT about the pin's watchability,
+            # not a fault in reading it. The distinction has teeth: the issue
+            # steps below fire only on `broken` or `stale`, and there is no
+            # generic failure handler, so leaving a rename on the fault path
+            # burns this job red every single day and never opens the sticky
+            # issue that would say why. `ls-tree` reads trees only, which the
+            # blobless clone already has, so it settles "is the path there?"
+            # without the lazy blob fetch `git show` just failed at. Status and
+            # output are captured SEPARATELY, for the reason spelled out at the
+            # `ls-tree` probe below.
+            probe_rc=0
+            probe_out="$(git -C /tmp/gw ls-tree origin/main -- "$bump_yaml" 2>&1)" || probe_rc=$?
+            if [ "$probe_rc" -eq 0 ] && [ -z "$probe_out" ]; then
+              reason="\`$bump_yaml\` does not exist in \`Comfy-Org/github-workflows@main\` any more, so this job cannot read \`WATCHED_PATHSPECS\` and cannot judge staleness at all. That will not clear on its own: upstream renamed or removed the bump workflow. Re-point the extractor in the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\` at upstream's new file."
+              {
+                echo "state=broken"
+                echo "broken_reason=$reason"
+              } >>"$GITHUB_OUTPUT"
+              echo "::error::$reason"
+              exit 1
+            fi
             # A FAULT, not a verdict: a lazy-fetch failure or a vanished
             # `origin/main` says nothing about the pin. No `state` is written.
             echo "::error::could not read $bump_yaml from github-workflows main -- git exited $upstream_rc: ${upstream_src:-(no output)}"
