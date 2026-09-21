@@ -169,7 +169,14 @@ const USES_RE = new RegExp(
 // pin while GitHub received the literal `<sha>#oops` -- and handed the same
 // wrong value to the `cursor-review-pin-freshness` watchdog via `--print-pin`.
 // The closing `\s*` still tolerates trailing whitespace.
-const WORKFLOWS_REF_RE = /^\s*workflows_ref:\s*(["']?)([^\s"']+?)\1(?:\s+#.*)?\s*$/;
+// The KEY may be quoted, for the same reason `USES_RE` and the `with:` test
+// tolerate one: `"workflows_ref": <sha>` is valid YAML that GitHub accepts and
+// that genuinely passes the input. Matched bare, such a caller read as passing
+// NO pin -- `lint()` reported "passes no `workflows_ref` input" and `printPin`
+// failed, which the daily watchdog turns into a `broken` verdict and a sticky
+// issue blaming a caller that is in fact correct. All three key patterns now
+// agree.
+const WORKFLOWS_REF_RE = /^\s*(["']?)workflows_ref\1\s*:\s*(["']?)([^\s"']+?)\2(?:\s+#.*)?\s*$/;
 // A line that opens a BLOCK SCALAR (`run: |`, `body: >-`). Group 1 spans the
 // indent AND any `- ` sequence marker, so its length is the KEY's column --
 // block content is indented deeper than the key, which for `- run: |` is not
@@ -305,7 +312,12 @@ function owningKey(lines, index, indent, inBlock) {
     // returned as the owner of `jobs:`. `jobs:` would then read as non-root,
     // every caller in the file would be dropped, and the file would pass with
     // no output: the silent skip this file's header promises never happens.
-    if (trimmed === "---" || trimmed === "..." || trimmed.startsWith("%")) continue;
+    // Matched as a PREFIX, not compared exactly: YAML allows a comment after
+    // either marker (`--- # doc`, `... # end`) and allows `---` to be followed
+    // by a node on the same line, and an exact comparison let all of those
+    // through to be returned as the owner of `jobs:` -- which reads as
+    // non-root, drops every caller in the file, and passes with no output.
+    if (/^(---|\.\.\.)(\s|$)/.test(trimmed) || trimmed.startsWith("%")) continue;
     const ownIndent = lines[i].length - lines[i].trimStart().length;
     if (ownIndent < indent) return { trimmed, indent: ownIndent, index: i };
   }
@@ -422,7 +434,9 @@ function workflowsRefInput(lines, usesIndex, usesIndent, inBlock) {
     if (indent !== withChildIndent) continue;
 
     const rm = WORKFLOWS_REF_RE.exec(line);
-    if (rm) return { value: rm[2], lineNo: i + 1 };
+    // Group 1 is the key's optional quote and group 2 the value's, so the
+    // VALUE is group 3.
+    if (rm) return { value: rm[3], lineNo: i + 1 };
   }
 
   return null;
@@ -553,22 +567,26 @@ function lint(callers) {
     // so a caller can be both misspelled and badly pinned and deserves to hear
     // about both in one run.
     //
-    // GitHub resolves owner/repo
-    // case-insensitively, so a non-canonical spelling runs fine -- but
-    // `.github/dependabot.yml` ignores this dependency by literal name, and an
-    // ignore written in canonical case does not cover `comfy-org/...`. Left
-    // alone, that caller is the one Dependabot is still free to half-bump,
-    // rewriting `uses:` and leaving `workflows_ref:` behind. Requiring the
-    // canonical spelling here is what lets those two ignore entries be a
-    // complete defence rather than a partial one.
+    // This is HYGIENE, and saying so matters because the stronger claim that
+    // used to be written here -- and in `.github/dependabot.yml` -- was not
+    // true. Dependabot matches `ignore.dependency-name` with
+    // `Dependabot::Config::UpdateConfig.wildcard_match?`, which LOWERCASES
+    // both the pattern and the candidate before comparing, so a caller spelled
+    // `comfy-org/github-workflows` is already covered by the canonical-case
+    // entries over there; this lint is not the other half of that defence and
+    // relaxing it would not open a hole in it. What one spelling does buy is
+    // that the caller, those ignore entries and the pin `--print-pin` hands
+    // the freshness watchdog all name the dependency identically, so whoever
+    // greps for one finds the rest.
     if (ownerRepo !== REUSABLE_OWNER_REPO) {
       errors.push(
-        `${at}: \`uses:\` names \`${ownerRepo}\`, but this repository pins that ` +
-          `dependency as \`${REUSABLE_OWNER_REPO}\`. GitHub accepts either, ` +
-          `Dependabot does not: \`.github/dependabot.yml\` ignores this dependency ` +
-          `by literal name, so a non-canonical spelling escapes the ignore and gets ` +
-          `its \`uses:\` bumped while \`workflows_ref:\` is left behind -- the split ` +
-          `pin this check exists to prevent. Spell it \`${REUSABLE_OWNER_REPO}\`.`,
+        `${at}: \`uses:\` names \`${ownerRepo}\`, but this repository spells that ` +
+          `dependency \`${REUSABLE_OWNER_REPO}\` everywhere else -- the ignore entries ` +
+          `in \`.github/dependabot.yml\` and the pin this script prints for the ` +
+          `freshness watchdog. GitHub and Dependabot both resolve the name ` +
+          `case-insensitively, so the mismatch does not by itself break anything; ` +
+          `one spelling is what keeps those three readable as the same dependency. ` +
+          `Spell it \`${REUSABLE_OWNER_REPO}\`.`,
       );
     }
 

@@ -45,8 +45,8 @@ updates:
       # rewrites `uses:`, splitting the pair. The bump-*-callers fleet in
       # github-workflows moves both pins together. Both entries are needed:
       # Dependabot names a reusable by its FULL path, and a bare `dependency-name`
-      # is an exact match (the exact form covers `owner/repo`, the `/*` form the
-      # per-file names). Do NOT collapse to `Comfy-Org/github-workflows*`.
+      # is an exact match (the exact form covers `owner/repo`, the globbed form
+      # the per-file names). Do NOT collapse to `Comfy-Org/github-workflows*`.
       #
       # No `versions:` or `update-types:` on purpose -- the ignore is TOTAL,
       # security advisories included. That is not an oversight to narrow later:
@@ -56,17 +56,27 @@ updates:
       # fleet is what moves these pins, and scripts/check-workflow-pins.mjs
       # fails CI if the pair is ever split again -- by Dependabot, or by hand.
       #
-      # Both entries are spelled in CANONICAL case, and that is load-bearing:
-      # Dependabot matches `dependency-name` against the name exactly as it is
-      # written in `uses:`, while GitHub itself resolves owner/repo
-      # case-insensitively. A caller spelled `comfy-org/github-workflows` would
-      # therefore run fine and slip straight past these two ignores. What keeps
-      # that from happening is the other half of the defence: lint (4) in
-      # scripts/check-workflow-pins.mjs rejects any non-canonical spelling, so
-      # the only callers that can exist are ones these entries cover. Do not
-      # relax that lint without widening the spellings here to match.
+      # Case does NOT have to match, and an earlier version of this comment was
+      # wrong to say it did. Dependabot compares `dependency-name` using
+      # `Dependabot::Config::UpdateConfig.wildcard_match?`, which lowercases BOTH
+      # the pattern and the candidate before matching, so these canonical-case
+      # entries already cover a caller spelled `comfy-org/github-workflows`.
+      # Lint (4) in scripts/check-workflow-pins.mjs still requires the canonical
+      # spelling, but as hygiene -- one name across the caller, these entries and
+      # the freshness watchdog -- not because a lowercase caller would escape
+      # here. Relaxing that lint does not open a hole in this ignore.
+      #
+      # The second entry is scoped to `.github/workflows/*` rather than a bare
+      # `/*`. The bare glob also swallowed STEP-level composite actions from this
+      # same repo (`Comfy-Org/github-workflows/actions/foo@<sha>`), which carry a
+      # single pin with no `workflows_ref:` partner -- nothing for Dependabot to
+      # split, so nothing to ignore. Ignoring them would have frozen them
+      # SILENTLY: check-workflow-pins.mjs skips step-level `uses:` by design, and
+      # the freshness watchdog only watches cursor-review.yml, so no alarm covers
+      # them. Reusable workflows can only live under `.github/workflows/`, so
+      # narrowing loses no coverage of the pin-pair this block exists to protect.
       - dependency-name: "Comfy-Org/github-workflows"
-      - dependency-name: "Comfy-Org/github-workflows/*"
+      - dependency-name: "Comfy-Org/github-workflows/.github/workflows/*"
     groups:
       actions-minor-and-patch:
         patterns:

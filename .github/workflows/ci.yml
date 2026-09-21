@@ -404,8 +404,69 @@ jobs:
           # Blobless and no checkout: this needs commits and trees to run `git
           # log` with a pathspec, never file contents. github-workflows is
           # public, so the ambient token is enough.
+          #
+          # The status is CAPTURED rather than left to `set -e`, for the same
+          # reason as every other upstream-facing call in this step: an
+          # uncaptured failure lands on the no-verdict path, which writes no
+          # `state=` and files nothing. Not every clone failure is transient --
+          # if the repository is deleted, made private, or moved without a
+          # redirect, this fails identically every day and the watchdog reddens
+          # in silence, the same permanent-versus-transient conflation the
+          # ancestry branch below was added to undo.
+          clone_rc=0
           git clone --filter=blob:none --no-checkout --quiet \
-            https://github.com/Comfy-Org/github-workflows "$gwtmp/gw"
+            https://github.com/Comfy-Org/github-workflows "$gwtmp/gw" \
+            2>"$gwtmp/clone.err" || clone_rc=$?
+          if [ "$clone_rc" -ne 0 ]; then
+            # Flattened for the same reason as `broken_reason` above.
+            clone_err="$(tr '\n' ' ' <"$gwtmp/clone.err")"
+            # GitHub answers "Repository not found" for a deleted repo AND for
+            # a private one the ambient token cannot see; both are permanent
+            # from here. Anything else -- DNS, TLS, a 5xx, a partial-clone
+            # hiccup -- is assumed transient and left to the no-verdict path.
+            if grep -qiE 'repository not found|not found|could not read from remote|authentication failed|access denied|terminal prompts disabled' <<<"$clone_err"; then
+              reason="\`Comfy-Org/github-workflows\` could not be reached at all -- \`git clone\` exited $clone_rc saying: ${clone_err:-(no output)}. That will not clear on its own: the repository has been deleted, made private, or moved without a redirect. Re-point the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\` at upstream's new home, or retire it."
+              {
+                echo "state=broken"
+                echo "broken_reason=$reason"
+              } >>"$GITHUB_OUTPUT"
+              echo "::error::$reason"
+              exit 1
+            fi
+            # NO verdict written: a network fault says nothing about the pin.
+            echo "::error::could not clone Comfy-Org/github-workflows -- git exited $clone_rc: ${clone_err:-(no output)}"
+            exit 1
+          fi
+
+          # UPSTREAM'S DEFAULT BRANCH, resolved ONCE from the clone's own
+          # `origin/HEAD` symref rather than hardcoded to `origin/main`.
+          #
+          # GitHub lets a repository move its default branch while KEEPING the
+          # old one, so `origin/main` continuing to resolve is NOT evidence
+          # that it is still the branch consumers see. Hardcoded, every check
+          # below -- the ancestry test, the `WATCHED_PATHSPECS` read, the path
+          # probes and the backlog walk -- would keep following a frozen
+          # branch, and this job could write `state=current` and close its own
+          # stale-pin issue while consumer-visible commits piled up on the real
+          # default. That is precisely the silent pass the job exists to catch,
+          # reached by the job itself.
+          default_ref="$(git -C "$gwtmp/gw" symbolic-ref --quiet --short refs/remotes/origin/HEAD)" \
+            || default_ref=""
+          if [ -z "$default_ref" ] \
+            || ! git -C "$gwtmp/gw" rev-parse --verify --quiet "$default_ref" >/dev/null; then
+            reason="This job could not resolve upstream's default branch from \`refs/remotes/origin/HEAD\` in the \`Comfy-Org/github-workflows\` clone${default_ref:+ (it names \`$default_ref\`, which does not resolve)}. It will not fall back to guessing \`main\`: the ancestry check, the \`WATCHED_PATHSPECS\` read, the path probes and the staleness walk all read that ref, and following the wrong branch reports a frozen pin as current. \`git clone\` sets that symref from the remote's own HEAD, so its absence is not transient. Investigate the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\`."
+            {
+              echo "state=broken"
+              echo "broken_reason=$reason"
+            } >>"$GITHUB_OUTPUT"
+            echo "::error::$reason"
+            exit 1
+          fi
+          upstream_branch="${default_ref#origin/}"
+          # Published for the issue-body steps below, which name the branch
+          # in prose and run in their own shells.
+          echo "upstream_branch=$upstream_branch" >>"$GITHUB_OUTPUT"
+          echo "Upstream default branch: $upstream_branch (via origin/HEAD)"
 
           # THE LIKELIEST GENUINELY-WRONG PIN is one that names no commit here
           # at all -- a mistyped SHA, a commit force-pushed away, one that only
@@ -487,19 +548,18 @@ jobs:
 
           # With the object known to be present, `merge-base --is-ancestor`
           # exits 1 for "not an ancestor" and 2+ for a hard error -- an
-          # unreadable object, `origin/main` gone after an upstream
-          # default-branch rename, a partial-clone fetch failure. Discarding
+          # unreadable object, a partial-clone fetch failure. Discarding
           # stderr and folding the two together reports an infrastructure fault
           # as "re-pin both pins" against a pin that is in fact correct. Only
           # exit 1 is a verdict about the pin, and only a verdict files an issue.
           ancestry_rc=0
-          git -C "$gwtmp/gw" merge-base --is-ancestor "$pin" origin/main 2>"$gwtmp/ancestry.err" \
+          git -C "$gwtmp/gw" merge-base --is-ancestor "$pin" "$default_ref" 2>"$gwtmp/ancestry.err" \
             || ancestry_rc=$?
           # Flattened for the same reason as `exists_err` above.
           ancestry_err="$(tr '\n' ' ' <"$gwtmp/ancestry.err")"
 
           if [ "$ancestry_rc" -eq 1 ]; then
-            reason="The pinned commit \`$pin\` exists in \`Comfy-Org/github-workflows\` but is not an ancestor of \`main\` -- both pins were moved to a side branch, or \`main\` was rewritten. Re-pin \`uses:\` and \`workflows_ref:\` in \`.github/workflows/ci-cursor-review.yml\` to a commit that is on \`main\`, then run \`node scripts/check-workflow-pins.mjs\`."
+            reason="The pinned commit \`$pin\` exists in \`Comfy-Org/github-workflows\` but is not an ancestor of \`$upstream_branch\` (upstream's default branch) -- both pins were moved to a side branch, or \`$upstream_branch\` was rewritten. Re-pin \`uses:\` and \`workflows_ref:\` in \`.github/workflows/ci-cursor-review.yml\` to a commit that is on \`$upstream_branch\`, then run \`node scripts/check-workflow-pins.mjs\`."
             {
               echo "state=broken"
               echo "broken_reason=$reason"
@@ -507,21 +567,13 @@ jobs:
             echo "::error::$reason"
             exit 1
           elif [ "$ancestry_rc" -ne 0 ]; then
-            # One of the faults folded in here is NOT transient: if upstream
-            # renames its default branch, `origin/main` is simply gone and
-            # stays gone. Every later step resolves that same ref, so the job
-            # would redden daily, write no verdict and file nothing -- the
-            # silent failure the rest of this step exists to convert into a
-            # sticky issue. Separate it out before falling through.
-            if ! git -C "$gwtmp/gw" rev-parse --verify --quiet origin/main >/dev/null; then
-              reason="\`origin/main\` does not resolve in the \`Comfy-Org/github-workflows\` clone -- upstream has most likely renamed its default branch. This job reads that ref for the ancestry check, the \`WATCHED_PATHSPECS\` read and the staleness walk, so it cannot judge the pin at all until the ref it follows is updated. Update the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\` to follow upstream's new default branch."
-              {
-                echo "state=broken"
-                echo "broken_reason=$reason"
-              } >>"$GITHUB_OUTPUT"
-              echo "::error::$reason"
-              exit 1
-            fi
+            # The non-transient fault that used to be separated out here -- an
+            # upstream default-branch rename leaving `origin/main` gone -- can
+            # no longer reach this branch: the ref is now resolved from
+            # `origin/HEAD` right after the clone, and a default that cannot be
+            # resolved is a `broken` verdict there rather than a daily red run
+            # here. What is left really is transient.
+            #
             # NO verdict written: nothing here established anything about the
             # pin, so the issue steps below must stay out of it. The red run
             # and this annotation are the whole record, which is right for the
@@ -557,7 +609,7 @@ jobs:
           # line landing mid-block ends the watched list early and silently
           # narrows what counts as staleness. Same reason the pin read above
           # routes stderr to a file.
-          upstream_src="$(git -C "$gwtmp/gw" show "origin/main:$bump_yaml" 2>"$gwtmp/upstream-show.err")" || upstream_rc=$?
+          upstream_src="$(git -C "$gwtmp/gw" show "$default_ref:$bump_yaml" 2>"$gwtmp/upstream-show.err")" || upstream_rc=$?
           if [ "$upstream_rc" -ne 0 ]; then
             # A path that is simply GONE upstream is permanent and
             # deterministic, so it is a VERDICT about the pin's watchability,
@@ -576,9 +628,9 @@ jobs:
             # as present and drop a permanent upstream rename onto the fault
             # path, which writes no `state` and files no issue.
             probe_rc=0
-            probe_out="$(git -C "$gwtmp/gw" ls-tree origin/main -- "$bump_yaml" 2>"$gwtmp/bump-probe.err")" || probe_rc=$?
+            probe_out="$(git -C "$gwtmp/gw" ls-tree "$default_ref" -- "$bump_yaml" 2>"$gwtmp/bump-probe.err")" || probe_rc=$?
             if [ "$probe_rc" -eq 0 ] && [ -z "$probe_out" ]; then
-              reason="\`$bump_yaml\` does not exist in \`Comfy-Org/github-workflows@main\` any more, so this job cannot read \`WATCHED_PATHSPECS\` and cannot judge staleness at all. That will not clear on its own: upstream renamed or removed the bump workflow. Re-point the extractor in the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\` at upstream's new file."
+              reason="\`$bump_yaml\` does not exist in \`Comfy-Org/github-workflows@$upstream_branch\` any more, so this job cannot read \`WATCHED_PATHSPECS\` and cannot judge staleness at all. That will not clear on its own: upstream renamed or removed the bump workflow. Re-point the extractor in the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\` at upstream's new file."
               {
                 echo "state=broken"
                 echo "broken_reason=$reason"
@@ -587,7 +639,7 @@ jobs:
               exit 1
             fi
             # A FAULT, not a verdict: a lazy-fetch failure or a vanished
-            # `origin/main` says nothing about the pin. No `state` is written.
+            # `$default_ref` says nothing about the pin. No `state` is written.
             show_err="$(tr '\n' ' ' <"$gwtmp/upstream-show.err")"
             echo "::error::could not read $bump_yaml from github-workflows main -- git exited $upstream_rc: ${show_err:-(no output)}"
             exit 1
@@ -673,7 +725,7 @@ jobs:
           # Fail CLOSED on an unreadable list, for the same reason as above: no
           # pathspecs means `git log` matches nothing, which reads as "current".
           if [ "${#watched[@]}" -eq 0 ]; then
-            reason="This job could not read \`WATCHED_PATHSPECS\` out of \`Comfy-Org/github-workflows@main:$bump_yaml\` -- the key is gone, or it is no longer written as a \`|\` block scalar. Without that list the staleness query has no pathspecs, matches nothing, and would report the pin current however stale it is, so it is failing closed instead. Re-check upstream's file and update the extractor in the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\`."
+            reason="This job could not read \`WATCHED_PATHSPECS\` out of \`Comfy-Org/github-workflows@$upstream_branch:$bump_yaml\` -- the key is gone, or it is no longer written as a \`|\` block scalar. Without that list the staleness query has no pathspecs, matches nothing, and would report the pin current however stale it is, so it is failing closed instead. Re-check upstream's file and update the extractor in the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\`."
             {
               echo "state=broken"
               echo "broken_reason=$reason"
@@ -842,7 +894,7 @@ jobs:
             # and a defect in a list this repo does not control, so it is a
             # `broken` VERDICT with a sticky issue instead.
             if [ "${probe#:}" != "$probe" ]; then
-              reason="\`Comfy-Org/github-workflows@main:$bump_yaml\` lists \`$path\` in \`WATCHED_PATHSPECS\`, and this job cannot parse its pathspec magic, so it cannot check that the entry still resolves -- and an unchecked entry is exactly the silent drift this probe exists to catch. Re-check upstream's list and the extractor in the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\`."
+              reason="\`Comfy-Org/github-workflows@$upstream_branch:$bump_yaml\` lists \`$path\` in \`WATCHED_PATHSPECS\`, and this job cannot parse its pathspec magic, so it cannot check that the entry still resolves -- and an unchecked entry is exactly the silent drift this probe exists to catch. Re-check upstream's list and the extractor in the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\`."
               {
                 echo "state=broken"
                 echo "broken_reason=$reason"
@@ -879,7 +931,7 @@ jobs:
             # failure must not file a confident `broken` issue about drift that
             # did not happen.
             ls_rc=0
-            ls_out="$(git -C "$gwtmp/gw" ls-tree origin/main -- "$probe" 2>"$gwtmp/ls-probe.err")" || ls_rc=$?
+            ls_out="$(git -C "$gwtmp/gw" ls-tree "$default_ref" -- "$probe" 2>"$gwtmp/ls-probe.err")" || ls_rc=$?
             if [ "$ls_rc" -ne 0 ]; then
               ls_err="$(tr '\n' ' ' <"$gwtmp/ls-probe.err")"
               echo "::error::could not list \`$probe\` in github-workflows main -- git exited $ls_rc: ${ls_err:-(no output)}"
@@ -889,7 +941,7 @@ jobs:
           done
 
           if [ "$positive" -eq 0 ]; then
-            reason="\`WATCHED_PATHSPECS\` in \`Comfy-Org/github-workflows@main:$bump_yaml\` parsed to ${#watched[@]} entry/entries, none of them a positive pathspec -- they are all \`:(exclude)\`/\`:!\` filters. A staleness check with no positive pathspec matches nothing and would report the pin current however stale it is, so it is failing closed. Re-check upstream's file and the extractor in \`.github/workflows/ci.yml\`."
+            reason="\`WATCHED_PATHSPECS\` in \`Comfy-Org/github-workflows@$upstream_branch:$bump_yaml\` parsed to ${#watched[@]} entry/entries, none of them a positive pathspec -- they are all \`:(exclude)\`/\`:!\` filters. A staleness check with no positive pathspec matches nothing and would report the pin current however stale it is, so it is failing closed. Re-check upstream's file and the extractor in \`.github/workflows/ci.yml\`."
             {
               echo "state=broken"
               echo "broken_reason=$reason"
@@ -899,7 +951,7 @@ jobs:
           fi
 
           if [ -n "$missing" ]; then
-            reason="\`WATCHED_PATHSPECS\` in \`Comfy-Org/github-workflows@main:$bump_yaml\` names ${missing# }, which does not exist on \`main\` any more. A staleness check over a path that resolves to nothing matches nothing and would report the pin current however stale it is, so it is failing closed instead. This is upstream's list to fix: the path was renamed or removed without its \`WATCHED_PATHSPECS\` entry following."
+            reason="\`WATCHED_PATHSPECS\` in \`Comfy-Org/github-workflows@$upstream_branch:$bump_yaml\` names ${missing# }, which does not exist on \`$upstream_branch\` any more. A staleness check over a path that resolves to nothing matches nothing and would report the pin current however stale it is, so it is failing closed instead. This is upstream's list to fix: the path was renamed or removed without its \`WATCHED_PATHSPECS\` entry following."
             {
               echo "state=broken"
               echo "broken_reason=$reason"
@@ -991,7 +1043,7 @@ jobs:
           log_rc=0
           behind_raw="$(git -C "$gwtmp/gw" log --first-parent \
             --format='%H %cI%x1E%(trailers:key=Skip-caller-bump,separator=%x1F,unfold)' \
-            "$pin..origin/main" -- "${watched[@]}" 2>"$gwtmp/behind.err")" || log_rc=$?
+            "$pin..$default_ref" -- "${watched[@]}" 2>"$gwtmp/behind.err")" || log_rc=$?
           if [ "$log_rc" -ne 0 ]; then
             log_err="$(tr '\n' ' ' <"$gwtmp/behind.err")"
             # Here-string rather than `printf | grep -q`: the pipe form puts a
@@ -1005,7 +1057,7 @@ jobs:
             # turns into a `broken` verdict, and it should not rest on the
             # buffering behaviour of whichever grep the runner ships.)
             if grep -qi 'pathspec' <<<"$log_err"; then
-              reason="\`git log\` could not use the pathspecs read from \`Comfy-Org/github-workflows@main:$bump_yaml\`, so this job cannot judge staleness at all. git exited $log_rc saying: ${log_err:-(no output)}. That will not clear on its own -- upstream's \`WATCHED_PATHSPECS\` carries a pathspec this check cannot use. Re-check upstream's list and the extractor in the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\`."
+              reason="\`git log\` could not use the pathspecs read from \`Comfy-Org/github-workflows@$upstream_branch:$bump_yaml\`, so this job cannot judge staleness at all. git exited $log_rc saying: ${log_err:-(no output)}. That will not clear on its own -- upstream's \`WATCHED_PATHSPECS\` carries a pathspec this check cannot use. Re-check upstream's list and the extractor in the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\`."
               {
                 echo "state=broken"
                 echo "broken_reason=$reason"
@@ -1025,8 +1077,8 @@ jobs:
           # The test is upstream's OWN regex, key included, applied to the whole
           # trailer LINE -- `.github/bump-callers/preflight.sh` recognises
           # exactly `^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$`.
-          # Matching anything wider than that fails OPEN, in two ways this job
-          # has now hit both of:
+          # Matching anything wider than that fails OPEN, in three ways this
+          # job has now hit all of:
           #
           #  - Value. Testing only the first whitespace-delimited token accepts
           #    `true (docs only)`, `true please` and `no,true`, none of which
@@ -1037,6 +1089,12 @@ jobs:
           #    does NOT match it and still owes a bump. `valueonly` hid the
           #    spelling that made the difference, so the key is no longer
           #    stripped: the whole line is emitted and matched.
+          #  - SEPARATOR. git accepts whitespace between the token and the
+          #    colon and normalises it away, so `Skip-caller-bump : true`
+          #    reaches this test looking canonical. That one cannot be fixed by
+          #    widening or narrowing the regex applied HERE, because the
+          #    offending spelling is gone by the time git hands the line over;
+          #    it takes the raw-line confirmation pass below.
           #
           # Either way the commit vanished from `behind`, `state=current` was
           # written over a frozen pin and the job closed its own stale-pin
@@ -1048,16 +1106,90 @@ jobs:
           # `set -e` DOES act on a bare `var="$(cmd)"` assignment, so an awk
           # failure would kill the step on the no-verdict path that files
           # nothing.
+          # PASS 1 -- git's trailer parse decides WHERE a declaration may live.
+          # `%(trailers:key=...)` applies git's trailer-BLOCK rules, and
+          # upstream's gate requires the line "IN ITS TRAILING TRAILER BLOCK"
+          # for a reason it spells out: a body-wide line search reads the token
+          # as a DECLARATION when it is only being QUOTED, so a commit that
+          # merely documents this feature would suppress its own bump. Keeping
+          # git's block selection is what rules that out -- it must not be
+          # traded for a plain scan of `%B`.
+          #
+          # The character class is upstream's `[[:space:]]`, not `[ \t]`, so
+          # the two spellings cannot drift apart on some whitespace git chooses
+          # to preserve.
           awk_rc=0
-          behind="$(printf '%s' "$behind_raw" | awk '
+          candidates="$(printf '%s' "$behind_raw" | awk '
             BEGIN { FS = "\036" }
             NF {
-              skip = 0
               n = split($2, vals, "\037")
               for (i = 1; i <= n; i++) {
-                if (vals[i] ~ /^[Ss]kip-[Cc]aller-[Bb]ump:[ \t]*true[ \t]*$/) skip = 1
+                if (vals[i] ~ /^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$/) {
+                  split($1, f, " "); print f[1]; break
+                }
               }
-              if (!skip) print $1
+            }')" || awk_rc=$?
+          if [ "$awk_rc" -ne 0 ]; then
+            echo "::error::could not parse the upstream commit list -- awk exited $awk_rc"
+            exit 1
+          fi
+
+          # PASS 2 -- RAW-LINE CONFIRMATION, and the reason this is not one
+          # pass. Pass 1 tests git's RECONSTRUCTION of the trailer, not the
+          # line upstream's `preflight.sh` reads: `%(trailers)` emits the
+          # TRIMMED token plus a hardcoded `": "`, and git's separator search
+          # accepts whitespace BEFORE the colon. So a commit trailered
+          #
+          #   Skip-caller-bump : true
+          #
+          # renders here as `Skip-caller-bump: true` and matched -- while
+          # upstream's anchored regex rejects the raw line and still owes a
+          # bump. (Verified against git 2.43.) That is the same fail-open
+          # direction, and the same consequence, as the key-case bug above: the
+          # commit vanishes from `behind` and `state=current` is written over a
+          # frozen pin.
+          #
+          # So a candidate must ALSO carry the literal line, in the message's
+          # trailing paragraph, spelled exactly as upstream matches it. The two
+          # tests are an AND: git decides the line is in the trailer block,
+          # upstream's own regex decides the line is spelled like a
+          # declaration. Neither alone is upstream's rule.
+          #
+          # A `git show` that fails leaves the candidate unconfirmed, which
+          # counts the commit as OWING a bump -- the closed direction, a
+          # spurious issue rather than a silently frozen pin.
+          : >"$gwtmp/confirmed"
+          while read -r sha; do
+            [ -n "$sha" ] || continue
+            # The match runs inside awk rather than `| grep -q` so nothing
+            # exits before the writer is done: `set -o pipefail` is in force.
+            if git -C "$gwtmp/gw" show -s --format=%B "$sha" | awk '
+                { lines[n++] = $0 }
+                END {
+                  start = 0
+                  for (i = n - 1; i >= 0; i--)
+                    if (lines[i] ~ /^[[:space:]]*$/) { start = i + 1; break }
+                  for (i = start; i < n; i++)
+                    if (lines[i] ~ /^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$/) exit 0
+                  exit 1
+                }'; then
+              printf '%s\n' "$sha" >>"$gwtmp/confirmed"
+            else
+              echo "::notice::upstream commit $sha carries a Skip-caller-bump trailer that git accepts but upstream's own gate does not match literally -- counting it as owing a bump"
+            fi
+          done <<<"$candidates"
+
+          # PASS 3 -- the owed list, rebuilt over the ORIGINAL input so the
+          # newest-first order the arithmetic below reads positionally is
+          # preserved.
+          behind="$(printf '%s' "$behind_raw" | awk -v cf="$gwtmp/confirmed" '
+            BEGIN {
+              FS = "\036"
+              while ((getline line < cf) > 0) confirmed[line] = 1
+            }
+            NF {
+              split($1, f, " ")
+              if (!(f[1] in confirmed)) print $1
             }')" || awk_rc=$?
           if [ "$awk_rc" -ne 0 ]; then
             echo "::error::could not parse the upstream commit list -- awk exited $awk_rc"
@@ -1250,7 +1382,7 @@ jobs:
             # owed commit has sat unpicked too long, so a PR whose pin CARRIES
             # that commit has answered exactly the complaint being made. It also
             # proves forward motion on its own -- `oldest_sha` is by
-            # construction inside `pin..origin/main`, so a pin descended from it
+            # construction inside `pin..<default>`, so a pin descended from it
             # cannot be the current pin or anything behind it.
             #
             # Tested by ANCESTRY rather than equality: the fleet pins callers to
@@ -1442,6 +1574,7 @@ jobs:
           OLDEST_SHA: ${{ steps.assess.outputs.oldest_sha }}
           OLDEST_DATE: ${{ steps.assess.outputs.oldest_date }}
           BEHIND_COUNT: ${{ steps.assess.outputs.behind_count }}
+          UPSTREAM_BRANCH: ${{ steps.assess.outputs.upstream_branch }}
           # Set only when the oldest owed commit is dated implausibly far
           # ahead of the runner's clock, which is why this verdict says "past
           # the grace window" for a commit whose age reads as 0.
@@ -1494,6 +1627,38 @@ jobs:
             overdue="The oldest one has been sitting there past the 3-day grace window."
           fi
 
+          # Step 1's remediation has to agree with the `cause` paragraph built
+          # above. A single fixed wording -- "if one is named above, it has
+          # already delivered both pins and only the merge is owed" -- was
+          # emitted for EVERY verdict that names a PR, including the two that
+          # say the opposite: `no`, where the PR's own pin does not carry the
+          # oldest owed commit and a fresh bump is owed, and `unknown`, where
+          # delivery could not be verified at all. It contradicted the
+          # diagnosis in the same issue body and pointed the reader at a merge
+          # that cannot clear the reported backlog.
+          if [ -z "$BUMP_PR" ]; then
+            step1="$(printf '%s\n' \
+              "1. **Is there a bump PR waiting on a human?** None is open on \`$BUMP_BRANCH\`, so" \
+              "   nothing is currently moving the pin -- go on to step 2 and step 3.")"
+          elif [ "$BUMP_DELIVERS" = yes ]; then
+            step1="$(printf '%s\n' \
+              "1. **Is there a bump PR waiting on a human?** PR #$BUMP_PR has already delivered" \
+              "   both pins and only the merge is owed -- review and land it, or close it so this" \
+              "   job stops counting it as delivery.")"
+          elif [ "$BUMP_DELIVERS" = no ]; then
+            step1="$(printf '%s\n' \
+              "1. **Is there a bump PR waiting on a human?** PR #$BUMP_PR is open, but its caller" \
+              "   pin does not carry the oldest owed commit, so merging it will NOT clear this" \
+              "   backlog. A fresh bump is owed -- re-dispatch the fleet (step 2), or hand-bump" \
+              "   (step 3).")"
+          else
+            step1="$(printf '%s\n' \
+              "1. **Is there a bump PR waiting on a human?** PR #$BUMP_PR is open, but this job" \
+              "   could not verify which commit its caller pin carries. Read that PR first: if it" \
+              "   already moves both pins to \`$NEWEST_SHA\`, only the merge is owed; if it does" \
+              "   not, a fresh bump is owed and steps 2 and 3 apply.")"
+          fi
+
           # The last line of the body is an HTML comment recording the pin as
           # of THIS report -- invisible to a reader, read by the close step
           # below, which refuses to close on `grace` unless the pin it sees now
@@ -1505,7 +1670,7 @@ jobs:
           # a `-->` or anything else that would break out of the comment.
           body="$(printf '%s\n' \
             "\`.github/workflows/ci-cursor-review.yml\` is pinned to \`$PIN\`, which is" \
-            "**$BEHIND_COUNT consumer-visible commit(s) behind \`Comfy-Org/github-workflows@main\`**." \
+            "**$BEHIND_COUNT consumer-visible commit(s) behind \`Comfy-Org/github-workflows@$UPSTREAM_BRANCH\`**." \
             "" \
             "| | commit | landed |" \
             "| --- | --- | --- |" \
@@ -1516,9 +1681,7 @@ jobs:
             "" \
             "Things to check, in this order:" \
             "" \
-            "1. **Is there a bump PR waiting on a human?** If one is named above, it has already" \
-            "   delivered both pins and only the merge is owed -- review and land it, or close it" \
-            "   so this job stops counting it as delivery." \
+            "$step1" \
             "2. **Is this repo still on the bump fleet's roster?** The fleet only visits repos" \
             "   listed in the \`CURSOR_REVIEW_CALLERS\` secret on \`Comfy-Org/github-workflows\`," \
             "   whose canonical copy lives in the private ops repo (deliberately not named here --" \
@@ -1646,7 +1809,7 @@ jobs:
       #
       # `grace` on its own is not that proof, which is why closing on it alone
       # was a bug: `age` is derived purely from the oldest currently-owed
-      # commit, and that commit drops out of the `"$pin..origin/main" --
+      # commit, and that commit drops out of the `"$pin..$default_ref" --
       # "${watched[@]}"` walk with the pin untouched whenever upstream narrows
       # `WATCHED_PATHSPECS` -- which `assess` re-reads live on every run, and
       # which upstream has done twice in the last few days. A completely frozen
@@ -1700,6 +1863,7 @@ jobs:
           # unread on that branch. `env:` always defines the name, so `set -u`
           # is satisfied either way.
           BEHIND_COUNT: ${{ steps.assess.outputs.behind_count }}
+          UPSTREAM_BRANCH: ${{ steps.assess.outputs.upstream_branch }}
           OLDEST_SHA: ${{ steps.assess.outputs.oldest_sha }}
           # On `grace`, compared against the pin recorded on the last stale
           # report to decide whether a bump actually landed, and quoted on the
@@ -1769,21 +1933,26 @@ jobs:
                 | grep -oE '[0-9a-f]{40}')" || recorded=""
             fi
 
-            # Shared opening sentence: the one thing every `grace` branch
-            # below genuinely knows. `printf '%s '` joins the lines with a
-            # space and leaves one trailing; drop it so the sentence that
-            # follows is not double-spaced.
+            # Shared opening PARAGRAPH: the one thing every `grace` branch
+            # below genuinely knows. Each branch adds a second paragraph of its
+            # own, and the two are joined with `printf '%s\n' "$premise" ""
+            # "$para2"` -- NOT by putting a `""` element inside a single
+            # `printf '%s '` list, which joins it with a space like every other
+            # element and emits one extra SPACE where markdown needs a blank
+            # LINE. That is what ran the backlog fact and the "not proof the
+            # pin moved" caveat together into one paragraph, blunting exactly
+            # the distinction they draw. WITHIN a paragraph `printf '%s '` is
+            # still right; it leaves one trailing space, so drop it with
+            # `${x% }`.
             premise="$(printf '%s ' \
               "Nothing is overdue any more. The pin is still $BEHIND_COUNT consumer-visible" \
-              "commit(s) behind \`Comfy-Org/github-workflows@main\`, but the oldest one it has" \
+              "commit(s) behind \`Comfy-Org/github-workflows@$UPSTREAM_BRANCH\`, but the oldest one it has" \
               "not picked up (\`$OLDEST_SHA\`) landed inside the 3-day grace window, so this" \
               "issue's premise -- a pin sitting frozen PAST that window -- no longer holds.")"
             premise="${premise% }"
 
             if [ -z "$recorded" ]; then
-              verdict="$(printf '%s ' \
-                "$premise" \
-                "" \
+              para2="$(printf '%s ' \
                 "That is a fact about the BACKLOG, not proof that the pin itself moved: the" \
                 "backlog also shrinks if upstream narrows \`WATCHED_PATHSPECS\`. The pin is" \
                 "currently \`$PIN\` -- compare it with the one quoted when this issue was filed" \
@@ -1791,29 +1960,25 @@ jobs:
                 "to compare against, because the issue predates that record or the read failed," \
                 "so it is closing on the backlog alone. It reopens on the first daily run that" \
                 "finds the pin frozen past the grace window again.")"
-              verdict="${verdict% }"
+              verdict="$(printf '%s\n' "$premise" "" "${para2% }")"
             elif [ "$recorded" != "$PIN" ]; then
-              verdict="$(printf '%s ' \
-                "$premise" \
-                "" \
+              para2="$(printf '%s ' \
                 "The pin moved from \`$recorded\` to \`$PIN\` since the last stale report, so a" \
                 "bump landed. It reopens on the first daily run that finds the pin frozen past" \
                 "the grace window again.")"
-              verdict="${verdict% }"
+              verdict="$(printf '%s\n' "$premise" "" "${para2% }")"
             else
               # The pin has NOT moved. Comment and leave the issue open; the
               # job's verdict is still `grace`, so this step exits 0.
-              held="$(printf '%s ' \
-                "$premise" \
-                "" \
+              para2="$(printf '%s ' \
                 "But the pin is still \`$PIN\` -- the same value recorded on the last stale" \
                 "report -- so the backlog shrank without the pin moving. The likeliest cause is" \
                 "upstream narrowing \`WATCHED_PATHSPECS\` in" \
-                "\`Comfy-Org/github-workflows@main:.github/workflows/bump-cursor-review-callers.yml\`," \
+                "\`Comfy-Org/github-workflows@$UPSTREAM_BRANCH:.github/workflows/bump-cursor-review-callers.yml\`," \
                 "which this job re-reads live on every run: fewer watched paths means fewer owed" \
                 "commits, on a pin nothing has touched. So this issue stays OPEN -- it closes" \
                 "when the pin actually moves, or when nothing is owed at all.")"
-              held="${held% }"
+              held="$(printf '%s\n' "$premise" "" "${para2% }")"
               gh issue comment "$existing" --body "$(printf '%s\n' \
                 "$held" \
                 "" \
