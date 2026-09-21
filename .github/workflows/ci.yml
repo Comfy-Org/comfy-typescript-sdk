@@ -674,8 +674,25 @@ jobs:
           # already guards against. A leading `::` (after any leading blanks) is
           # rewritten to the runner's own percent-escape for a colon, so the
           # entry still prints readably and cannot open a command.
+          #
+          # The ESCAPE alone is not sufficient, because the two sides disagree
+          # about what a leading blank is. The runner trims with .NET
+          # `TrimStart()`, which strips every `char.IsWhiteSpace` code point --
+          # U+00A0, U+202F, U+2028 among them -- while glibc's POSIX
+          # `[[:space:]]` in a UTF-8 locale deliberately excludes the
+          # non-breaking ones. Verified here: an entry spelled
+          # `<U+00A0>::stop-commands::<token>` passes through the expression
+          # below untouched, and prepending ASCII spaces does not help because
+          # the runner trims those too -- so the command still reaches column 0
+          # and executes.
+          #
+          # Prefixing each line with a NON-WHITESPACE marker closes that
+          # unconditionally, without enumerating whitespace classes the two
+          # implementations will keep disagreeing about: whatever the runner
+          # trims, it stops at the `-`. The escape is kept as well, so the
+          # common ASCII case still prints as `%3A%3A`.
           echo "Watched pathspecs, read from upstream $bump_yaml:"
-          printf '%s\n' "${watched[@]}" | sed -e 's/^[[:space:]]*::/%3A%3A/' -e 's/^/  /'
+          printf '%s\n' "${watched[@]}" | sed -e 's/^[[:space:]]*::/%3A%3A/' -e 's/^/  - /'
 
           # Upstream's list can itself name a path that no longer resolves --
           # a rename landed in its `paths:` filter but not here. `git log` over
