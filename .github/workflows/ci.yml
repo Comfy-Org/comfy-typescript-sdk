@@ -408,7 +408,31 @@ jobs:
             # a private one the ambient token cannot see; both are permanent
             # from here. Anything else -- DNS, TLS, a 5xx, a partial-clone
             # hiccup -- is assumed transient and left to the no-verdict path.
-            if grep -qiE 'repository not found|not found|could not read from remote|authentication failed|access denied|terminal prompts disabled' <<<"$clone_err"; then
+            #
+            # The alternatives are ANCHORED on the messages that really are
+            # permanent, because this branch asserts as FACT that the
+            # repository was deleted, made private or moved. A bare `not
+            # found` subsumed the explicit `remote: Repository not found` and
+            # matched those two words anywhere in git's stderr -- an HTTP
+            # reason phrase like `The requested URL returned error: 404 Not
+            # Found`, or an object/pack-level "not found" from a partial-clone
+            # fetch -- and `authentication failed` / `access denied` come just
+            # as easily from a transient token blip as from a permanent loss
+            # of access. Each of those filed a sticky issue stating a cause
+            # nobody established: a fault reported as a verdict, the same
+            # conflation the rest of this step exists to remove, only pointing
+            # the other way. `terminal prompts disabled` stays because git
+            # only emits it once credentials were demanded and refused, which
+            # for an anonymous public clone means the repo is not anonymously
+            # readable any more.
+            #
+            # The two `not found` spellings are the ones GitHub really emits
+            # over HTTPS, verified against git 2.43 -- a deleted or private
+            # repo answers `remote: Repository not found.` followed by
+            # `fatal: repository '<url>' not found`, and both are anchored on
+            # their own leading token so neither can match a 404 reason phrase
+            # or a loose object message.
+            if grep -qiE "remote: repository not found|fatal: repository '[^']*' not found|could not read from remote repository|terminal prompts disabled" <<<"$clone_err"; then
               reason="\`Comfy-Org/github-workflows\` could not be reached at all -- \`git clone\` exited $clone_rc saying: ${clone_err:-(no output)}. That will not clear on its own: the repository has been deleted, made private, or moved without a redirect. Re-point the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\` at upstream's new home, or retire it."
               {
                 echo "state=broken"
@@ -521,7 +545,7 @@ jobs:
             else
               detail="exists in \`Comfy-Org/github-workflows\` but names a \`$pin_type\`, not a commit"
             fi
-            reason="The pinned commit \`$pin\` $detail. Re-pin \`uses:\` and \`workflows_ref:\` in \`.github/workflows/ci-cursor-review.yml\` to a commit that is on \`main\`, then run \`node scripts/check-workflow-pins.mjs\`."
+            reason="The pinned commit \`$pin\` $detail. Re-pin \`uses:\` and \`workflows_ref:\` in \`.github/workflows/ci-cursor-review.yml\` to a commit that is on \`$upstream_branch\`, then run \`node scripts/check-workflow-pins.mjs\`."
             {
               echo "state=broken"
               echo "broken_reason=$reason"
@@ -563,7 +587,7 @@ jobs:
             # and this annotation are the whole record, which is right for the
             # faults that genuinely are transient -- an unreadable object, a
             # partial-clone fetch failure.
-            echo "::error::could not determine whether $pin is an ancestor of github-workflows main -- git exited $ancestry_rc: ${ancestry_err:-(no output)}"
+            echo "::error::could not determine whether $pin is an ancestor of github-workflows $upstream_branch -- git exited $ancestry_rc: ${ancestry_err:-(no output)}"
             exit 1
           fi
 
@@ -625,7 +649,7 @@ jobs:
             # A FAULT, not a verdict: a lazy-fetch failure or a vanished
             # `$default_ref` says nothing about the pin. No `state` is written.
             show_err="$(tr '\n' ' ' <"$gwtmp/upstream-show.err")"
-            echo "::error::could not read $bump_yaml from github-workflows main -- git exited $upstream_rc: ${show_err:-(no output)}"
+            echo "::error::could not read $bump_yaml from github-workflows $upstream_branch -- git exited $upstream_rc: ${show_err:-(no output)}"
             exit 1
           fi
 
@@ -918,7 +942,7 @@ jobs:
             ls_out="$(git -C "$gwtmp/gw" ls-tree "$default_ref" -- "$probe" 2>"$gwtmp/ls-probe.err")" || ls_rc=$?
             if [ "$ls_rc" -ne 0 ]; then
               ls_err="$(tr '\n' ' ' <"$gwtmp/ls-probe.err")"
-              echo "::error::could not list \`$probe\` in github-workflows main -- git exited $ls_rc: ${ls_err:-(no output)}"
+              echo "::error::could not list \`$probe\` in github-workflows $upstream_branch -- git exited $ls_rc: ${ls_err:-(no output)}"
               exit 1
             fi
             [ -n "$ls_out" ] || missing="$missing \`$path\`"
@@ -1150,6 +1174,23 @@ jobs:
             if git -C "$gwtmp/gw" show -s --format=%B "$sha" | awk '
                 { lines[n++] = $0 }
                 END {
+                  # TRAILING BLANKS COME OFF FIRST, and this is load-bearing
+                  # rather than tidiness. `--format=%B` contains a `%`, so git
+                  # reads it as `tformat:` and appends a TERMINATOR newline
+                  # after the message body -- which already ends in one. awk
+                  # therefore always sees a final EMPTY record, the backward
+                  # scan below matches it on its first iteration, `start` is
+                  # set to `n`, and the forward loop never executes: every
+                  # candidate fell through to `exit 1`. That made this whole
+                  # pass inert in the fail-CLOSED direction -- each trailered
+                  # commit was logged as "upstream gate does not match
+                  # literally" and counted as owing a bump, so a surface the
+                  # fleet had deliberately declined to bump for would age past
+                  # the grace window and file the "nothing is moving this pin"
+                  # issue. Blank lines at the end are not part of the trailing
+                  # paragraph in any case, so dropping them is also what the
+                  # block rule means.
+                  while (n > 0 && lines[n - 1] ~ /^[[:space:]]*$/) n--
                   start = 0
                   for (i = n - 1; i >= 0; i--)
                     if (lines[i] ~ /^[[:space:]]*$/) { start = i + 1; break }
@@ -1323,7 +1364,22 @@ jobs:
           # is moving this pin" while a perfectly good bump sat open. Loud is
           # the only safe direction for a value this job's verdict depends on.
           if [ -z "$DEFAULT_BRANCH" ]; then
-            echo "::error::this job could not read the repository's default branch from the event payload, so it cannot tell whether an open bump PR would land on the branch it judges. Refusing to guess."
+            # A `broken` VERDICT, not a bare red run. Whether the event payload
+            # carries `repository.default_branch` is a fixed property of the
+            # event, not a blip: if it is ever empty here it is empty every
+            # day. The issue steps are gated on the verdict rather than on
+            # `failure()`, so exiting without writing `state=` reddens the
+            # daily run forever in silence -- nobody is told the pin stopped
+            # being watched. That is exactly why the clone, `origin/HEAD`,
+            # pathspec and `git log` branches all write `state=broken` plus a
+            # `broken_reason` for their permanent faults; this one is the same
+            # class and gets the same treatment.
+            reason="This job could not read the repository's default branch from the scheduled event payload (\`github.event.repository.default_branch\` was empty), so it cannot tell whether an open bump PR on \`$BUMP_BRANCH\` would land on the branch it judges. It will not guess: matching a bump PR against the wrong base would mute this watchdog for a PR that cannot move the caller. This will not clear on its own -- investigate the \`cursor-review-pin-freshness\` job in \`.github/workflows/ci.yml\`."
+            {
+              echo "state=broken"
+              echo "broken_reason=$reason"
+            } >>"$GITHUB_OUTPUT"
+            echo "::error::$reason"
             exit 1
           fi
           bump="$(gh pr list --repo "$GH_REPO" --state open \
@@ -1636,11 +1692,20 @@ jobs:
               "   backlog. A fresh bump is owed -- re-dispatch the fleet (step 2), or hand-bump" \
               "   (step 3).")"
           else
+            # The bar named here is `$OLDEST_SHA`, matching the `no` branch
+            # above and this job's OWN delivery test
+            # (`merge-base --is-ancestor "$oldest_sha" "$head_pin"`). Naming
+            # `$NEWEST_SHA` made the advice STRICTER than the criterion it
+            # stands in for -- upstream's tip is recomputed every run, so a
+            # reader who found the PR pinned to anything older would
+            # re-dispatch or close a PR this job would itself have counted as
+            # delivering, which is the same moving-target bar the delivery
+            # test above deliberately rejected.
             step1="$(printf '%s\n' \
               "1. **Is there a bump PR waiting on a human?** PR #$BUMP_PR is open, but this job" \
-              "   could not verify which commit its caller pin carries. Read that PR first: if it" \
-              "   already moves both pins to \`$NEWEST_SHA\`, only the merge is owed; if it does" \
-              "   not, a fresh bump is owed and steps 2 and 3 apply.")"
+              "   could not verify which commit its caller pin carries. Read that PR first: if its" \
+              "   pin already carries the oldest owed commit \`$OLDEST_SHA\`, only the merge is" \
+              "   owed; if it does not, a fresh bump is owed and steps 2 and 3 apply.")"
           fi
 
           body="$(printf '%s\n' \
@@ -1665,7 +1730,7 @@ jobs:
             "   original failure -- a silently dropped roster entry, for three weeks." \
             "3. **Or hand-bump.** Move BOTH pins in \`.github/workflows/ci-cursor-review.yml\`" \
             "   (the \`uses:\` SHA and the \`workflows_ref:\` input) to \`$NEWEST_SHA\`, update the" \
-            "   trailing \`# github-workflows main (short)\` comment, and verify with:" \
+            "   trailing \`# github-workflows $UPSTREAM_BRANCH (short)\` comment, and verify with:" \
             "" \
             "       node scripts/check-workflow-pins.mjs" \
             "" \
