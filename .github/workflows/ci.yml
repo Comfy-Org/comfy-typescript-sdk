@@ -179,6 +179,26 @@ jobs:
   sdk-parity:
     name: sdk-parity (python surface freshness)
     runs-on: ubuntu-latest
+    # The workflow-level `cancel-in-progress` above deliberately stops
+    # superseding `schedule` runs, so that a re-run cannot cancel an in-flight
+    # cron run mid-mutation. That removes the single-instance guarantee this
+    # job was silently relying on: its two issue steps below are the same
+    # non-atomic list-then-mutate (`gh issue list`, then `create`/`comment`/
+    # `close`) against one shared sticky issue, so two concurrent scheduled
+    # runs could both list, both find nothing, and both `gh issue create` --
+    # and the close step, which closes only the FIRST title match, would never
+    # reconcile the duplicate. So take the guarantee back explicitly, the same
+    # way `cursor-review-pin-freshness` does: queue rather than cancel, since
+    # cancelling is what abandons a half-applied mutation.
+    #
+    # Only SCHEDULED runs share a group. That is the only event whose steps
+    # touch an issue (both are gated `github.event_name == 'schedule'`), and a
+    # flat group would otherwise serialise every PR's and every push's
+    # `sdk-parity` behind one another for no benefit -- `github.run_id` is
+    # unique per run, so those keep running fully in parallel.
+    concurrency:
+      group: sdk-parity-${{ github.event_name == 'schedule' && 'schedule' || github.run_id }}
+      cancel-in-progress: false
     permissions:
       contents: read
       # Only used by the two scheduled-run steps below, which file/close the
@@ -1989,6 +2009,30 @@ jobs:
           gh label create "$MODE_LABEL" --force --color ededed \
             --description "cursor-review pin freshness watchdog: the pin is stale" >/dev/null
 
+          # Dedup key for the once-per-pin suppression further down. The report
+          # body is NOT a function of the pin alone: both the `cause` premise
+          # built just below and the `step1` remediation built after it branch
+          # on $BUMP_PR and $BUMP_DELIVERS, so the SAME frozen pin produces a
+          # materially different report once a bump PR opens against it, once
+          # that PR stops carrying the owed commit, or once it ages past
+          # BUMP_PR_GRACE_SECONDS and re-enters `stale` out of `delivered`.
+          # Keying the suppression on the pin alone would skip every one of
+          # those updates and leave the thread's newest durable message saying
+          # "no PR is open, so nothing is moving the pin" while the actual
+          # thing to chase is an open PR that has stopped counting as delivery.
+          # So key on the pin AND the bump state that selects those branches.
+          #
+          # Deliberately NOT keyed on the bump PR's AGE, which appears in one
+          # premise and changes every day: that would defeat the suppression
+          # entirely on exactly the long-frozen pins it exists for.
+          report_pr="$(printf '%s' "${BUMP_PR:-}" | tr -cd '0-9')"
+          report_pr="${report_pr:-none}"
+          case "${BUMP_DELIVERS:-}" in
+            yes|no|unknown) report_delivers="$BUMP_DELIVERS" ;;
+            *) report_delivers=none ;;
+          esac
+          REPORT_KEY="$PIN $report_pr $report_delivers"
+
           if [ -n "$BUMP_PR" ] && [ "$BUMP_DELIVERS" = no ]; then
             cause="$(printf '%s ' \
               "PR #$BUMP_PR is open on \`$BUMP_BRANCH\`, but its own caller pin does not carry" \
@@ -2110,12 +2154,13 @@ jobs:
             "" \
             "Run: $RUN_URL" \
             "" \
-            "<!-- cursor-review-pin: $PIN -->")"
+            "<!-- cursor-review-pin: $PIN -->" \
+            "<!-- cursor-review-pin-report: $REPORT_KEY -->")"
 
           existing="$(gh issue list --state open --label "$MODE_LABEL" --limit 100 \
             --json number --jq 'min_by(.number).number // empty')"
           if [ -n "$existing" ]; then
-            # Comment once per PIN, not once per run. The block above is the
+            # Comment once per REPORT, not once per run. The block above is the
             # WHOLE report, and a pin that is frozen -- the case this watchdog
             # exists to report -- reaches this line every day for as long as it
             # stays frozen, so commenting unconditionally grew the thread by one
@@ -2127,12 +2172,23 @@ jobs:
             # long-frozen pins that matter most. This mirrors the
             # `held_reported` check in the close step.
             #
-            # "Already reported" is: the newest marker of EITHER form on the
-            # thread is a PLAIN `cursor-review-pin:` one carrying THIS pin. If
-            # the close step has since recorded a `-held` marker, that one is
-            # newer, so this is a fresh entry into the stale state and worth
-            # saying again. The exact-string compare (not a prefix test) is why
-            # a `-held` marker for this same pin cannot suppress a stale report.
+            # "Already reported" needs BOTH of the thread's newest markers to
+            # match, because the report is a function of two things:
+            #
+            #   * the newest marker of EITHER pin form is a PLAIN
+            #     `cursor-review-pin:` one carrying THIS pin. If the close step
+            #     has since recorded a `-held` marker, that one is newer, so
+            #     this is a fresh entry into the stale state and worth saying
+            #     again. The exact-string compare (not a prefix test) is why a
+            #     `-held` marker for this same pin cannot suppress a report.
+            #   * the newest `cursor-review-pin-report:` marker carries this
+            #     run's $REPORT_KEY, i.e. the same pin AND the same bump-PR
+            #     state. The pin alone does not determine the report: see the
+            #     note where REPORT_KEY is built.
+            #
+            # Requiring both only ever makes this step SAY MORE, never less, so
+            # it cannot re-open the unbounded-thread problem above: the bump
+            # state changes a handful of times per frozen pin, not daily.
             #
             # An unreadable thread falls THROUGH to commenting, the opposite of
             # the close step's choice, because the conservative direction is the
@@ -2141,12 +2197,29 @@ jobs:
             # could drop the only durable record that the pin is stale. Every
             # run annotates its own log either way.
             reported=0
-            if newest_marker="$( { gh api "repos/$GH_REPO/issues/$existing" --jq '.body' \
+            if thread="$( { gh api "repos/$GH_REPO/issues/$existing" --jq '.body' \
                  && gh api --paginate "repos/$GH_REPO/issues/$existing/comments?per_page=100" \
-                      --jq '.[] | select(.user.login == "github-actions[bot]") | .body'; } 2>/dev/null \
-                 | grep -oE '<!-- cursor-review-pin(-held)?: [0-9a-f]{40} -->' \
-                 | tail -n 1)"; then
-              if [ "$newest_marker" = "<!-- cursor-review-pin: $PIN -->" ]; then
+                      --jq '.[] | select(.user.login == "github-actions[bot]") | .body'; } 2>/dev/null)"; then
+              # One fetch, two reads. The `-report` marker is a SEPARATE marker
+              # rather than extra fields on the pin marker, because the pin
+              # marker is the close step's movement proof and that step matches
+              # it as an exact 40-hex string; `cursor-review-pin-report:` does
+              # not match `cursor-review-pin(-held)?:`, so it is invisible
+              # there and the movement proof is unchanged.
+              newest_marker="$(printf '%s\n' "$thread" \
+                | grep -oE '<!-- cursor-review-pin(-held)?: [0-9a-f]{40} -->' \
+                | tail -n 1)" || true
+              newest_report="$(printf '%s\n' "$thread" \
+                | grep -oE '<!-- cursor-review-pin-report: [0-9a-f]{40} ([0-9]+|none) (yes|no|unknown|none) -->' \
+                | tail -n 1)" || true
+              # BOTH must match. The pin test is what a `-held` marker resets
+              # (a fresh entry into the stale state is worth saying again); the
+              # report test is what a CHANGED bump state resets. A report
+              # written before this key existed carries no `-report` marker, so
+              # it reads empty and the next run re-reports once, which is the
+              # same direction this step already errs in on a bad read.
+              if [ "$newest_marker" = "<!-- cursor-review-pin: $PIN -->" ] \
+                 && [ "$newest_report" = "<!-- cursor-review-pin-report: $REPORT_KEY -->" ]; then
                 reported=1
               fi
             fi
@@ -2154,7 +2227,7 @@ jobs:
             if [ "$reported" -eq 0 ]; then
               gh issue comment "$existing" --body "$body"
             else
-              echo "::notice::issue #$existing already carries the stale-pin report for $PIN as its newest record, so this run is not repeating it. The verdict is still stale -- see the annotation from the assess step."
+              echo "::notice::issue #$existing already carries the stale-pin report for [$REPORT_KEY] (pin, bump PR, delivery) as its newest record, so this run is not repeating it. The verdict is still stale -- see the annotation from the assess step."
             fi
             exit 0
           fi
