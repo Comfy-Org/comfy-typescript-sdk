@@ -282,11 +282,14 @@ export interface RunJsonResult<TData = unknown> {
   /**
    * `X-Comfy-Router-Dropped-Params`: native fields the translation that produced
    * this call's request body could not express exactly on the provider that
-   * served it; each entry names the field and why.
+   * served it. Each entry normally names the field and why — but not
+   * guaranteed: {@link parseDroppedParams} keeps a header that is not a JSON
+   * array of strings as ONE entry holding the raw wire value, so an entry can
+   * be that raw value rather than a field-plus-reason disclosure.
    *
-   * TWO things produce such a translation, both under the default
-   * `strictMode: false`: an explicit {@link RunOptions.modelProvider}, and an
-   * automatic `fallback_provider` retry — which is ON by default and
+   * TWO things produce such a translation: an explicit
+   * {@link RunOptions.modelProvider} under the default `strictMode: false`, and
+   * an automatic `fallback_provider` retry — which is ON by default and
    * independent of `modelProvider` (see {@link RunOptions.fallbackProvider}).
    * So a call that never set `modelProvider` can still come back with a
    * non-null value here: the primary attempt failed, and the retry translated
@@ -296,8 +299,16 @@ export interface RunJsonResult<TData = unknown> {
    * never the primary attempt's — pair it with
    * {@link RunJsonResult.servingProvider} to see which provider it refers to.
    *
-   * `null` when no translation ran (no `modelProvider` and no fallback retry,
-   * or `strictMode: true`), and when translation ran and dropped nothing.
+   * `null` when no translation ran, and when one ran and dropped nothing — the
+   * server omits the header in both cases. `strictMode: true` is NOT on its own
+   * a guarantee of `null`: the spec scopes `strict_mode` to `modelProvider`
+   * ("only meaningful together with `model_provider`"), so it suppresses that
+   * translation only and does not govern the automatic fallback retry. Turn
+   * {@link RunOptions.fallbackProvider} off too if you need that guarantee.
+   *
+   * Prefer an explicit `!== null` check over a truthiness test: the server
+   * omitting the header gives `null`, but a present-but-empty header (`"[]"`)
+   * parses to an empty array, which is a non-null empty disclosure.
    */
   droppedParams: readonly string[] | null;
 }
