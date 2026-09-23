@@ -36,6 +36,18 @@ export const PYTHON_SOURCE_FILES = {
 /** The two `models` namespace classes: the sync client's, then the async client's. */
 export const PYTHON_MODELS_CLASSES = ["Models", "AsyncModels"];
 
+/**
+ * Public classes that live in `models.py` but are NOT part of the models-method
+ * surface: result/value types the namespace methods return, not namespaces with
+ * operations of their own. `RouterRunResult` is the run's response object -- the
+ * Python twin of this SDK's `RunResult` type, which the parity check likewise
+ * tracks as a returned shape rather than a method surface. Listing them here is
+ * what keeps the unrecognized-class guard in `extractModelsMethods` a hard
+ * failure for a genuinely new *namespace* class while not misreading a result
+ * type as one.
+ */
+export const PYTHON_MODELS_RESULT_CLASSES = ["RouterRunResult"];
+
 class ExtractionError extends Error {}
 
 function fail(message) {
@@ -114,12 +126,15 @@ function publicMethods(body) {
  */
 export function extractModelsMethods(source) {
   const declared = [...source.matchAll(/^class\s+([A-Za-z]\w*)\s*[(:]/gm)].map((m) => m[1]);
-  const unknown = declared.filter((name) => !PYTHON_MODELS_CLASSES.includes(name));
+  const unknown = declared.filter(
+    (name) => !PYTHON_MODELS_CLASSES.includes(name) && !PYTHON_MODELS_RESULT_CLASSES.includes(name),
+  );
   if (unknown.length > 0) {
     fail(
       `${PYTHON_SOURCE_FILES.models}: unrecognized public class(es) ${unknown.join(", ")}. ` +
         "If one of them is part of the `models` namespace surface, add it to " +
-        "PYTHON_MODELS_CLASSES (and declare any intentional asymmetry in " +
+        "PYTHON_MODELS_CLASSES; if it is a result/value type the methods return, add it to " +
+        "PYTHON_MODELS_RESULT_CLASSES (and declare any intentional asymmetry in " +
         "src/sdk/surface-parity.test.ts).",
     );
   }
