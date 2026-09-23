@@ -145,22 +145,6 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
     modelsMethodsAheadOfPython: ["schema", "list"],
   },
   {
-    id: "queue-error-buckets-land-first-in-typescript",
-    why:
-      "The vendored Router contract's most recent sync grew three queue-tier error buckets — " +
-      "`cancelled`, `queue_timeout` and `request_not_found` — and this SDK's spec-coverage gate " +
-      "requires a class per bucket the moment the spec declares one. The Python SDK's twin (its " +
-      "reconcile of the same spec sync, comfy-python-sdk#159) is still open, so its committed " +
-      "surface snapshot does not carry them yet. This is a LEAD, not a divergence: the rot guard " +
-      "below fails the moment the Python snapshot grows any of the three, which is the signal to " +
-      "delete this entry rather than keep it.",
-    routerErrorClassesAheadOfPython: [
-      ["Cancelled", "cancelled"],
-      ["QueueTimeout", "queue_timeout"],
-      ["RequestNotFound", "request_not_found"],
-    ],
-  },
-  {
     id: "collect-switched-off-by-budget",
     why:
       "Python switches the collect loop off with a BOOLEAN (`RetryPolicy.retry_collectable=False`) " +
