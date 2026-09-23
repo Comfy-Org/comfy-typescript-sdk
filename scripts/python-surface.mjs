@@ -36,6 +36,18 @@ export const PYTHON_SOURCE_FILES = {
 /** The two `models` namespace classes: the sync client's, then the async client's. */
 export const PYTHON_MODELS_CLASSES = ["Models", "AsyncModels"];
 
+/**
+ * Public classes that live in `models.py` but are NOT part of the models-method
+ * surface: result/value types the namespace methods return, not namespaces with
+ * operations of their own. `RouterRunResult` is the run's response object -- the
+ * Python twin of this SDK's `RunResult` type, which the parity check likewise
+ * tracks as a returned shape rather than a method surface. Listing them here is
+ * what keeps the unrecognized-class guard in `extractModelsMethods` a hard
+ * failure for a genuinely new *namespace* class while not misreading a result
+ * type as one.
+ */
+export const PYTHON_MODELS_RESULT_CLASSES = ["RouterRunResult"];
+
 class ExtractionError extends Error {}
 
 function fail(message) {
@@ -114,12 +126,15 @@ function publicMethods(body) {
  */
 export function extractModelsMethods(source) {
   const declared = [...source.matchAll(/^class\s+([A-Za-z]\w*)\s*[(:]/gm)].map((m) => m[1]);
-  const unknown = declared.filter((name) => !PYTHON_MODELS_CLASSES.includes(name));
+  const unknown = declared.filter(
+    (name) => !PYTHON_MODELS_CLASSES.includes(name) && !PYTHON_MODELS_RESULT_CLASSES.includes(name),
+  );
   if (unknown.length > 0) {
     fail(
       `${PYTHON_SOURCE_FILES.models}: unrecognized public class(es) ${unknown.join(", ")}. ` +
         "If one of them is part of the `models` namespace surface, add it to " +
-        "PYTHON_MODELS_CLASSES (and declare any intentional asymmetry in " +
+        "PYTHON_MODELS_CLASSES; if it is a result/value type the methods return, add it to " +
+        "PYTHON_MODELS_RESULT_CLASSES (and declare any intentional asymmetry in " +
         "src/sdk/surface-parity.test.ts).",
     );
   }
@@ -318,25 +333,59 @@ function dunderAll(source, file) {
   return names;
 }
 
+/** Names imported by each `from <module> import ...` in a source file, keyed by module. */
+function importsBySourceModule(source) {
+  const byModule = new Map();
+  for (const [, module, body] of source.matchAll(
+    /^from\s+([.\w]+)\s+import\s+(\([\s\S]*?\)|[^\n]+)/gm,
+  )) {
+    const set = byModule.get(module) ?? new Set();
+    for (const [name] of body.matchAll(/[A-Za-z_]\w*/g)) set.add(name);
+    byModule.set(module, set);
+  }
+  return byModule;
+}
+
 /**
- * Error classes the package root re-exports — the intersection of the classes
- * defined in `comfy_sdk/exceptions.py` and the names in `comfy_sdk.__all__`.
+ * Error classes the package root re-exports.
  *
- * The router errors are deliberately not in here: the Python SDK does not
- * re-export `router_exceptions` from its root, because three of those names
- * are already taken at the root by the workflow-API exceptions. The
- * TypeScript SDK resolves the same collision the same way, with a
- * `routerErrors` namespace.
+ * Both SDKs flatten the *exceptions module*'s error classes onto the package
+ * root and keep the router error hierarchy under a namespace
+ * (`comfy_sdk.router_exceptions` / `routerErrors`). The one crossover is the
+ * names the exceptions module deliberately re-exports so a single `except` /
+ * `catch` works against either import: the base error (`ComfyError`) and the
+ * three names shared with the workflow-API exceptions (`Forbidden`,
+ * `InsufficientCredits`, `Unauthorized`). The router base and the cancel-route
+ * classes stay namespaced even though the root `__all__` lists them.
+ *
+ * `exceptions.py` used to *define* all of these as `class` statements, so the
+ * old rule — classes defined here, intersected with the root `__all__` —
+ * captured them. It now *imports* the base and the crossover names (from
+ * `._errors` and `.router_exceptions`) and re-exports them, so the rule reads
+ * what it defines and what it re-imports:
+ *   - a class defined in `exceptions.py`            -> a workflow-API exception
+ *   - a name imported from `._errors`               -> the base error
+ *   - a router class imported from `.router_exceptions`, other than the router
+ *     base -> a crossover name
  */
-export function extractExportedErrorClasses(exceptionsSource, initSource) {
+export function extractExportedErrorClasses(exceptionsSource, initSource, routerErrorClasses) {
   const defined = [...exceptionsSource.matchAll(/^class\s+(\w+)\s*\(/gm)].map((m) => m[1]);
   if (defined.length === 0) fail(`${PYTHON_SOURCE_FILES.exceptions}: no classes found.`);
 
+  const imports = importsBySourceModule(exceptionsSource);
+  const fromBase = imports.get("._errors") ?? new Set();
+  const fromRouter = imports.get(".router_exceptions") ?? new Set();
+  const routerBase = routerErrorClasses[0]; // `RouterError` — stays namespaced.
+  const crossover = routerErrorClasses.filter(
+    (name) => name !== routerBase && fromRouter.has(name),
+  );
+
+  const surface = new Set([...defined, ...fromBase, ...crossover]);
   const exported = new Set(dunderAll(initSource, PYTHON_SOURCE_FILES.packageInit));
-  const names = defined.filter((name) => exported.has(name)).sort();
+  const names = [...surface].filter((name) => exported.has(name)).sort();
   if (names.length === 0) {
     fail(
-      `${PYTHON_SOURCE_FILES.exceptions}: none of its classes appear in ` +
+      `${PYTHON_SOURCE_FILES.exceptions}: none of its error classes appear in ` +
         `${PYTHON_SOURCE_FILES.packageInit}'s \`__all__\`.`,
     );
   }
@@ -364,7 +413,11 @@ export function extractPythonSurface(sources, { repo, ref }) {
     routerErrorTypes: routerErrors.errorTypes,
     routerErrorTypeOrder: routerErrors.errorTypeOrder,
     routerErrorTypeByStatus: extractErrorTypeByStatus(sources.routerExceptions),
-    exportedErrorClasses: extractExportedErrorClasses(sources.exceptions, sources.packageInit),
+    exportedErrorClasses: extractExportedErrorClasses(
+      sources.exceptions,
+      sources.packageInit,
+      routerErrors.classes,
+    ),
     retryPolicyFields: extractRetryPolicyFields(sources.retry),
   };
 }

@@ -216,7 +216,7 @@ const { data, requestId } = await comfy.models.run(
 );
 ```
 
-`run` accepts a third options argument: `signal`, `timeoutMs`, `maxBytes`, `idempotencyKey`, and `retry`.
+`run` accepts a third options argument: `signal`, `timeoutMs`, `maxBytes`, `idempotencyKey`, `retry`, and the provider knobs `modelProvider`, `strictMode`, and `fallbackProvider` (see [Choosing a provider](#choosing-a-provider)).
 
 The default deadline is **20 minutes** — minutes rather than seconds, because the finished generation is the response and a short default would abort work that had already been paid for. It covers the whole call, retries included, rather than restarting per attempt, which is also why it is twenty and not ten: Comfy's own deadline is ten minutes, so a default of ten would leave nothing for the collect described below. Pass `timeoutMs: null` to disable it, and prefer pairing that with a `signal`.
 
@@ -259,6 +259,20 @@ Pass `retry: false` for a single attempt, or narrow it per call:
 await comfy.models.run("bfl/flux-2-pro", { prompt: "a cat" }, { retry: false });
 await comfy.models.run("bfl/flux-2-pro", { prompt: "a cat" }, { retry: { budgetMs: 30_000 } });
 ```
+
+#### Choosing a provider
+
+A model can be served by more than one provider. By default a run goes to the model's default provider; pass `modelProvider` to route it through an alternate one instead (`"fal"`, `"wavespeed"`, `"runware"`, `"higgsfield"`, ...):
+
+```ts
+const { data } = await comfy.models.run(
+  "bfl/flux-2-pro",
+  { prompt: "a cat" },
+  { modelProvider: "fal" },
+);
+```
+
+Under the default `strictMode` (`false`) the `input` you pass stays this model's own native shape and Router translates it to the alternate provider's schema on the way in and the response back on the way out; `strictMode: true` sends and returns that provider's raw shape unchanged, so `input` must already be that provider's schema. `fallbackProvider` is on by default — pass `false` to opt out, so a failure is refused rather than retried against the model's other registered provider. All three are sent only when set, so a call that names none of them is unchanged.
 
 #### Collecting a generation after a lost response
 
