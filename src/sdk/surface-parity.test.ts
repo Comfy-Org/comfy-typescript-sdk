@@ -97,6 +97,15 @@ interface Asymmetry {
    * deliberate divergence belongs in `why` with no field at all.
    */
   readonly modelsMethodsAheadOfPython?: readonly string[];
+  /**
+   * Public `models` methods the Python SDK ships that this SDK deliberately
+   * does NOT — a documented, permanent divergence rather than a lag waiting to
+   * be closed. This is the one case where the Python side is allowed to lead:
+   * `why` has to justify it. The rot guard below still applies in the other
+   * direction — an entry must name a method the Python SDK has and this SDK
+   * lacks, so the day this SDK grows it the entry has to be deleted.
+   */
+  readonly pythonModelsMethodsNotInTypescript?: readonly string[];
 }
 
 const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
@@ -145,6 +154,18 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
     modelsMethodsAheadOfPython: ["schema", "list"],
   },
   {
+    id: "run-detailed-deferred-in-typescript",
+    why:
+      "The Python SDK's `models.run_detailed` returns the full run envelope — the " +
+      "result plus the per-attempt Router metadata — where this SDK exposes `run` " +
+      "alone for now. This is a deliberate, documented divergence rather than a " +
+      "lag: a `runDetailed` on this side is a product decision still to be made, " +
+      "not a method waiting to be mirrored. The rot guard below keeps the entry " +
+      "honest — it fails the day this SDK grows `runDetailed`, which is when the " +
+      "two surfaces should be compared on it again.",
+    pythonModelsMethodsNotInTypescript: ["run_detailed"],
+  },
+  {
     id: "collect-switched-off-by-budget",
     why:
       "Python switches the collect loop off with a BOOLEAN (`RetryPolicy.retry_collectable=False`) " +
@@ -169,6 +190,9 @@ const AHEAD_OF_PYTHON: readonly (readonly [string, string])[] = INTENTIONAL_ASYM
 const AHEAD_CLASS_NAMES = new Set(AHEAD_OF_PYTHON.map(([className]) => className));
 const AHEAD_MODELS_METHODS = new Set(
   INTENTIONAL_ASYMMETRIES.flatMap((a) => a.modelsMethodsAheadOfPython ?? []),
+);
+const TS_OMITTED_MODELS_METHODS = new Set(
+  INTENTIONAL_ASYMMETRIES.flatMap((a) => a.pythonModelsMethodsNotInTypescript ?? []),
 );
 const AHEAD_ERROR_TYPES = new Set(AHEAD_OF_PYTHON.map(([, errorType]) => errorType));
 
@@ -325,13 +349,18 @@ describe("cross-SDK surface parity", () => {
     );
     expect(pythonSync.length, "no synchronous Python `models` class in the snapshot").toBe(1);
 
-    // Filtered on BOTH sides, so the day the Python SDK catches up produces
-    // exactly ONE failure — the rot guard below, whose message says to delete
-    // the entry — rather than a divergence line per method.
+    // Leads are filtered on BOTH sides, so the day the Python SDK catches up
+    // produces exactly ONE failure — the rot guard below, whose message says to
+    // delete the entry — rather than a divergence line per method. Methods this
+    // SDK deliberately omits (`TS_OMITTED_MODELS_METHODS`) are Python-only by
+    // design, so they are dropped from the Python side alone and guarded by
+    // their own rot check below.
     expect(
       nameDivergences(
         "comfy.models",
-        pythonSync[0][1].filter((name) => !AHEAD_MODELS_METHODS.has(name)),
+        pythonSync[0][1].filter(
+          (name) => !AHEAD_MODELS_METHODS.has(name) && !TS_OMITTED_MODELS_METHODS.has(name),
+        ),
         methodNames(models).filter((name) => !AHEAD_MODELS_METHODS.has(name)),
       ),
     ).toEqual([]);
@@ -359,6 +388,33 @@ describe("cross-SDK surface parity", () => {
       expect(
         pythonMethods.has(name),
         `the Python SDK now carries \`models.${name}\` — delete its entry from ` +
+          "INTENTIONAL_ASYMMETRIES so the two surfaces are compared again",
+      ).toBe(false);
+    }
+  });
+
+  it("keeps every declared `models` omission live, and only in the lagging direction", async () => {
+    // The mirror of the lead rot guard, for the one asymmetry that runs the
+    // other way: a method the Python SDK ships and this SDK omits on purpose.
+    // The entry has to name a method Python really has, and it has to STOP
+    // naming one this SDK has since grown — otherwise the allowlist goes on
+    // excusing a divergence that no longer exists and hides the next real one.
+    const python = await loadPythonSurface();
+    const pythonMethods = new Set(
+      Object.entries(python.modelsMethods)
+        .filter(([className]) => !ASYNC_MODELS_CLASSES.has(className))
+        .flatMap(([, methods]) => methods),
+    );
+    const typescriptMethods = new Set(methodNames(models));
+
+    for (const name of TS_OMITTED_MODELS_METHODS) {
+      expect(
+        pythonMethods.has(name),
+        `the allowlist says the Python SDK ships \`models.${name}\`, but its snapshot does not`,
+      ).toBe(true);
+      expect(
+        typescriptMethods.has(name),
+        `this SDK now exposes \`comfy.models.${name}\` — delete its entry from ` +
           "INTENTIONAL_ASYMMETRIES so the two surfaces are compared again",
       ).toBe(false);
     }
