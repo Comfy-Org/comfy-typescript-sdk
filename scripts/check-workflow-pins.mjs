@@ -33,8 +33,8 @@
  * buried deeper (inside a block scalar, or under a nested mapping) are both
  * ignored, so neither can stand in for a pin the job does not actually pass.
  *
- * The scan is structure-aware in the two places text matching would otherwise
- * be wrong in the SILENT direction:
+ * The scan is structure-aware in the three places text matching would
+ * otherwise be wrong in the SILENT direction:
  *
  * - Block scalars (`run: |`) are skipped, so a `uses:` line quoted inside a
  *   shell script body is not mistaken for a caller. This file's own sibling
@@ -44,17 +44,43 @@
  *   and take the daily `cursor-review-pin-freshness` watchdog down with it.
  * - The `uses` KEY may be quoted (`"uses":`), which YAML allows and which must
  *   not read as "no uses: here".
+ * - A job-level `uses:` whose VALUE this scanner cannot read is REPORTED by
+ *   file and line, not skipped: a block scalar (`uses: >-`), a value pushed
+ *   onto a continuation line, an unterminated quoted scalar, or any other
+ *   spelling that still names a Comfy-Org/github-workflows reusable. So is a
+ *   job written as a FLOW mapping (`review: { uses: ..., with: { ... } }`),
+ *   whose `uses:` never starts a line for the scan to match. Each of those
+ *   used to read as "no caller here", so a split pin written that way next to
+ *   one plain sibling caller passed the lint, and `--print-pin` answered with
+ *   the sibling's SHA instead of refusing. Both modes now exit 1 naming the
+ *   line -- and the message names the spelling to write instead, so the fix is
+ *   a reword, not a call the author can no longer make. A single-line `uses:`
+ *   naming some OTHER owner -- a local reusable, or a third party's -- is read
+ *   fine and is genuinely not this lint's business, so it stays a silent skip.
  *
- * A STEP's `- uses:` is deliberately NOT matched. `jobs.<id>.uses` is the only
- * place GitHub accepts a reusable-workflow call; a `- uses:` inside `steps:` is
- * a composite ACTION, which pins once and has no `workflows_ref` to disagree
- * with. Matching it would make this lint demand a pin that cannot exist.
+ * A STEP's `uses:` is deliberately NOT matched, and that is enforced by
+ * POSITION rather than by spelling: the matched `uses:` must be a direct child
+ * of a `<job id>:` key which is itself a direct child of the top-level `jobs:`.
+ * Spelling alone is not enough -- it rules out `- uses:`, where `uses` is the
+ * step's first key, but the form written throughout this repo (`- name:` on one
+ * line, `uses:` indented beneath) is a plain mapping key and matches. Either
+ * way `jobs.<id>.uses` is the only place GitHub accepts a reusable-workflow
+ * call; a `uses:` inside `steps:` is a composite ACTION, which pins once and
+ * has no `workflows_ref` to disagree with. Matching one would make this lint
+ * demand a pin that cannot exist.
  *
- * One documented limit, which reads as "input absent": a `with:` written as a
- * FLOW mapping (`with: { ... }`) is not parsed. That fails LOUDLY as a missing
- * input rather than passing silently, which is the direction this lint is
- * allowed to be wrong in -- so it does not justify carrying a YAML parser into
- * a job that deliberately runs without `pnpm install`.
+ * Finding NO caller at all is an ERROR. This repo calls these reusables, so an
+ * empty scan means the lint checked nothing, and the same edit would silence
+ * `--print-pin` and the daily watchdog with it.
+ *
+ * One documented limit, which reads as "input absent": on a job whose `uses:`
+ * IS readable, a `with:` written as a FLOW mapping (`with: { ... }`) is not
+ * parsed. That fails LOUDLY as a missing input rather than passing silently,
+ * which is the direction this lint is allowed to be wrong in -- so it does not
+ * justify carrying a YAML parser into a job that deliberately runs without
+ * `pnpm install`. (A job whose WHOLE body is a flow mapping is a different
+ * case and is reported by name, above: there the `uses:` is unreadable too, so
+ * nothing is left to fail loudly about.)
  *
  * Block-mapping key ORDER is not a limit: `with:` may sit above or below its
  * job's `uses:`, because the scan covers the whole job body rather than only
@@ -100,19 +126,87 @@ const REUSABLE_OWNER_REPO = "Comfy-Org/github-workflows";
 // that this repo calls all take one.
 const NO_WORKFLOWS_REF = new Set([]);
 
+// Reusables the `cursor-review-pin-freshness` watchdog in .github/workflows/ci.yml
+// actually watches -- it asks `--print-pin` for ONE named file.
+//
+// The `ignore:` block in .github/dependabot.yml is deliberately repo-WIDE for
+// every `Comfy-Org/github-workflows` reusable, security advisories included,
+// because Dependabot cannot move a double-pinned caller correctly at all. That
+// leaves upstream staleness entirely to the watchdog -- so a SECOND org
+// reusable called from this repo would have its only bump mechanism muted and
+// no freshness alarm to replace it, and `lint()` below would prove nothing more
+// than that its two pins agree with each other while both froze together. That
+// is precisely the silently-frozen pin this whole lint exists to end, so
+// adding such a caller is a red build here until the watchdog is extended to
+// cover it too.
+const WATCHDOG_COVERED = new Set(["cursor-review.yml"]);
+
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
+
+// `owner/repo` as a case-INSENSITIVE regex fragment, one character class per
+// letter. GitHub resolves an owner and a repository name without regard to
+// case, so `comfy-org/github-workflows/...` is a WORKING caller of the very
+// reusable this script exists to police -- but interpolated case-sensitively it
+// was invisible to the scan, and with the canonical-case caller keeping
+// `callers.length` non-zero the repo-wide fail-closed guard below never noticed.
+// An invisible caller may carry a branch ref or a split pin straight past the
+// lint, which is the silent skip this file's header promises never happens.
+// Only the owner and repository are relaxed: the workflow PATH after them is a
+// git path and stays case-sensitive, as do the ref comparisons.
+const caseInsensitiveOwnerRepo = (s) =>
+  s.replace(/[A-Za-z]/g, (ch) => `[${ch.toUpperCase()}${ch.toLowerCase()}]`).replace(/\//g, "\\/");
+
 // `uses: Comfy-Org/github-workflows/.github/workflows/<name>.yml@<ref>  # <comment>`
 // The value may be quoted (`uses: "owner/repo/...@sha"`). Unquoted is what
 // every caller doc writes, but a quoted one must not read as "no uses: here" --
 // a silent skip is the one direction this lint must never fail in.
 // Matched only as a job-level mapping KEY, never as a step's `- uses:` (see
 // the header). The key and the value may each be quoted.
+// The owner/repo is CAPTURED as well as matched, so lint (4) below can hold
+// every caller to ONE spelling. A non-canonical caller is still MATCHED here --
+// deliberately, since an unseen caller is the one failure this lint must never
+// have -- and is then reported rather than skipped.
+//
+// That lint is HYGIENE, not the other half of the ignore: Dependabot compares
+// `dependency-name` with `Dependabot::Config::UpdateConfig.wildcard_match?`,
+// which LOWERCASES both pattern and candidate, so a caller spelled
+// `comfy-org/github-workflows` is already covered by the canonical-case entry
+// in `.github/dependabot.yml`. (An earlier draft of this comment claimed the
+// match was case-SENSITIVE and that a lowercase caller escaped the ignore --
+// it does not; see the same correction in that file.) What one spelling buys
+// is that the caller, that ignore entry and the pin `--print-pin` hands the
+// freshness watchdog all name the dependency identically.
+// The path segment is `[^@\s"']+`, NOT a lazy `\S+?`. Two nested lazy
+// quantifiers over overlapping character sets backtrack quadratically on a
+// line that does not match: `uses: Comfy-Org/github-workflows/` followed by
+// many `@` and a trailing quote gives the outer group one start position per
+// `@`, and forces the inner group to grow to the quote from each of them.
+// Measured at 4x per doubling of the `@` run. This job runs on `pull_request`
+// and checks out the MERGE COMMIT, so a fork PR could add such a
+// `.github/workflows/*.yml` and burn the job to its timeout. Excluding `@`
+// from the path leaves exactly one split point per line, which is linear --
+// and matches identically, since the separator is the FIRST `@` either way
+// (a ref may still contain `@`, and still does: group 6 is unchanged).
 const USES_RE = new RegExp(
-  String.raw`^(\s*)(["']?)uses\2\s*:\s*(["']?)` +
-    REUSABLE_OWNER_REPO.replace("/", "\\/") +
-    String.raw`\/(\S+?)@([^\s"']+?)\3\s*(?:#(.*))?$`,
+  String.raw`^(\s*)(["']?)uses\2\s*:\s*(["']?)(` +
+    caseInsensitiveOwnerRepo(REUSABLE_OWNER_REPO) +
+    String.raw`)\/([^@\s"']+)@([^\s"']+?)\3(?:\s+#(.*))?\s*$`,
 );
-const WORKFLOWS_REF_RE = /^\s*workflows_ref:\s*(["']?)([^\s"']+?)\1\s*(?:#.*)?$/;
+// The `#` must be preceded by WHITESPACE in both patterns: YAML starts a comment
+// only at a `#` that follows a space (or opens the line), so
+// `workflows_ref: <40-hex>#oops` is the single scalar `<40-hex>#oops`, not a pin
+// carrying a comment. Allowing a bare `#` let that line lint CLEAN as a 40-hex
+// pin while GitHub received the literal `<sha>#oops` -- and handed the same
+// wrong value to the `cursor-review-pin-freshness` watchdog via `--print-pin`.
+// The closing `\s*` still tolerates trailing whitespace.
+// The KEY may be quoted, for the same reason `USES_RE` and the `with:` test
+// tolerate one: `"workflows_ref": <sha>` is valid YAML that GitHub accepts and
+// that genuinely passes the input. Matched bare, such a caller read as passing
+// NO pin -- `lint()` reported "passes no `workflows_ref` input" and `printPin`
+// failed, which the daily watchdog turns into a `broken` verdict and a sticky
+// issue blaming a caller that is in fact correct. All three key patterns now
+// agree.
+const WORKFLOWS_REF_RE = /^\s*(["']?)workflows_ref\1\s*:\s*(["']?)([^\s"']+?)\2(?:\s+#.*)?\s*$/;
 // A line that opens a BLOCK SCALAR (`run: |`, `body: >-`). Group 1 spans the
 // indent AND any `- ` sequence marker, so its length is the KEY's column --
 // block content is indented deeper than the key, which for `- run: |` is not
@@ -122,19 +216,284 @@ const BLOCK_SCALAR_RE = /^(\s*(?:-\s+)?)[^\s#][^:]*:\s*[|>][0-9+-]*\s*(?:#.*)?$/
 // parenthesises the abbreviation (`# github-workflows main (425c154)`), so when
 // the comment carries any parenthesised candidate those are the whole set --
 // anything else in the comment is prose and not a claim about this pin.
-const PAREN_SHA_RE = /\(([0-9a-f]{7,40})\)/g;
+//
+// BOTH patterns accept `A-F` as well as `a-f`. Hex commit IDs are
+// case-insensitive, so `# github-workflows main (DEADBEE)` plainly names a
+// commit -- but matched lowercase-only it yielded no candidate at all and
+// assertion (3) was skipped without a word, the silent direction this file's
+// header promises to avoid. Candidates are lowercased at the COMPARISON site
+// rather than here, so the error message still quotes the comment as written.
+const PAREN_SHA_RE = /\(([0-9a-fA-F]{7,40})\)/g;
 // Fallback for a comment written without parentheses: 7-40 hex characters as a
 // whole word. 7 is git's minimum abbreviation, so shorter tokens (`# v7`) are
-// version spellings. All-DIGIT runs are dropped: `20260919` is a date, and a
-// real abbreviated SHA that happens to be all digits is a 1-in-1.7-million
-// coincidence that costs only a comment reworded to the parenthesised form.
-const BARE_SHA_RE = /\b[0-9a-f]{7,40}\b/g;
+// version spellings. DATE-shaped runs are dropped -- see `commentShaCandidates`
+// for why that test is a LENGTH one rather than "contains no a-f".
+const BARE_SHA_RE = /\b[0-9a-fA-F]{7,40}\b/g;
+// A `uses:` MAPPING KEY that opens a block scalar (`uses: >-`, `uses: |`) and
+// so carries its value on the following lines. Same key shapes `USES_RE`
+// tolerates; only the value differs.
+const USES_BLOCK_SCALAR_RE = /^(\s*)(["']?)uses\2\s*:\s*[|>][0-9+-]*\s*(?:#.*)?$/;
+// The OTHER way a `uses:` value can sit on the following line: a plain
+// multi-line scalar, with no `|`/`>` indicator at all and the value simply
+// indented beneath the key. It is valid YAML that GitHub accepts, and it
+// evades the scan even more completely than the block-scalar form --
+// `USES_RE` sees no value, `USES_BLOCK_SCALAR_RE` sees no indicator, and
+// `blockScalarMask` does not mark the continuation lines either (there is no
+// indicator for it to key on), so nothing hides them and nothing reads them.
+// Same consequence as the block-scalar shape: the caller is dropped in
+// silence, free to carry a branch ref or a split pin, while the repo-wide
+// zero-caller guard stays quiet because other callers keep the count
+// non-zero.
+const USES_EMPTY_VALUE_RE = /^(\s*)(["']?)uses\2\s*:\s*(?:#.*)?$/;
+// The same owner/repo, for testing a block scalar's folded VALUE rather than a
+// whole `uses:` line.
+const OWNER_REPO_RE = new RegExp(caseInsensitiveOwnerRepo(REUSABLE_OWNER_REPO));
+// A `<job id>:` key -- a bare key with no value, optionally quoted. GitHub
+// restricts job ids to `[A-Za-z_][A-Za-z0-9_-]*`.
+const JOB_ID_KEY_RE = /^(["']?)[A-Za-z_][A-Za-z0-9_-]*\1\s*:\s*(?:#.*)?$/;
+const JOBS_KEY_RE = /^(["']?)jobs\1\s*:\s*(?:#.*)?$/;
+// A `uses` KEY with ANY value at all, including none on this line. `USES_RE`
+// above matches only the value spellings this scanner can READ, so the gap
+// between the two is exactly the set of `uses:` lines that would otherwise be
+// skipped in silence -- which is what `unreadableUsesReason` classifies.
+const USES_KEY_RE = /^(\s*)(["']?)uses\2\s*:(.*)$/;
+// A `<job id>:` whose value opens a FLOW mapping (`review: { uses: ... }`).
+// Being a job rather than some other flow-mapped key is decided by POSITION at
+// the call site (its owning key must be the column-0 `jobs:`), not by
+// hardcoding the two-space indent every workflow in this repo happens to use.
+//
+// EVERY such job is reported, including one that calls no reusable at all: a
+// flow mapping nests to any depth on one line, so "does this contain a
+// `uses:`" is precisely the question a line-anchored scanner cannot answer,
+// and guessing at it would put the silent skip straight back. No workflow in
+// this repo is written that way, and the remedy the message asks for -- spell
+// the job as a block mapping -- costs a reformat.
+const FLOW_JOB_RE = /^(["']?)[A-Za-z_][A-Za-z0-9_-]*\1\s*:\s*\{/;
 
-/** Commit abbreviations the trailing comment claims, most precise form first. */
+/**
+ * Commit abbreviations the trailing comment claims, most precise form first.
+ *
+ * The date filter applies to BOTH branches. It used to sit only on the
+ * fallback, so the parenthesised branch returned every token raw and
+ * short-circuited past it -- and since the caller requires every candidate to
+ * prefix the ref, a perfectly correct
+ * `# github-workflows main (425c154) -- bumped (20260919)` reddened CI over the
+ * date. That is the same false positive the filter was added to remove.
+ *
+ * The test is LENGTH, not "contains an a-f". Dropping every ALL-DIGIT token was
+ * far too broad: a hex abbreviation is all digits with probability (10/16)^n,
+ * which at git's 7-character minimum is ~3.7% -- about 1 in 27, not the
+ * 1-in-1.7-million a "digits are never a SHA" reading assumes. That silently
+ * skipped assertion (3) for roughly one caller in 27, and a check that silently
+ * verifies nothing is the direction this script's header promises never to fail
+ * in. A date written for humans is 8 digits (`20260919`), so only 8-digit runs
+ * are dropped; 7-digit and 9-plus-digit runs are kept and checked like any
+ * other abbreviation. An 8-character all-digit SHA abbreviation is still
+ * skipped -- ~2.3%, and unlike the old filter it costs only the one caller that
+ * writes its abbreviation to 8 characters instead of the documented 7.
+ *
+ * ALL surviving candidates are returned, not just the first. A comment naming a
+ * second commit is ambiguous either way, and honouring only the first would
+ * miss a stale token written after a fresh one -- trading this loud, one-reword
+ * false positive for a silent miss, which is the direction this lint is not
+ * allowed to be wrong in.
+ */
 function commentShaCandidates(comment) {
-  const parenthesised = [...comment.matchAll(PAREN_SHA_RE)].map((m) => m[1]);
+  const notADate = (c) => !/^[0-9]{8}$/.test(c);
+  const parenthesised = [...comment.matchAll(PAREN_SHA_RE)].map((m) => m[1]).filter(notADate);
   if (parenthesised.length > 0) return parenthesised;
-  return (comment.match(BARE_SHA_RE) ?? []).filter((c) => /[a-f]/.test(c));
+  return (comment.match(BARE_SHA_RE) ?? []).filter(notADate);
+}
+
+/**
+ * Every line that is CONTENT of a block scalar (`key: |`/`>`), by index.
+ *
+ * The forward scan in `findCallers` has always tracked this, but the WALK-BACK
+ * that resolves a `uses:` to its owning key did not -- it read raw lines, so a
+ * column-0 line inside an earlier `run: |` body (a flush-left heredoc body, or
+ * its `EOF` terminator) was returned as the owning key. `isJobLevelUses` then
+ * said false and a genuine job-level caller was dropped with NO output, which
+ * is the silent skip this lint's header promises never happens. Computing the
+ * mask once per file and sharing it keeps the two directions agreeing about
+ * what is structure and what is text.
+ */
+function blockScalarMask(lines) {
+  const mask = Array.from({ length: lines.length }, () => false);
+  let blockKeyIndent = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trimStart();
+    const indent = lines[i].length - trimmed.length;
+
+    if (blockKeyIndent !== null) {
+      if (trimmed === "" || indent > blockKeyIndent) {
+        mask[i] = true;
+        continue;
+      }
+      blockKeyIndent = null;
+    }
+
+    if (trimmed.startsWith("#")) continue;
+
+    const bm = BLOCK_SCALAR_RE.exec(lines[i]);
+    if (bm) blockKeyIndent = bm[1].length;
+  }
+
+  return mask;
+}
+
+/**
+ * For every line, the chain of enclosing mapping keys VISIBLE above it --
+ * innermost first, each node linking outward to the key that owns it.
+ *
+ * This is the "previous smaller indent" stack, built in ONE forward pass and
+ * shared by every walk-back in this file. It replaces a scan that started at
+ * the `uses:` line and walked backward to a shallower line each time it was
+ * asked. That scan was O(file) per question, and `isJobLevelUses` asks it
+ * three times per caller while `workflowsRefInput` asks a fourth -- so a
+ * workflow file carrying N sibling job-level `uses: Comfy-Org/github-workflows/...`
+ * lines at one indent cost O(N^2), with a `trim()`/`trimStart()` allocation
+ * per iteration. `workflow-pins` runs on `pull_request` against the MERGE
+ * COMMIT, so a fork PR could add such a `.github/workflows/*.yml` and push the
+ * job toward its 5-minute timeout -- the same reachability that got the
+ * quadratic `USES_RE` backtracking fixed, by the same route.
+ *
+ * A lookup is now O(nesting depth), which YAML bounds at a handful of levels
+ * regardless of how long the file is.
+ *
+ * Skipping rules are UNCHANGED and live here alone, so the forward and
+ * backward directions cannot drift about what counts as structure: block-
+ * scalar CONTENT, blank lines and whole-line comments are not keys, and
+ * neither is a document marker (`---`, `...`) or a `%YAML`/`%TAG` directive.
+ * Those last two matter because they sit at column 0: against an INDENTED root
+ * mapping (legal YAML that GitHub accepts, and the case `isJobLevelUses` asks
+ * its question structurally to support) one would otherwise be returned as the
+ * owner of `jobs:`, which then reads as non-root, drops every caller in the
+ * file, and passes with no output -- the silent skip this file's header
+ * promises never happens. Matched as a PREFIX, not compared exactly, because
+ * YAML allows a comment after either marker (`--- # doc`, `... # end`) and
+ * allows `---` to be followed by a node on the same line.
+ */
+function owningKeyChain(lines, inBlock) {
+  const chain = Array.from({ length: lines.length }, () => null);
+  let top = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    // What a question asked AT line `i` can see above it -- recorded before
+    // line `i` itself joins the stack, so a line is never its own owner.
+    chain[i] = top;
+
+    if (inBlock[i]) continue;
+    const trimmed = lines[i].trim();
+    if (trimmed === "" || trimmed.startsWith("#")) continue;
+    if (/^(---|\.\.\.)(\s|$)/.test(trimmed) || trimmed.startsWith("%")) continue;
+
+    const indent = lines[i].length - lines[i].trimStart().length;
+    // A key at or deeper than this one is closed by it, so it can no longer
+    // own anything below -- and it can never be the nearest shallower line for
+    // a later question either, because THIS line sits between the two and is
+    // at least as shallow.
+    while (top !== null && top.indent >= indent) top = top.parent;
+    top = { trimmed, indent, index: i, parent: top };
+  }
+
+  return chain;
+}
+
+/**
+ * The nearest line above `index` indented SHALLOWER than `indent` -- that is,
+ * the key that owns it -- or `null` if nothing does.
+ *
+ * Read off the precomputed chain rather than rescanned. The chain's indents
+ * increase from the outside in, so the FIRST node shallower than `indent` is
+ * also the nearest one above `index`.
+ */
+function owningKey(chain, index, indent) {
+  let node = chain[index];
+  while (node !== null && node.indent >= indent) node = node.parent;
+  return node;
+}
+
+/**
+ * True when the `uses:` on `usesIndex` really is `jobs.<id>.uses`.
+ *
+ * SPELLING IS NOT ENOUGH. `USES_RE` only rules out the step form whose FIRST
+ * key is `uses` (`- uses:`); the form this repo writes throughout -- `- name:`
+ * on one line and `uses:` indented beneath it -- is a plain mapping key and
+ * matches it happily. So a step consuming a `Comfy-Org/github-workflows`
+ * composite ACTION would be pulled into the lint, and with `NO_WORKFLOWS_REF`
+ * failing closed it would hard-error demanding a `workflows_ref` input that a
+ * composite action cannot accept -- exactly the outcome the header promises is
+ * avoided. Position is what actually selects a reusable call: the `uses:` must
+ * be a direct child of a `<job id>:` key, which is itself a direct child of the
+ * top-level `jobs:`.
+ */
+function isJobLevelUses(chain, usesIndex, usesIndent) {
+  const job = owningKey(chain, usesIndex, usesIndent);
+  if (job === null || !JOB_ID_KEY_RE.test(job.trimmed)) return false;
+  const jobs = owningKey(chain, job.index, job.indent);
+  if (jobs === null || !JOBS_KEY_RE.test(jobs.trimmed)) return false;
+  // `jobs:` must be a ROOT key, which is asked STRUCTURALLY -- nothing
+  // shallower owns it -- rather than as `indent === 0`. A YAML block mapping
+  // may legally begin at any column provided it is consistent, and GitHub
+  // accepts a workflow whose root mapping is indented; against a column test
+  // every caller in such a file read as not-job-level and was dropped from the
+  // lint with no output, the silent skip this file's header promises never
+  // happens. `owningKey` already skips blanks, comments and block-scalar
+  // content, so a flush-left comment or heredoc body cannot pose as an owner.
+  return owningKey(chain, jobs.index, jobs.indent) === null;
+}
+
+/**
+ * A YAML value with its trailing `# ...` comment removed.
+ *
+ * A comment opens at a `#` that begins the value or follows whitespace, which
+ * is YAML's own rule -- `@sha#1` is part of the ref, not a comment.
+ */
+function stripTrailingComment(value) {
+  const at = value.search(/(?:^|\s)#/);
+  return at === -1 ? value : value.slice(0, at).trim();
+}
+
+/**
+ * Why a job-level `uses:` value cannot be read, or `null` when it reads fine
+ * and simply names something that is not this lint's business.
+ *
+ * Reached only for a `uses:` that `USES_RE` did NOT match and that the
+ * block-scalar and continuation-line checks in `findCallers` did not already
+ * handle -- those two shapes carry their value on the NEXT line, so they are
+ * judged there, where the folded value can be read. "Reads fine" here therefore
+ * means a single-line value naming some other owner -- a local reusable
+ * (`./.github/workflows/x.yml`) or a third party's
+ * (`octo/repo/.github/workflows/x.yml@v1`). Those pin once, have no
+ * `workflows_ref` to disagree with, and are correctly skipped in silence.
+ *
+ * Everything else is a spelling this text-level scanner cannot see THROUGH,
+ * and every one of them used to be indistinguishable from "no caller on this
+ * line". The quoted-scalar check runs on the RAW value, before the comment is
+ * stripped, so a `#` inside an unterminated quote is read as part of the
+ * scalar rather than as the comment that would make the quote look closed.
+ */
+function unreadableUsesReason(rawValue) {
+  const raw = rawValue.trim();
+
+  const quote = raw[0];
+  if ((quote === '"' || quote === "'") && !raw.slice(1).includes(quote)) {
+    return "multi-line quoted scalar";
+  }
+
+  const value = stripTrailingComment(raw);
+  // GitHub resolves owner and repository names CASE-INSENSITIVELY, and so does
+  // `USES_RE`, so the test here must too: a case-sensitive one would return
+  // null for `comfy-org/github-workflows` written in a shape `USES_RE` cannot
+  // parse (no `@ref`, say) and skip a working caller in silence -- the lint
+  // would report "all pins agree" across a genuinely split pair and
+  // `--print-pin` would hand the watchdog the other job's SHA.
+  if (value.toLowerCase().includes(REUSABLE_OWNER_REPO.toLowerCase())) {
+    return "owner/path/ref did not parse";
+  }
+
+  return null;
 }
 
 /**
@@ -165,26 +524,45 @@ function commentShaCandidates(comment) {
  *
  * Blank lines and whole-line comments carry no structure and never end a block
  * (a comment is often written flush-left).
+ *
+ * Returns `null` when the job passes no `workflows_ref`, else
+ * `{ value, lineNo, duplicateLineNo }` describing the FIRST one. The scan keeps
+ * going after that first hit purely to set `duplicateLineNo`: a job that passes
+ * the key twice is an ambiguity neither caller of this function may resolve
+ * silently, so both report it instead. See the note at the match itself.
  */
-function workflowsRefInput(lines, usesIndex, usesIndent) {
+function workflowsRefInput(lines, inBlock, chain, memo, usesIndex, usesIndent) {
+  // The job's `<job id>:` key is the nearest shallower line above `uses:`; the
+  // body starts just after it, so a `with:` block written ABOVE `uses:` is
+  // still inside the scanned range.
+  const job = owningKey(chain, usesIndex, usesIndent);
+  const bodyStart = job === null ? 0 : job.index + 1;
+
+  // MEMOISED PER JOB BODY, because the answer is a property of the job, not of
+  // the `uses:` line that asked. The scan below reads the whole body and no
+  // longer stops at the first hit (it has to see a second `workflows_ref:` to
+  // report the duplicate), so N sibling job-level `uses:` lines under ONE job
+  // key would otherwise rescan that same body N times -- O(N^2) on a file a
+  // fork PR controls, against a job with a 5-minute timeout. `bodyStart` and
+  // `usesIndent` together identify the range scanned, so they are the key.
+  const memoKey = `${bodyStart}:${usesIndent}`;
+  if (memo.has(memoKey)) {
+    const hit = memo.get(memoKey);
+    // Copied out so a caller can never mutate another caller's answer.
+    return hit === null ? null : { ...hit };
+  }
+
   let inWith = false;
+  // The first `workflows_ref:` seen, and where a second one was seen if there
+  // was one. See the duplicate note at the match below.
+  let found = null;
   // The indent shared by `with:`'s direct children, learned from the first one.
   let withChildIndent = null;
 
-  // Walk back to the job's `<job id>:` key -- the nearest shallower line above
-  // `uses:` -- and start just after it, so a `with:` block written above
-  // `uses:` is still inside the scanned body.
-  let bodyStart = 0;
-  for (let i = usesIndex - 1; i >= 0; i--) {
-    const trimmed = lines[i].trim();
-    if (trimmed === "" || trimmed.startsWith("#")) continue;
-    if (lines[i].length - lines[i].trimStart().length < usesIndent) {
-      bodyStart = i + 1;
-      break;
-    }
-  }
-
   for (let i = bodyStart; i < lines.length; i++) {
+    // Block-scalar CONTENT is text, not structure: a flush-left line in a
+    // `run: |` body must not read as "shallower than `uses:`" and end the job.
+    if (inBlock[i]) continue;
     const line = lines[i];
     const trimmed = line.trim();
     if (trimmed === "" || trimmed.startsWith("#")) continue;
@@ -195,7 +573,11 @@ function workflowsRefInput(lines, usesIndex, usesIndent) {
 
     // A sibling of `uses:`: opens the `with:` block, or closes it.
     if (indent === usesIndent) {
-      inWith = /^with:\s*(?:#.*)?$/.test(trimmed);
+      // Quoted key tolerated for the same reason `USES_RE` tolerates one: a
+      // `"with":` block is valid YAML that GitHub accepts and that genuinely
+      // passes `workflows_ref`, so reading it as absent would report a caller
+      // as passing no pin when it passes one.
+      inWith = /^(["']?)with\1\s*:\s*(?:#.*)?$/.test(trimmed);
       withChildIndent = null;
       continue;
     }
@@ -209,77 +591,235 @@ function workflowsRefInput(lines, usesIndex, usesIndent) {
     if (indent !== withChildIndent) continue;
 
     const rm = WORKFLOWS_REF_RE.exec(line);
-    if (rm) return { value: rm[2], lineNo: i + 1 };
+    // Group 1 is the key's optional quote and group 2 the value's, so the
+    // VALUE is group 3.
+    //
+    // The scan does NOT stop at the first hit. Returning it immediately meant
+    // this lint and `--print-pin` both read the FIRST `workflows_ref:` while
+    // the value GitHub actually passes is whichever one its own YAML parser
+    // keeps -- so a caller carrying two, the first agreeing with `uses:` and
+    // the second stale, would SPLIT the pin while passing the very check that
+    // exists to catch a split. A duplicate key is never legitimate here, so
+    // rather than reason about which side wins, the second occurrence is
+    // recorded and reported as its own error.
+    if (rm) {
+      if (found) {
+        found.duplicateLineNo = i + 1;
+        break;
+      }
+      found = { value: rm[3], lineNo: i + 1, duplicateLineNo: null };
+    }
   }
 
-  return null;
+  memo.set(memoKey, found);
+  return found === null ? null : { ...found };
 }
 
 /**
- * Every `Comfy-Org/github-workflows` caller in `.github/workflows`, parsed.
+ * Every `Comfy-Org/github-workflows` caller in `.github/workflows`, parsed,
+ * plus every job-level `uses:` written in a spelling this scanner cannot read.
  *
  * PARSING ONLY -- it asserts nothing at all. Both modes read these records, so
  * neither can drift from the other about what counts as a caller, which line
  * holds its `uses:` ref, or where its `workflows_ref` input lives.
+ *
+ * `unreadable` is the fail-closed half, and both modes must read it. A caller
+ * the scanner cannot see is not the same thing as a caller that is not there:
+ * with one plain sibling caller in the file, an unreadable second job left the
+ * lint reporting "all pins agree" over a split pair, and left `--print-pin`
+ * returning the sibling's SHA to the daily watchdog as though it were the only
+ * pin in the repo.
  */
 function findCallers() {
   const callers = [];
+  const unreadable = [];
 
   for (const file of readdirSync(WORKFLOWS_DIR).sort()) {
     if (!file.endsWith(".yml") && !file.endsWith(".yaml")) continue;
     const rel = `.github/workflows/${file}`;
     const lines = readFileSync(join(WORKFLOWS_DIR, file), "utf8").split("\n");
 
-    // Column of the key owning the block scalar we are inside, or null.
-    let blockKeyIndent = null;
+    // Computed ONCE and shared with the walk-backs below, so the forward and
+    // backward directions can never disagree about which lines are structure.
+    const inBlock = blockScalarMask(lines);
+    // Likewise once: every "which key owns this line" question in this file is
+    // a lookup into this chain rather than its own backward scan.
+    const chain = owningKeyChain(lines, inBlock);
+    // One `workflows_ref` answer per job body, not per `uses:` line that asks.
+    const refMemo = new Map();
 
     for (let i = 0; i < lines.length; i++) {
-      const trimmed = lines[i].trimStart();
-      const indent = lines[i].length - trimmed.length;
+      // Inside a block scalar: content, never structure.
+      if (inBlock[i]) continue;
 
-      // Inside a block scalar: content is anything indented deeper than its
-      // key, plus blank lines. The first line at or above the key's column
-      // ends it and is then read normally.
-      if (blockKeyIndent !== null) {
-        if (trimmed === "" || indent > blockKeyIndent) continue;
-        blockKeyIndent = null;
-      }
+      const trimmed = lines[i].trimStart();
 
       // A whole-line comment can quote a `uses:` while documenting it; the
       // header of ci-cursor-review.yml does exactly that.
       if (trimmed.startsWith("#")) continue;
 
-      const bm = BLOCK_SCALAR_RE.exec(lines[i]);
-      if (bm) {
-        blockKeyIndent = bm[1].length;
+      // A job whose whole body is a FLOW mapping hides its `uses:` mid-line,
+      // where no line-anchored match can reach it. Position is what makes this
+      // a job rather than some other flow-mapped key -- `on: { push: { ... } }`
+      // is owned by `on:`, not by `jobs:`, and must not be reported. `jobs:`
+      // must be a ROOT key, asked structurally for the reason `isJobLevelUses`
+      // gives, so an indented root mapping cannot hide one either.
+      if (FLOW_JOB_RE.test(trimmed)) {
+        const indent = lines[i].length - trimmed.length;
+        const jobs = owningKey(chain, i, indent);
+        if (
+          jobs !== null &&
+          JOBS_KEY_RE.test(jobs.trimmed) &&
+          owningKey(chain, jobs.index, jobs.indent) === null
+        ) {
+          unreadable.push({
+            rel,
+            lineNo: i + 1,
+            reason: "job written as a flow mapping",
+          });
+          continue;
+        }
+      }
+
+      // A job-level `uses:` written as a BLOCK SCALAR (`uses: >-` with the
+      // value on the next line) is legal YAML that GitHub accepts, and it is
+      // invisible to this scan TWICE over: the header line carries no value for
+      // `USES_RE` to match, and `blockScalarMask` deliberately hides the
+      // continuation lines that do. The repo-wide zero-caller guard in the CLI
+      // below is NOT a backstop for it -- that fires only when the WHOLE
+      // repository yields nothing, so one caller rewritten this way is dropped
+      // in silence for as long as any other caller keeps the count non-zero,
+      // free to carry a branch ref or a split pin. Detect the shape itself.
+      const bs = USES_BLOCK_SCALAR_RE.exec(lines[i]);
+      if (bs) {
+        // The folded value is exactly the lines the mask marks as this key's
+        // content. Only a call to OUR reusable is this lint's business, so an
+        // unrelated `uses: >-` is read and left alone rather than reddened.
+        let folded = "";
+        for (let j = i + 1; j < lines.length && inBlock[j]; j++) folded += ` ${lines[j].trim()}`;
+        if (OWNER_REPO_RE.test(folded) && isJobLevelUses(chain, i, bs[1].length)) {
+          fail(
+            `${rel}:${i + 1}: this job calls \`${REUSABLE_OWNER_REPO}\` through a ` +
+              `block-scalar \`uses:\`, which puts the pin on a continuation line where ` +
+              `this text-level scanner cannot read it -- and an unreadable caller is ` +
+              `skipped in silence rather than checked. Write the call as a plain ` +
+              `one-line scalar: \`uses: ${REUSABLE_OWNER_REPO}/.github/workflows/<name>.yml@<40-hex>\`.`,
+          );
+        }
+        continue;
+      }
+
+      // The indicator-less sibling of the shape above. The continuation is
+      // gathered here rather than read off `inBlock`, because a plain
+      // multi-line scalar has no indicator for `blockScalarMask` to key on:
+      // its value is every following line indented DEEPER than the key, up to
+      // the first line that is not.
+      const ev = USES_EMPTY_VALUE_RE.exec(lines[i]);
+      if (ev) {
+        const keyIndent = ev[1].length;
+        let folded = "";
+        for (let j = i + 1; j < lines.length; j++) {
+          const cont = lines[j];
+          const contTrimmed = cont.trim();
+          if (contTrimmed === "") continue;
+          // The comment skip is tested BEFORE the dedent break, not after.
+          // A YAML comment carries no indentation semantics -- it is not
+          // content and cannot close a multi-line plain scalar -- so a
+          // full-line comment written at or below the key column is legal in
+          // the middle of this fold and GitHub accepts it. Tested after the
+          // break, such a line ended the fold instead: `folded` stayed empty,
+          // `OWNER_REPO_RE` failed, and the caller was dropped in SILENCE,
+          // free to carry a branch ref or a split pin with the repo-wide
+          // zero-caller guard kept quiet by any other caller. Silence is the
+          // one direction this lint must never fail in.
+          if (contTrimmed.startsWith("#")) continue;
+          if (cont.length - cont.trimStart().length <= keyIndent) break;
+          folded += ` ${contTrimmed}`;
+        }
+        // Only a call to OUR reusable is this lint's business -- an unrelated
+        // `uses:` written this way is left alone rather than reddened, exactly
+        // as for the block-scalar form.
+        if (OWNER_REPO_RE.test(folded) && isJobLevelUses(chain, i, keyIndent)) {
+          fail(
+            `${rel}:${i + 1}: this job calls \`${REUSABLE_OWNER_REPO}\` through a ` +
+              `\`uses:\` whose value sits on a continuation line, where this ` +
+              `text-level scanner cannot read the pin -- and an unreadable caller is ` +
+              `skipped in silence rather than checked. Write the call as a plain ` +
+              `one-line scalar: \`uses: ${REUSABLE_OWNER_REPO}/.github/workflows/<name>.yml@<40-hex>\`.`,
+          );
+        }
         continue;
       }
 
       const m = USES_RE.exec(lines[i]);
-      if (!m) continue;
+      if (!m) {
+        // Not a value this scanner can read -- but the KEY may still be a
+        // job-level `uses:`, in which case failing closed on it is the whole
+        // point. `unreadableUsesReason` returns null for the one shape that is
+        // legitimately none of this lint's business.
+        const km = USES_KEY_RE.exec(lines[i]);
+        if (km !== null && isJobLevelUses(chain, i, km[1].length)) {
+          const reason = unreadableUsesReason(km[3]);
+          if (reason !== null) unreadable.push({ rel, lineNo: i + 1, reason });
+        }
+        continue;
+      }
 
-      const [, indentStr, , , workflowPath, ref, comment] = m;
+      const [, indentStr, , , ownerRepo, workflowPath, ref, comment] = m;
+
+      // `jobs.<id>.uses` only -- see `isJobLevelUses`. A composite-action step
+      // is not a reusable-workflow call and has no second pin to disagree.
+      if (!isJobLevelUses(chain, i, indentStr.length)) continue;
 
       callers.push({
         rel,
+        ownerRepo,
         reusable: workflowPath.split("/").pop(),
         usesLineNo: i + 1,
         ref,
         comment,
-        workflowsRef: workflowsRefInput(lines, i, indentStr.length),
+        workflowsRef: workflowsRefInput(lines, inBlock, chain, refMemo, i, indentStr.length),
       });
     }
   }
 
-  return callers;
+  return { callers, unreadable };
 }
 
-/** The three pin assertions, as a list of human-readable problems. */
+/** The four pin assertions, as a list of human-readable problems. */
 function lint(callers) {
   const errors = [];
 
-  for (const { rel, reusable, usesLineNo, ref, comment, workflowsRef } of callers) {
+  for (const { rel, ownerRepo, reusable, usesLineNo, ref, comment, workflowsRef } of callers) {
     const at = `${rel}:${usesLineNo}`;
+
+    // (4) The owner/repo must be spelled CANONICALLY. Checked FIRST, and it
+    // does not `continue`: unlike (1) the spelling is independent of the ref,
+    // so a caller can be both misspelled and badly pinned and deserves to hear
+    // about both in one run.
+    //
+    // This is HYGIENE, and saying so matters because the stronger claim that
+    // used to be written here -- and in `.github/dependabot.yml` -- was not
+    // true. Dependabot matches `ignore.dependency-name` with
+    // `Dependabot::Config::UpdateConfig.wildcard_match?`, which LOWERCASES
+    // both the pattern and the candidate before comparing, so a caller spelled
+    // `comfy-org/github-workflows` is already covered by the canonical-case
+    // entry over there; this lint is not the other half of that defence and
+    // relaxing it would not open a hole in it. What one spelling does buy is
+    // that the caller, that ignore entry and the pin `--print-pin` hands
+    // the freshness watchdog all name the dependency identically, so whoever
+    // greps for one finds the rest.
+    if (ownerRepo !== REUSABLE_OWNER_REPO) {
+      errors.push(
+        `${at}: \`uses:\` names \`${ownerRepo}\`, but this repository spells that ` +
+          `dependency \`${REUSABLE_OWNER_REPO}\` everywhere else -- the ignore entry ` +
+          `in \`.github/dependabot.yml\` and the pin this script prints for the ` +
+          `freshness watchdog. GitHub and Dependabot both resolve the name ` +
+          `case-insensitively, so the mismatch does not by itself break anything; ` +
+          `one spelling is what keeps those three readable as the same dependency. ` +
+          `Spell it \`${REUSABLE_OWNER_REPO}\`.`,
+      );
+    }
 
     // (1) The `uses:` ref must be immutable.
     if (!FULL_SHA_RE.test(ref)) {
@@ -297,7 +837,10 @@ function lint(callers) {
     // that takes no `workflows_ref`.
     if (comment) {
       for (const candidate of commentShaCandidates(comment)) {
-        if (!ref.startsWith(candidate)) {
+        // `ref` is already proven 40-hex LOWERCASE by (1) above, so the
+        // candidate is lowercased for the prefix test -- `DEADBEE` and
+        // `deadbee` name the same commit and neither may read as a mismatch.
+        if (!ref.startsWith(candidate.toLowerCase())) {
           errors.push(
             `${at}: the trailing comment names commit \`${candidate}\`, but ` +
               `\`uses:\` is pinned to \`${ref}\`. Update the comment to ` +
@@ -323,6 +866,25 @@ function lint(callers) {
       continue;
     }
 
+    // (5) A DUPLICATE `workflows_ref:` under the same `with:`. Reported on its
+    // own, before the value comparison, because the comparison below can only
+    // read one of them: whichever this scan saw first. GitHub's parser decides
+    // which one is really passed, and if it keeps the other, a caller whose
+    // second entry is stale would pass (2) while shipping a split pin -- the
+    // exact failure this script exists to prevent. Duplicate mapping keys are
+    // never legitimate, so the fix is always to delete one, never to work out
+    // which side wins.
+    if (workflowsRef.duplicateLineNo) {
+      errors.push(
+        `${rel}:${workflowsRef.duplicateLineNo}: a second \`workflows_ref\` input ` +
+          `(the first is on line ${workflowsRef.lineNo}) -- this job passes the key ` +
+          `twice under one \`with:\`. Which value reaches the reusable is up to ` +
+          `GitHub's YAML parser, so the pair below cannot be checked reliably and ` +
+          `a stale duplicate could split the pin unnoticed. Delete the entry that ` +
+          `is not \`${ref}\`.`,
+      );
+    }
+
     if (workflowsRef.value !== ref) {
       errors.push(
         `${rel}:${workflowsRef.lineNo}: \`workflows_ref\` is \`${workflowsRef.value}\` but ` +
@@ -338,6 +900,37 @@ function lint(callers) {
 
 function fail(message) {
   console.error(`check-workflow-pins: ${message}`);
+  process.exit(1);
+}
+
+/**
+ * Report every unreadable job-level `uses:` on STDERR and exit 1.
+ *
+ * Runs in BOTH modes, and before either mode's own checks, because neither can
+ * say anything true while a caller is invisible to it: the lint would compare
+ * the pins it can see and call them agreed, and `--print-pin` would hand the
+ * watchdog one SHA as if it were the only pin in the repo. Nothing goes to
+ * STDOUT -- `cursor-review-pin-freshness` captures this script's stdout with
+ * `$(...)`, so a diagnostic written there becomes the "pin" it feeds to git.
+ */
+function reportUnreadable(unreadable) {
+  console.error(
+    `check-workflow-pins: ${unreadable.length} job-level \`uses:\` line(s) this ` +
+      `checker cannot read:\n`,
+  );
+  for (const { rel, lineNo, reason } of unreadable) {
+    console.error(
+      `  - ${rel}:${lineNo}: job-level \`uses:\` is written in a spelling this checker ` +
+        `cannot read (${reason}); write ` +
+        `\`uses: ${REUSABLE_OWNER_REPO}/.github/workflows/<name>.yml@<sha>\` on one line`,
+    );
+  }
+  console.error(
+    `\nThis is a fail-CLOSED report, not a style rule: a caller this scanner ` +
+      `cannot see reads exactly like no caller at all, so a pin split inside ` +
+      `one would pass the lint and \`--print-pin\` would answer with some other ` +
+      `job's SHA.`,
+  );
   process.exit(1);
 }
 
@@ -373,6 +966,21 @@ function printPin(callers, wanted) {
     fail(`--print-pin ${wanted}: ${at} sets no \`workflows_ref\`; there is no pin to print.`);
   }
 
+  // A DUPLICATE `workflows_ref:` is an ambiguity about which value is the pin,
+  // so this mode fails for the same reason it refuses two callers above: it
+  // returns one pin and cannot choose. Unlike the pair equality -- left to the
+  // lint on purpose, so one split pin does not redden two jobs -- there is no
+  // single answer to print here, and printing the first silently hands the
+  // freshness watchdog a SHA that GitHub's parser may not be passing at all.
+  if (caller.workflowsRef.duplicateLineNo) {
+    fail(
+      `--print-pin ${wanted}: ${caller.rel} passes \`workflows_ref\` twice under one ` +
+        `\`with:\` (lines ${caller.workflowsRef.lineNo} and ` +
+        `${caller.workflowsRef.duplicateLineNo}); which one GitHub passes is up to its ` +
+        `YAML parser, so there is no single pin to print. Delete the stale entry.`,
+    );
+  }
+
   const pin = caller.workflowsRef.value;
   if (!FULL_SHA_RE.test(pin)) {
     fail(
@@ -398,9 +1006,48 @@ if (printPinArg !== null) {
   if (printPinArg === "") {
     fail("--print-pin needs a reusable workflow file name, e.g. `--print-pin cursor-review.yml`.");
   }
-  printPin(findCallers(), printPinArg);
+  const { callers, unreadable } = findCallers();
+  if (unreadable.length > 0) reportUnreadable(unreadable);
+  printPin(callers, printPinArg);
 } else {
-  const callers = findCallers();
+  const { callers, unreadable } = findCallers();
+
+  // Checked BEFORE the zero-caller guard below, so a file whose only caller is
+  // unreadable is reported as the spelling it is rather than as an empty repo.
+  if (unreadable.length > 0) reportUnreadable(unreadable);
+
+  // ZERO CALLERS IS AN ERROR, not a notice. This repo does call these
+  // reusables, so an empty result means this lint checked NOTHING. The
+  // spellings that used to be the likeliest cause -- a folded `uses: >-`, a
+  // flow-mapping job -- are reported by name above, so reaching here means the
+  // scanner found no job-level `uses:` at all. That edit would take
+  // `--print-pin` down with it and silence the daily
+  // `cursor-review-pin-freshness` watchdog in the same change, so the lint and
+  // its watchdog would go quiet together. Fail loudly instead.
+  if (callers.length === 0) {
+    fail(
+      `no ${REUSABLE_OWNER_REPO} caller found under .github/workflows, so this ` +
+        `lint checked nothing. If the callers really were removed, delete this ` +
+        `script along with its \`workflow-pins\` job and the ` +
+        `\`cursor-review-pin-freshness\` watchdog that depends on \`--print-pin\`.`,
+    );
+  }
+
+  const unwatched = [...new Set(callers.map((c) => c.reusable))]
+    .filter((r) => !WATCHDOG_COVERED.has(r))
+    .sort();
+  if (unwatched.length > 0) {
+    fail(
+      `${unwatched.map((r) => `\`${r}\``).join(", ")} ` +
+        `${unwatched.length === 1 ? "is a reusable" : "are reusables"} called from this ` +
+        `repo but not watched by the \`cursor-review-pin-freshness\` job in ` +
+        `.github/workflows/ci.yml, while .github/dependabot.yml ignores EVERY ` +
+        `${REUSABLE_OWNER_REPO} reusable -- so nothing would ever tell you that pin had ` +
+        `gone stale. Extend that watchdog to the new reusable and add it to ` +
+        `\`WATCHDOG_COVERED\` in this script, or narrow the Dependabot ignore.`,
+    );
+  }
+
   const errors = lint(callers);
 
   if (errors.length > 0) {
@@ -416,15 +1063,9 @@ if (printPinArg !== null) {
     process.exit(1);
   }
 
-  if (callers.length === 0) {
-    // Not an error -- the repo may simply not call these reusables any more --
-    // but a lint that silently checks nothing is worse than no lint, so say so.
-    console.log(`check-workflow-pins: no ${REUSABLE_OWNER_REPO} callers found; nothing to check.`);
-  } else {
-    console.log(
-      `check-workflow-pins: ${callers.length} ${REUSABLE_OWNER_REPO} caller(s) ` +
-        `checked, all pins agree.\n` +
-        callers.map((c) => `  - ${c.rel}:${c.usesLineNo} -> ${c.reusable}`).join("\n"),
-    );
-  }
+  console.log(
+    `check-workflow-pins: ${callers.length} ${REUSABLE_OWNER_REPO} caller(s) ` +
+      `checked, all pins agree.\n` +
+      callers.map((c) => `  - ${c.rel}:${c.usesLineNo} -> ${c.reusable}`).join("\n"),
+  );
 }
