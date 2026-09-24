@@ -39,7 +39,8 @@ export const zJobWorkflowResponse = z.object({
 
 /**
  * Lifecycle: queued → running → succeeded | failed | expired;
- * a cancel request moves running → canceling → canceled.
+ * a cancel request, or the deletion of the deployment the job is running
+ * on, moves running → canceling → canceled.
  * Terminal states: succeeded, canceled, failed, expired.
  *
  */
@@ -106,6 +107,23 @@ export const zOutput = z.object({
 });
 
 /**
+ * One problem ComfyUI found with a node. `type` is ComfyUI's code for it (for example `value_not_in_list`, `value_bigger_than_max`, `dependency_cycle`); `details` usually starts with the input it is about.
+ */
+export const zJobNodeErrorReason = z.object({
+    type: z.string(),
+    message: z.string(),
+    details: z.string().optional()
+});
+
+/**
+ * One node ComfyUI rejected, and why.
+ */
+export const zJobNodeError = z.object({
+    class_type: z.string().optional(),
+    errors: z.array(zJobNodeErrorReason)
+});
+
+/**
  * Execution failure detail, carried in `job.error` (not an HTTP error).
  */
 export const zJobError = z.object({
@@ -113,7 +131,8 @@ export const zJobError = z.object({
     message: z.string(),
     node_id: z.string().nullish(),
     class_type: z.string().nullish(),
-    traceback: z.string().nullish()
+    traceback: z.string().nullish(),
+    node_errors: z.record(z.string(), zJobNodeError).optional()
 });
 
 /**
@@ -142,7 +161,9 @@ export const zJob = z.object({
  * `queue_full` (429 + Retry-After), `insufficient_credits` (402),
  * `not_found` (404), `unauthorized` (401), `forbidden` (403).
  * Deployment-scoped surfaces add: `deployment_not_ready` (429 +
- * Retry-After — the deployment can still reach ready; retry) and
+ * Retry-After — the deployment can still reach ready; retry),
+ * `deployment_unavailable` (429 + Retry-After: the deployment is ready
+ * but its GPU provider is not taking work on it yet; retry) and
  * `deployment_stopped` (422 — terminal deployment state; a retry
  * cannot succeed without operator action). A 429 is disambiguated
  * by `error.code` alone; clients should treat any 429 + Retry-After

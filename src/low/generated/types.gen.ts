@@ -105,7 +105,8 @@ export type JobWorkflowResponse = {
 
 /**
  * Lifecycle: queued → running → succeeded | failed | expired;
- * a cancel request moves running → canceling → canceled.
+ * a cancel request, or the deletion of the deployment the job is running
+ * on, moves running → canceling → canceled.
  * Terminal states: succeeded, canceled, failed, expired.
  *
  */
@@ -184,6 +185,29 @@ export type JobError = {
     node_id?: string | null;
     class_type?: string | null;
     traceback?: string | null;
+    /**
+     * Every node ComfyUI rejected when it refused the workflow before running any of it (a value outside its allowed range, a model the deployment does not contain, a graph that loops back on itself), keyed by node id, under the names ComfyUI gave them. Absent when the workflow ran and a node raised: `node_id`, `class_type` and `traceback` describe that failure instead.
+     */
+    node_errors?: {
+        [key: string]: JobNodeError;
+    };
+};
+
+/**
+ * One node ComfyUI rejected, and why.
+ */
+export type JobNodeError = {
+    class_type?: string;
+    errors: Array<JobNodeErrorReason>;
+};
+
+/**
+ * One problem ComfyUI found with a node. `type` is ComfyUI's code for it (for example `value_not_in_list`, `value_bigger_than_max`, `dependency_cycle`); `details` usually starts with the input it is about.
+ */
+export type JobNodeErrorReason = {
+    type: string;
+    message: string;
+    details?: string;
 };
 
 /**
@@ -194,7 +218,9 @@ export type JobError = {
  * `queue_full` (429 + Retry-After), `insufficient_credits` (402),
  * `not_found` (404), `unauthorized` (401), `forbidden` (403).
  * Deployment-scoped surfaces add: `deployment_not_ready` (429 +
- * Retry-After — the deployment can still reach ready; retry) and
+ * Retry-After — the deployment can still reach ready; retry),
+ * `deployment_unavailable` (429 + Retry-After: the deployment is ready
+ * but its GPU provider is not taking work on it yet; retry) and
  * `deployment_stopped` (422 — terminal deployment state; a retry
  * cannot succeed without operator action). A 429 is disambiguated
  * by `error.code` alone; clients should treat any 429 + Retry-After
@@ -274,7 +300,7 @@ export type PostAssetsErrors = {
      */
     409: ErrorEnvelope;
     /**
-     * `idempotency_key_reuse` or validation failure.
+     * `idempotency_key_reuse`, `input_blocked` (the bytes are already stored and flagged by content moderation, so `file_path` is not registered for them), or validation failure.
      */
     422: ErrorEnvelope;
     /**
@@ -571,7 +597,7 @@ export type PostJobsErrors = {
      */
     422: ErrorEnvelope;
     /**
-     * `queue_full` (bounded queue depth reached) or, on deployment-scoped surfaces, `deployment_not_ready` (deployment still provisioning/starting). Disambiguate by `error.code`; both mean back off and retry after `Retry-After`.
+     * `queue_full` (bounded queue depth reached) or, on deployment-scoped surfaces, `deployment_not_ready` (deployment still provisioning/starting) or `deployment_unavailable` (the deployment is ready but its GPU provider is not taking work on it yet). Disambiguate by `error.code`; all three mean back off and retry after `Retry-After`.
      */
     429: ErrorEnvelope;
     /**
