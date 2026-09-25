@@ -594,6 +594,9 @@ describe("--print-pin", () => {
 
 describe("spellings the scanner cannot read fail closed", () => {
   const CANNOT_READ = "job-level `uses:` is written in a spelling this checker cannot read";
+  // The shapes that carry their value on the NEXT line are judged where the
+  // folded value can be read, and name the one-line spelling to write instead.
+  const NEXT_LINE = "this job calls `Comfy-Org/github-workflows` through a";
 
   /**
    * Both modes must refuse, and for the SAME reason at the SAME line.
@@ -606,9 +609,9 @@ describe("spellings the scanner cannot read fail closed", () => {
    * have been caught by the zero-caller guard and proved nothing about this
    * one.
    */
-  function expectBothModesRefuse(lines: string[], at: number, reason: string) {
+  function expectBothModesRefuse(lines: string[], at: number, message: string) {
     const root = fixtureRoot({ [WORKFLOW]: yaml(lines) });
-    const expected = `${REL}:${at}: ${CANNOT_READ} (${reason})`;
+    const expected = `${REL}:${at}: ${message}`;
 
     const lintResult = run(root);
     expect(lintResult.status).toBe(1);
@@ -636,13 +639,17 @@ describe("spellings the scanner cannot read fail closed", () => {
     ];
     // The OPENER is the reported line, not the value line beneath it: the
     // value line is block-scalar content, which the scanner masks out.
-    expectBothModesRefuse(lines, lineNo(lines, opener), "folded/literal block scalar");
+    expectBothModesRefuse(lines, lineNo(lines, opener), NEXT_LINE);
   });
 
   it("reports a job written as a FLOW mapping, whose `uses:` never starts a line", () => {
     const flowJob = `  flow: { uses: "${REUSABLE}@${OTHER}", with: { workflows_ref: "${OTHER}" } }`;
     const lines = [...pinnedCaller(), flowJob];
-    expectBothModesRefuse(lines, lineNo(lines, flowJob), "job written as a flow mapping");
+    expectBothModesRefuse(
+      lines,
+      lineNo(lines, flowJob),
+      `${CANNOT_READ} (job written as a flow mapping)`,
+    );
   });
 
   it("reports a bare `uses:` whose value sits on a CONTINUATION line", () => {
@@ -655,7 +662,7 @@ describe("spellings the scanner cannot read fail closed", () => {
       "    with:",
       `      workflows_ref: ${OTHER}`,
     ];
-    expectBothModesRefuse(lines, lineNo(lines, bareKey), "value on a continuation line");
+    expectBothModesRefuse(lines, lineNo(lines, bareKey), NEXT_LINE);
   });
 
   it("names the SPELLING even when the unreadable job is the only one in the file", () => {
@@ -676,17 +683,16 @@ describe("spellings the scanner cannot read fail closed", () => {
     const root = fixtureRoot({ [WORKFLOW]: yaml(lines) });
     const { status, stderr } = run(root);
     expect(status).toBe(1);
-    expect(stderr).toContain(`${REL}:${lineNo(lines, opener)}: ${CANNOT_READ}`);
+    expect(stderr).toContain(`${REL}:${lineNo(lines, opener)}: ${NEXT_LINE}`);
     expect(stderr).not.toContain("lint checked nothing");
   });
 
-  it("reports a caller whose owner/repo differs only in LETTER CASE", () => {
+  it("refuses a caller whose owner/repo differs only in LETTER CASE", () => {
     // GitHub resolves owner and repository names case-insensitively, so this
-    // job really does call the same reusable as the sibling above it -- but
-    // `USES_RE` is case-sensitive and does not read it as a caller. Skipping it
-    // in silence would leave a second, genuinely split pin invisible, which is
-    // precisely the hole this guard exists to close, so it fails closed and
-    // names the spelling instead.
+    // job really does call the same reusable as the sibling above it. Skipping
+    // it in silence would leave a second, genuinely split pin invisible, so it
+    // is READ as a caller: the lint names the spelling, and `--print-pin` sees
+    // two callers of one reusable and refuses to choose between them.
     const lowerCased = `    uses: ${REUSABLE.toLowerCase()}@${OTHER}`;
     const lines = [
       ...pinnedCaller(),
@@ -695,7 +701,56 @@ describe("spellings the scanner cannot read fail closed", () => {
       "    with:",
       `      workflows_ref: ${OTHER}`,
     ];
-    expectBothModesRefuse(lines, lineNo(lines, lowerCased), "owner/path/ref did not parse");
+    const root = fixtureRoot({ [WORKFLOW]: yaml(lines) });
+
+    const lintResult = run(root);
+    expect(lintResult.status).toBe(1);
+    expect(lintResult.stderr).toContain(
+      `${REL}:${lineNo(lines, lowerCased)}: \`uses:\` names \`comfy-org/github-workflows\``,
+    );
+    expect(lintResult.stdout).not.toContain("all pins agree");
+
+    const pinResult = run(root, "--print-pin", "cursor-review.yml");
+    expect(pinResult.status).toBe(1);
+    expect(pinResult.stdout).toBe("");
+    expect(pinResult.stderr).toContain("2 callers of `cursor-review.yml` found");
+  });
+
+  it("reports a quoted `uses:` whose closing quote is on a later line", () => {
+    // A quoted scalar may span lines, so the value -- pin included -- is only
+    // complete on a line the line-anchored scan never reads as a `uses:`.
+    const opener = `    uses: "${REUSABLE}@${OTHER}`;
+    const lines = [
+      ...pinnedCaller(),
+      "  quoted:",
+      opener,
+      '      "',
+      "    with:",
+      `      workflows_ref: ${OTHER}`,
+    ];
+    expectBothModesRefuse(
+      lines,
+      lineNo(lines, opener),
+      `${CANNOT_READ} (multi-line quoted scalar)`,
+    );
+  });
+
+  it("reports a one-line `uses:` naming the reusable in a shape that does not parse", () => {
+    // No `@ref` at all: `USES_RE` cannot read it as a caller, but it still
+    // names the org reusable, so it is not some other owner's business either.
+    const unparsed = `    uses: ${REUSABLE}`;
+    const lines = [
+      ...pinnedCaller(),
+      "  no-ref:",
+      unparsed,
+      "    with:",
+      `      workflows_ref: ${OTHER}`,
+    ];
+    expectBothModesRefuse(
+      lines,
+      lineNo(lines, unparsed),
+      `${CANNOT_READ} (owner/path/ref did not parse)`,
+    );
   });
 
   it("stays silent about a job-level `uses:` that names some OTHER owner", () => {
