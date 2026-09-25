@@ -182,6 +182,49 @@ export function parseRetryAfter(headers: HeadersLike): number | null {
 }
 
 /**
+ * `X-Comfy-Refusal-Subject` — which input or output a content-policy refusal
+ * was about. Mirrored in the body as `refusal_subject`; see
+ * {@link RouterError.refusalSubject}.
+ */
+export const REFUSAL_SUBJECT_HEADER = "X-Comfy-Refusal-Subject";
+
+/**
+ * The refusal subjects the upstream Router contract documents, for
+ * autocomplete and for a caller who wants to enumerate them.
+ *
+ * Not yet pinned to `spec/router-openapi.yaml`: the vendored copy predates the
+ * contract change that added `refusal_subject` and `X-Comfy-Refusal-Subject`,
+ * so there is nothing in it to compare this list or the header name against.
+ * `router-spec-contract.test.ts` carries a rot guard that fails the day a sync
+ * brings either name in — that is the moment to pin both against the spec.
+ *
+ * The bare `input` / `output` name the side when the provider did not name a
+ * modality; the other eight name the side and the modality both.
+ *
+ * {@link RouterError.refusalSubject} is deliberately NOT narrowed to this list,
+ * for the same reason `errorType` is not narrowed to
+ * {@link ROUTER_ERROR_TYPES}: a newer server may name a subject this release
+ * has not heard of, and that value reaches the caller verbatim. Treat a value
+ * outside this list as unspecified — as if Router had named no subject — rather
+ * than switching exhaustively over it.
+ */
+export const REFUSAL_SUBJECTS = [
+  "input",
+  "output",
+  "input_text",
+  "input_image",
+  "input_video",
+  "input_audio",
+  "output_text",
+  "output_image",
+  "output_video",
+  "output_audio",
+] as const;
+
+/** One of the ten refusal subjects this release knows about. */
+export type RefusalSubject = (typeof REFUSAL_SUBJECTS)[number];
+
+/**
  * One model-level validation failure, in the FastAPI `detail[]` form.
  *
  * `type` is the SPECIFIC provider reason (`value_error`, `missing`,
@@ -229,6 +272,8 @@ export interface RouterErrorOptions {
   httpStatus?: number | null;
   /** See {@link RouterError.retryAfter}. */
   retryAfter?: number | null;
+  /** See {@link RouterError.refusalSubject}. */
+  refusalSubject?: string | null;
 }
 
 /**
@@ -283,6 +328,40 @@ export class RouterError extends Error {
    */
   readonly retryAfter: number | null;
 
+  /**
+   * Which input or output a content-policy refusal was about — `"output_audio"`,
+   * `"input_image"`, … — off `X-Comfy-Refusal-Subject`, falling back to the
+   * body's `refusal_subject`; `null` when the response named none.
+   *
+   * Router sets it only on a {@link ContentPolicyViolation}, and only when the
+   * provider named the refused subject with a machine-readable code, so its
+   * absence is the common case and means "not said", not "the whole request".
+   * It lets a caller change the one thing that was refused rather than give up:
+   *
+   * ```ts
+   * try {
+   *   return await comfy.models.subscribe(model, input);
+   * } catch (err) {
+   *   if (err instanceof routerErrors.ContentPolicyViolation && err.refusalSubject === "output_audio") {
+   *     return comfy.models.subscribe(model, { ...input, generate_audio: false });
+   *   }
+   *   throw err;
+   * }
+   * ```
+   *
+   * Only the surfaces that raise `routerErrors.*` carry it — the queued
+   * `submit` / `subscribe` / `handle`. `comfy.models.run` maps its failures into
+   * the `ComfyError` family instead (a refusal there is a `ComfyError` with
+   * `code: "content_policy_violation"`), and that error does not carry the
+   * subject yet.
+   *
+   * It is the raw string, not narrowed to {@link REFUSAL_SUBJECTS}: a newer
+   * server may send a subject this release does not know, and a caller should
+   * treat one as unspecified. It is on the BASE class, like
+   * {@link retryAfter}, so an unrecognized bucket from a newer server keeps it.
+   */
+  readonly refusalSubject: string | null;
+
   constructor(message: string, options: RouterErrorOptions = {}) {
     super(message);
     // Restore the prototype explicitly. Extending a built-in is the classic
@@ -298,6 +377,7 @@ export class RouterError extends Error {
     this.requestId = options.requestId ?? null;
     this.httpStatus = options.httpStatus ?? null;
     this.retryAfter = options.retryAfter ?? null;
+    this.refusalSubject = options.refusalSubject ?? null;
   }
 }
 
@@ -332,6 +412,9 @@ export class InvalidInput extends RouterError {
  * The model's content policy refused the request. Deterministic: retrying the
  * same input will not succeed, so this is the one failure a retry policy must
  * not treat like {@link ProviderError}.
+ *
+ * What CAN succeed is a changed request, and {@link RouterError.refusalSubject}
+ * says which input or output to change when the provider named one.
  */
 export class ContentPolicyViolation extends RouterError {
   static override readonly errorType = "content_policy_violation";
@@ -617,6 +700,18 @@ export interface HeadersLike {
 interface RequestErrorBody {
   detail?: unknown;
   error_type?: unknown;
+  refusal_subject?: unknown;
+}
+
+/**
+ * One refusal subject out of a header or body value, or `null` when the value
+ * names none: not a string, blank once trimmed, or comma-joined — `Headers.get`
+ * joins a repeated header with `", "`, and two subjects are not one subject.
+ */
+function readRefusalSubject(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const subject = value.trim();
+  return subject === "" || subject.includes(",") ? null : subject;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -686,11 +781,21 @@ export function toRouterError(status: number, headers: HeadersLike, body: unknow
   // Python SDK does with the same response.
   const errorType = headerType || bodyType || statusType;
 
+  // Header first, body second — the same order the bucket is read in. Router
+  // mirrors one onto the other, so they only disagree if something between
+  // here and Router rewrote one of them, and the header is the half this module
+  // already trusts for the bucket. A value that names no single subject says
+  // nothing and falls through, like an empty bucket.
+  const refusalSubject =
+    readRefusalSubject(headers.get(REFUSAL_SUBJECT_HEADER)) ??
+    readRefusalSubject(envelope.refusal_subject);
+
   const options: RouterErrorOptions = {
     errorType,
     requestId,
     httpStatus: status,
     retryAfter: parseRetryAfter(headers),
+    refusalSubject,
   };
   // Own-property lookup only. A plain `BY_ERROR_TYPE[errorType]` would resolve
   // an `error_type` of `constructor` or `toString` off `Object.prototype` and
