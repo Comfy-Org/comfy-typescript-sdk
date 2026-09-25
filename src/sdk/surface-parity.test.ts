@@ -161,6 +161,16 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
     ],
   },
   {
+    id: "refusal-subject-lands-first-in-typescript",
+    why:
+      "`RouterError.refusalSubject` (off `X-Comfy-Refusal-Subject`, falling back to the body's " +
+      "`refusal_subject`) and the `REFUSAL_SUBJECTS` list land here before the Python SDK's " +
+      "`refusal_subject` twin. This is a LEAD, not a divergence. This check compares class, " +
+      "method and error_type NAMES and does not read instance attributes, so the entry " +
+      "suppresses nothing and has no rot guard to fire: delete it by hand once the Python " +
+      "twin is on its default branch, so a reviewer does not read a lag that has closed.",
+  },
+  {
     id: "collect-switched-off-by-budget",
     why:
       "Python switches the collect loop off with a BOOLEAN (`RetryPolicy.retry_collectable=False`) " +

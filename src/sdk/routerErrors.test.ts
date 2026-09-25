@@ -22,6 +22,8 @@ import {
   ProviderTimeout,
   QueueTimeout,
   RateLimited,
+  REFUSAL_SUBJECT_HEADER,
+  REFUSAL_SUBJECTS,
   REQUEST_ERROR_TYPES,
   REQUEST_ID_HEADER,
   parseRetryAfter,
@@ -734,5 +736,115 @@ describe("Retry-After", () => {
     expect(refused).toBeInstanceOf(InvalidInput);
     expect(refused.retryAfter).toBeNull();
     expect(new RouterError("boom").retryAfter).toBeNull();
+  });
+});
+
+describe("refusalSubject", () => {
+  const policyHeaders = (extra: Record<string, string> = {}) =>
+    new Headers({ [ERROR_TYPE_HEADER]: "content_policy_violation", ...extra });
+
+  it("documents the ten subjects the Router contract lists", () => {
+    expect(REFUSAL_SUBJECTS).toEqual([
+      "input",
+      "output",
+      "input_text",
+      "input_image",
+      "input_video",
+      "input_audio",
+      "output_text",
+      "output_image",
+      "output_video",
+      "output_audio",
+    ]);
+  });
+
+  it("reads the header, which wins over the body when the two disagree", async () => {
+    const err = await raise(
+      stubErrorResponse(
+        400,
+        {
+          detail: "The provider refused the request.",
+          error_type: "content_policy_violation",
+          refusal_subject: "input_image",
+        },
+        {
+          [ERROR_TYPE_HEADER]: "content_policy_violation",
+          [REFUSAL_SUBJECT_HEADER]: "output_audio",
+        },
+      ),
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ContentPolicyViolation);
+    expect((err as ContentPolicyViolation).refusalSubject).toBe("output_audio");
+  });
+
+  it("falls back to the body's refusal_subject when the header is absent", () => {
+    const err = toRouterError(400, policyHeaders(), {
+      detail: "refused",
+      error_type: "content_policy_violation",
+      refusal_subject: "input_text",
+    });
+    expect(err).toBeInstanceOf(ContentPolicyViolation);
+    expect(err.refusalSubject).toBe("input_text");
+  });
+
+  it("falls through an empty header to the body, as the bucket does", () => {
+    const err = toRouterError(400, policyHeaders({ [REFUSAL_SUBJECT_HEADER]: "" }), {
+      refusal_subject: "output_video",
+    });
+    expect(err.refusalSubject).toBe("output_video");
+  });
+
+  it("is undefined when neither the header nor the body names one", () => {
+    const err = toRouterError(400, policyHeaders(), { detail: "refused" });
+    expect(err).toBeInstanceOf(ContentPolicyViolation);
+    expect(err.refusalSubject).toBeUndefined();
+    expect(new ContentPolicyViolation("refused").refusalSubject).toBeUndefined();
+    expect(new RouterError("x").refusalSubject).toBeUndefined();
+  });
+
+  it("ignores a body refusal_subject that is not a string", () => {
+    const err = toRouterError(400, policyHeaders(), { refusal_subject: 3 });
+    expect(err.refusalSubject).toBeUndefined();
+  });
+
+  it("passes a subject this release does not know through verbatim", () => {
+    const fromHeader = toRouterError(
+      400,
+      policyHeaders({ [REFUSAL_SUBJECT_HEADER]: "input_3d_mesh" }),
+      {},
+    );
+    expect(fromHeader.refusalSubject).toBe("input_3d_mesh");
+    const fromBody = toRouterError(400, policyHeaders(), { refusal_subject: "output_hologram" });
+    expect(fromBody.refusalSubject).toBe("output_hologram");
+  });
+
+  it("rides on the base class too, so an unknown bucket keeps it", () => {
+    const err = toRouterError(
+      400,
+      new Headers({
+        [ERROR_TYPE_HEADER]: "some_future_bucket",
+        [REFUSAL_SUBJECT_HEADER]: "output_image",
+      }),
+      {},
+    );
+    expect(err.constructor).toBe(RouterError);
+    expect(err.refusalSubject).toBe("output_image");
+  });
+
+  it("is never set by the 422 validation shape, whose body is a detail[] array", () => {
+    const err = toRouterError(422, new Headers({ [ERROR_TYPE_HEADER]: "invalid_input" }), {
+      detail: [{ loc: ["body", "prompt"], msg: "Field required", type: "missing" }],
+    });
+    expect(err).toBeInstanceOf(InvalidInput);
+    expect(err.refusalSubject).toBeUndefined();
+  });
+
+  it("is read off a queued completion's body when it carries one", () => {
+    const err = errorFromCompletion(
+      { error_type: "content_policy_violation", refusal_subject: "output_audio" },
+      "req-queued",
+    );
+    expect(err).toBeInstanceOf(ContentPolicyViolation);
+    expect(err?.refusalSubject).toBe("output_audio");
   });
 });

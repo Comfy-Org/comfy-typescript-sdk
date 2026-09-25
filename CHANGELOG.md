@@ -35,6 +35,14 @@ entry. See CONTRIBUTING.md.
   `request_not_found` buckets the vendored Router contract now declares, so a
   queued failure carrying one of them is a typed `catch` rather than a bare
   `RouterError`.
+- **`refusalSubject` on `routerErrors.RouterError`, and the
+  `REFUSAL_SUBJECTS` list.** A `ContentPolicyViolation` now says which input
+  or output was refused (`"output_audio"`, `"input_image"`, …) when Router
+  names one, read from the `X-Comfy-Refusal-Subject` header and falling back
+  to the body's `refusal_subject`, so a caller can drop the one refused part
+  and retry. `undefined` when the response names none. It is the raw string
+  and not narrowed to the ten documented values: treat an unknown value as
+  unspecified.
 
 ## [0.3.0] - 2026-09-14
 
