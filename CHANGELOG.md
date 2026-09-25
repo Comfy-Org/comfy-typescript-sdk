@@ -54,9 +54,10 @@ entry. See CONTRIBUTING.md.
   body that declares a JSON type and does not parse still raises
   `invalid_response`.
 - **A queued result larger than `DEFAULT_MAX_RESPONSE_BYTES` now raises
-  `response_too_large`** where it used to be read with no limit.
-  `get()`/`subscribe()` take no per-call `maxBytes`, so this surface has no
-  override.
+  `response_too_large`** where it used to be read with no limit. `get()` and
+  `subscribe()` take a per-call `maxBytes` with the same meaning as
+  `models.run`'s (`null` disables the cap), and the request stays collectable,
+  so a later `get()` with a larger cap still fetches it.
 
 ## [0.3.0] - 2026-09-14
 

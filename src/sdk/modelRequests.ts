@@ -68,7 +68,6 @@ import { fillRoute, parseModelId, parseRequestId } from "./modelRoutes.js";
 import {
   CONTENT_TYPE_HEADER,
   decodeUtf8,
-  DEFAULT_MAX_RESPONSE_BYTES,
   DROPPED_PARAMS_HEADER,
   FALLBACK_PROVIDER_HEADER,
   isJsonMediaType,
@@ -76,6 +75,7 @@ import {
   mediaTypeOf,
   parseDroppedParams,
   readBodyWithin,
+  resolveMaxBytes,
   type RunResult,
   UTF8_STRICT,
 } from "./models.js";
@@ -160,13 +160,18 @@ export const MIN_REQUEST_TIMEOUT_MS = 1_000;
  *
  * They are spelled as literals rather than derived from `RUN_ROUTE_TEMPLATE`
  * on purpose. `./models.ts` imports THIS module (to assemble the frozen
- * `models` namespace) and this module imports nothing from it at run time —
- * only `RunResult` as a type, which is erased. Reading `RUN_ROUTE_TEMPLATE`
- * here would turn that one-way dependency into a cycle whose safety would then
- * rest on evaluation order, and `RUN_ROUTE_TEMPLATE` cannot move out of
- * `./models.ts` because `scripts/router-route-contract.mjs` reads it out of
- * that file's source text. So the run path is spelled twice, and the test is
- * what keeps the two spellings honest.
+ * `models` namespace), and this module imports values back from it — the
+ * header names, the body reader and the media-type helpers the result read
+ * shares with `run`. That cycle is safe for one reason only: every one of
+ * those imports is read inside a function that runs after both modules have
+ * finished evaluating, never at this module's top level. A top-level read
+ * (a `const` initialised from `RUN_ROUTE_TEMPLATE`, say) would be a TDZ
+ * `ReferenceError` under one import order and fine under the other. So the
+ * run path is spelled here rather than read, and `RUN_ROUTE_TEMPLATE` cannot
+ * move out of `./models.ts` because `scripts/router-route-contract.mjs` reads
+ * it out of that file's source text; the test is what keeps the two
+ * spellings honest. Keep every import from `./models.js` out of top-level
+ * initialisers.
  */
 export const MODEL_REQUESTS_ROUTE_TEMPLATE = "/v2/models/{provider}/{model}/requests";
 /** One queued request — the route its RESULT is collected from. */
@@ -285,6 +290,15 @@ export interface WaitOptions {
   timeoutMs?: number | null;
   /** Retry policy for each individual poll and for the result fetch. */
   retry?: RetryOptions | false;
+  /**
+   * Largest result body the collecting fetch will buffer, in bytes. Omit for
+   * `DEFAULT_MAX_RESPONSE_BYTES` (64 MiB); pass `null` to disable the
+   * cap. The same knob, and the same semantics, as `RunOptions.maxBytes` on
+   * `comfy.models.run`: a result past it rejects with `response_too_large`
+   * (carrying `maxBytes` on `details`) and is not retried. The request stays
+   * collectable, so a later call with a larger cap can still fetch it.
+   */
+  maxBytes?: number | null;
 }
 
 /** Options accepted by {@link Models.subscribe}. */
@@ -315,6 +329,15 @@ export interface SubscribeOptions extends SubmitOptions {
    * caller's patience.
    */
   timeoutMs?: number | null;
+  /**
+   * Largest result body the collecting fetch will buffer, in bytes. Omit for
+   * `DEFAULT_MAX_RESPONSE_BYTES` (64 MiB); pass `null` to disable the
+   * cap. The same knob, and the same semantics, as `RunOptions.maxBytes` on
+   * `comfy.models.run`: a result past it rejects with `response_too_large`
+   * (carrying `maxBytes` on `details`) and is not retried. The request stays
+   * collectable, so a later call with a larger cap can still fetch it.
+   */
+  maxBytes?: number | null;
 }
 
 // -- wire reading ------------------------------------------------------------
@@ -541,7 +564,7 @@ interface QueueCall {
    * result call, whose 200 may be the partner's own media type. `subject`
    * names the call in a cap-breach message.
    */
-  bytes?: { maxBytes: number | null; subject: string; capAdvice?: string };
+  bytes?: { maxBytes: number | null; subject: string };
 }
 
 /**
@@ -641,7 +664,6 @@ async function send(call: QueueCall): Promise<QueueResponse> {
           call.bytes.maxBytes,
           call.bytes.subject,
           call.idempotencyKey ?? null,
-          call.bytes.capAdvice,
         );
         bodyText = response.ok ? "" : decodeUtf8(bodyBytes);
       }
@@ -872,8 +894,8 @@ export class RequestHandle<TData = unknown> {
    *
    * A model whose partner answers with its own media type resolves to the
    * `binary` arm (`data` is a `Uint8Array`, `contentType` the partner's type),
-   * same as `run`. The result body is read within
-   * {@link DEFAULT_MAX_RESPONSE_BYTES}; a larger one rejects with
+   * same as `run`. The result body is read within {@link WaitOptions.maxBytes}
+   * (`DEFAULT_MAX_RESPONSE_BYTES` by default); a larger one rejects with
    * `response_too_large`.
    *
    * Rejects with the typed exception from `routerErrors` when the completion
@@ -886,6 +908,8 @@ export class RequestHandle<TData = unknown> {
    * no more than the first time.
    */
   async get(options: WaitOptions = {}): Promise<RunResult<TData>> {
+    // Before the first poll, so a bad cap is reported without spending a wait.
+    const maxBytes = resolveMaxBytes(options.maxBytes, "RequestHandle.get");
     const timeoutMs = options.timeoutMs ?? null;
     const deadlineAt = timeoutMs === null ? null : Date.now() + timeoutMs;
     let completion: QueueUpdate | null = null;
@@ -894,6 +918,7 @@ export class RequestHandle<TData = unknown> {
       signal: options.signal,
       budgetMs: remainingMs(deadlineAt),
       retry: options.retry ?? this.#retry,
+      maxBytes,
     });
   }
 
@@ -908,7 +933,12 @@ export class RequestHandle<TData = unknown> {
    */
   async collect(
     completion: QueueUpdate | null,
-    options: { signal?: AbortSignal; budgetMs: number | null; retry: RetryOptions | false },
+    options: {
+      signal?: AbortSignal;
+      budgetMs: number | null;
+      retry: RetryOptions | false;
+      maxBytes: number | null;
+    },
   ): Promise<RunResult<TData>> {
     if (completion === null) {
       // Unreachable while `events` always yields the completion it stops on;
@@ -928,13 +958,8 @@ export class RequestHandle<TData = unknown> {
       // binary arm alongside the JSON one, and this call now handles both.
       accept: "application/json, */*;q=0.9",
       bytes: {
-        maxBytes: DEFAULT_MAX_RESPONSE_BYTES,
+        maxBytes: options.maxBytes,
         subject: `the result of model request ${this.requestId}`,
-        // Not `tooLarge`'s "raise/lower maxBytes": the queued surface takes no
-        // per-call cap, so that advice would name a fix the caller cannot make.
-        capAdvice:
-          `the queued result read is capped at DEFAULT_MAX_RESPONSE_BYTES and takes no ` +
-          `per-call maxBytes`,
       },
     });
     if (response.status === 202) {
@@ -1142,6 +1167,8 @@ export async function subscribe<TData = unknown>(
   input: Record<string, unknown>,
   options: SubscribeOptions = {},
 ): Promise<RunResult<TData>> {
+  // Before the submit: a cap this call cannot have should not cost a generation.
+  const maxBytes = resolveMaxBytes(options.maxBytes, "models.subscribe");
   const timeoutMs = options.timeoutMs ?? null;
   // The clock starts HERE, before the submit, so `timeoutMs` bounds the whole
   // call as documented and not only the polling after it.
@@ -1197,6 +1224,7 @@ export async function subscribe<TData = unknown>(
     signal: options.signal,
     budgetMs: remainingMs(deadlineAt),
     retry: options.retry ?? {},
+    maxBytes,
   });
 }
 

@@ -876,10 +876,56 @@ describe("RequestHandle on a binary result", () => {
       expect(err.code).toBe("response_too_large");
       expect(err.details?.maxBytes).toBe(DEFAULT_MAX_RESPONSE_BYTES);
       expect(err.message).toContain(REQUEST_ID);
-      // The queued surface has no per-call cap, so the advice must not name one.
-      expect(err.message).not.toContain("raise maxBytes");
-      expect(err.message).toContain("takes no per-call maxBytes");
+      // `get()` takes `maxBytes`, so the advice to raise it is one the caller can act on.
+      expect(err.message).toContain("raise maxBytes");
       expect(server.state.requests.map((r) => r.path)).toEqual([STATUS_PATH, REQUEST_PATH]);
+    });
+  });
+
+  it("honours a per-call maxBytes on get(), and a larger one collects the same request", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = binaryScript(MP3_BYTES, "audio/mpeg");
+      const handle = comfy.models.handle(MODEL, REQUEST_ID);
+
+      const err = (await handle.get({ maxBytes: 4 }).catch((e: unknown) => e)) as ComfyError;
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("response_too_large");
+      expect(err.details?.maxBytes).toBe(4);
+
+      const result = await handle.get({ maxBytes: null });
+      expect(result.kind).toBe("binary");
+      expect(Array.from(result.data as Uint8Array)).toEqual(Array.from(MP3_BYTES));
+    });
+  });
+
+  it("honours a per-call maxBytes on subscribe()", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = binaryScript(MP3_BYTES, "audio/mpeg");
+
+      const err = (await comfy.models
+        .subscribe(MODEL, { prompt: "a cat" }, { maxBytes: 4 })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("response_too_large");
+      expect(err.details?.maxBytes).toBe(4);
+    });
+  });
+
+  it("rejects an invalid maxBytes before any request is made", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = binaryScript(MP3_BYTES, "audio/mpeg");
+
+      await expect(
+        comfy.models.subscribe(MODEL, { prompt: "a cat" }, { maxBytes: Number.NaN }),
+      ).rejects.toThrow(/models\.subscribe\(options\.maxBytes\)/);
+      await expect(comfy.models.handle(MODEL, REQUEST_ID).get({ maxBytes: -1 })).rejects.toThrow(
+        /RequestHandle\.get\(options\.maxBytes\)/,
+      );
+      expect(server.state.requests).toEqual([]);
     });
   });
 });
