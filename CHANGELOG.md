@@ -48,6 +48,15 @@ entry. See CONTRIBUTING.md.
 - **A queued result route answering `200` with an empty body now raises
   `invalid_response`** instead of resolving to `{ kind: "json", data: {} }`.
   An empty `200` is a truncated or malformed response, not a result.
+- **A queued result `200` with no `Content-Type` whose body is not JSON
+  (including invalid UTF-8) now resolves as `kind: "binary"` with
+  `contentType: ""`** instead of raising `invalid_response`, as `run` does. A
+  body that declares a JSON type and does not parse still raises
+  `invalid_response`.
+- **A queued result larger than `DEFAULT_MAX_RESPONSE_BYTES` now raises
+  `response_too_large`** where it used to be read with no limit.
+  `get()`/`subscribe()` take no per-call `maxBytes`, so this surface has no
+  override.
 
 ## [0.3.0] - 2026-09-14
 
