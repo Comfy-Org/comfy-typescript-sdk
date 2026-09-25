@@ -846,12 +846,14 @@ function tooLarge(
   maxBytes: number,
   breach: CapBreach,
   cause?: unknown,
+  capAdvice?: string,
 ): ComfyError {
   const cap = `${String(maxBytes)}-byte maxBytes cap`;
   const advice =
-    "allocationFailedAt" in breach
+    capAdvice ??
+    ("allocationFailedAt" in breach
       ? "lower maxBytes, or ask this model for a smaller result"
-      : "raise maxBytes for this call, or pass maxBytes: null to disable the cap";
+      : "raise maxBytes for this call, or pass maxBytes: null to disable the cap");
   let what: string;
   if ("contentLength" in breach) {
     what = `declares a Content-Length of ${String(breach.contentLength)} bytes, past the ${cap}`;
@@ -928,13 +930,16 @@ export function isTooLarge(exc: unknown): boolean {
  *
  * `subject` names the call in a cap-breach message (`models.run("a/b")`), and
  * `idempotencyKey` is stamped on that error — `null` for a route that sends
- * none, such as the queued result read in modelRequests.ts.
+ * none, such as the queued result read in modelRequests.ts. `capAdvice`
+ * replaces the "raise/lower maxBytes" hints for a caller whose surface has no
+ * `maxBytes` to change, so the message never recommends an impossible fix.
  */
 export async function readBodyWithin(
   response: Response,
   maxBytes: number | null,
   subject: string,
   idempotencyKey: string | null,
+  capAdvice?: string,
 ): Promise<Uint8Array> {
   if (maxBytes === null) return new Uint8Array(await response.arrayBuffer());
 
@@ -945,7 +950,15 @@ export async function readBodyWithin(
     // streaming into the buffer — not downloading it is the whole point of
     // checking the header first.
     await response.body?.cancel().catch(() => undefined);
-    throw tooLarge(subject, response, idempotencyKey, maxBytes, { contentLength: declared });
+    throw tooLarge(
+      subject,
+      response,
+      idempotencyKey,
+      maxBytes,
+      { contentLength: declared },
+      undefined,
+      capAdvice,
+    );
   }
 
   const body = response.body;
@@ -972,6 +985,7 @@ export async function readBodyWithin(
         maxBytes,
         { bytesRead, allocationFailedAt: byteLength },
         exc,
+        capAdvice,
       );
     }
   };
@@ -1005,7 +1019,15 @@ export async function readBodyWithin(
       const received = total + value.byteLength;
       if (received > maxBytes) {
         if (!truncate) {
-          throw tooLarge(subject, response, idempotencyKey, maxBytes, { bytesRead: received });
+          throw tooLarge(
+            subject,
+            response,
+            idempotencyKey,
+            maxBytes,
+            { bytesRead: received },
+            undefined,
+            capAdvice,
+          );
         }
         const room = maxBytes - total;
         if (room > 0) {

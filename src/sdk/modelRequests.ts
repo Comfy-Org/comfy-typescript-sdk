@@ -346,8 +346,13 @@ function text(value: unknown): string | null {
   return trimmed === "" ? null : trimmed;
 }
 
-function invalidResponse(message: string, requestId: string | null, httpStatus?: number) {
-  return new ComfyError(message, { code: "invalid_response", httpStatus, requestId });
+function invalidResponse(
+  message: string,
+  requestId: string | null,
+  httpStatus?: number,
+  cause?: unknown,
+) {
+  return new ComfyError(message, { code: "invalid_response", httpStatus, requestId, cause });
 }
 
 /**
@@ -536,7 +541,7 @@ interface QueueCall {
    * result call, whose 200 may be the partner's own media type. `subject`
    * names the call in a cap-breach message.
    */
-  bytes?: { maxBytes: number | null; subject: string };
+  bytes?: { maxBytes: number | null; subject: string; capAdvice?: string };
 }
 
 /**
@@ -621,6 +626,7 @@ async function send(call: QueueCall): Promise<QueueResponse> {
           call.bytes.maxBytes,
           call.bytes.subject,
           call.idempotencyKey ?? null,
+          call.bytes.capAdvice,
         );
         bodyText = response.ok ? "" : decodeUtf8(bodyBytes);
       }
@@ -911,6 +917,11 @@ export class RequestHandle<TData = unknown> {
       bytes: {
         maxBytes: DEFAULT_MAX_RESPONSE_BYTES,
         subject: `the result of model request ${this.requestId}`,
+        // Not `tooLarge`'s "raise/lower maxBytes": the queued surface takes no
+        // per-call cap, so that advice would name a fix the caller cannot make.
+        capAdvice:
+          `the queued result read is capped at DEFAULT_MAX_RESPONSE_BYTES and takes no ` +
+          `per-call maxBytes`,
       },
     });
     if (response.status === 202) {
@@ -931,6 +942,15 @@ export class RequestHandle<TData = unknown> {
       // A non-2xx raises the typed router error from its (UTF-8-decoded)
       // envelope; any other 2xx is not the result the contract promises.
       decode(response, [200]);
+      // `decode` always throws for a non-200 today; this makes that an
+      // enforced invariant rather than an incidental one, so a change there
+      // cannot fall through into code that reports `httpStatus: 200`.
+      throw invalidResponse(
+        `the result route for request ${this.requestId} answered ${String(response.status)} ` +
+          "where 200 was expected",
+        requestId,
+        response.status,
+      );
     }
     const bytes = response.body ?? new Uint8Array(0);
     if (bytes.byteLength === 0) {
@@ -965,7 +985,7 @@ export class RequestHandle<TData = unknown> {
       // Strict when nothing declared a type, as in `finish`: a lossy decode
       // could turn bytes into a JSON string of U+FFFDs.
       body = JSON.parse(mediaType === "" ? UTF8_STRICT.decode(bytes) : decodeUtf8(bytes));
-    } catch {
+    } catch (exc) {
       // No `Content-Type` and not JSON: nothing claimed a document, so it is
       // the bytes arm with no media type to report. A declared JSON body that
       // does not parse is the server contradicting its own header.
@@ -979,7 +999,12 @@ export class RequestHandle<TData = unknown> {
           droppedParams,
         };
       }
-      throw invalidResponse("the queue answered 200 with a body that is not JSON", requestId, 200);
+      throw invalidResponse(
+        "the queue answered 200 with a body that is not JSON",
+        requestId,
+        200,
+        exc,
+      );
     }
     // Checked again on the result body: which of the two responses carries the
     // `error_type` is the server's choice, and reading only one of them is how

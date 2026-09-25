@@ -576,6 +576,7 @@ describe("RequestHandle.get", () => {
         .catch((e: unknown) => e)) as ComfyError;
       expect(err).toBeInstanceOf(ComfyError);
       expect(err.code).toBe("invalid_response");
+      expect(err.cause).toBeInstanceOf(SyntaxError);
     });
   });
 
@@ -851,6 +852,9 @@ describe("RequestHandle on a binary result", () => {
       expect(err.code).toBe("response_too_large");
       expect(err.details?.maxBytes).toBe(DEFAULT_MAX_RESPONSE_BYTES);
       expect(err.message).toContain(REQUEST_ID);
+      // The queued surface has no per-call cap, so the advice must not name one.
+      expect(err.message).not.toContain("raise maxBytes");
+      expect(err.message).toContain("takes no per-call maxBytes");
       expect(server.state.requests.map((r) => r.path)).toEqual([STATUS_PATH, REQUEST_PATH]);
     });
   });
