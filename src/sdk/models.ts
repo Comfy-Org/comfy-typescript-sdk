@@ -189,6 +189,15 @@ const RESPONSE_TOO_LARGE = "response_too_large";
 const INITIAL_BODY_CAPACITY = 65_536;
 
 /**
+ * Most a declared `Content-Length` may pre-size the capped read's buffer to.
+ * An in-cap header is still only a claim: a peer that declares 64 MiB and then
+ * stalls after a few bytes would otherwise have the full allocation committed
+ * before the first `read()`. Past this the buffer grows by doubling as bytes
+ * actually arrive, which costs a few copies on an honest large body.
+ */
+const MAX_PRESIZED_CAPACITY = 16 * INITIAL_BODY_CAPACITY;
+
+/**
  * Stand-in for the body of a response this call never read, so the one
  * variable `finish` reads is always assigned. Never reaches `finish`: the
  * loop repeats instead.
@@ -775,7 +784,9 @@ function errorFromResponse(
 }
 
 /**
- * Resolve `options.maxBytes` to a cap, or to `null` for "no cap".
+ * Resolve `options.maxBytes` to a cap, or to `null` for "no cap". `caller`
+ * names the surface in the rejection — `run` here, the queued result read in
+ * `./modelRequests.ts`.
  *
  * Validated at the call site rather than in the read, for the reason the
  * credentials check is: a process that asked for a cap it cannot have should
@@ -783,12 +794,15 @@ function errorFromResponse(
  * explicit check — every comparison against it is false, so it would read as
  * "no cap" and silently undo the ceiling the caller thought they set.
  */
-function resolveMaxBytes(maxBytes: number | null | undefined): number | null {
+export function resolveMaxBytes(
+  maxBytes: number | null | undefined,
+  caller = "models.run",
+): number | null {
   if (maxBytes === undefined) return DEFAULT_MAX_RESPONSE_BYTES;
   if (maxBytes === null) return null;
   if (typeof maxBytes !== "number" || !Number.isFinite(maxBytes) || maxBytes < 0) {
     throw new TypeError(
-      "models.run(options.maxBytes): expected a non-negative number of bytes, " +
+      `${caller}(options.maxBytes): expected a non-negative number of bytes, ` +
         // A number renders raw and everything else keeps its quoting:
         // `JSON.stringify` writes `NaN` as `null`, which is the one value the
         // same sentence calls valid, so the rejection would name what it
@@ -840,9 +854,9 @@ type CapBreach =
  * apart.
  */
 function tooLarge(
-  model: string,
+  subject: string,
   response: Response,
-  idempotencyKey: string,
+  idempotencyKey: string | null,
   maxBytes: number,
   breach: CapBreach,
   cause?: unknown,
@@ -870,7 +884,7 @@ function tooLarge(
     // again.
     what = `exceeds the ${cap} (abandoned after ${String(breach.bytesRead)} bytes)`;
   }
-  return new ComfyError(`models.run("${model}") response body ${what}; ${advice}`, {
+  return new ComfyError(`${subject} response body ${what}; ${advice}`, {
     code: RESPONSE_TOO_LARGE,
     httpStatus: response.status,
     details: { maxBytes, ...breach },
@@ -892,7 +906,7 @@ function tooLarge(
  * The code alone is not the test, for the reason {@link tooLarge} gives: the
  * server controls `code`. `details.maxBytes` is set nowhere else.
  */
-function isTooLarge(exc: unknown): boolean {
+export function isTooLarge(exc: unknown): boolean {
   return (
     exc instanceof ComfyError &&
     exc.code === RESPONSE_TOO_LARGE &&
@@ -925,12 +939,16 @@ function isTooLarge(exc: unknown): boolean {
  *
  * With no cap the runtime's own buffering does the work, which is what this
  * route did before the cap existed.
+ *
+ * `subject` names the call in a cap-breach message (`models.run("a/b")`), and
+ * `idempotencyKey` is stamped on that error — `null` for a route that sends
+ * none, such as the queued result read in modelRequests.ts.
  */
-async function readBodyWithin(
+export async function readBodyWithin(
   response: Response,
   maxBytes: number | null,
-  model: string,
-  idempotencyKey: string,
+  subject: string,
+  idempotencyKey: string | null,
 ): Promise<Uint8Array> {
   if (maxBytes === null) return new Uint8Array(await response.arrayBuffer());
 
@@ -941,7 +959,7 @@ async function readBodyWithin(
     // streaming into the buffer — not downloading it is the whole point of
     // checking the header first.
     await response.body?.cancel().catch(() => undefined);
-    throw tooLarge(model, response, idempotencyKey, maxBytes, { contentLength: declared });
+    throw tooLarge(subject, response, idempotencyKey, maxBytes, { contentLength: declared });
   }
 
   const body = response.body;
@@ -962,7 +980,7 @@ async function readBodyWithin(
       return new Uint8Array(byteLength);
     } catch (exc) {
       throw tooLarge(
-        model,
+        subject,
         response,
         idempotencyKey,
         maxBytes,
@@ -980,7 +998,26 @@ async function readBodyWithin(
   // which is the threat this cap is for — and concatenating at the end holds
   // every chunk AND the finished copy at once. Here each chunk is copied in
   // and dropped as it arrives, and the buffer is never larger than the cap.
-  let buffer = allocate(Math.min(declared ?? INITIAL_BODY_CAPACITY, maxBytes), 0);
+  //
+  // Pre-sized from `Content-Length` only when that header was vetted above: an
+  // error response's is not, and a bogus huge one on a near-empty error page
+  // would otherwise buy a `maxBytes` allocation for almost nothing. Even a
+  // vetted one pre-sizes no further than MAX_PRESIZED_CAPACITY, since being
+  // under the cap does not make it true. The allocation also cancels the
+  // reader on failure, since it sits outside the `try` below and a locked,
+  // unread stream would leak its socket.
+  const initial = Math.min(
+    truncate ? INITIAL_BODY_CAPACITY : (declared ?? INITIAL_BODY_CAPACITY),
+    MAX_PRESIZED_CAPACITY,
+    maxBytes,
+  );
+  let buffer: Uint8Array;
+  try {
+    buffer = allocate(initial, 0);
+  } catch (exc) {
+    await reader.cancel().catch(() => undefined);
+    throw exc;
+  }
   let total = 0;
   /** Grow to hold `needed` bytes, keeping the `total` already written. */
   const reserve = (needed: number): void => {
@@ -1001,7 +1038,7 @@ async function readBodyWithin(
       const received = total + value.byteLength;
       if (received > maxBytes) {
         if (!truncate) {
-          throw tooLarge(model, response, idempotencyKey, maxBytes, { bytesRead: received });
+          throw tooLarge(subject, response, idempotencyKey, maxBytes, { bytesRead: received });
         }
         const room = maxBytes - total;
         if (room > 0) {
@@ -1201,7 +1238,12 @@ async function run<TData = unknown>(
         // the `Content-Type`. Decoding is deferred to the one branch that wants
         // a string ({@link decodeUtf8}), which is what `text()` would have done
         // anyway.
-        responseBody = await readBodyWithin(response, maxBytes, model, idempotencyKey);
+        responseBody = await readBodyWithin(
+          response,
+          maxBytes,
+          `models.run("${model}")`,
+          idempotencyKey,
+        );
       } else {
         // Never read: the whole content of a response this call is going to
         // ask again about is "ask again", which the status line already said.
@@ -1253,9 +1295,9 @@ const UTF8 = new TextDecoder();
  * JSON (`22 FF 22` becomes the document `"\uFFFD"`), which would hand a
  * caller a corrupted string where the bytes of their generation should be.
  */
-const UTF8_STRICT = new TextDecoder("utf-8", { fatal: true });
+export const UTF8_STRICT = new TextDecoder("utf-8", { fatal: true });
 
-function decodeUtf8(bytes: Uint8Array): string {
+export function decodeUtf8(bytes: Uint8Array): string {
   return UTF8.decode(bytes);
 }
 
@@ -1270,7 +1312,7 @@ function decodeUtf8(bytes: Uint8Array): string {
  * — which matches neither the exact type nor the `+json` suffix, and would
  * send an ordinary JSON result down the binary branch.
  */
-function mediaTypeOf(contentType: string): string {
+export function mediaTypeOf(contentType: string): string {
   return contentType.split(";")[0].split(",")[0].trim().toLowerCase();
 }
 
@@ -1289,7 +1331,7 @@ function mediaTypeOf(contentType: string): string {
  * value with no `type/subtype` at all (`garbage+json`) is not read as a
  * document on the strength of its last five characters.
  */
-function isJsonMediaType(mediaType: string): boolean {
+export function isJsonMediaType(mediaType: string): boolean {
   const slash = mediaType.indexOf("/");
   if (slash === -1) return false;
   const subtype = mediaType.slice(slash + 1);

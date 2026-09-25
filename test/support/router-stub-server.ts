@@ -39,14 +39,20 @@ export interface RecordedRequest {
   path: string;
   body: string;
   idempotencyKey: string | null;
+  /** The request's `Accept` header, or `null` when it sent none. */
+  accept: string | null;
 }
 
 /** A scripted answer from {@link RouterServerState.respond}. */
 export interface ScriptedResponse {
   status: number;
-  /** A string is sent verbatim (for non-JSON fixtures); anything else is
-   * JSON-encoded. Omitted sends an empty body. */
+  /** A `Uint8Array` is sent byte for byte (a binary fixture), a string
+   * verbatim (for non-JSON fixtures); anything else is JSON-encoded. Omitted
+   * sends an empty body. */
   body?: unknown;
+  /** `Content-Type`; omitted keeps {@link RouterServerState.contentType},
+   * `null` omits the header. */
+  contentType?: string | null;
   /** `X-Comfy-Request-Id`; omitted keeps {@link RouterServerState.requestId}. */
   requestId?: string | null;
   /** `X-Comfy-Error-Type`; omitted keeps {@link RouterServerState.errorType}. */
@@ -356,6 +362,7 @@ export class RouterStubServer {
       path: state.lastPath ?? "",
       body: raw,
       idempotencyKey: state.lastIdempotencyKey,
+      accept: state.lastAccept,
     };
     state.requests.push(recorded);
 
@@ -482,13 +489,21 @@ export class RouterStubServer {
         if (scripted.errorType === null) delete scriptedHeaders["X-Comfy-Error-Type"];
         else scriptedHeaders["X-Comfy-Error-Type"] = scripted.errorType;
       }
+      if (scripted.contentType !== undefined) {
+        if (scripted.contentType === null) delete scriptedHeaders["Content-Type"];
+        else scriptedHeaders["Content-Type"] = scripted.contentType;
+      }
       if (scripted.body === undefined) {
         res.writeHead(scripted.status, scriptedHeaders);
         res.end();
         return;
       }
       const scriptedBody =
-        typeof scripted.body === "string" ? scripted.body : JSON.stringify(scripted.body);
+        scripted.body instanceof Uint8Array
+          ? Buffer.from(scripted.body.buffer, scripted.body.byteOffset, scripted.body.byteLength)
+          : typeof scripted.body === "string"
+            ? scripted.body
+            : JSON.stringify(scripted.body);
       scriptedHeaders["Content-Length"] = String(Buffer.byteLength(scriptedBody));
       res.writeHead(scripted.status, scriptedHeaders);
       res.end(scriptedBody);
