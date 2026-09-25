@@ -337,6 +337,39 @@ export async function readRouterOperations(specPath = ROUTER_SPEC_PATH) {
 }
 
 /**
+ * The header names one operation's `200` declares, lowercased and sorted.
+ *
+ * {@link runSuccessHeaderNames} for any operation, located by `operationId`
+ * rather than by the run route's path item. The queued result read
+ * (`getRouterModelRequestResult`) uses it: `RequestHandle.collect` lifts the
+ * same `X-Comfy-Credits-Used` header off that `200`, and the contract test
+ * watches whether the contract declares it there. An operation that is not
+ * declared at all is refused rather than read as "no headers", for the same
+ * reason every extractor here refuses an empty read.
+ */
+export function successHeaderNames(doc, operationId) {
+  const matches = routerOperations(doc).filter(
+    (operation) => operation.operationId === operationId,
+  );
+  if (matches.length !== 1) {
+    fail(`spec/router-openapi.yaml declares no operation ${JSON.stringify(operationId)}`);
+  }
+  const { path, method } = matches[0];
+  const operation = deref(doc, doc.paths[path])[method];
+  const responses = deref(doc, operation.responses ?? {});
+  const ok = deref(doc, responses["200"] ?? {});
+  if (ok === null || typeof ok !== "object") return [];
+  return Object.keys(deref(doc, ok.headers ?? {}))
+    .map((name) => name.toLowerCase())
+    .sort();
+}
+
+/** {@link successHeaderNames} for the vendored contract on disk. */
+export async function readSuccessHeaderNames(operationId, specPath = ROUTER_SPEC_PATH) {
+  return successHeaderNames(parse(await readFile(specPath, "utf-8")), operationId);
+}
+
+/**
  * Read one `export const <NAME> = "<path template>";` out of
  * `src/sdk/models.ts` — the same acquisition `readRunRouteTemplate` does, for
  * the two discovery routes that now have constants of their own.

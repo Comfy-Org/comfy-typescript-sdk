@@ -826,7 +826,7 @@ export class RequestHandle<TData = unknown> {
    * one fetch, so collecting a result twice — or from a second process — costs
    * no more than the first time.
    */
-  async get(options: WaitOptions = {}): Promise<BuiltRunResult<TData>> {
+  async get(options: WaitOptions = {}): Promise<RunResult<TData>> {
     const timeoutMs = options.timeoutMs ?? null;
     const deadlineAt = timeoutMs === null ? null : Date.now() + timeoutMs;
     let completion: QueueUpdate | null = null;
@@ -850,7 +850,7 @@ export class RequestHandle<TData = unknown> {
   async collect(
     completion: QueueUpdate | null,
     options: { signal?: AbortSignal; budgetMs: number | null; retry: RetryOptions | false },
-  ): Promise<BuiltRunResult<TData>> {
+  ): Promise<RunResult<TData>> {
     if (completion === null) {
       // Unreachable while `events` always yields the completion it stops on;
       // checked anyway, because the alternative is a null dereference in the
@@ -901,11 +901,15 @@ export class RequestHandle<TData = unknown> {
     // disclose — but reading them keeps the two result shapes identical and
     // means this path needs no edit on the day that route does gain them.
     //
-    // `X-Comfy-Credits-Used` is NOT in that category: a queued run costs
-    // exactly what a synchronous one does, so Router has every reason to
-    // stamp it here. Absent stays `null`, which reads as "not reported"
-    // rather than as free either way.
-    return {
+    // `X-Comfy-Credits-Used` is read on the same reasoning, and the contract
+    // does not declare it on this route yet either: `getRouterModelRequestResult`'s
+    // `200` names no credits header, so a queued result reads `null` ("not
+    // reported", never "free") until Router stamps it here. The rot guard in
+    // router-spec-contract.test.ts fires the day the contract declares it.
+    //
+    // Typed as the internal `BuiltRunResult` so omitting a field here fails
+    // `tsc`; returned as the public `RunResult`, the same type `run` returns.
+    const result: BuiltRunResult<TData> = {
       kind: "json",
       data: body as TData,
       requestId: response.headers.get(REQUEST_ID_HEADER),
@@ -913,6 +917,7 @@ export class RequestHandle<TData = unknown> {
       droppedParams: parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER)),
       creditsUsed: parseCreditsUsed(response.headers.get(CREDITS_USED_HEADER)),
     };
+    return result;
   }
 
   /**

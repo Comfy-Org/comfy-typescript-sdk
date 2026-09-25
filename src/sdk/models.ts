@@ -330,7 +330,8 @@ export interface RunJsonResult<TData = unknown> {
   droppedParams: readonly string[] | null;
   /**
    * `X-Comfy-Credits-Used`: what Router priced this call at, verbatim — a
-   * decimal string carrying up to two decimal places (`"0.42"`).
+   * decimal string (`"12.5"`). The contract does not fix its scale, so do not
+   * round or store it at a fixed number of places.
    *
    * Three things it is not, and each of them changes what you may do with it:
    *

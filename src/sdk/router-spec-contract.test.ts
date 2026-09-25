@@ -39,6 +39,7 @@ import { describe, expect, it } from "vitest";
 import {
   readRouterOperations,
   readRouterRouteContract,
+  readSuccessHeaderNames,
   routerOperations,
   templatePlaceholders,
 } from "../../scripts/router-route-contract.mjs";
@@ -107,6 +108,30 @@ describe("router route contract (spec/router-openapi.yaml)", () => {
         "creditsUsed: null on every call and this pin is how you found out — do not delete it " +
         "to go green.",
     ).toEqual([CREDITS_USED_HEADER.toLowerCase()]);
+  });
+
+  /**
+   * The queued twin of the pin above — and a ROT GUARD, because today there
+   * is nothing to pin it to.
+   *
+   * `RequestHandle.collect` lifts `creditsUsed` off `getRouterModelRequestResult`'s
+   * `200` with the same `CREDITS_USED_HEADER`, but that response declares no
+   * credits header, so a queued result's `creditsUsed` is coupled to nothing
+   * the contract states and will read `null` until Router both stamps and
+   * declares it. This asserts that absence, so the sync that declares it
+   * reddens here: when it fires, replace this with the pin above's shape
+   * (exactly `[CREDITS_USED_HEADER.toLowerCase()]`) rather than deleting it.
+   */
+  it("still declares no credits header on the queued result read (rot guard)", async () => {
+    const declared = await readSuccessHeaderNames("getRouterModelRequestResult");
+    // Sanity: the read works at all, so an empty read cannot pass as "absent".
+    expect(declared).toContain("x-comfy-request-id");
+    expect(
+      declared.filter((name) => name.includes("credits")),
+      "getRouterModelRequestResult's 200 now declares a credits header. Replace this rot " +
+        "guard with a pin that its name equals CREDITS_USED_HEADER in src/sdk/models.ts, " +
+        "which RequestHandle.collect in src/sdk/modelRequests.ts already reads.",
+    ).toEqual([]);
   });
 
   it("spells COMFY_ROUTER_BASE_URL the host the contract declares", async () => {

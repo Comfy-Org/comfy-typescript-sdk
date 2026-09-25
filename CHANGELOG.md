@@ -32,8 +32,9 @@ entry. See CONTRIBUTING.md.
   surface does not accept them.
 - **`creditsUsed` on a run result — what Router priced the call at.** Both
   arms of `RunResult` (`RunJsonResult` and `RunBinaryResult`) now carry the
-  `X-Comfy-Credits-Used` response header, and so does the queued
-  `RequestHandle.get()` result. Typed `string | null`, verbatim off the wire:
+  `X-Comfy-Credits-Used` response header. The queued `RequestHandle.get()`
+  result reads it too, but the contract does not declare it on the queued
+  result route yet, so there it is `null` until Router stamps it. Typed `string | null`, verbatim off the wire:
   the value is decimal and a caller reconciling money should parse it
   deliberately rather than receive a float this SDK chose the rounding of.
   Three caveats it is worth reading the TSDoc for — it is a price rather than
