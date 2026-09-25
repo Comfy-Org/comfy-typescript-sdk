@@ -1728,11 +1728,17 @@ jobs:
               && [ "$(git rev-parse refs/bump-head 2>/dev/null)" = "$bump_head" ]
             then
               have_head=yes
-              git ls-tree --name-only "refs/bump-head" .github/workflows/ \
+              # NUL-separated (`-z`), because without it `ls-tree` C-quotes any
+              # path carrying a non-ASCII byte, `"` or `\` -- the name then
+              # arrives wrapped in quotes, fails the `.y*ml` filter below and
+              # is silently left out of the scratch root, so the lint would
+              # pass over a smaller file set than the merged tree's
+              # `readdirSync` sees.
+              git ls-tree -z --name-only "refs/bump-head" .github/workflows/ \
                 >"$scratch/wf.list" 2>/dev/null || : >"$scratch/wf.list"
               # Read from a FILE, not a pipe: a `... | while` loop runs in a
               # subshell and `have_head=no` set inside it would not survive.
-              while IFS= read -r wf; do
+              while IFS= read -r -d '' wf; do
                 case "$wf" in
                   *.yml|*.yaml) ;;
                   *) continue ;;
@@ -1880,18 +1886,28 @@ jobs:
               elif [ "$carries" = no ]; then
                 bump_delivers=no
                 bump_no_reason=ancestry
-              elif [ "$lint_verdict" = fault ]; then
+              elif [ "$lint_verdict" = fault ] && [ "$carries" = yes ]; then
                 # Its OWN cause string: on this path the pin was read and
                 # checked and only the auxiliary lint failed to run, so the
                 # generic "could not verify which commit its caller pin
                 # carries" text would send the reader to audit a PR whose pin
                 # this job in fact read fine.
+                #
+                # Gated on `carries = yes` because that is the only state in
+                # which "its pin reads fine" is TRUE. The commonest lint fault
+                # (a broken node, a missing script copy) takes `--print-pin`
+                # down the same way, leaving `carries=unknown` -- a double
+                # fault that falls through to the generic `unknown` text below,
+                # which is what it actually is.
                 bump_delivers=unknown
                 bump_no_reason=lint-fault
+                # The `yes` note above bills "a fixup commit", which presumes a
+                # defect this path never established. State the bare fact.
+                carries_note="Its pin does carry the oldest owed commit ($oldest_sha)."
                 # TRUNCATED: a node fault prints a whole stack trace, and this
                 # string is bound for an `::error::` annotation and a public
                 # issue body. The full text stays in the step log.
-                lint_first="node exited $lint_rc: $(tr '\n' ' ' <"$gwtmp/bump-lint.err" | cut -c1-300)"
+                lint_first="node exited $lint_rc: $(tr '\r\n' '  ' <"$gwtmp/bump-lint.err" | cut -c1-300)"
               else
                 bump_delivers=$carries
               fi
@@ -1910,7 +1926,7 @@ jobs:
               if [ "$lint_verdict" = fail ]; then
                 echo "  lint: $lint_first"
               elif [ "$lint_verdict" = fault ]; then
-                echo "  lint could not be RUN -- node exited $lint_rc: $(tr '\n' ' ' <"$gwtmp/bump-lint.err" | cut -c1-500)"
+                echo "  lint could not be RUN -- node exited $lint_rc: $(tr '\r\n' '  ' <"$gwtmp/bump-lint.err" | cut -c1-500)"
               fi
             else
               # The fetch or the materialisation failed, so nothing was read at
@@ -1936,6 +1952,7 @@ jobs:
             # survive into the issue body and the annotation below.
             lint_first="$(printf '%s' "$lint_first" | tr '\n\r' '  ')"
             carries_note="$(printf '%s' "$carries_note" | tr '\n\r' '  ')"
+            field_eof="BUMP_FIELD_EOF_$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 
             {
               echo "bump_pr=$bump_pr"
@@ -1945,12 +1962,15 @@ jobs:
               # The DELIMITER form, not `name=value`, for the two free-text
               # fields: it is the form that stays correct if the flattening
               # above ever stops being enough, and it costs two extra lines.
-              echo "bump_lint_first<<__BUMP_FIELD_EOF__"
+              # The delimiter is RUN-UNIQUE, as GitHub's docs recommend: a
+              # fixed literal is closed early by a value carrying a line equal
+              # to it, and the remainder then parses as `key=value` records.
+              echo "bump_lint_first<<$field_eof"
               printf '%s\n' "$lint_first"
-              echo "__BUMP_FIELD_EOF__"
-              echo "bump_carries_note<<__BUMP_FIELD_EOF__"
+              echo "$field_eof"
+              echo "bump_carries_note<<$field_eof"
               printf '%s\n' "$carries_note"
-              echo "__BUMP_FIELD_EOF__"
+              echo "$field_eof"
             } >>"$GITHUB_OUTPUT"
           fi
 
