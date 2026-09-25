@@ -840,9 +840,9 @@ type CapBreach =
  * apart.
  */
 function tooLarge(
-  model: string,
+  subject: string,
   response: Response,
-  idempotencyKey: string,
+  idempotencyKey: string | null,
   maxBytes: number,
   breach: CapBreach,
   cause?: unknown,
@@ -870,7 +870,7 @@ function tooLarge(
     // again.
     what = `exceeds the ${cap} (abandoned after ${String(breach.bytesRead)} bytes)`;
   }
-  return new ComfyError(`models.run("${model}") response body ${what}; ${advice}`, {
+  return new ComfyError(`${subject} response body ${what}; ${advice}`, {
     code: RESPONSE_TOO_LARGE,
     httpStatus: response.status,
     details: { maxBytes, ...breach },
@@ -892,7 +892,7 @@ function tooLarge(
  * The code alone is not the test, for the reason {@link tooLarge} gives: the
  * server controls `code`. `details.maxBytes` is set nowhere else.
  */
-function isTooLarge(exc: unknown): boolean {
+export function isTooLarge(exc: unknown): boolean {
   return (
     exc instanceof ComfyError &&
     exc.code === RESPONSE_TOO_LARGE &&
@@ -925,12 +925,16 @@ function isTooLarge(exc: unknown): boolean {
  *
  * With no cap the runtime's own buffering does the work, which is what this
  * route did before the cap existed.
+ *
+ * `subject` names the call in a cap-breach message (`models.run("a/b")`), and
+ * `idempotencyKey` is stamped on that error — `null` for a route that sends
+ * none, such as the queued result read in modelRequests.ts.
  */
-async function readBodyWithin(
+export async function readBodyWithin(
   response: Response,
   maxBytes: number | null,
-  model: string,
-  idempotencyKey: string,
+  subject: string,
+  idempotencyKey: string | null,
 ): Promise<Uint8Array> {
   if (maxBytes === null) return new Uint8Array(await response.arrayBuffer());
 
@@ -941,7 +945,7 @@ async function readBodyWithin(
     // streaming into the buffer — not downloading it is the whole point of
     // checking the header first.
     await response.body?.cancel().catch(() => undefined);
-    throw tooLarge(model, response, idempotencyKey, maxBytes, { contentLength: declared });
+    throw tooLarge(subject, response, idempotencyKey, maxBytes, { contentLength: declared });
   }
 
   const body = response.body;
@@ -962,7 +966,7 @@ async function readBodyWithin(
       return new Uint8Array(byteLength);
     } catch (exc) {
       throw tooLarge(
-        model,
+        subject,
         response,
         idempotencyKey,
         maxBytes,
@@ -1001,7 +1005,7 @@ async function readBodyWithin(
       const received = total + value.byteLength;
       if (received > maxBytes) {
         if (!truncate) {
-          throw tooLarge(model, response, idempotencyKey, maxBytes, { bytesRead: received });
+          throw tooLarge(subject, response, idempotencyKey, maxBytes, { bytesRead: received });
         }
         const room = maxBytes - total;
         if (room > 0) {
@@ -1201,7 +1205,12 @@ async function run<TData = unknown>(
         // the `Content-Type`. Decoding is deferred to the one branch that wants
         // a string ({@link decodeUtf8}), which is what `text()` would have done
         // anyway.
-        responseBody = await readBodyWithin(response, maxBytes, model, idempotencyKey);
+        responseBody = await readBodyWithin(
+          response,
+          maxBytes,
+          `models.run("${model}")`,
+          idempotencyKey,
+        );
       } else {
         // Never read: the whole content of a response this call is going to
         // ask again about is "ask again", which the status line already said.
@@ -1253,9 +1262,9 @@ const UTF8 = new TextDecoder();
  * JSON (`22 FF 22` becomes the document `"\uFFFD"`), which would hand a
  * caller a corrupted string where the bytes of their generation should be.
  */
-const UTF8_STRICT = new TextDecoder("utf-8", { fatal: true });
+export const UTF8_STRICT = new TextDecoder("utf-8", { fatal: true });
 
-function decodeUtf8(bytes: Uint8Array): string {
+export function decodeUtf8(bytes: Uint8Array): string {
   return UTF8.decode(bytes);
 }
 
@@ -1270,7 +1279,7 @@ function decodeUtf8(bytes: Uint8Array): string {
  * — which matches neither the exact type nor the `+json` suffix, and would
  * send an ordinary JSON result down the binary branch.
  */
-function mediaTypeOf(contentType: string): string {
+export function mediaTypeOf(contentType: string): string {
   return contentType.split(";")[0].split(",")[0].trim().toLowerCase();
 }
 
@@ -1289,7 +1298,7 @@ function mediaTypeOf(contentType: string): string {
  * value with no `type/subtype` at all (`garbage+json`) is not read as a
  * document on the strength of its last five characters.
  */
-function isJsonMediaType(mediaType: string): boolean {
+export function isJsonMediaType(mediaType: string): boolean {
   const slash = mediaType.indexOf("/");
   if (slash === -1) return false;
   const subtype = mediaType.slice(slash + 1);

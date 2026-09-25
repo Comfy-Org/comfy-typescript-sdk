@@ -36,6 +36,16 @@ entry. See CONTRIBUTING.md.
   queued failure carrying one of them is a typed `catch` rather than a bare
   `RouterError`.
 
+### Changed
+
+- **`RequestHandle.get()` / `models.subscribe()` now return the `binary` arm
+  of `RunResult` when the queued result route answers a non-JSON
+  `Content-Type`**, matching `models.run` and the Router spec's `*/*` arm. The
+  result request now sends `Accept: application/json, */*;q=0.9` and is read
+  within the same `DEFAULT_MAX_RESPONSE_BYTES` cap `run` applies. Not reachable
+  on today's Router, which refuses binary models at submit; forward-compatible
+  only.
+
 ## [0.3.0] - 2026-09-14
 
 ### Added
