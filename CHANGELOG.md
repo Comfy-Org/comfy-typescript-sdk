@@ -45,6 +45,9 @@ entry. See CONTRIBUTING.md.
   within the same `DEFAULT_MAX_RESPONSE_BYTES` cap `run` applies. Not reachable
   on today's Router, which refuses binary models at submit; forward-compatible
   only.
+- **A queued result route answering `200` with an empty body now raises
+  `invalid_response`** instead of resolving to `{ kind: "json", data: {} }`.
+  An empty `200` is a truncated or malformed response, not a result.
 
 ## [0.3.0] - 2026-09-14
 

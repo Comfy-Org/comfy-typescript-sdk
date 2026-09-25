@@ -836,6 +836,30 @@ describe("RequestHandle on a binary result", () => {
     });
   });
 
+  it("drops the body of a retryable result response instead of reading it", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      let resultCalls = 0;
+      server.state.respond = (request) => {
+        if (request.path === STATUS_PATH) return { status: 200, body: DONE };
+        resultCalls += 1;
+        // A 503 that declares a body it never sends: reading it would wait
+        // out the deadline, so the retry landing proves it was never read.
+        if (resultCalls === 1) {
+          return { status: 503, headers: { "Content-Length": String(DEFAULT_MAX_RESPONSE_BYTES) } };
+        }
+        return { status: 200, body: MP3_BYTES, contentType: "audio/mpeg" };
+      };
+
+      const result = await comfy.models
+        .handle(MODEL, REQUEST_ID)
+        .get({ retry: { baseDelayMs: 1 }, timeoutMs: 5_000 });
+
+      expect(result.kind).toBe("binary");
+      expect(resultCalls).toBe(2);
+    });
+  });
+
   it("refuses a result that declares more than the default cap, without retrying", async () => {
     await withRouterStub(async (server) => {
       useStub(server);

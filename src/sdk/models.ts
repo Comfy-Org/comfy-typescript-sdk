@@ -849,11 +849,15 @@ function tooLarge(
   capAdvice?: string,
 ): ComfyError {
   const cap = `${String(maxBytes)}-byte maxBytes cap`;
+  // `capAdvice` replaces only the advice about changing the cap: an
+  // allocation failure happened UNDER the cap, so blaming the cap for it would
+  // be wrong, and asking for a smaller result still applies either way.
   const advice =
-    capAdvice ??
-    ("allocationFailedAt" in breach
-      ? "lower maxBytes, or ask this model for a smaller result"
-      : "raise maxBytes for this call, or pass maxBytes: null to disable the cap");
+    "allocationFailedAt" in breach
+      ? capAdvice === undefined
+        ? "lower maxBytes, or ask this model for a smaller result"
+        : "ask this model for a smaller result"
+      : (capAdvice ?? "raise maxBytes for this call, or pass maxBytes: null to disable the cap");
   let what: string;
   if ("contentLength" in breach) {
     what = `declares a Content-Length of ${String(breach.contentLength)} bytes, past the ${cap}`;
@@ -998,7 +1002,23 @@ export async function readBodyWithin(
   // which is the threat this cap is for — and concatenating at the end holds
   // every chunk AND the finished copy at once. Here each chunk is copied in
   // and dropped as it arrives, and the buffer is never larger than the cap.
-  let buffer = allocate(Math.min(declared ?? INITIAL_BODY_CAPACITY, maxBytes), 0);
+  //
+  // Pre-sized from `Content-Length` only when that header was vetted above: an
+  // error response's is not, and a bogus huge one on a near-empty error page
+  // would otherwise buy a `maxBytes` allocation for almost nothing. The
+  // allocation also cancels the reader on failure, since it sits outside the
+  // `try` below and a locked, unread stream would leak its socket.
+  const initial = Math.min(
+    truncate ? INITIAL_BODY_CAPACITY : (declared ?? INITIAL_BODY_CAPACITY),
+    maxBytes,
+  );
+  let buffer: Uint8Array;
+  try {
+    buffer = allocate(initial, 0);
+  } catch (exc) {
+    await reader.cancel().catch(() => undefined);
+    throw exc;
+  }
   let total = 0;
   /** Grow to hold `needed` bytes, keeping the `total` already written. */
   const reserve = (needed: number): void => {

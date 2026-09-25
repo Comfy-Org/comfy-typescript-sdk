@@ -609,16 +609,31 @@ async function send(call: QueueCall): Promise<QueueResponse> {
     let response: Response;
     let bodyText: string;
     let bodyBytes: Uint8Array | undefined;
+    // Non-null once this response has been classified as one to ask again
+    // about, and is then the backoff before that re-ask.
+    let repeatAfterMs: number | null = null;
     try {
       response = await fetch(
         call.url,
         withInactivityLimits({ method: call.method, headers, body: call.body, signal }, requestMs),
       );
+      // Classified from the status line BEFORE the body is touched, as `run`
+      // does: the content of a response this call is going to ask again about
+      // is "ask again", so it is dropped rather than downloaded (and, on the
+      // capped path, buffered) once per attempt. Out of budget leaves this
+      // `null` and falls through to raise the failure the server actually
+      // gave, rather than a synthetic "retries exhausted".
+      if (isRetryableStatus(response.status, response.headers.get(ERROR_TYPE_HEADER))) {
+        repeatAfterMs = nextAttemptDelayMs(attempt, retry, clock());
+      }
       // Inside the same `try` as the fetch on purpose: the deadline covers
       // body consumption too, so a signal that fires while the body is still
       // streaming rejects HERE, and translating it in only one of the two
       // places would leak a bare DOMException out of the other.
-      if (call.bytes === undefined) {
+      if (repeatAfterMs !== null) {
+        await response.body?.cancel().catch(() => undefined);
+        bodyText = "";
+      } else if (call.bytes === undefined) {
         bodyText = await response.text();
       } else {
         bodyBytes = await readBodyWithin(
@@ -649,15 +664,10 @@ async function send(call: QueueCall): Promise<QueueResponse> {
       continue;
     }
 
-    if (isRetryableStatus(response.status, response.headers.get(ERROR_TYPE_HEADER))) {
-      const delay = nextAttemptDelayMs(attempt, retry, clock());
-      if (delay !== null) {
-        await abortableSleep(delay, call.signal);
-        attempt += 1;
-        continue;
-      }
-      // Out of budget — fall through and raise the failure the server actually
-      // gave, rather than a synthetic "retries exhausted".
+    if (repeatAfterMs !== null) {
+      await abortableSleep(repeatAfterMs, call.signal);
+      attempt += 1;
+      continue;
     }
     return { status: response.status, headers: response.headers, text: bodyText, body: bodyBytes };
   }
@@ -667,13 +677,15 @@ async function send(call: QueueCall): Promise<QueueResponse> {
 function decode(response: QueueResponse, accepted: readonly number[]): unknown {
   let body: unknown;
   let parsed = true;
+  let parseError: unknown;
   if (response.text === "") {
     // A `204` (and a `202` with no body) is a legitimate answer to a cancel.
     body = {};
   } else {
     try {
       body = JSON.parse(response.text);
-    } catch {
+    } catch (exc) {
+      parseError = exc;
       parsed = false;
       body = null;
     }
@@ -687,6 +699,7 @@ function decode(response: QueueResponse, accepted: readonly number[]): unknown {
       `the queue answered ${String(response.status)} with a body that is not JSON`,
       response.headers.get(REQUEST_ID_HEADER),
       response.status,
+      parseError,
     );
   }
   if (!accepted.includes(response.status)) {
