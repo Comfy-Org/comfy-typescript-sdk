@@ -145,7 +145,35 @@ export async function readRouterRouteContract(specPath = ROUTER_SPEC_PATH) {
     serverUrl,
     parameterNames: pathParameterNames(doc, pathItem, pathItem.post),
     retryAfterStatuses: retryAfterStatuses(doc, pathItem),
+    runSuccessHeaderNames: runSuccessHeaderNames(doc, pathItem),
   };
+}
+
+/**
+ * The header names the run route's `200` declares, lowercased and sorted.
+ *
+ * This is the acquisition half of the credits-header pin in
+ * `src/sdk/router-spec-contract.test.ts`, which compares `CREDITS_USED_HEADER`
+ * in `src/sdk/models.ts` against the name the contract declares. That constant
+ * spent one release pinned to NOTHING, because the vendored contract did not
+ * declare `X-Comfy-Credits-Used`; the sync that brought
+ * `RouterCreditsUsedHeader` is what turned the rot guard that stood there into
+ * a real comparison.
+ *
+ * Unlike {@link retryAfterStatuses} this does NOT fail on an empty result: a
+ * `200` legitimately need not declare headers, so reporting the empty set is a
+ * truthful read. The caller is where that becomes an assertion — the pin
+ * demands the credits header be present AND spelled the way the SDK spells it,
+ * so a sync that drops the header reddens there rather than passing vacuously
+ * here.
+ */
+export function runSuccessHeaderNames(doc, pathItem) {
+  const responses = deref(doc, pathItem.post.responses ?? {});
+  const ok = deref(doc, responses["200"] ?? {});
+  if (ok === null || typeof ok !== "object") return [];
+  return Object.keys(deref(doc, ok.headers ?? {}))
+    .map((name) => name.toLowerCase())
+    .sort();
 }
 
 /**
@@ -306,6 +334,39 @@ export function routerOperations(doc) {
 /** {@link routerOperations} for the vendored contract on disk. */
 export async function readRouterOperations(specPath = ROUTER_SPEC_PATH) {
   return routerOperations(parse(await readFile(specPath, "utf-8")));
+}
+
+/**
+ * The header names one operation's `200` declares, lowercased and sorted.
+ *
+ * {@link runSuccessHeaderNames} for any operation, located by `operationId`
+ * rather than by the run route's path item. The queued result read
+ * (`getRouterModelRequestResult`) uses it: `RequestHandle.collect` lifts the
+ * same `X-Comfy-Credits-Used` header off that `200`, and the contract test
+ * watches whether the contract declares it there. An operation that is not
+ * declared at all is refused rather than read as "no headers", for the same
+ * reason every extractor here refuses an empty read.
+ */
+export function successHeaderNames(doc, operationId) {
+  const matches = routerOperations(doc).filter(
+    (operation) => operation.operationId === operationId,
+  );
+  if (matches.length !== 1) {
+    fail(`spec/router-openapi.yaml declares no operation ${JSON.stringify(operationId)}`);
+  }
+  const { path, method } = matches[0];
+  const operation = deref(doc, doc.paths[path])[method];
+  const responses = deref(doc, operation.responses ?? {});
+  const ok = deref(doc, responses["200"] ?? {});
+  if (ok === null || typeof ok !== "object") return [];
+  return Object.keys(deref(doc, ok.headers ?? {}))
+    .map((name) => name.toLowerCase())
+    .sort();
+}
+
+/** {@link successHeaderNames} for the vendored contract on disk. */
+export async function readSuccessHeaderNames(operationId, specPath = ROUTER_SPEC_PATH) {
+  return successHeaderNames(parse(await readFile(specPath, "utf-8")), operationId);
 }
 
 /**

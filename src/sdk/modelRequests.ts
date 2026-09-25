@@ -66,8 +66,11 @@ import { requireCredentials, resolveBaseUrl } from "./credentials.js";
 import { ComfyError } from "./exceptions.js";
 import { fillRoute, parseModelId, parseRequestId } from "./modelRoutes.js";
 import {
+  type BuiltRunResult,
+  CREDITS_USED_HEADER,
   DROPPED_PARAMS_HEADER,
   FALLBACK_PROVIDER_HEADER,
+  parseCreditsUsed,
   parseDroppedParams,
   type RunResult,
 } from "./models.js";
@@ -897,13 +900,24 @@ export class RequestHandle<TData = unknown> {
     // so a queued run cannot address an alternate provider and has nothing to
     // disclose — but reading them keeps the two result shapes identical and
     // means this path needs no edit on the day that route does gain them.
-    return {
+    //
+    // `X-Comfy-Credits-Used` is read on the same reasoning, and the contract
+    // does not declare it on this route yet either: `getRouterModelRequestResult`'s
+    // `200` names no credits header, so a queued result reads `null` ("not
+    // reported", never "free") until Router stamps it here. The rot guard in
+    // router-spec-contract.test.ts fires the day the contract declares it.
+    //
+    // Typed as the internal `BuiltRunResult` so omitting a field here fails
+    // `tsc`; returned as the public `RunResult`, the same type `run` returns.
+    const result: BuiltRunResult<TData> = {
       kind: "json",
       data: body as TData,
       requestId: response.headers.get(REQUEST_ID_HEADER),
       servingProvider: response.headers.get(FALLBACK_PROVIDER_HEADER),
       droppedParams: parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER)),
+      creditsUsed: parseCreditsUsed(response.headers.get(CREDITS_USED_HEADER)),
     };
+    return result;
   }
 
   /**

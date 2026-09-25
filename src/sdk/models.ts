@@ -217,6 +217,51 @@ export const FALLBACK_PROVIDER_HEADER = "X-Comfy-Router-Fallback-Provider";
 export const DROPPED_PARAMS_HEADER = "X-Comfy-Router-Dropped-Params";
 
 /**
+ * `X-Comfy-Credits-Used` — what Router priced this call at, in credits. See
+ * {@link RunJsonResult.creditsUsed}.
+ *
+ * Pinned against the vendored contract: `runRouterModel`'s `200` declares
+ * `X-Comfy-Credits-Used` (as `RouterCreditsUsedHeader`), and
+ * `router-spec-contract.test.ts` asserts this constant spells that declared
+ * name. Until the sync that brought it, this was the one header constant in
+ * this file pinned to nothing, watched by a rot guard in that same file —
+ * because the drift it would suffer is SILENT: a name wrong by one segment
+ * reports `creditsUsed: null` on every run forever, which is indistinguishable
+ * from the "Router reported no cost" this field is documented to mean.
+ */
+export const CREDITS_USED_HEADER = "X-Comfy-Credits-Used";
+
+/**
+ * Normalize the `X-Comfy-Credits-Used` header value.
+ *
+ * Trimmed, and a BLANK value read as absent rather than passed through. An
+ * empty header is not a price: handed back verbatim it arrives as `""`, which
+ * survives the documented `creditsUsed != null` presence check and then reads
+ * as a reported cost of zero through `Number("")` — precisely the
+ * free-versus-not-reported collapse {@link RunJsonResult.creditsUsed} is typed
+ * `string | null` to prevent. Trimming is the same discipline `declaredLength`
+ * applies to `Content-Length` and `mediaTypeOf` applies to `Content-Type`.
+ *
+ * Any other value is handed back VERBATIM, and that is deliberate — including
+ * the one `Headers.get` joins out of a header sent twice (`"0.42, 0.42"`).
+ * Nothing here guesses at a price: picking one of two figures would invent a
+ * charge, and collapsing a cost that WAS reported into `null` would claim the
+ * one thing that value is documented to mean — that it was not.
+ *
+ * That puts the shape check on the caller, and the obvious parses do not do
+ * it for you: `parseFloat("0.42, 0.42")` silently returns `0.42` (the very
+ * pick refused above), and `Number("0.42, 0.42")` returns `NaN` without
+ * throwing, which then poisons any running total it is added to. Validate the
+ * string before trusting it as one figure (for example against
+ * `/^\d+(\.\d+)?$/`).
+ */
+export function parseCreditsUsed(raw: string | null): string | null {
+  if (raw === null) return null;
+  const value = raw.trim();
+  return value === "" ? null : value;
+}
+
+/**
  * Parse the `X-Comfy-Router-Dropped-Params` header value.
  *
  * The spec describes this header as "a JSON array of strings" in prose while
@@ -289,6 +334,53 @@ export interface RunJsonResult<TData = unknown> {
    * `null` when no translation ran, or it ran and dropped nothing.
    */
   droppedParams: readonly string[] | null;
+  /**
+   * `X-Comfy-Credits-Used`: what Router priced this call at, verbatim — a
+   * decimal string (`"12.5"`). The contract does not fix its scale, so do not
+   * round or store it at a fixed number of places.
+   *
+   * Three things it is not, and each of them changes what you may do with it:
+   *
+   * - **It is a price, not a settled ledger entry.** It is what Router
+   *   computed as it answered this call, not a posted balance movement. The
+   *   workspace's ledger is reconciled server-side and can disagree — a
+   *   refund, a correction, a replay that is not charged a second time. Show
+   *   it and reconcile against it; do not treat it as the authoritative
+   *   charge.
+   * - **`null` means "not reported", never "free".** A response carrying no
+   *   header says nothing at all about the cost, and a substantial share of
+   *   real Router runs carry none today even where the cost is known. Summing
+   *   `null` as zero understates spend.
+   * - **`"0"` is a real reported cost.** A genuinely free call and an
+   *   unreported one are different answers, so branch on PRESENCE
+   *   (`creditsUsed != null`) and never on the value being non-zero — the
+   *   falsiness of `"0"`'s numeric reading is exactly the bug.
+   *
+   * Success-only, and that is the contract's own word rather than this SDK's
+   * choice: `RouterCreditsUsedHeader` says it "is written only on the path
+   * that returns a result, which a refused call never reaches". So a run that
+   * was priced and then failed does not carry a cost here to be dropped —
+   * there is nothing on the throwing paths to lift, and {@link ComfyError}
+   * carrying no credits field is the contract's shape, not an omission.
+   *
+   * `string | null` rather than `number | null` on purpose, the same way
+   * {@link droppedParams} keeps the server's own shape: the wire value is
+   * decimal, `Number("")` and `Number(null)` are both `0`, and a caller
+   * reconciling money should not silently receive a float nothing asked it to
+   * parse. Parse it deliberately, and check the result: `Number` answers `NaN`
+   * rather than throwing on a value that is not one decimal, and `parseFloat`
+   * quietly reads only its leading figure (see {@link parseCreditsUsed}).
+   *
+   * OPTIONAL only for source compatibility. Every result this SDK constructs
+   * sets the field, so a value read off a real run is `string | null` and
+   * never `undefined`; the `?` is there so a consumer's own `RunJsonResult`
+   * literal — a test double written against 0.4.0, which shipped these two
+   * interfaces without this field — still compiles. That is also why the
+   * presence check above is the loose `!= null` rather than `!== null`: it is
+   * the one form that reads a hand-built literal's missing field the same way
+   * it reads an unstamped response.
+   */
+  creditsUsed?: string | null;
 }
 
 /**
@@ -319,6 +411,8 @@ export interface RunBinaryResult {
   servingProvider: string | null;
   /** As {@link RunJsonResult.droppedParams}. */
   droppedParams: readonly string[] | null;
+  /** As {@link RunJsonResult.creditsUsed}, optional for the same reason. */
+  creditsUsed?: string | null;
 }
 
 /**
@@ -342,6 +436,24 @@ export interface RunBinaryResult {
  * ```
  */
 export type RunResult<TData = unknown> = RunJsonResult<TData> | RunBinaryResult;
+
+/**
+ * A {@link RunResult} as this SDK CONSTRUCTS one: every optional field set.
+ *
+ * `creditsUsed` is optional on the two published interfaces purely so a
+ * consumer's own result literal still compiles against them (see
+ * {@link RunJsonResult.creditsUsed}). Inside this package the opposite rule
+ * has to hold: a return site that omits it answers `undefined`, which a
+ * caller's documented `creditsUsed != null` check reads as "Router reported
+ * no cost" — the free-versus-not-reported confusion this field was added to
+ * end, arriving through the back door of the compatibility marker that ends
+ * it for everyone else. So the SDK's own producers are typed as this, and the
+ * compiler names the omission rather than a caller meeting it as a charge
+ * that went missing.
+ */
+export type BuiltRunResult<TData = unknown> =
+  | (RunJsonResult<TData> & Required<Pick<RunJsonResult<TData>, "creditsUsed">>)
+  | (RunBinaryResult & Required<Pick<RunBinaryResult, "creditsUsed">>);
 
 export interface RunOptions {
   /**
@@ -1302,7 +1414,7 @@ function finish<TData>(
   response: Response,
   responseBody: Uint8Array,
   idempotencyKey: string,
-): RunResult<TData> {
+): BuiltRunResult<TData> {
   const requestId = response.headers.get(REQUEST_ID_HEADER);
   // Read before any branch returns: these disclose HOW the call ran (which
   // provider served it, what a translation dropped), and an alt-provider
@@ -1310,6 +1422,10 @@ function finish<TData>(
   // cannot tell an alt-provider run from a native one.
   const servingProvider = response.headers.get(FALLBACK_PROVIDER_HEADER);
   const droppedParams = parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER));
+  // Read here for the same reason, and kept as the raw header string: what the
+  // call COST is not recoverable from the body either, and `null` has to stay
+  // distinguishable from a reported `"0"`.
+  const creditsUsed = parseCreditsUsed(response.headers.get(CREDITS_USED_HEADER));
   if (!response.ok) throw errorFromResponse(response, decodeUtf8(responseBody), idempotencyKey);
 
   // A 202 is a task handle, not a result. This route is the synchronous one,
@@ -1360,6 +1476,7 @@ function finish<TData>(
       requestId,
       servingProvider,
       droppedParams,
+      creditsUsed,
     };
   }
 
@@ -1387,6 +1504,7 @@ function finish<TData>(
         requestId,
         servingProvider,
         droppedParams,
+        creditsUsed,
       };
     }
     throw new ComfyError(
@@ -1400,7 +1518,14 @@ function finish<TData>(
       },
     );
   }
-  return { kind: "json", data: data as TData, requestId, servingProvider, droppedParams };
+  return {
+    kind: "json",
+    data: data as TData,
+    requestId,
+    servingProvider,
+    droppedParams,
+    creditsUsed,
+  };
 }
 
 // -- discovery: the model catalog, and one model's published schemas ---------
