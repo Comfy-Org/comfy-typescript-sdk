@@ -34,6 +34,9 @@
  * one-way vendored copy, and the SDK is the side that follows.
  */
 
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -58,6 +61,7 @@ import {
   MODEL_REQUESTS_ROUTE_TEMPLATE,
 } from "./modelRequests.js";
 import { isCollectable } from "./retry.js";
+import { REFUSAL_SUBJECT_HEADER } from "./routerErrors.js";
 
 describe("router route contract (spec/router-openapi.yaml)", () => {
   it("spells RUN_ROUTE_TEMPLATE the path the contract declares for runRouterModel", async () => {
@@ -399,6 +403,34 @@ describe("queued model-request routes (spec/router-openapi.yaml)", () => {
       MODEL_REQUEST_CANCEL_ROUTE_TEMPLATE,
     ]) {
       expect(templatePlaceholders(template)).toEqual([...parameterNames, "request_id"]);
+    }
+  });
+});
+
+/**
+ * `RouterError.refusalSubject`'s two wire names — the `X-Comfy-Refusal-Subject`
+ * header and the body's `refusal_subject` — and the `REFUSAL_SUBJECTS` list.
+ *
+ * The upstream contract declares them, but the vendored copy predates that
+ * change, so there is nothing here to compare them against yet. This is a rot
+ * guard, not a pin: it fails the day a sync brings either name into
+ * `spec/router-openapi.yaml`. When it fires, replace it with a comparison of
+ * `REFUSAL_SUBJECT_HEADER`, the body field and `REFUSAL_SUBJECTS` in
+ * `src/sdk/routerErrors.ts` against what the spec declares.
+ */
+describe("refusal subject wire names (spec/router-openapi.yaml)", () => {
+  it("are not declared by the vendored contract yet", () => {
+    const spec = readFileSync(
+      fileURLToPath(new URL("../../spec/router-openapi.yaml", import.meta.url)),
+      "utf8",
+    ).toLowerCase();
+    for (const name of [REFUSAL_SUBJECT_HEADER, "refusal_subject"]) {
+      expect(
+        spec.includes(name.toLowerCase()),
+        `spec/router-openapi.yaml now declares ${name} — pin REFUSAL_SUBJECT_HEADER, the ` +
+          "body's `refusal_subject` and REFUSAL_SUBJECTS in src/sdk/routerErrors.ts against " +
+          "it and replace this rot guard",
+      ).toBe(false);
     }
   });
 });

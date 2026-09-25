@@ -743,7 +743,7 @@ describe("refusalSubject", () => {
   const policyHeaders = (extra: Record<string, string> = {}) =>
     new Headers({ [ERROR_TYPE_HEADER]: "content_policy_violation", ...extra });
 
-  it("documents the ten subjects the Router contract lists", () => {
+  it("documents the ten subjects the upstream Router contract lists", () => {
     expect(REFUSAL_SUBJECTS).toEqual([
       "input",
       "output",
@@ -794,17 +794,43 @@ describe("refusalSubject", () => {
     expect(err.refusalSubject).toBe("output_video");
   });
 
-  it("is undefined when neither the header nor the body names one", () => {
+  it("is null when neither the header nor the body names one", () => {
     const err = toRouterError(400, policyHeaders(), { detail: "refused" });
     expect(err).toBeInstanceOf(ContentPolicyViolation);
-    expect(err.refusalSubject).toBeUndefined();
-    expect(new ContentPolicyViolation("refused").refusalSubject).toBeUndefined();
-    expect(new RouterError("x").refusalSubject).toBeUndefined();
+    expect(err.refusalSubject).toBeNull();
+    expect(new ContentPolicyViolation("refused").refusalSubject).toBeNull();
+    expect(new RouterError("x").refusalSubject).toBeNull();
+  });
+
+  it("trims the value, and falls through a blank header to the body", () => {
+    const trimmed = toRouterError(
+      400,
+      policyHeaders({ [REFUSAL_SUBJECT_HEADER]: " output_audio " }),
+      {},
+    );
+    expect(trimmed.refusalSubject).toBe("output_audio");
+    const blank = toRouterError(400, policyHeaders({ [REFUSAL_SUBJECT_HEADER]: "   " }), {
+      refusal_subject: "input_image",
+    });
+    expect(blank.refusalSubject).toBe("input_image");
+    expect(
+      toRouterError(400, policyHeaders(), { refusal_subject: "  " }).refusalSubject,
+    ).toBeNull();
+  });
+
+  it("treats a repeated header, which Headers.get comma-joins, as naming no subject", () => {
+    const headers = policyHeaders();
+    headers.append(REFUSAL_SUBJECT_HEADER, "input_image");
+    headers.append(REFUSAL_SUBJECT_HEADER, "output_audio");
+    expect(toRouterError(400, headers, {}).refusalSubject).toBeNull();
+    expect(toRouterError(400, headers, { refusal_subject: "output_audio" }).refusalSubject).toBe(
+      "output_audio",
+    );
   });
 
   it("ignores a body refusal_subject that is not a string", () => {
     const err = toRouterError(400, policyHeaders(), { refusal_subject: 3 });
-    expect(err.refusalSubject).toBeUndefined();
+    expect(err.refusalSubject).toBeNull();
   });
 
   it("passes a subject this release does not know through verbatim", () => {
@@ -836,7 +862,7 @@ describe("refusalSubject", () => {
       detail: [{ loc: ["body", "prompt"], msg: "Field required", type: "missing" }],
     });
     expect(err).toBeInstanceOf(InvalidInput);
-    expect(err.refusalSubject).toBeUndefined();
+    expect(err.refusalSubject).toBeNull();
   });
 
   it("is read off a queued completion's body when it carries one", () => {

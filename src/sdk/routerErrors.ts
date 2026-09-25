@@ -189,8 +189,14 @@ export function parseRetryAfter(headers: HeadersLike): number | null {
 export const REFUSAL_SUBJECT_HEADER = "X-Comfy-Refusal-Subject";
 
 /**
- * The refusal subjects the Router contract documents today, for autocomplete
- * and for a caller who wants to enumerate them.
+ * The refusal subjects the upstream Router contract documents, for
+ * autocomplete and for a caller who wants to enumerate them.
+ *
+ * Not yet pinned to `spec/router-openapi.yaml`: the vendored copy predates the
+ * contract change that added `refusal_subject` and `X-Comfy-Refusal-Subject`,
+ * so there is nothing in it to compare this list or the header name against.
+ * `router-spec-contract.test.ts` carries a rot guard that fails the day a sync
+ * brings either name in — that is the moment to pin both against the spec.
  *
  * The bare `input` / `output` name the side when the provider did not name a
  * modality; the other eight name the side and the modality both.
@@ -267,7 +273,7 @@ export interface RouterErrorOptions {
   /** See {@link RouterError.retryAfter}. */
   retryAfter?: number | null;
   /** See {@link RouterError.refusalSubject}. */
-  refusalSubject?: string;
+  refusalSubject?: string | null;
 }
 
 /**
@@ -325,7 +331,7 @@ export class RouterError extends Error {
   /**
    * Which input or output a content-policy refusal was about — `"output_audio"`,
    * `"input_image"`, … — off `X-Comfy-Refusal-Subject`, falling back to the
-   * body's `refusal_subject`; `undefined` when the response named none.
+   * body's `refusal_subject`; `null` when the response named none.
    *
    * Router sets it only on a {@link ContentPolicyViolation}, and only when the
    * provider named the refused subject with a machine-readable code, so its
@@ -333,17 +339,28 @@ export class RouterError extends Error {
    * It lets a caller change the one thing that was refused rather than give up:
    *
    * ```ts
-   * if (err instanceof routerErrors.ContentPolicyViolation && err.refusalSubject === "output_audio") {
-   *   return comfy.models.run(model, { ...input, generate_audio: false });
+   * try {
+   *   return await comfy.models.subscribe(model, input);
+   * } catch (err) {
+   *   if (err instanceof routerErrors.ContentPolicyViolation && err.refusalSubject === "output_audio") {
+   *     return comfy.models.subscribe(model, { ...input, generate_audio: false });
+   *   }
+   *   throw err;
    * }
    * ```
+   *
+   * Only the surfaces that raise `routerErrors.*` carry it — the queued
+   * `submit` / `subscribe` / `handle`. `comfy.models.run` maps its failures into
+   * the `ComfyError` family instead (a refusal there is a `ComfyError` with
+   * `code: "content_policy_violation"`), and that error does not carry the
+   * subject yet.
    *
    * It is the raw string, not narrowed to {@link REFUSAL_SUBJECTS}: a newer
    * server may send a subject this release does not know, and a caller should
    * treat one as unspecified. It is on the BASE class, like
    * {@link retryAfter}, so an unrecognized bucket from a newer server keeps it.
    */
-  readonly refusalSubject: string | undefined;
+  readonly refusalSubject: string | null;
 
   constructor(message: string, options: RouterErrorOptions = {}) {
     super(message);
@@ -360,7 +377,7 @@ export class RouterError extends Error {
     this.requestId = options.requestId ?? null;
     this.httpStatus = options.httpStatus ?? null;
     this.retryAfter = options.retryAfter ?? null;
-    this.refusalSubject = options.refusalSubject;
+    this.refusalSubject = options.refusalSubject ?? null;
   }
 }
 
@@ -686,6 +703,17 @@ interface RequestErrorBody {
   refusal_subject?: unknown;
 }
 
+/**
+ * One refusal subject out of a header or body value, or `null` when the value
+ * names none: not a string, blank once trimmed, or comma-joined — `Headers.get`
+ * joins a repeated header with `", "`, and two subjects are not one subject.
+ */
+function readRefusalSubject(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const subject = value.trim();
+  return subject === "" || subject.includes(",") ? null : subject;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -756,11 +784,11 @@ export function toRouterError(status: number, headers: HeadersLike, body: unknow
   // Header first, body second — the same order the bucket is read in. Router
   // mirrors one onto the other, so they only disagree if something between
   // here and Router rewrote one of them, and the header is the half this module
-  // already trusts for the bucket. An empty value on either says nothing and
-  // falls through, like an empty bucket.
-  const bodySubject =
-    typeof envelope.refusal_subject === "string" ? envelope.refusal_subject : null;
-  const refusalSubject = headers.get(REFUSAL_SUBJECT_HEADER) || bodySubject || undefined;
+  // already trusts for the bucket. A value that names no single subject says
+  // nothing and falls through, like an empty bucket.
+  const refusalSubject =
+    readRefusalSubject(headers.get(REFUSAL_SUBJECT_HEADER)) ??
+    readRefusalSubject(envelope.refusal_subject);
 
   const options: RouterErrorOptions = {
     errorType,
