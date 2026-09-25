@@ -244,10 +244,16 @@ export const CREDITS_USED_HEADER = "X-Comfy-Credits-Used";
  *
  * Any other value is handed back VERBATIM, and that is deliberate — including
  * the one `Headers.get` joins out of a header sent twice (`"0.42, 0.42"`).
- * Nothing here guesses at a price. A value that will not parse is left intact
- * so the caller's own parse fails loudly on it, which beats this SDK picking
- * one of two figures, and beats collapsing a cost that WAS reported into
- * `null` — the one value documented to mean it was not.
+ * Nothing here guesses at a price: picking one of two figures would invent a
+ * charge, and collapsing a cost that WAS reported into `null` would claim the
+ * one thing that value is documented to mean — that it was not.
+ *
+ * That puts the shape check on the caller, and the obvious parses do not do
+ * it for you: `parseFloat("0.42, 0.42")` silently returns `0.42` (the very
+ * pick refused above), and `Number("0.42, 0.42")` returns `NaN` without
+ * throwing, which then poisons any running total it is added to. Validate the
+ * string before trusting it as one figure (for example against
+ * `/^\d+(\.\d+)?$/`).
  */
 export function parseCreditsUsed(raw: string | null): string | null {
   if (raw === null) return null;
@@ -361,8 +367,9 @@ export interface RunJsonResult<TData = unknown> {
    * {@link droppedParams} keeps the server's own shape: the wire value is
    * decimal, `Number("")` and `Number(null)` are both `0`, and a caller
    * reconciling money should not silently receive a float nothing asked it to
-   * parse. Parse it deliberately, and let a value that will not parse fail
-   * where you can see it.
+   * parse. Parse it deliberately, and check the result: `Number` answers `NaN`
+   * rather than throwing on a value that is not one decimal, and `parseFloat`
+   * quietly reads only its leading figure (see {@link parseCreditsUsed}).
    *
    * OPTIONAL only for source compatibility. Every result this SDK constructs
    * sets the field, so a value read off a real run is `string | null` and
