@@ -1836,6 +1836,26 @@ describe("refusalSubject on models.run", () => {
     });
   });
 
+  it("stays a ComfyError, subject intact, when the bucket names an Object.prototype key", async () => {
+    for (const errorType of ["constructor", "toString", "__proto__"]) {
+      const err = await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.respond = () => ({
+          status: 400,
+          errorType,
+          headers: { "X-Comfy-Refusal-Subject": "output_audio" },
+          body: { detail: "refused" },
+        });
+        return (await comfy.models
+          .run(MODEL, {}, { retry: FAST })
+          .catch((e: unknown) => e)) as ComfyError;
+      });
+      expect(err, errorType).toBeInstanceOf(ComfyError);
+      expect(err.code, errorType).toBe(errorType);
+      expect(err.refusalSubject, errorType).toBe("output_audio");
+    }
+  });
+
   it("is present, and null, on a models.schema() or models.list() failure", async () => {
     await withRouterStub(async (server) => {
       useStub(server);

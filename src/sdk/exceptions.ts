@@ -83,9 +83,11 @@ export class ComfyError extends Error {
    *
    * Router sets it only on a `content_policy_violation`, and only when the
    * provider named the refused subject, so `null` is the common case and means
-   * "not said", not "the whole request". Only `comfy.models.run` can populate
-   * it today: the discovery responses behind `models.schema()` and
-   * `models.list()` never carry the header, so there it is always `null`.
+   * "not said", not "the whole request". Router only names a subject on a
+   * run-route refusal today, so in practice only `comfy.models.run` populates
+   * it; the read is not gated on {@link ComfyError.code}, so a discovery
+   * failure from `models.schema()` or `models.list()` would carry one only if
+   * the response itself did.
    *
    * It is the raw string, not narrowed to `routerErrors.REFUSAL_SUBJECTS` — the
    * same pass-through {@link ComfyError.code} gets — so treat a value outside

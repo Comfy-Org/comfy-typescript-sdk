@@ -765,7 +765,11 @@ function errorFromResponse(
     message = `HTTP ${String(status)}`;
   }
 
-  const cls = BY_ERROR_TYPE[code] ?? ComfyError;
+  // Own-property lookup only, as `routerErrors.toRouterError` does: `code` is
+  // server-supplied, and a bare index would resolve `constructor` or
+  // `toString` off `Object.prototype` — `new Object(...)` throws a `String`
+  // wrapper, not a ComfyError, and the rest are not constructors at all.
+  const cls = Object.hasOwn(BY_ERROR_TYPE, code) ? BY_ERROR_TYPE[code] : ComfyError;
   return new cls(message, {
     code,
     httpStatus: status,
