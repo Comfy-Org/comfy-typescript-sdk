@@ -803,13 +803,18 @@ describe("refusalSubject", () => {
   });
 
   it("trims the value, and falls through a blank header to the body", () => {
-    const trimmed = toRouterError(
-      400,
-      policyHeaders({ [REFUSAL_SUBJECT_HEADER]: " output_audio " }),
-      {},
-    );
+    // Not `new Headers()`: its constructor strips leading and trailing
+    // whitespace from values, which would hide whether the reader trims at all.
+    const rawHeaders = (value: string) => ({
+      get: (name: string) => {
+        const key = name.toLowerCase();
+        if (key === ERROR_TYPE_HEADER.toLowerCase()) return "content_policy_violation";
+        return key === REFUSAL_SUBJECT_HEADER.toLowerCase() ? value : null;
+      },
+    });
+    const trimmed = toRouterError(400, rawHeaders(" output_audio "), {});
     expect(trimmed.refusalSubject).toBe("output_audio");
-    const blank = toRouterError(400, policyHeaders({ [REFUSAL_SUBJECT_HEADER]: "   " }), {
+    const blank = toRouterError(400, rawHeaders("   "), {
       refusal_subject: "input_image",
     });
     expect(blank.refusalSubject).toBe("input_image");
@@ -826,6 +831,19 @@ describe("refusalSubject", () => {
     expect(toRouterError(400, headers, { refusal_subject: "output_audio" }).refusalSubject).toBe(
       "output_audio",
     );
+  });
+
+  it("reads a repeat of the same subject as that subject", () => {
+    const headers = policyHeaders();
+    headers.append(REFUSAL_SUBJECT_HEADER, "input_image");
+    headers.append(REFUSAL_SUBJECT_HEADER, "input_image");
+    expect(toRouterError(400, headers, {}).refusalSubject).toBe("input_image");
+    expect(
+      toRouterError(400, policyHeaders(), { refusal_subject: "a, b" }).refusalSubject,
+    ).toBeNull();
+    expect(
+      toRouterError(400, policyHeaders(), { refusal_subject: ", " }).refusalSubject,
+    ).toBeNull();
   });
 
   it("ignores a body refusal_subject that is not a string", () => {

@@ -1804,6 +1804,12 @@ describe("refusalSubject on models.run", () => {
     expect(err.refusalSubject).toBeNull();
   });
 
+  it("names the subject when a repeated header repeats the same one", async () => {
+    // A proxy re-adding the origin's header: "output_audio, output_audio".
+    const err = await refusal({ "X-Comfy-Refusal-Subject": ["output_audio", "output_audio"] }, {});
+    expect(err.refusalSubject).toBe("output_audio");
+  });
+
   it("is null for a body value that is not a string", async () => {
     const err = await refusal({}, { refusal_subject: 3 });
     expect(err.refusalSubject).toBeNull();
