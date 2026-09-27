@@ -705,13 +705,15 @@ interface RequestErrorBody {
 
 /**
  * One refusal subject out of a header or body value, or `null` when the value
- * names none: not a string, blank once trimmed, or comma-joined — `Headers.get`
- * joins a repeated header with `", "`, and two subjects are not one subject.
+ * names none: not a string, blank once trimmed, or comma-joined from two
+ * different subjects — `Headers.get` joins a repeated header with `", "`, and
+ * two subjects are not one subject. A repeat of the SAME subject (a proxy
+ * re-adding a header the origin already set) still names that one.
  */
 function readRefusalSubject(value: unknown): string | null {
   if (typeof value !== "string") return null;
-  const subject = value.trim();
-  return subject === "" || subject.includes(",") ? null : subject;
+  const [first, ...rest] = value.split(",").map((part) => part.trim());
+  return first === "" || rest.some((part) => part !== first) ? null : first;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

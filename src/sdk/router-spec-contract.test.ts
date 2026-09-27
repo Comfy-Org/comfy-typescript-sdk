@@ -424,7 +424,11 @@ describe("refusal subject wire names (spec/router-openapi.yaml)", () => {
       fileURLToPath(new URL("../../spec/router-openapi.yaml", import.meta.url)),
       "utf8",
     ).toLowerCase();
-    for (const name of [REFUSAL_SUBJECT_HEADER, "refusal_subject"]) {
+    // Both needles are spelled out rather than read off REFUSAL_SUBJECT_HEADER,
+    // so a misspelled constant cannot silence the guard meant to catch it; the
+    // first expectation keeps the constant honest in the meantime.
+    expect(REFUSAL_SUBJECT_HEADER).toBe("X-Comfy-Refusal-Subject");
+    for (const name of ["X-Comfy-Refusal-Subject", "refusal_subject"]) {
       expect(
         spec.includes(name.toLowerCase()),
         `spec/router-openapi.yaml now declares ${name} — pin REFUSAL_SUBJECT_HEADER, the ` +
