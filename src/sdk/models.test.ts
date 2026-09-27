@@ -1735,6 +1735,120 @@ describe("comfy.models.run argument validation", () => {
   });
 });
 
+describe("refusalSubject on models.run", () => {
+  const FAST = { budgetMs: 5_000, baseDelayMs: 5, maxDelayMs: 20 };
+
+  /** Run once against a scripted `content_policy_violation` 400 and return
+   * what it threw. */
+  async function refusal(
+    headers: Record<string, string | string[]>,
+    body: Record<string, unknown>,
+  ): Promise<ComfyError> {
+    return withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = () => ({
+        status: 400,
+        errorType: "content_policy_violation",
+        headers,
+        body: { detail: "refused by the provider's policy", ...body },
+      });
+      const err = (await comfy.models
+        .run(MODEL, {}, { retry: FAST })
+        .catch((e: unknown) => e)) as ComfyError;
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("content_policy_violation");
+      return err;
+    });
+  }
+
+  it("reads the subject off X-Comfy-Refusal-Subject", async () => {
+    const err = await refusal(
+      { "X-Comfy-Refusal-Subject": "output_audio" },
+      { error_type: "content_policy_violation" },
+    );
+    expect(err.refusalSubject).toBe("output_audio");
+  });
+
+  it("prefers the header when the header and the body disagree", async () => {
+    const err = await refusal(
+      { "X-Comfy-Refusal-Subject": "input_image" },
+      { refusal_subject: "output_text" },
+    );
+    expect(err.refusalSubject).toBe("input_image");
+  });
+
+  it("falls back to the body's refusal_subject when the header is absent", async () => {
+    const err = await refusal({}, { refusal_subject: "input_text" });
+    expect(err.refusalSubject).toBe("input_text");
+  });
+
+  it("is null when neither the header nor the body names one", async () => {
+    const err = await refusal({}, { error_type: "content_policy_violation" });
+    expect(err.refusalSubject).toBeNull();
+  });
+
+  it("treats a blank header as absent, so the body still answers", async () => {
+    const fromBody = await refusal(
+      { "X-Comfy-Refusal-Subject": "   " },
+      { refusal_subject: "output_video" },
+    );
+    expect(fromBody.refusalSubject).toBe("output_video");
+
+    const neither = await refusal({ "X-Comfy-Refusal-Subject": "" }, {});
+    expect(neither.refusalSubject).toBeNull();
+  });
+
+  it("is null for a repeated header, which names two subjects rather than one", async () => {
+    // Two real header lines: `Headers.get` joins them as "input_image, output_text".
+    const err = await refusal({ "X-Comfy-Refusal-Subject": ["input_image", "output_text"] }, {});
+    expect(err.refusalSubject).toBeNull();
+  });
+
+  it("is null for a body value that is not a string", async () => {
+    const err = await refusal({}, { refusal_subject: 3 });
+    expect(err.refusalSubject).toBeNull();
+  });
+
+  it("passes an unknown but well-formed subject through unchanged", async () => {
+    const err = await refusal({ "X-Comfy-Refusal-Subject": "input_3d_mesh" }, {});
+    expect(err.refusalSubject).toBe("input_3d_mesh");
+  });
+
+  it("stays null on the 422 detail[] validation shape", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = () => ({
+        status: 422,
+        errorType: "invalid_input",
+        body: { detail: [{ loc: ["body", "prompt"], msg: "field required", type: "missing" }] },
+      });
+      const err = (await comfy.models
+        .run(MODEL, {}, { retry: FAST })
+        .catch((e: unknown) => e)) as ComfyError;
+      expect(err.code).toBe("invalid_input");
+      expect(err.refusalSubject).toBeNull();
+    });
+  });
+
+  it("is present, and null, on a models.schema() or models.list() failure", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 401;
+      server.state.errorType = "unauthorized";
+      server.state.body = { detail: "bad key", error_type: "unauthorized" };
+
+      const fromSchema = (await comfy.models.schema(MODEL).catch((e: unknown) => e)) as ComfyError;
+      expect(fromSchema.refusalSubject).toBeNull();
+
+      const fromList = (await comfy.models
+        .list()
+        .page()
+        .catch((e: unknown) => e)) as ComfyError;
+      expect(fromList.refusalSubject).toBeNull();
+    });
+  });
+});
+
 describe("parseDroppedParams", () => {
   it("reads the header as JSON, because a comma split would shred its own example", () => {
     // The spec describes this header as "a JSON array of strings" while

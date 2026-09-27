@@ -21,6 +21,8 @@ export interface ComfyErrorOptions {
   retryAfter?: number | null;
   /** See {@link ComfyError.idempotencyKey}. */
   idempotencyKey?: string | null;
+  /** See {@link ComfyError.refusalSubject}. */
+  refusalSubject?: string | null;
   /** The underlying failure, when this error wraps one (a fetch abort, say). */
   cause?: unknown;
 }
@@ -72,6 +74,26 @@ export class ComfyError extends Error {
    */
   readonly idempotencyKey: string | null;
 
+  /**
+   * Which input or output a content-policy refusal was about — `"output_audio"`,
+   * `"input_image"`, … — off `X-Comfy-Refusal-Subject`, falling back to the
+   * body's `refusal_subject`; `null` when the response named none. The
+   * `ComfyError` twin of `routerErrors.RouterError.refusalSubject`, read the
+   * same way.
+   *
+   * Router sets it only on a `content_policy_violation`, and only when the
+   * provider named the refused subject, so `null` is the common case and means
+   * "not said", not "the whole request". Only `comfy.models.run` can populate
+   * it today: the discovery responses behind `models.schema()` and
+   * `models.list()` never carry the header, so there it is always `null`.
+   *
+   * It is the raw string, not narrowed to `routerErrors.REFUSAL_SUBJECTS` — the
+   * same pass-through {@link ComfyError.code} gets — so treat a value outside
+   * that list as unspecified. It is on the base class because `models.run`
+   * raises a refusal as a bare `ComfyError`.
+   */
+  readonly refusalSubject: string | null;
+
   constructor(message: string, options: ComfyErrorOptions = {}) {
     super(message, "cause" in options ? { cause: options.cause } : undefined);
     this.name = new.target.name;
@@ -81,6 +103,7 @@ export class ComfyError extends Error {
     this.requestId = options.requestId ?? null;
     this.retryAfter = options.retryAfter ?? null;
     this.idempotencyKey = options.idempotencyKey ?? null;
+    this.refusalSubject = options.refusalSubject ?? null;
   }
 }
 

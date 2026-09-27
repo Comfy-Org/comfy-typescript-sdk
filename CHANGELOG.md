@@ -43,7 +43,11 @@ entry. See CONTRIBUTING.md.
   and retry. `null` when the response names none. It is not narrowed to the
   ten documented values: treat an unknown value as unspecified. Only the
   queued `submit` / `subscribe` / `handle` surface raises `RouterError`;
-  `models.run`'s `ComfyError` does not carry the subject yet.
+  `models.run` carries the same value on `ComfyError.refusalSubject`.
+- **`ComfyError.refusalSubject`** — `comfy.models.run`'s
+  `content_policy_violation` now names the refused input/output, read from
+  `X-Comfy-Refusal-Subject` with a fallback to the body's `refusal_subject`;
+  `null` when unnamed.
 
 ## [0.3.0] - 2026-09-14
 

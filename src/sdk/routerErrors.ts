@@ -349,11 +349,11 @@ export class RouterError extends Error {
    * }
    * ```
    *
-   * Only the surfaces that raise `routerErrors.*` carry it — the queued
-   * `submit` / `subscribe` / `handle`. `comfy.models.run` maps its failures into
-   * the `ComfyError` family instead (a refusal there is a `ComfyError` with
-   * `code: "content_policy_violation"`), and that error does not carry the
-   * subject yet.
+   * The queued `submit` / `subscribe` / `handle` raise `routerErrors.*` and
+   * carry it here. `comfy.models.run` maps its failures into the `ComfyError`
+   * family instead — a refusal there is a `ComfyError` with
+   * `code: "content_policy_violation"` — and carries the same value, read the
+   * same way, on `ComfyError.refusalSubject`.
    *
    * It is the raw string, not narrowed to {@link REFUSAL_SUBJECTS}: a newer
    * server may send a subject this release does not know, and a caller should
@@ -707,8 +707,12 @@ interface RequestErrorBody {
  * One refusal subject out of a header or body value, or `null` when the value
  * names none: not a string, blank once trimmed, or comma-joined — `Headers.get`
  * joins a repeated header with `", "`, and two subjects are not one subject.
+ *
+ * Exported, like {@link parseRetryAfter}, so `comfy.models.run` reads
+ * `ComfyError.refusalSubject` through the same normalizer — this module
+ * imports nothing, so a shared helper has to live here rather than beside it.
  */
-function readRefusalSubject(value: unknown): string | null {
+export function readRefusalSubject(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const subject = value.trim();
   return subject === "" || subject.includes(",") ? null : subject;
