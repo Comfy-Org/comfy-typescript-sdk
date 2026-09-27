@@ -42,7 +42,7 @@ const client = new Comfy({ apiKey: "..." }); // Comfy Cloud
 
 const wf = await client.workflows.fromFile("workflow_api.json");
 const asset = client.assets.fromFile("photo.png"); // lazy; hashed + uploaded on first use
-wf.setInput("10", "image", asset);
+wf.setInput("10", "image", asset); // "10" is a LoadImage node: bind handles to a loader's file widget
 
 const job = await client.run(wf); // submit, then poll to a terminal state
 await job.getOutputs("13")[0].toFile("out.png");
