@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { ApiError } from "../low/index.js";
 import {
   BlobNotFound,
+  ComfyError,
   Forbidden,
   HashMismatch,
   IdempotencyKeyReuse,
@@ -69,5 +70,14 @@ describe("translate", () => {
       caught = e;
     }
     expect(caught).toBe(original); // identity preserved; not coerced into a ComfyError
+  });
+});
+
+describe("ComfyError.refusalSubject", () => {
+  it("defaults to null and round-trips the option", () => {
+    expect(new ComfyError("x").refusalSubject).toBeNull();
+    expect(new ComfyError("x", { refusalSubject: "output_audio" }).refusalSubject).toBe(
+      "output_audio",
+    );
   });
 });
