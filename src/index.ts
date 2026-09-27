@@ -18,7 +18,7 @@
  *
  * const wf = await client.workflows.fromFile("workflow_api.json");
  * const asset = client.assets.fromFile("photo.png"); // lazy; uploaded on use
- * wf.setInput("10", "image", asset); // "10" is a LoadImage node
+ * wf.setInput("10", "image", asset); // "10" is a LoadImage node: bind handles to a loader's file widget
  *
  * const job = await client.run(wf);
  * await job.getOutputs("13")[0].toFile("out.png");

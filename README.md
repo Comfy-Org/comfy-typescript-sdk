@@ -656,7 +656,7 @@ handle is actually used. Embed the handle directly in a workflow input with
 
 ```ts
 const asset = client.assets.fromFile("photo.png");
-wf.setInput("10", "image", asset);
+wf.setInput("10", "image", asset); // "10" is a LoadImage node: see below
 ```
 
 An asset handle resolves to a **filename** on the server, not to decoded
