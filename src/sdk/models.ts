@@ -1678,6 +1678,11 @@ async function discoveryFetch(
   const timeoutMs =
     options.timeoutMs === undefined ? DEFAULT_DISCOVERY_TIMEOUT_MS : options.timeoutMs;
   const signal = composeSignal(options.signal, timeoutMs);
+  // The non-2xx response whose body read failed, as in `run`: its status and
+  // headers are already the verdict, and with no retry here the first cut-off
+  // read would otherwise surface as the reader's `TypeError: terminated`.
+  // Asserted rather than annotated for the same narrowing reason as there.
+  let unreadError = null as Response | null;
   try {
     const response = await fetch(
       url,
@@ -1687,7 +1692,13 @@ async function discoveryFetch(
     // the deadline covers reading the body too, and translating the abort in
     // only one of the two places would leak a bare DOMException out of the
     // other. A `304` has no body and `.text()` answers "" for it.
-    const text = await response.text();
+    let text: string;
+    try {
+      text = await response.text();
+    } catch (exc) {
+      if (!response.ok) unreadError = response;
+      throw exc;
+    }
     return { response, text };
   } catch (exc) {
     if (isTimeout(exc, options.signal)) {
@@ -1697,6 +1708,10 @@ async function discoveryFetch(
         { code: "request_timeout", cause: exc },
       );
     }
+    // After the deadline and the caller's abort, so neither is re-dressed as
+    // the status it cut short.
+    if (options.signal?.aborted) throw exc;
+    if (unreadError !== null) throw errorFromResponse(unreadError, "", null, exc);
     throw exc;
   }
 }

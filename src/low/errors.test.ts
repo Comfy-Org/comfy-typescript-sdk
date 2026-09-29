@@ -69,4 +69,15 @@ describe("errorFromEnvelope", () => {
       expect(err.message).toBe("?");
     },
   );
+
+  it.each([[["queue_full"]], [{ toString: null }], [42]])(
+    "reads a non-string code %j as absent, not as a lookup key",
+    (code) => {
+      const err = errorFromEnvelope(503, {
+        error: { code: code as unknown as string, message: "?" },
+      });
+      expect(err.constructor.name).toBe("ApiError");
+      expect(err.code).toBe("error");
+    },
+  );
 });

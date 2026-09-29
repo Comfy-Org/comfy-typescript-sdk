@@ -132,7 +132,10 @@ export function errorFromEnvelope(
   let message = err && typeof err === "object" ? err.message : undefined;
   const details = err && typeof err === "object" ? err.details : undefined;
 
-  if (!code) {
+  // A string or nothing: `code` is typed `string` downstream, and a non-string
+  // off the wire (an array, an object) would be coerced into a lookup key and
+  // stamped onto the error as-is.
+  if (typeof code !== "string" || !code) {
     code = CODE_BY_STATUS[httpStatus] ?? "error";
   }
   if (!message) {

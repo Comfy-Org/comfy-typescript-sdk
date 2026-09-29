@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { ApiError } from "../low/index.js";
 import {
   BlobNotFound,
+  ComfyError,
   Forbidden,
   HashMismatch,
   IdempotencyKeyReuse,
@@ -37,6 +38,16 @@ describe("toSdkError", () => {
     const apiError = new ApiError("boom", { code, httpStatus: 400 });
     expect(toSdkError(apiError)).toBeInstanceOf(expectedClass);
   });
+
+  it.each(["constructor", "toString", "__proto__", "hasOwnProperty"])(
+    "never resolves a code of %s off Object.prototype",
+    (code) => {
+      const sdkError = toSdkError(new ApiError("?", { code, httpStatus: 500 }));
+      expect(sdkError.constructor).toBe(ComfyError);
+      expect(sdkError.code).toBe(code);
+      expect(sdkError.message).toBe("?");
+    },
+  );
 
   it("carries retryAfter onto QueueFull", () => {
     const apiError = new ApiError("full", { code: "queue_full", httpStatus: 429, retryAfter: 5 });
