@@ -56,6 +56,16 @@ describe("toSdkError", () => {
     expect((sdkError as QueueFull).retryAfter).toBe(5);
   });
 
+  it.each([
+    ["rate_limited", 429],
+    ["service_unavailable", 503],
+    ["not_found", 404],
+  ])("carries retryAfter onto a %s error too", (code, httpStatus) => {
+    const sdkError = toSdkError(new ApiError("wait", { code, httpStatus, retryAfter: 120 }));
+    expect(sdkError).toBeInstanceOf(ComfyError);
+    expect(sdkError.retryAfter).toBe(120);
+  });
+
   it("preserves an absent retryAfter on QueueFull", () => {
     const apiError = new ApiError("full", { code: "queue_full", httpStatus: 429 });
     const sdkError = toSdkError(apiError);

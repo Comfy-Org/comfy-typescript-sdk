@@ -701,8 +701,17 @@ interface ErrorBody {
 function describeValidationFailures(detail: readonly unknown[]): string {
   const described = detail.map((entry) => {
     const item = (entry ?? {}) as { loc?: unknown; msg?: unknown; type?: unknown };
-    const loc = Array.isArray(item.loc) ? item.loc.join(".") : "";
-    const msg = typeof item.msg === "string" ? item.msg : String(item.type ?? "invalid");
+    // Only strings and numbers are stringified: this runs on the error path, and
+    // an entry off the wire with no usable `toString` must not throw from it.
+    const loc = Array.isArray(item.loc)
+      ? item.loc.filter((seg) => typeof seg === "string" || typeof seg === "number").join(".")
+      : "";
+    const msg =
+      typeof item.msg === "string"
+        ? item.msg
+        : typeof item.type === "string"
+          ? item.type
+          : "invalid";
     return loc ? `${loc}: ${msg}` : msg;
   });
   const count =

@@ -187,7 +187,14 @@ export function toSdkError(exc: ApiError): ComfyError {
   // `exc.code` comes off the server's envelope, and a plain index would
   // resolve `constructor` or `toString` off `Object.prototype`.
   const cls = Object.hasOwn(BY_CODE, exc.code) ? BY_CODE[exc.code] : ComfyError;
-  return new cls(exc.message, { code: exc.code, httpStatus: exc.httpStatus, details: exc.details });
+  return new cls(exc.message, {
+    code: exc.code,
+    httpStatus: exc.httpStatus,
+    details: exc.details,
+    // Not just `QueueFull`'s: a `503` or a `rate_limited` `429` that named a
+    // pace carries it too (see `ComfyError.retryAfter`).
+    retryAfter: exc.retryAfter,
+  });
 }
 
 /**

@@ -55,6 +55,15 @@ entry. See CONTRIBUTING.md.
   failed every `instanceof` check, or threw a `TypeError` from inside the
   SDK's own error path. A `code` that is not a string is now ignored in
   favour of the status-derived one instead of being stamped onto the error.
+  The same goes for a `message` that is not a string, which falls back to
+  `HTTP <status>` instead of throwing a `TypeError` or being flattened.
+- **`retryAfter` now survives translation to the `sdk` layer for every error,
+  not just `QueueFull`.** A `503`, or a `429` whose code is not `queue_full`,
+  that sent `Retry-After` reached the caller with `retryAfter: null`.
+- **A `comfy.models.run` validation failure whose `detail[]` entry carries a
+  non-string `type` or `loc` segment no longer throws a `TypeError`** from
+  inside the SDK's error path; the typed error is raised with the entry
+  summarized as `invalid`.
 
 ## [0.3.0] - 2026-09-14
 

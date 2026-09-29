@@ -138,7 +138,10 @@ export function errorFromEnvelope(
   if (typeof code !== "string" || !code) {
     code = CODE_BY_STATUS[httpStatus] ?? "error";
   }
-  if (!message) {
+  // Same for `message`: the `Error` constructor stringifies whatever it is
+  // handed, and an object with no usable `toString` would throw a bare
+  // `TypeError` from here instead of the `ApiError` this exists to build.
+  if (typeof message !== "string" || !message) {
     message = `HTTP ${httpStatus}`;
   }
 

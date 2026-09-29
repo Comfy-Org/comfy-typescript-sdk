@@ -505,6 +505,26 @@ describe("comfy.models.run failures", () => {
     });
   });
 
+  it("summarizes a validation entry with no usable toString instead of throwing", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 422;
+      server.state.errorType = "invalid_input";
+      server.state.body = {
+        detail: [
+          { loc: ["body"], type: { toString: null } },
+          { loc: ["body", { toString: null }, "seed"], msg: "too small" },
+        ],
+      };
+
+      const err = (await comfy.models.run(MODEL, {}).catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("invalid_input");
+      expect(err.message).toBe("2 validation errors: body: invalid; body.seed: too small");
+    });
+  });
+
   it("still produces a typed error when the body is not the router's at all", async () => {
     await withRouterStub(async (server) => {
       useStub(server);

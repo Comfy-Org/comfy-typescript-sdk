@@ -70,6 +70,17 @@ describe("errorFromEnvelope", () => {
     },
   );
 
+  it.each([[["a", "b"]], [{ toString: null }], [42]])(
+    "reads a non-string message %j as absent, not as the error's text",
+    (message) => {
+      const err = errorFromEnvelope(503, {
+        error: { code: "queue_full", message: message as unknown as string },
+      });
+      expect(err).toBeInstanceOf(QueueFull);
+      expect(err.message).toBe("HTTP 503");
+    },
+  );
+
   it.each([[["queue_full"]], [{ toString: null }], [42]])(
     "reads a non-string code %j as absent, not as a lookup key",
     (code) => {
