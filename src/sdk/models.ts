@@ -684,7 +684,9 @@ export interface Models {
    * Router contract declares `X-Comfy-Credits-Used` on the synchronous run
    * route but not on the queued result route, so the queued value is
    * unpinned and a caller should expect `null` ("not reported", never
-   * "free") here. Reconcile spend from {@link Models.run} if it matters.
+   * "free") here, and reconcile spend against the workspace ledger if it
+   * matters. Calling {@link Models.run} to learn the price is a second,
+   * separately billed generation, not a lookup of this one.
    *
    * ```ts
    * const { data } = await comfy.models.subscribe(

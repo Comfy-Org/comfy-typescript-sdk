@@ -35,7 +35,8 @@ entry. See CONTRIBUTING.md.
   `X-Comfy-Credits-Used` response header. The queued result
   (`RequestHandle.get()`, and so `comfy.models.subscribe`) reads it too, but
   the contract does not declare it on the queued result route, so there it is
-  unpinned: expect `null`, and reconcile spend from `run` if it matters.
+  unpinned: expect `null`, and reconcile spend against the workspace ledger if
+  it matters (calling `run` for the price is a second, billed generation).
   Typed `string | null`, verbatim off the wire:
   the value is decimal and a caller reconciling money should parse it
   deliberately rather than receive a float this SDK chose the rounding of.
