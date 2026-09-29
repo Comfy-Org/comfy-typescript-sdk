@@ -254,6 +254,9 @@ describe("a queue call whose error body is cut off mid-read", () => {
       expect(err.errorType).toBe("invalid_input");
       expect(err.requestId).toBe(REQUEST_ID);
       expect(err.cause).toBeInstanceOf(TypeError);
+      // The body was never read, so the message must not summarize one.
+      expect(err.message).toBe("HTTP 422");
+      expect((err as routerErrors.InvalidInput).detail).toEqual([]);
       expect(server.state.requestCount).toBe(1);
     });
   });
@@ -273,6 +276,7 @@ describe("a queue call whose error body is cut off mid-read", () => {
 
       expect(err).toBeInstanceOf(routerErrors.RequestNotFound);
       expect(err.httpStatus).toBe(404);
+      expect(err.message).toBe("HTTP 404");
       expect(err.requestId).toBe(REQUEST_ID);
       expect(err.cause).toBeInstanceOf(TypeError);
       expect(Object.keys(err)).not.toContain("cause");

@@ -311,12 +311,17 @@ export class RouterError extends Error {
  * array; those entries are on {@link detail} with their `loc`, `msg`, `type`
  * and `ctx` intact, because flattening them into the message would destroy
  * the granularity an integration branches on. {@link detail} is an empty
- * array for the Router-level case, which names no field.
+ * array for the Router-level case, which names no field — and also when the
+ * response body could not be read at all, in which case `cause` carries the
+ * read failure and the message is the bare `HTTP <status>`.
  */
 export class InvalidInput extends RouterError {
   static override readonly errorType = "invalid_input";
 
-  /** Per-field validation failures; empty when the rejection named no field. */
+  /**
+   * Per-field validation failures; empty when the rejection named no field, or
+   * when the body was cut off before it could be read (`cause` is set then).
+   */
   readonly detail: readonly ValidationErrorDetail[];
 
   constructor(

@@ -48,6 +48,11 @@ entry. See CONTRIBUTING.md.
   `cause`. Retry behaviour is unchanged, and a cut-off 2xx body, a deadline,
   a caller abort, a size-cap breach or a failure with no response at all
   still raise exactly what they did.
+- **A Comfy API v2 error whose `code` names an `Object.prototype` member
+  (`constructor`, `toString`, …) now raises a plain `ApiError`.** The
+  code-to-class lookup read inherited properties, so such a code produced
+  something that failed every `instanceof ApiError` check, or threw a
+  `TypeError` from inside the SDK's own error path.
 
 ## [0.3.0] - 2026-09-14
 

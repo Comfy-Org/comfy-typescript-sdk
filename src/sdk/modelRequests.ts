@@ -617,7 +617,12 @@ async function send(call: QueueCall): Promise<QueueResponse> {
       // After the two exits above on purpose, so a deadline and a caller
       // abort are never re-dressed as the status they cut short.
       if (delay === null && unreadError !== null) {
-        const error = toRouterError(unreadError.status, unreadError.headers, null);
+        // A string `detail` names the message outright, so this reads `HTTP 422`
+        // like the `models.run` twin — not `InvalidInput`'s "rejected as invalid"
+        // summary of an empty `detail[]`, which would claim a body it never read.
+        const error = toRouterError(unreadError.status, unreadError.headers, {
+          detail: `HTTP ${String(unreadError.status)}`,
+        });
         // Defined rather than assigned, so `cause` is the non-enumerable own
         // property ES2022's `new Error(msg, { cause })` makes — the shape the
         // `models.run` twin of this path gets — and a structured logger or

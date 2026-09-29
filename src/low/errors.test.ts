@@ -59,4 +59,14 @@ describe("errorFromEnvelope", () => {
     const err = errorFromEnvelope(500, { error: { code: "weird_new_code", message: "?" } });
     expect(err.constructor.name).toBe("ApiError");
   });
+
+  it.each(["constructor", "toString", "__proto__", "hasOwnProperty"])(
+    "never resolves a code of %s off Object.prototype",
+    (code) => {
+      const err = errorFromEnvelope(500, { error: { code, message: "?" } });
+      expect(err.constructor.name).toBe("ApiError");
+      expect(err.code).toBe(code);
+      expect(err.message).toBe("?");
+    },
+  );
 });
