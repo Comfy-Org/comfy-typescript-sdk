@@ -971,7 +971,12 @@ describe("RequestHandle on a binary result", () => {
   it("resolves the cap inside collect() for a direct caller", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
-      server.state.respond = binaryScript(MP3_BYTES, "audio/mpeg");
+      // Declared past the default cap and never sent: a body small enough to
+      // pass under any cap would read the same whether omission meant the
+      // default or no cap at all.
+      server.state.respond = binaryScript(undefined, "audio/mpeg", {
+        "Content-Length": String(DEFAULT_MAX_RESPONSE_BYTES + 1),
+      });
       const handle = comfy.models.handle(MODEL, REQUEST_ID);
       const completion = await handle.status();
 
@@ -979,8 +984,12 @@ describe("RequestHandle on a binary result", () => {
         handle.collect(completion, { budgetMs: null, retry: false, maxBytes: Number.NaN }),
       ).rejects.toThrow(/RequestHandle\.collect\(options\.maxBytes\)/);
       // Omitted is the default cap, not "no cap".
-      const result = await handle.collect(completion, { budgetMs: null, retry: false });
-      expect(result.kind).toBe("binary");
+      await expect(
+        handle.collect(completion, { budgetMs: null, retry: false }),
+      ).rejects.toMatchObject({
+        code: "response_too_large",
+        details: { maxBytes: DEFAULT_MAX_RESPONSE_BYTES },
+      });
       expect(server.state.requests.map((r) => r.path)).toEqual([STATUS_PATH, REQUEST_PATH]);
     });
   });

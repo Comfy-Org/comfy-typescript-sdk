@@ -1173,6 +1173,7 @@ describe("comfy.models.run response size cap", () => {
         .run(MODEL, {}, { maxBytes: 64 })
         .catch((e: unknown) => e)) as ComfyError;
 
+      expect(err).toBeInstanceOf(ComfyError);
       expect(err.code).toBe("invalid_input");
       expect(err.httpStatus).toBe(422);
       expect(err.details?.detail).toHaveLength(1);
@@ -1189,6 +1190,7 @@ describe("comfy.models.run response size cap", () => {
         .run(MODEL, {}, { maxBytes: 16 })
         .catch((e: unknown) => e)) as ComfyError;
 
+      expect(err).toBeInstanceOf(ComfyError);
       expect(err.code).toBe("unexpected_response");
       expect(err.httpStatus).toBe(202);
       expect(err.message).toContain("202 (accepted, not finished)");
