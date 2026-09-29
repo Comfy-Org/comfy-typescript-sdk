@@ -36,6 +36,19 @@ entry. See CONTRIBUTING.md.
   queued failure carrying one of them is a typed `catch` rather than a bare
   `RouterError`.
 
+### Fixed
+
+- **An error response whose body could not be read now raises the typed
+  error for its status and headers.** When a non-2xx answer from
+  `comfy.models.run` or one of the queued request calls (`submit`, `status`,
+  `get`, `cancel`, …) lost its connection mid-body and no retry remained, the
+  call rejected with the runtime's bare `TypeError: terminated`. It now
+  rejects with the error that status and headers describe — `InsufficientCredits`,
+  `InvalidInput` and so on, with the request id — and the read failure as
+  `cause`. Retry behaviour is unchanged, and a cut-off 2xx body, a deadline,
+  a caller abort, a size-cap breach or a failure with no response at all
+  still raise exactly what they did.
+
 ## [0.3.0] - 2026-09-14
 
 ### Added

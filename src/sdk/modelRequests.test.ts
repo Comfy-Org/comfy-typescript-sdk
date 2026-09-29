@@ -236,6 +236,42 @@ describe("comfy.models.submit", () => {
   });
 });
 
+describe("a queue call whose error body is cut off mid-read", () => {
+  it("raises the typed router error its status and headers describe, with the read failure as cause", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 422;
+      server.state.errorType = "invalid_input";
+      server.state.cutBodyTimes = 1;
+
+      const err = (await comfy.models
+        .submit(MODEL, {}, { retry: false })
+        .catch((e: unknown) => e)) as routerErrors.RouterError;
+
+      expect(err).toBeInstanceOf(routerErrors.InvalidInput);
+      expect(err).toBeInstanceOf(routerErrors.RouterError);
+      expect(err.httpStatus).toBe(422);
+      expect(err.errorType).toBe("invalid_input");
+      expect(err.requestId).toBe(REQUEST_ID);
+      expect(err.cause).toBeInstanceOf(TypeError);
+      expect(server.state.requestCount).toBe(1);
+    });
+  });
+
+  it("does not re-dress a 2xx whose body was cut: that is still the raw read failure", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 201;
+      server.state.cutBodyTimes = 1;
+
+      const err = await comfy.models.submit(MODEL, {}, { retry: false }).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(TypeError);
+      expect(err).not.toBeInstanceOf(ComfyError);
+    });
+  });
+});
+
 describe("RequestHandle.status", () => {
   it("GETs the status route once and reports what the queue said", async () => {
     await withRouterStub(async (server) => {

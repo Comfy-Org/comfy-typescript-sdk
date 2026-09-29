@@ -729,6 +729,7 @@ function errorFromResponse(
   response: Response,
   bodyText: string,
   idempotencyKey: string | null,
+  cause?: unknown,
 ): ComfyError {
   const status = response.status;
   const requestId = response.headers.get(REQUEST_ID_HEADER);
@@ -771,6 +772,9 @@ function errorFromResponse(
     // `requestId` is already on the error to avoid.
     retryAfter: parseRetryAfter(response.headers),
     idempotencyKey,
+    // Only when given: `ComfyError` sets `cause` on the presence of the key,
+    // so passing `undefined` through would still stamp an empty one.
+    ...(cause === undefined ? {} : { cause }),
   });
 }
 
@@ -1141,6 +1145,15 @@ async function run<TData = unknown>(
     // Non-null once this response has been classified as one to ask again
     // about, and is then the backoff before that re-ask.
     let repeatAfterMs: number | null = null;
+    // The non-2xx response whose body read failed. Kept because its status
+    // and headers are already a complete verdict: once no retry remains, the
+    // typed error they describe is what this call owes, not the reader's
+    // `TypeError: terminated`.
+    //
+    // Asserted rather than annotated: TypeScript does not see the assignment
+    // inside the inner `catch` reach the outer one, and would narrow this to
+    // `null` there for good.
+    let unreadError = null as Response | null;
     try {
       // `withInactivityLimits` derives undici's own headers/body timers from
       // the same remaining budget as `signal`. Without it this call is capped
@@ -1201,7 +1214,12 @@ async function run<TData = unknown>(
         // the `Content-Type`. Decoding is deferred to the one branch that wants
         // a string ({@link decodeUtf8}), which is what `text()` would have done
         // anyway.
-        responseBody = await readBodyWithin(response, maxBytes, model, idempotencyKey);
+        try {
+          responseBody = await readBodyWithin(response, maxBytes, model, idempotencyKey);
+        } catch (exc) {
+          if (!response.ok) unreadError = response;
+          throw exc;
+        }
       } else {
         // Never read: the whole content of a response this call is going to
         // ask again about is "ask again", which the status line already said.
@@ -1226,6 +1244,11 @@ async function run<TData = unknown>(
       // A caller's abort is theirs: never retried, never re-dressed.
       if (options.signal?.aborted) throw exc;
       const delay = nextDelayMs();
+      // After the three exits above on purpose, so a cap breach, a deadline
+      // and a caller abort are never re-dressed as the status they cut short.
+      if (delay === null && unreadError !== null) {
+        throw errorFromResponse(unreadError, "", idempotencyKey, exc);
+      }
       if (delay === null) throw exc;
       // Abortable, so an abort during the backoff stops the loop here rather
       // than sleeping out the delay and sending one more attempt.

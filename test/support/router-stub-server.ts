@@ -102,6 +102,16 @@ export interface RouterServerState {
    */
   stallBodyContentLength: number;
   /**
+   * For the first N requests, send the ordinary status line and headers
+   * (`X-Comfy-Error-Type`, `X-Comfy-Request-Id` and `Retry-After` included)
+   * with NO `Content-Length`, write a partial JSON prefix, then destroy the
+   * socket — a connection dropped mid-body. Unlike {@link resetTimes}, which
+   * sends no status line at all, the client HAS a `Response` here and only
+   * its body read fails; unlike {@link stallBody}, which never drops, the read
+   * rejects (`TypeError: terminated`) rather than waiting on a deadline.
+   */
+  cutBodyTimes: number;
+  /**
    * Send the body as N chunks of `chunkBytes` each with NO `Content-Length`,
    * so the response is chunked and its size cannot be known before it is
    * read. Writes respect backpressure, so a client that stops reading part
@@ -223,6 +233,7 @@ function defaultState(): RouterServerState {
     hang: false,
     stallBody: false,
     stallBodyContentLength: 4096,
+    cutBodyTimes: 0,
     chunkedBody: null,
     chunkedChunksSent: 0,
     chunkedBodyCompleted: false,
@@ -446,6 +457,16 @@ export class RouterStubServer {
     // anything.
     if (state.retryAfter !== null) headers["Retry-After"] = state.retryAfter;
     if (state.idempotentReplayed) headers["Idempotent-Replayed"] = "true";
+
+    if (state.cutBodyTimes > 0) {
+      state.cutBodyTimes -= 1;
+      // No Content-Length, so the drop is a truncated chunked body rather
+      // than a short fixed-length one; either way the client's read rejects
+      // after `fetch` has already resolved with the status.
+      res.writeHead(state.status, headers);
+      res.write('{"detail":[', () => res.socket?.destroy());
+      return;
+    }
 
     if (state.stallBody) {
       // A Content-Length the body never reaches, so the client keeps reading.
