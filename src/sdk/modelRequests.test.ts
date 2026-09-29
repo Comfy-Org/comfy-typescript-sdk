@@ -17,7 +17,14 @@ import {
   RouterStubServer,
   withRouterStub,
 } from "../../test/support/router-stub-server.js";
-import { comfy, ComfyError, config, CREDENTIALS_ENV_VAR, MissingCredentials } from "./index.js";
+import {
+  comfy,
+  ComfyError,
+  config,
+  CREDENTIALS_ENV_VAR,
+  DEFAULT_MAX_RESPONSE_BYTES,
+  MissingCredentials,
+} from "./index.js";
 import * as routerErrors from "./routerErrors.js";
 
 const CREDENTIAL = "comfyui-test-credential";
@@ -457,9 +464,8 @@ describe("RequestHandle.get", () => {
       const result = await handle.get();
 
       // The DISCRIMINANT, so a caller can narrow one `RunResult` across both
-      // paths. The queued result route is read as a document, so this arm is
-      // the only one it produces — `"binary"` is the synchronous route's,
-      // decided off the generation's own `Content-Type`.
+      // paths. `"json"` is what a JSON `Content-Type` produces; a partner's own
+      // media type produces `"binary"`, exactly as on the synchronous route.
       expect(result.kind).toBe("json");
       // No cast: `data` is the supplied type, exactly as `run<T>` gives it.
       expect(result.data.images[0].url).toBe("https://example.invalid/out.png");
@@ -570,7 +576,37 @@ describe("RequestHandle.get", () => {
         .catch((e: unknown) => e)) as ComfyError;
       expect(err).toBeInstanceOf(ComfyError);
       expect(err.code).toBe("invalid_response");
+      expect(err.cause).toBeInstanceOf(SyntaxError);
     });
+  });
+
+  it("keeps queuedRequestId when parsing a declared-JSON result fails for a reason other than its shape", async () => {
+    const marker = '{"rangeErrorMarker":true}';
+    const realParse = JSON.parse;
+    const spy = vi.spyOn(JSON, "parse").mockImplementation((text: string, reviver?) => {
+      if (text === marker) throw new RangeError("Maximum call stack size exceeded");
+      return realParse(text, reviver) as unknown;
+    });
+    try {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.respond = (request) => {
+          if (request.path === STATUS_PATH) return { status: 200, body: DONE };
+          return { status: 200, body: marker, contentType: "application/json" };
+        };
+        const err = await comfy.models
+          .handle(MODEL, REQUEST_ID)
+          .get()
+          .catch((e: unknown) => e);
+
+        if (!(err instanceof ComfyError)) throw err;
+        expect(err.code).toBe("invalid_response");
+        expect(err.details?.queuedRequestId).toBe(REQUEST_ID);
+        expect(err.cause).toBeInstanceOf(RangeError);
+      });
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("reports a 202 on the result route rather than typing it as a result", async () => {
@@ -705,6 +741,300 @@ describe("comfy.models.handle", () => {
       expect(server.state.lastPath).toBe(
         "/v2/models/fal%20ai/flux%23pro/requests/req%20id%231/status",
       );
+    });
+  });
+});
+
+/**
+ * The result route's 200 is declared as `application/json` OR `*\/*` bytes, and
+ * the handle branches on `Content-Type` exactly as `run` does. Router refuses
+ * binary models at submit today, so this is the contract's arm rather than one
+ * a live queue produces yet.
+ */
+describe("RequestHandle on a binary result", () => {
+  /** The head of a real `audio/mpeg` body, including bytes that are not valid
+   * UTF-8 and would not survive a text decode — the fixture `run` uses. */
+  const MP3_BYTES = new Uint8Array([
+    0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xfb, 0x90, 0x64, 0x00, 0x0d,
+  ]);
+
+  function binaryScript(
+    body: Uint8Array | string | undefined,
+    contentType: string | null,
+    headers?: Record<string, string>,
+  ) {
+    return (request: RecordedRequest) => {
+      if (request.method === "POST" && request.path === SUBMIT_PATH) {
+        return { status: 201, body: { request_id: REQUEST_ID, status: "IN_QUEUE" } };
+      }
+      if (request.path === STATUS_PATH) return { status: 200, body: DONE };
+      return { status: 200, body, contentType, headers };
+    };
+  }
+
+  it("get() resolves audio/mpeg bytes verbatim as the binary arm", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = binaryScript(MP3_BYTES, "audio/mpeg");
+      server.state.requestId = "http-req-bin";
+
+      const result = await comfy.models.handle(MODEL, REQUEST_ID).get();
+
+      if (result.kind !== "binary") throw new Error(`expected binary, got ${result.kind}`);
+      expect(result.contentType).toBe("audio/mpeg");
+      expect(result.data).toEqual(MP3_BYTES);
+      expect(result.requestId).toBe("http-req-bin");
+    });
+  });
+
+  it("subscribe() resolves to the binary arm too", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = binaryScript(MP3_BYTES, "audio/mpeg");
+
+      const result = await comfy.models.subscribe(MODEL, { text: "hi" });
+
+      if (result.kind !== "binary") throw new Error(`expected binary, got ${result.kind}`);
+      expect(result.data).toEqual(MP3_BYTES);
+    });
+  });
+
+  it("keeps the full Content-Type string, parameters included", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = binaryScript(MP3_BYTES, "audio/mpeg; rate=44100");
+
+      const result = await comfy.models.handle(MODEL, REQUEST_ID).get();
+
+      if (result.kind !== "binary") throw new Error(`expected binary, got ${result.kind}`);
+      expect(result.contentType).toBe("audio/mpeg; rate=44100");
+    });
+  });
+
+  it("returns a headerless non-JSON body as binary with an empty contentType", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = binaryScript(MP3_BYTES, null);
+
+      const result = await comfy.models.handle(MODEL, REQUEST_ID).get();
+
+      if (result.kind !== "binary") throw new Error(`expected binary, got ${result.kind}`);
+      expect(result.contentType).toBe("");
+      expect(result.data).toEqual(MP3_BYTES);
+    });
+  });
+
+  it("still parses a headerless JSON body as the json arm", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = binaryScript(JSON.stringify(PAYLOAD), null);
+
+      const result = await comfy.models.handle(MODEL, REQUEST_ID).get();
+
+      expect(result.kind).toBe("json");
+      expect(result.data).toEqual(PAYLOAD);
+    });
+  });
+
+  it("accepts any media type on the result request and only JSON on the status request", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = binaryScript(MP3_BYTES, "audio/mpeg");
+
+      await comfy.models.handle(MODEL, REQUEST_ID).get();
+
+      expect(server.state.requests.map((r) => [r.path, r.accept])).toEqual([
+        [STATUS_PATH, "application/json"],
+        [REQUEST_PATH, "application/json, */*;q=0.9"],
+      ]);
+    });
+  });
+
+  it("rejects an empty 200 rather than handing back zero bytes", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = binaryScript(undefined, "audio/mpeg");
+
+      const err = (await comfy.models
+        .handle(MODEL, REQUEST_ID)
+        .get()
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("invalid_response");
+    });
+  });
+
+  it("drops the body of a retryable result response instead of reading it", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      let resultCalls = 0;
+      server.state.respond = (request) => {
+        if (request.path === STATUS_PATH) return { status: 200, body: DONE };
+        resultCalls += 1;
+        // A 503 that declares a body it never sends: reading it would wait
+        // out the deadline, so the retry landing proves it was never read.
+        if (resultCalls === 1) {
+          return { status: 503, headers: { "Content-Length": String(DEFAULT_MAX_RESPONSE_BYTES) } };
+        }
+        return { status: 200, body: MP3_BYTES, contentType: "audio/mpeg" };
+      };
+
+      const result = await comfy.models
+        .handle(MODEL, REQUEST_ID)
+        .get({ retry: { baseDelayMs: 1 }, timeoutMs: 5_000 });
+
+      expect(result.kind).toBe("binary");
+      expect(resultCalls).toBe(2);
+    });
+  });
+
+  it("refuses a result that declares more than the default cap, without retrying", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = binaryScript(undefined, "audio/mpeg", {
+        "Content-Length": String(DEFAULT_MAX_RESPONSE_BYTES + 1),
+      });
+
+      const err = (await comfy.models
+        .handle(MODEL, REQUEST_ID)
+        .get()
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("response_too_large");
+      expect(err.details?.maxBytes).toBe(DEFAULT_MAX_RESPONSE_BYTES);
+      expect(err.message).toContain(REQUEST_ID);
+      // `get()` takes `maxBytes`, so the advice to raise it is one the caller can act on.
+      expect(err.message).toContain("raise maxBytes");
+      expect(server.state.requests.map((r) => r.path)).toEqual([STATUS_PATH, REQUEST_PATH]);
+    });
+  });
+
+  it("honours a per-call maxBytes on get(), and a larger one collects the same request", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = binaryScript(MP3_BYTES, "audio/mpeg");
+      const handle = comfy.models.handle(MODEL, REQUEST_ID);
+
+      const err = (await handle.get({ maxBytes: 4 }).catch((e: unknown) => e)) as ComfyError;
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("response_too_large");
+      expect(err.details?.maxBytes).toBe(4);
+      expect(err.details?.queuedRequestId).toBe(REQUEST_ID);
+
+      const result = await handle.get({ maxBytes: null });
+      expect(result.kind).toBe("binary");
+      expect(Array.from(result.data as Uint8Array)).toEqual(Array.from(MP3_BYTES));
+    });
+  });
+
+  it("honours a per-call maxBytes on subscribe()", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = binaryScript(MP3_BYTES, "audio/mpeg");
+
+      const err = (await comfy.models
+        .subscribe(MODEL, { prompt: "a cat" }, { maxBytes: 4 })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("response_too_large");
+      expect(err.details?.maxBytes).toBe(4);
+      // `subscribe` returns no handle on this path, so the error is the only
+      // place the id to collect with a larger cap can come from.
+      expect(err.details?.queuedRequestId).toBe(REQUEST_ID);
+      const result = await comfy.models
+        .handle(MODEL, err.details?.queuedRequestId as string)
+        .get({ maxBytes: null });
+      expect(result.kind).toBe("binary");
+    });
+  });
+
+  it("reports a 202 from the result route as not finished, even past the cap", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = (request) => {
+        if (request.path === STATUS_PATH) return { status: 200, body: DONE };
+        return { status: 202, body: { request_id: REQUEST_ID, status: "IN_PROGRESS" } };
+      };
+
+      const err = (await comfy.models
+        .handle(MODEL, REQUEST_ID)
+        .get({ maxBytes: 4 })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("invalid_response");
+      expect(err.httpStatus).toBe(202);
+      expect(err.message).toContain("answered 202");
+      // "Not finished" is exactly when collecting later is the remedy.
+      expect(err.details?.queuedRequestId).toBe(REQUEST_ID);
+    });
+  });
+
+  it("reads an error envelope past a small cap far enough to keep its body-only bucket", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = (request) => {
+        if (request.path === STATUS_PATH) return { status: 200, body: DONE };
+        return {
+          status: 422,
+          body: {
+            error_type: "invalid_input",
+            detail: [{ loc: ["body", "prompt"], msg: "m".repeat(2_000), type: "value_error" }],
+          },
+        };
+      };
+
+      const err = (await comfy.models
+        .handle(MODEL, REQUEST_ID)
+        .get({ maxBytes: 4 })
+        .catch((e: unknown) => e)) as routerErrors.InvalidInput;
+
+      expect(err).toBeInstanceOf(routerErrors.InvalidInput);
+      expect(err.detail).toHaveLength(1);
+    });
+  });
+
+  it("resolves the cap inside collect() for a direct caller", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      // Declared past the default cap and never sent: a body small enough to
+      // pass under any cap would read the same whether omission meant the
+      // default or no cap at all.
+      server.state.respond = binaryScript(undefined, "audio/mpeg", {
+        "Content-Length": String(DEFAULT_MAX_RESPONSE_BYTES + 1),
+      });
+      const handle = comfy.models.handle(MODEL, REQUEST_ID);
+      const completion = await handle.status();
+
+      await expect(
+        handle.collect(completion, { budgetMs: null, retry: false, maxBytes: Number.NaN }),
+      ).rejects.toThrow(/RequestHandle\.collect\(options\.maxBytes\)/);
+      // Omitted is the default cap, not "no cap".
+      await expect(
+        handle.collect(completion, { budgetMs: null, retry: false }),
+      ).rejects.toMatchObject({
+        code: "response_too_large",
+        details: { maxBytes: DEFAULT_MAX_RESPONSE_BYTES },
+      });
+      expect(server.state.requests.map((r) => r.path)).toEqual([STATUS_PATH, REQUEST_PATH]);
+    });
+  });
+
+  it("rejects an invalid maxBytes before any request is made", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = binaryScript(MP3_BYTES, "audio/mpeg");
+
+      await expect(
+        comfy.models.subscribe(MODEL, { prompt: "a cat" }, { maxBytes: Number.NaN }),
+      ).rejects.toThrow(/models\.subscribe\(options\.maxBytes\)/);
+      await expect(comfy.models.handle(MODEL, REQUEST_ID).get({ maxBytes: -1 })).rejects.toThrow(
+        /RequestHandle\.get\(options\.maxBytes\)/,
+      );
+      expect(server.state.requests).toEqual([]);
     });
   });
 });

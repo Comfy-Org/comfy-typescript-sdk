@@ -553,6 +553,36 @@ describe("comfy.models.run failures", () => {
       expect(err.requestId).toBe("6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21");
     });
   });
+
+  it("keeps the identifiers when parsing a declared-JSON 200 fails for a reason other than its shape", async () => {
+    // A `RangeError` (a nesting too deep for the stack, a string too long to
+    // allocate) is not the body's fault, but it must still leave as a
+    // ComfyError carrying what a caller needs to re-collect the generation.
+    const marker = '{"rangeErrorMarker":true}';
+    const realParse = JSON.parse;
+    const spy = vi.spyOn(JSON, "parse").mockImplementation((text: string, reviver?) => {
+      if (text === marker) throw new RangeError("Maximum call stack size exceeded");
+      return realParse(text, reviver) as unknown;
+    });
+    try {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.contentType = "application/json";
+        server.state.body = marker;
+
+        const err = await comfy.models.run(MODEL, {}).catch((e: unknown) => e);
+
+        if (!(err instanceof ComfyError)) throw err;
+        expect(err.code).toBe("unexpected_response");
+        expect(err.httpStatus).toBe(200);
+        expect(err.requestId).toBe("6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21");
+        expect(err.idempotencyKey).toEqual(expect.any(String));
+        expect(err.cause).toBeInstanceOf(RangeError);
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
 });
 
 /**
@@ -1154,6 +1184,46 @@ describe("comfy.models.run response size cap", () => {
       expect(err).toBeInstanceOf(InsufficientCredits);
       expect(err.code).toBe("insufficient_credits");
       expect(err.httpStatus).toBe(402);
+    });
+  });
+
+  it("reads an error envelope past a small cap far enough to keep its body-only bucket", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      // No `X-Comfy-Error-Type`: the bucket and the per-field failures are in
+      // the body alone, so cutting it at a 64-byte result cap would leave an
+      // unparseable fragment and a bare `http_422`.
+      server.state.status = 422;
+      server.state.body = {
+        error_type: "invalid_input",
+        detail: [{ loc: ["body", "prompt"], msg: "m".repeat(2_000), type: "value_error" }],
+      };
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { maxBytes: 64 })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("invalid_input");
+      expect(err.httpStatus).toBe(422);
+      expect(err.details?.detail).toHaveLength(1);
+    });
+  });
+
+  it("reports a 202 as not finished rather than as a cap breach", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 202;
+      server.state.body = { request_id: "r", status: "IN_PROGRESS", padding: "p".repeat(2_000) };
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { maxBytes: 16 })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("unexpected_response");
+      expect(err.httpStatus).toBe(202);
+      expect(err.message).toContain("202 (accepted, not finished)");
     });
   });
 
