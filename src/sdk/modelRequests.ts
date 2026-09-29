@@ -618,7 +618,16 @@ async function send(call: QueueCall): Promise<QueueResponse> {
       // abort are never re-dressed as the status they cut short.
       if (delay === null && unreadError !== null) {
         const error = toRouterError(unreadError.status, unreadError.headers, null);
-        error.cause = exc;
+        // Defined rather than assigned, so `cause` is the non-enumerable own
+        // property ES2022's `new Error(msg, { cause })` makes — the shape the
+        // `models.run` twin of this path gets — and a structured logger or
+        // `JSON.stringify` does not walk into the raw transport failure.
+        Object.defineProperty(error, "cause", {
+          value: exc,
+          writable: true,
+          configurable: true,
+          enumerable: false,
+        });
         throw error;
       }
       if (delay === null) throw exc;

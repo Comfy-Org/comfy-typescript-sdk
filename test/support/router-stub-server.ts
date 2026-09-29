@@ -53,6 +53,12 @@ export interface ScriptedResponse {
   errorType?: string | null;
   /** Extra response headers — `Retry-After` is the one the queue needs. */
   headers?: Record<string, string>;
+  /**
+   * Send the status line and headers, then drop the connection mid-body —
+   * {@link RouterServerState.cutBodyTimes} for one scripted route, so a
+   * status, result or cancel read can be cut rather than only the submit.
+   */
+  cutBody?: boolean;
 }
 
 export interface RouterServerState {
@@ -161,8 +167,9 @@ export interface RouterServerState {
    * and cancel in turn and a single `body` cannot describe all four.
    *
    * Consulted LAST, after `resetTimes`, `hang`, `delayMs`, `failTimes`,
-   * `stallBody` and `chunkedBody`, so every one of those scenarios still
-   * composes with it.
+   * `cutBodyTimes`, `stallBody` and `chunkedBody`, so every one of those
+   * scenarios still composes with it. To cut the body of one scripted route
+   * rather than of the first N requests, return `cutBody: true` instead.
    * Returning `null` falls through to the plain `status`/`body` answer.
    */
   respond: ((request: RecordedRequest, index: number) => ScriptedResponse | null) | null;
@@ -502,6 +509,11 @@ export class RouterStubServer {
       if (scripted.errorType !== undefined) {
         if (scripted.errorType === null) delete scriptedHeaders["X-Comfy-Error-Type"];
         else scriptedHeaders["X-Comfy-Error-Type"] = scripted.errorType;
+      }
+      if (scripted.cutBody === true) {
+        res.writeHead(scripted.status, scriptedHeaders);
+        res.write('{"detail":[', () => res.socket?.destroy());
+        return;
       }
       if (scripted.body === undefined) {
         res.writeHead(scripted.status, scriptedHeaders);

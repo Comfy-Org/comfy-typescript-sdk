@@ -258,6 +258,28 @@ describe("a queue call whose error body is cut off mid-read", () => {
     });
   });
 
+  it("covers the handle's reads too, and keeps cause non-enumerable", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = (request) =>
+        request.method === "GET" && request.path === STATUS_PATH
+          ? { status: 404, errorType: "request_not_found", cutBody: true }
+          : null;
+
+      const err = (await comfy.models
+        .handle(MODEL, REQUEST_ID)
+        .status({ retry: false })
+        .catch((e: unknown) => e)) as routerErrors.RouterError;
+
+      expect(err).toBeInstanceOf(routerErrors.RequestNotFound);
+      expect(err.httpStatus).toBe(404);
+      expect(err.requestId).toBe(REQUEST_ID);
+      expect(err.cause).toBeInstanceOf(TypeError);
+      expect(Object.keys(err)).not.toContain("cause");
+      expect(server.state.requestCount).toBe(1);
+    });
+  });
+
   it("does not re-dress a 2xx whose body was cut: that is still the raw read failure", async () => {
     await withRouterStub(async (server) => {
       useStub(server);

@@ -1412,6 +1412,25 @@ describe("comfy.models.run when an error body is cut off mid-read", () => {
     });
   });
 
+  it("never resolves a header bucket off Object.prototype", async () => {
+    for (const errorType of ["constructor", "toString", "__proto__"]) {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.status = 400;
+        server.state.errorType = errorType;
+        server.state.cutBodyTimes = 1;
+
+        const err = (await comfy.models
+          .run(MODEL, {}, { retry: false })
+          .catch((e: unknown) => e)) as ComfyError;
+
+        expect(err, errorType).toBeInstanceOf(ComfyError);
+        expect(err.code, errorType).toBe(errorType);
+        expect(err.httpStatus, errorType).toBe(400);
+      });
+    }
+  });
+
   it("still retries the read failure while budget remains, as before", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
