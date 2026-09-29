@@ -1000,8 +1000,10 @@ export class RequestHandle<TData = unknown> {
         details: { queuedRequestId: this.requestId },
       },
     });
-    // On every invalid answer below too: the request may well still be
-    // collectable later, and a `subscribe` caller has no handle to do it with.
+    // On every `invalid_response` built below too: the request may well still
+    // be collectable later, and a `subscribe` caller has no handle to do it
+    // with. Not on the typed `RouterError` a non-2xx raises through `decode`:
+    // that class has no `details` to carry it on.
     const queued = { queuedRequestId: this.requestId };
     if (response.status === 202) {
       // The status read said COMPLETED and the result route says otherwise.
@@ -1075,12 +1077,13 @@ export class RequestHandle<TData = unknown> {
       // says anything about the body's shape. A `RangeError` — a nesting too
       // deep for the stack, a string too long to allocate — is this process
       // failing on a body that may well be a document, and reporting it as the
-      // binary arm would hand back bytes the caller was owed parsed.
-      if (!(exc instanceof SyntaxError || exc instanceof TypeError)) throw exc;
+      // binary arm would hand back bytes the caller was owed parsed; it still
+      // leaves as the `invalid_response` below, carrying `queuedRequestId`.
+      //
       // No `Content-Type` and not JSON: nothing claimed a document, so it is
       // the bytes arm with no media type to report. A declared JSON body that
       // does not parse is the server contradicting its own header.
-      if (mediaType === "") {
+      if (mediaType === "" && (exc instanceof SyntaxError || exc instanceof TypeError)) {
         return {
           kind: "binary",
           data: bytes,

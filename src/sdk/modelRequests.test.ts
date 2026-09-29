@@ -580,6 +580,35 @@ describe("RequestHandle.get", () => {
     });
   });
 
+  it("keeps queuedRequestId when parsing a declared-JSON result fails for a reason other than its shape", async () => {
+    const marker = '{"rangeErrorMarker":true}';
+    const realParse = JSON.parse;
+    const spy = vi.spyOn(JSON, "parse").mockImplementation((text: string, reviver?) => {
+      if (text === marker) throw new RangeError("Maximum call stack size exceeded");
+      return realParse(text, reviver) as unknown;
+    });
+    try {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.respond = (request) => {
+          if (request.path === STATUS_PATH) return { status: 200, body: DONE };
+          return { status: 200, body: marker, contentType: "application/json" };
+        };
+        const err = await comfy.models
+          .handle(MODEL, REQUEST_ID)
+          .get()
+          .catch((e: unknown) => e);
+
+        if (!(err instanceof ComfyError)) throw err;
+        expect(err.code).toBe("invalid_response");
+        expect(err.details?.queuedRequestId).toBe(REQUEST_ID);
+        expect(err.cause).toBeInstanceOf(RangeError);
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("reports a 202 on the result route rather than typing it as a result", async () => {
     await withRouterStub(async (server) => {
       useStub(server);

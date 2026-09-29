@@ -205,8 +205,14 @@ const MAX_PRESIZED_CAPACITY = 16 * INITIAL_BODY_CAPACITY;
  * `detail[]` are parsed out of it — so a small result cap cutting the
  * envelope mid-document would silently degrade the typed error. Still a
  * bound: an error page is never read past `max(maxBytes, this)`.
+ *
+ * Its own literal rather than an alias of MAX_PRESIZED_CAPACITY, which answers
+ * a different question (how much a stalling peer's `Content-Length` may
+ * pre-commit): tuning that one down must not silently shrink this floor, which
+ * `GetOptions.maxBytes`, `SubscribeOptions.maxBytes` and the CHANGELOG
+ * promise as 1 MiB.
  */
-const MIN_ERROR_BODY_BYTES = MAX_PRESIZED_CAPACITY;
+const MIN_ERROR_BODY_BYTES = 1_048_576;
 
 /**
  * Stand-in for the body of a response this call never read, so the one
@@ -443,7 +449,10 @@ export interface RunOptions {
    * this call DOES hand back is truncated at the cap instead of refused: the
    * bucket a caller branches on comes from the status and the header, and
    * losing `Unauthorized` or `InsufficientCredits` to a cap breach would cost
-   * more than the body was worth. Only a RESULT past the cap raises.
+   * more than the body was worth. Only a RESULT past the cap raises. An error
+   * body is read to at least 1 MiB even under a smaller cap, so the envelope
+   * its typed error is parsed from survives: below 1 MiB the cap bounds the
+   * result, not the error page.
    */
   maxBytes?: number | null;
   /**
@@ -1014,11 +1023,14 @@ export async function readBodyWithin(
     try {
       return new Uint8Array(byteLength);
     } catch (exc) {
+      // `limit`, not `maxBytes`: on an error body the read is governed by the
+      // MIN_ERROR_BODY_BYTES floor, and the cap this reports has to be the
+      // bound that was actually applied (the two are equal on a result).
       throw tooLarge(
         subject,
         response,
         idempotencyKey,
-        maxBytes,
+        limit,
         { bytesRead, allocationFailedAt: byteLength },
         exc,
         extraDetails,
@@ -1481,15 +1493,17 @@ function finish<TData>(
     // the stack, a string too long to allocate, which `maxBytes: null` makes
     // reachable — is this process failing on a body that may well be a
     // document, and reporting it as the binary arm would hand back bytes the
-    // caller was owed parsed.
-    if (!(exc instanceof SyntaxError || exc instanceof TypeError)) throw exc;
+    // caller was owed parsed. It still leaves as the `ComfyError` below
+    // rather than bare, so it keeps the `requestId` and `idempotencyKey` a
+    // caller needs to re-collect a generation Router already billed.
+    //
     // No `Content-Type` at all and a body that is not JSON: nothing claimed
     // this was a document, so it is the binary branch with no media type to
     // report rather than a failure. A response that DID say JSON and then
     // wasn't is still the error it always was — that is the server
     // contradicting its own header, which no caller can do anything useful
     // with a `Uint8Array` of.
-    if (mediaType === "") {
+    if (mediaType === "" && (exc instanceof SyntaxError || exc instanceof TypeError)) {
       return {
         kind: "binary",
         data: responseBody,

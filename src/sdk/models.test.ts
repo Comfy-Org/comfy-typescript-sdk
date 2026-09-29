@@ -553,6 +553,36 @@ describe("comfy.models.run failures", () => {
       expect(err.requestId).toBe("6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21");
     });
   });
+
+  it("keeps the identifiers when parsing a declared-JSON 200 fails for a reason other than its shape", async () => {
+    // A `RangeError` (a nesting too deep for the stack, a string too long to
+    // allocate) is not the body's fault, but it must still leave as a
+    // ComfyError carrying what a caller needs to re-collect the generation.
+    const marker = '{"rangeErrorMarker":true}';
+    const realParse = JSON.parse;
+    const spy = vi.spyOn(JSON, "parse").mockImplementation((text: string, reviver?) => {
+      if (text === marker) throw new RangeError("Maximum call stack size exceeded");
+      return realParse(text, reviver) as unknown;
+    });
+    try {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.contentType = "application/json";
+        server.state.body = marker;
+
+        const err = await comfy.models.run(MODEL, {}).catch((e: unknown) => e);
+
+        if (!(err instanceof ComfyError)) throw err;
+        expect(err.code).toBe("unexpected_response");
+        expect(err.httpStatus).toBe(200);
+        expect(err.requestId).toBe("6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21");
+        expect(err.idempotencyKey).toEqual(expect.any(String));
+        expect(err.cause).toBeInstanceOf(RangeError);
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
 });
 
 /**
