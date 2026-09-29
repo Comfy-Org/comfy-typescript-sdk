@@ -36,6 +36,35 @@ entry. See CONTRIBUTING.md.
   queued failure carrying one of them is a typed `catch` rather than a bare
   `RouterError`.
 
+### Fixed
+
+- **An error response whose body could not be read now raises the typed
+  error for its status and headers.** When a non-2xx answer from
+  `comfy.models.run`, `comfy.models.schema`, `comfy.models.list` or one of
+  the queued request calls (`submit`, `status`, `get`, `cancel`, …) lost its
+  connection mid-body and no retry remained, the call rejected with the runtime's bare `TypeError: terminated`. It now
+  rejects with the error that status and headers describe — `InsufficientCredits`,
+  `InvalidInput` and so on, with the request id — and the read failure as
+  `cause`. Retry behaviour is unchanged, and a cut-off 2xx body, a deadline,
+  a caller abort, a size-cap breach or a failure with no response at all
+  still raise exactly what they did.
+- **A Comfy API v2 error whose `code` names an `Object.prototype` member
+  (`constructor`, `toString`, …) now raises a plain `ApiError`, and a plain
+  `ComfyError` once translated to the `sdk` layer.** Both code-to-class
+  lookups read inherited properties, so such a code produced something that
+  failed every `instanceof` check, or threw a `TypeError` from inside the
+  SDK's own error path. A `code` that is not a string is now ignored in
+  favour of the status-derived one instead of being stamped onto the error.
+  The same goes for a `message` that is not a string, which falls back to
+  `HTTP <status>` instead of throwing a `TypeError` or being flattened.
+- **`retryAfter` now survives translation to the `sdk` layer for every error,
+  not just `QueueFull`.** A `503`, or a `429` whose code is not `queue_full`,
+  that sent `Retry-After` reached the caller with `retryAfter: null`.
+- **A `comfy.models.run` validation failure whose `detail[]` entry carries a
+  non-string `type` or `loc` segment no longer throws a `TypeError`** from
+  inside the SDK's error path; the typed error is raised with the entry
+  summarized as `invalid`.
+
 ## [0.3.0] - 2026-09-14
 
 ### Added
