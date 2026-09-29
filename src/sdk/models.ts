@@ -192,8 +192,9 @@ const INITIAL_BODY_CAPACITY = 65_536;
  * Most a declared `Content-Length` may pre-size the capped read's buffer to.
  * An in-cap header is still only a claim: a peer that declares 64 MiB and then
  * stalls after a few bytes would otherwise have the full allocation committed
- * before the first `read()`. Past this the buffer grows by doubling as bytes
- * actually arrive, which costs a few copies on an honest large body.
+ * before the first `read()`. Past this, once the bytes actually outgrow it,
+ * the buffer jumps straight to the declared length (one copy, exact fit), and
+ * grows by doubling only where no usable length was declared.
  */
 const MAX_PRESIZED_CAPACITY = 16 * INITIAL_BODY_CAPACITY;
 
@@ -860,6 +861,7 @@ function tooLarge(
   maxBytes: number,
   breach: CapBreach,
   cause?: unknown,
+  extraDetails: Record<string, unknown> = {},
 ): ComfyError {
   const cap = `${String(maxBytes)}-byte maxBytes cap`;
   const advice =
@@ -887,7 +889,7 @@ function tooLarge(
   return new ComfyError(`${subject} response body ${what}; ${advice}`, {
     code: RESPONSE_TOO_LARGE,
     httpStatus: response.status,
-    details: { maxBytes, ...breach },
+    details: { ...extraDetails, maxBytes, ...breach },
     requestId: response.headers.get(REQUEST_ID_HEADER),
     // Set on every other response-derived error, and documented as "any
     // failure that carried the header has it" — a cap breach on a paced
@@ -943,23 +945,40 @@ export function isTooLarge(exc: unknown): boolean {
  * `subject` names the call in a cap-breach message (`models.run("a/b")`), and
  * `idempotencyKey` is stamped on that error — `null` for a route that sends
  * none, such as the queued result read in modelRequests.ts.
+ *
+ * `extra.truncate` overrides which responses are truncated rather than
+ * refused (default: every non-2xx), for a route whose only payload status is
+ * narrower than "any 2xx" — the queued result read, where a `202` is a control
+ * answer to diagnose rather than a result to cap. `extra.details` is merged
+ * into a cap breach's `details`, for a caller with an identifier of its own to
+ * hand back.
  */
 export async function readBodyWithin(
   response: Response,
   maxBytes: number | null,
   subject: string,
   idempotencyKey: string | null,
+  extra: { truncate?: boolean; details?: Record<string, unknown> } = {},
 ): Promise<Uint8Array> {
   if (maxBytes === null) return new Uint8Array(await response.arrayBuffer());
 
-  const truncate = !response.ok;
+  const truncate = extra.truncate ?? !response.ok;
+  const extraDetails = extra.details ?? {};
   const declared = declaredLength(response);
   if (!truncate && declared !== null && declared > maxBytes) {
     // Drop the connection rather than leave a body nothing will ever read
     // streaming into the buffer — not downloading it is the whole point of
     // checking the header first.
     await response.body?.cancel().catch(() => undefined);
-    throw tooLarge(subject, response, idempotencyKey, maxBytes, { contentLength: declared });
+    throw tooLarge(
+      subject,
+      response,
+      idempotencyKey,
+      maxBytes,
+      { contentLength: declared },
+      undefined,
+      extraDetails,
+    );
   }
 
   const body = response.body;
@@ -986,6 +1005,7 @@ export async function readBodyWithin(
         maxBytes,
         { bytesRead, allocationFailedAt: byteLength },
         exc,
+        extraDetails,
       );
     }
   };
@@ -1019,10 +1039,20 @@ export async function readBodyWithin(
     throw exc;
   }
   let total = 0;
-  /** Grow to hold `needed` bytes, keeping the `total` already written. */
+  /**
+   * Grow to hold `needed` bytes, keeping the `total` already written.
+   *
+   * A vetted `Content-Length` the bytes have now outgrown the pre-size for is
+   * jumped to in ONE step rather than doubled towards: the peer has already
+   * delivered MAX_PRESIZED_CAPACITY bytes of it, so this no longer buys a
+   * stalling peer a large allocation for nothing, and an honest body keeps a
+   * single-buffer peak and an exact fit instead of a doubled one it drags
+   * along for the result's lifetime.
+   */
   const reserve = (needed: number): void => {
     if (needed <= buffer.byteLength) return;
     let capacity = buffer.byteLength === 0 ? INITIAL_BODY_CAPACITY : buffer.byteLength;
+    if (!truncate && declared !== null && needed <= declared) capacity = declared;
     while (capacity < needed) capacity *= 2;
     // `needed` never exceeds the cap, so clamping here cannot undershoot it.
     const grown = allocate(Math.min(capacity, maxBytes), total);
@@ -1038,7 +1068,15 @@ export async function readBodyWithin(
       const received = total + value.byteLength;
       if (received > maxBytes) {
         if (!truncate) {
-          throw tooLarge(subject, response, idempotencyKey, maxBytes, { bytesRead: received });
+          throw tooLarge(
+            subject,
+            response,
+            idempotencyKey,
+            maxBytes,
+            { bytesRead: received },
+            undefined,
+            extraDetails,
+          );
         }
         const room = maxBytes - total;
         if (room > 0) {

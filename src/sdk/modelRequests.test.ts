@@ -892,6 +892,7 @@ describe("RequestHandle on a binary result", () => {
       expect(err).toBeInstanceOf(ComfyError);
       expect(err.code).toBe("response_too_large");
       expect(err.details?.maxBytes).toBe(4);
+      expect(err.details?.queuedRequestId).toBe(REQUEST_ID);
 
       const result = await handle.get({ maxBytes: null });
       expect(result.kind).toBe("binary");
@@ -911,6 +912,50 @@ describe("RequestHandle on a binary result", () => {
       expect(err).toBeInstanceOf(ComfyError);
       expect(err.code).toBe("response_too_large");
       expect(err.details?.maxBytes).toBe(4);
+      // `subscribe` returns no handle on this path, so the error is the only
+      // place the id to collect with a larger cap can come from.
+      expect(err.details?.queuedRequestId).toBe(REQUEST_ID);
+      const result = await comfy.models
+        .handle(MODEL, err.details?.queuedRequestId as string)
+        .get({ maxBytes: null });
+      expect(result.kind).toBe("binary");
+    });
+  });
+
+  it("reports a 202 from the result route as not finished, even past the cap", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = (request) => {
+        if (request.path === STATUS_PATH) return { status: 200, body: DONE };
+        return { status: 202, body: { request_id: REQUEST_ID, status: "IN_PROGRESS" } };
+      };
+
+      const err = (await comfy.models
+        .handle(MODEL, REQUEST_ID)
+        .get({ maxBytes: 4 })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("invalid_response");
+      expect(err.httpStatus).toBe(202);
+      expect(err.message).toContain("answered 202");
+    });
+  });
+
+  it("resolves the cap inside collect() for a direct caller", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = binaryScript(MP3_BYTES, "audio/mpeg");
+      const handle = comfy.models.handle(MODEL, REQUEST_ID);
+      const completion = await handle.status();
+
+      await expect(
+        handle.collect(completion, { budgetMs: null, retry: false, maxBytes: Number.NaN }),
+      ).rejects.toThrow(/RequestHandle\.collect\(options\.maxBytes\)/);
+      // Omitted is the default cap, not "no cap".
+      const result = await handle.collect(completion, { budgetMs: null, retry: false });
+      expect(result.kind).toBe("binary");
+      expect(server.state.requests.map((r) => r.path)).toEqual([STATUS_PATH, REQUEST_PATH]);
     });
   });
 

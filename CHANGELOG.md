@@ -57,7 +57,13 @@ entry. See CONTRIBUTING.md.
   `response_too_large`** where it used to be read with no limit. `get()` and
   `subscribe()` take a per-call `maxBytes` with the same meaning as
   `models.run`'s (`null` disables the cap), and the request stays collectable,
-  so a later `get()` with a larger cap still fetches it.
+  so a later `get()` with a larger cap still fetches it. The error carries the
+  queued request's id as `details.queuedRequestId`, which is how a
+  `subscribe()` caller — who gets no handle back — reaches it. `get()` takes
+  the new `GetOptions` (`WaitOptions` plus `maxBytes`), so `events()` no
+  longer accepts a cap it would ignore. The cap applies to the result `200`
+  only: a `202` or error answer from the result route is truncated at it
+  rather than refused, so it still reports its own diagnosis.
 
 ## [0.3.0] - 2026-09-14
 

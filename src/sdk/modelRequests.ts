@@ -267,7 +267,7 @@ export interface SubmitOptions {
   retry?: RetryOptions | false;
 }
 
-/** Options accepted by {@link RequestHandle.get} and {@link RequestHandle.events}. */
+/** Options accepted by {@link RequestHandle.events}, and the base of {@link GetOptions}. */
 export interface WaitOptions {
   /**
    * Abort the wait. Bounds the poll requests, their retries, the pauses
@@ -290,13 +290,22 @@ export interface WaitOptions {
   timeoutMs?: number | null;
   /** Retry policy for each individual poll and for the result fetch. */
   retry?: RetryOptions | false;
+}
+
+/**
+ * Options accepted by {@link RequestHandle.get}: the wait, plus the one knob
+ * only the result fetch has. Not on {@link WaitOptions}, because `events`
+ * fetches no result and a cap it silently ignored would read as enforced.
+ */
+export interface GetOptions extends WaitOptions {
   /**
    * Largest result body the collecting fetch will buffer, in bytes. Omit for
    * `DEFAULT_MAX_RESPONSE_BYTES` (64 MiB); pass `null` to disable the
    * cap. The same knob, and the same semantics, as `RunOptions.maxBytes` on
    * `comfy.models.run`: a result past it rejects with `response_too_large`
-   * (carrying `maxBytes` on `details`) and is not retried. The request stays
-   * collectable, so a later call with a larger cap can still fetch it.
+   * (carrying `maxBytes`, and the queued request's id as `queuedRequestId`,
+   * on `details`) and is not retried. The request stays collectable, so a
+   * later call with a larger cap can still fetch it.
    */
   maxBytes?: number | null;
 }
@@ -334,8 +343,11 @@ export interface SubscribeOptions extends SubmitOptions {
    * `DEFAULT_MAX_RESPONSE_BYTES` (64 MiB); pass `null` to disable the
    * cap. The same knob, and the same semantics, as `RunOptions.maxBytes` on
    * `comfy.models.run`: a result past it rejects with `response_too_large`
-   * (carrying `maxBytes` on `details`) and is not retried. The request stays
-   * collectable, so a later call with a larger cap can still fetch it.
+   * (carrying `maxBytes`, and the queued request's id as `queuedRequestId`,
+   * on `details`) and is not retried. The request stays collectable, but this
+   * call returns no handle, so collect it with
+   * `comfy.models.handle(model, details.queuedRequestId).get({ maxBytes })`
+   * and a larger cap. It is NOT cancelled: the generation is already paid for.
    */
   maxBytes?: number | null;
 }
@@ -562,9 +574,10 @@ interface QueueCall {
   /**
    * Read the body as bytes within `maxBytes`, rather than as text — for the
    * result call, whose 200 may be the partner's own media type. `subject`
-   * names the call in a cap-breach message.
+   * names the call in a cap-breach message, and `details` is merged into that
+   * error's `details`.
    */
-  bytes?: { maxBytes: number | null; subject: string };
+  bytes?: { maxBytes: number | null; subject: string; details?: Record<string, unknown> };
 }
 
 /**
@@ -664,6 +677,14 @@ async function send(call: QueueCall): Promise<QueueResponse> {
           call.bytes.maxBytes,
           call.bytes.subject,
           call.idempotencyKey ?? null,
+          {
+            // Only a 200 is a result. Any other status — a 202 control answer,
+            // an error envelope — is truncated at the cap rather than refused,
+            // so the caller gets the diagnosis that status carries instead of
+            // advice to raise a cap its result never reached.
+            truncate: response.status !== 200,
+            details: call.bytes.details,
+          },
         );
         bodyText = response.ok ? "" : decodeUtf8(bodyBytes);
       }
@@ -894,7 +915,7 @@ export class RequestHandle<TData = unknown> {
    *
    * A model whose partner answers with its own media type resolves to the
    * `binary` arm (`data` is a `Uint8Array`, `contentType` the partner's type),
-   * same as `run`. The result body is read within {@link WaitOptions.maxBytes}
+   * same as `run`. The result body is read within {@link GetOptions.maxBytes}
    * (`DEFAULT_MAX_RESPONSE_BYTES` by default); a larger one rejects with
    * `response_too_large`.
    *
@@ -907,7 +928,7 @@ export class RequestHandle<TData = unknown> {
    * one fetch, so collecting a result twice — or from a second process — costs
    * no more than the first time.
    */
-  async get(options: WaitOptions = {}): Promise<RunResult<TData>> {
+  async get(options: GetOptions = {}): Promise<RunResult<TData>> {
     // Before the first poll, so a bad cap is reported without spending a wait.
     const maxBytes = resolveMaxBytes(options.maxBytes, "RequestHandle.get");
     const timeoutMs = options.timeoutMs ?? null;
@@ -937,9 +958,13 @@ export class RequestHandle<TData = unknown> {
       signal?: AbortSignal;
       budgetMs: number | null;
       retry: RetryOptions | false;
-      maxBytes: number | null;
+      maxBytes?: number | null;
     },
   ): Promise<RunResult<TData>> {
+    // Resolved here too, not only by `get` and `subscribe`: this method is
+    // reachable on the exported class, and an unresolved `undefined` or `NaN`
+    // would read as "no cap". Idempotent on a value either of them resolved.
+    const maxBytes = resolveMaxBytes(options.maxBytes, "RequestHandle.collect");
     if (completion === null) {
       // Unreachable while `events` always yields the completion it stops on;
       // checked anyway, because the alternative is a null dereference in the
@@ -958,8 +983,11 @@ export class RequestHandle<TData = unknown> {
       // binary arm alongside the JSON one, and this call now handles both.
       accept: "application/json, */*;q=0.9",
       bytes: {
-        maxBytes: options.maxBytes,
+        maxBytes,
         subject: `the result of model request ${this.requestId}`,
+        // `subscribe` hands back no handle when the cap rejects, so the
+        // error carries the id `models.handle(model, id).get` needs to retry.
+        details: { queuedRequestId: this.requestId },
       },
     });
     if (response.status === 202) {
@@ -1024,6 +1052,12 @@ export class RequestHandle<TData = unknown> {
       // could turn bytes into a JSON string of U+FFFDs.
       body = JSON.parse(mediaType === "" ? UTF8_STRICT.decode(bytes) : decodeUtf8(bytes));
     } catch (exc) {
+      // Only a failed parse (`SyntaxError`) or invalid UTF-8 (`TypeError`)
+      // says anything about the body's shape. A `RangeError` — a nesting too
+      // deep for the stack, a string too long to allocate — is this process
+      // failing on a body that may well be a document, and reporting it as the
+      // binary arm would hand back bytes the caller was owed parsed.
+      if (!(exc instanceof SyntaxError || exc instanceof TypeError)) throw exc;
       // No `Content-Type` and not JSON: nothing claimed a document, so it is
       // the bytes arm with no media type to report. A declared JSON body that
       // does not parse is the server contradicting its own header.
