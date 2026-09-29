@@ -151,7 +151,7 @@ Python SDK, per the note at the top of the file.
 
 ## 4. Checks a PR must pass
 
-CI runs the `test` job on Node 22 **and** 24, plus two standalone jobs. Locally:
+CI runs the `test` job on Node 22, 24, **and** 26, plus two standalone jobs. Locally:
 
 ```bash
 pnpm install --frozen-lockfile
