@@ -939,6 +939,32 @@ describe("RequestHandle on a binary result", () => {
       expect(err.code).toBe("invalid_response");
       expect(err.httpStatus).toBe(202);
       expect(err.message).toContain("answered 202");
+      // "Not finished" is exactly when collecting later is the remedy.
+      expect(err.details?.queuedRequestId).toBe(REQUEST_ID);
+    });
+  });
+
+  it("reads an error envelope past a small cap far enough to keep its body-only bucket", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = (request) => {
+        if (request.path === STATUS_PATH) return { status: 200, body: DONE };
+        return {
+          status: 422,
+          body: {
+            error_type: "invalid_input",
+            detail: [{ loc: ["body", "prompt"], msg: "m".repeat(2_000), type: "value_error" }],
+          },
+        };
+      };
+
+      const err = (await comfy.models
+        .handle(MODEL, REQUEST_ID)
+        .get({ maxBytes: 4 })
+        .catch((e: unknown) => e)) as routerErrors.InvalidInput;
+
+      expect(err).toBeInstanceOf(routerErrors.InvalidInput);
+      expect(err.detail).toHaveLength(1);
     });
   });
 

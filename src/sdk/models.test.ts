@@ -1157,6 +1157,44 @@ describe("comfy.models.run response size cap", () => {
     });
   });
 
+  it("reads an error envelope past a small cap far enough to keep its body-only bucket", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      // No `X-Comfy-Error-Type`: the bucket and the per-field failures are in
+      // the body alone, so cutting it at a 64-byte result cap would leave an
+      // unparseable fragment and a bare `http_422`.
+      server.state.status = 422;
+      server.state.body = {
+        error_type: "invalid_input",
+        detail: [{ loc: ["body", "prompt"], msg: "m".repeat(2_000), type: "value_error" }],
+      };
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { maxBytes: 64 })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err.code).toBe("invalid_input");
+      expect(err.httpStatus).toBe(422);
+      expect(err.details?.detail).toHaveLength(1);
+    });
+  });
+
+  it("reports a 202 as not finished rather than as a cap breach", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 202;
+      server.state.body = { request_id: "r", status: "IN_PROGRESS", padding: "p".repeat(2_000) };
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { maxBytes: 16 })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err.code).toBe("unexpected_response");
+      expect(err.httpStatus).toBe(202);
+      expect(err.message).toContain("202 (accepted, not finished)");
+    });
+  });
+
   it("still refuses a RESULT past the cap when the status is a 200", async () => {
     await withRouterStub(async (server) => {
       useStub(server);

@@ -192,16 +192,27 @@ const INITIAL_BODY_CAPACITY = 65_536;
  * Most a declared `Content-Length` may pre-size the capped read's buffer to.
  * An in-cap header is still only a claim: a peer that declares 64 MiB and then
  * stalls after a few bytes would otherwise have the full allocation committed
- * before the first `read()`. Past this, once the bytes actually outgrow it,
- * the buffer jumps straight to the declared length (one copy, exact fit), and
- * grows by doubling only where no usable length was declared.
+ * before the first `read()`. Past this the buffer grows by doubling, in step
+ * with the bytes actually received, and a vetted length only clamps the last
+ * step to an exact fit.
  */
 const MAX_PRESIZED_CAPACITY = 16 * INITIAL_BODY_CAPACITY;
 
 /**
+ * Least an error body is read to before it is truncated, whatever the caller's
+ * `maxBytes`. The cap is sized for a RESULT, and an error envelope carries
+ * more than prose — the body-only `error_type` and a validation failure's
+ * `detail[]` are parsed out of it — so a small result cap cutting the
+ * envelope mid-document would silently degrade the typed error. Still a
+ * bound: an error page is never read past `max(maxBytes, this)`.
+ */
+const MIN_ERROR_BODY_BYTES = MAX_PRESIZED_CAPACITY;
+
+/**
  * Stand-in for the body of a response this call never read, so the one
- * variable `finish` reads is always assigned. Never reaches `finish`: the
- * loop repeats instead.
+ * variable `finish` reads is always assigned. Reaches `finish` only for a 2xx
+ * other than 200, which it diagnoses from the status line without the body;
+ * otherwise the loop repeats instead.
  */
 const EMPTY_BODY = new Uint8Array(0);
 
@@ -939,6 +950,10 @@ export function isTooLarge(exc: unknown): boolean {
  * response was actually carrying. The cap still bounds the allocation; it
  * just no longer overrides the verdict.
  *
+ * An error body is read to at least MIN_ERROR_BODY_BYTES even under a smaller
+ * cap, so a result cap sized small does not cut the envelope the typed error
+ * is parsed from.
+ *
  * With no cap the runtime's own buffering does the work, which is what this
  * route did before the cap existed.
  *
@@ -946,23 +961,24 @@ export function isTooLarge(exc: unknown): boolean {
  * `idempotencyKey` is stamped on that error — `null` for a route that sends
  * none, such as the queued result read in modelRequests.ts.
  *
- * `extra.truncate` overrides which responses are truncated rather than
- * refused (default: every non-2xx), for a route whose only payload status is
- * narrower than "any 2xx" — the queued result read, where a `202` is a control
- * answer to diagnose rather than a result to cap. `extra.details` is merged
- * into a cap breach's `details`, for a caller with an identifier of its own to
- * hand back.
+ * Only a 2xx is capped; the callers never read a 2xx other than a 200 (they
+ * drop its body unread, since its status line is the whole diagnosis).
+ * `extra.details` is merged into a cap breach's `details`, for a caller with
+ * an identifier of its own to hand back.
  */
 export async function readBodyWithin(
   response: Response,
   maxBytes: number | null,
   subject: string,
   idempotencyKey: string | null,
-  extra: { truncate?: boolean; details?: Record<string, unknown> } = {},
+  extra: { details?: Record<string, unknown> } = {},
 ): Promise<Uint8Array> {
   if (maxBytes === null) return new Uint8Array(await response.arrayBuffer());
 
-  const truncate = extra.truncate ?? !response.ok;
+  const truncate = !response.ok;
+  // Where the read stops: the cap for a result, and never less than
+  // MIN_ERROR_BODY_BYTES for an error body, which is truncated there instead.
+  const limit = truncate ? Math.max(maxBytes, MIN_ERROR_BODY_BYTES) : maxBytes;
   const extraDetails = extra.details ?? {};
   const declared = declaredLength(response);
   if (!truncate && declared !== null && declared > maxBytes) {
@@ -1029,7 +1045,7 @@ export async function readBodyWithin(
   const initial = Math.min(
     truncate ? INITIAL_BODY_CAPACITY : (declared ?? INITIAL_BODY_CAPACITY),
     MAX_PRESIZED_CAPACITY,
-    maxBytes,
+    limit,
   );
   let buffer: Uint8Array;
   try {
@@ -1042,20 +1058,22 @@ export async function readBodyWithin(
   /**
    * Grow to hold `needed` bytes, keeping the `total` already written.
    *
-   * A vetted `Content-Length` the bytes have now outgrown the pre-size for is
-   * jumped to in ONE step rather than doubled towards: the peer has already
-   * delivered MAX_PRESIZED_CAPACITY bytes of it, so this no longer buys a
-   * stalling peer a large allocation for nothing, and an honest body keeps a
-   * single-buffer peak and an exact fit instead of a doubled one it drags
-   * along for the result's lifetime.
+   * By doubling, so each step commits at most as much again as the peer has
+   * actually delivered: jumping to a declared length in one hop would let a
+   * peer that declares 64 MiB, sends a little past the pre-size and stalls
+   * pin the whole declaration — the amplification MAX_PRESIZED_CAPACITY is
+   * there to close. A vetted `Content-Length` only clamps the step that would
+   * overshoot it, so an honest body still ends on an exact fit.
    */
   const reserve = (needed: number): void => {
     if (needed <= buffer.byteLength) return;
     let capacity = buffer.byteLength === 0 ? INITIAL_BODY_CAPACITY : buffer.byteLength;
-    if (!truncate && declared !== null && needed <= declared) capacity = declared;
     while (capacity < needed) capacity *= 2;
-    // `needed` never exceeds the cap, so clamping here cannot undershoot it.
-    const grown = allocate(Math.min(capacity, maxBytes), total);
+    if (!truncate && declared !== null && needed <= declared) {
+      capacity = Math.min(capacity, declared);
+    }
+    // `needed` never exceeds the limit, so clamping here cannot undershoot it.
+    const grown = allocate(Math.min(capacity, limit), total);
     grown.set(buffer.subarray(0, total));
     buffer = grown;
   };
@@ -1066,7 +1084,7 @@ export async function readBodyWithin(
       const { done, value } = await reader.read();
       if (done) break;
       const received = total + value.byteLength;
-      if (received > maxBytes) {
+      if (received > limit) {
         if (!truncate) {
           throw tooLarge(
             subject,
@@ -1078,11 +1096,11 @@ export async function readBodyWithin(
             extraDetails,
           );
         }
-        const room = maxBytes - total;
+        const room = limit - total;
         if (room > 0) {
-          reserve(maxBytes);
+          reserve(limit);
           buffer.set(value.subarray(0, room), total);
-          total = maxBytes;
+          total = limit;
         }
         truncated = true;
         break;
@@ -1263,7 +1281,12 @@ async function run<TData = unknown>(
         repeatAfterMs = nextDelayMs();
       }
 
-      if (repeatAfterMs === null) {
+      if (repeatAfterMs === null && response.ok && response.status !== 200) {
+        // A 2xx that is not the 200 result — a 202 handle, a 204 — is
+        // diagnosed by `finish` from its status line alone, so its body is
+        // dropped unread rather than downloaded and capped for nothing.
+        await response.body?.cancel().catch(() => undefined);
+      } else if (repeatAfterMs === null) {
         // Inside the same `try` as the fetch on purpose: the deadline covers
         // body consumption too, so a signal that fires while the result is
         // still streaming rejects HERE, and translating it in only one of the
@@ -1453,6 +1476,13 @@ function finish<TData>(
       mediaType === "" ? UTF8_STRICT.decode(responseBody) : decodeUtf8(responseBody),
     );
   } catch (exc) {
+    // Only a failed parse (`SyntaxError`) or invalid UTF-8 (`TypeError`) says
+    // anything about the body's shape. A `RangeError` — a nesting too deep for
+    // the stack, a string too long to allocate, which `maxBytes: null` makes
+    // reachable — is this process failing on a body that may well be a
+    // document, and reporting it as the binary arm would hand back bytes the
+    // caller was owed parsed.
+    if (!(exc instanceof SyntaxError || exc instanceof TypeError)) throw exc;
     // No `Content-Type` at all and a body that is not JSON: nothing claimed
     // this was a document, so it is the binary branch with no media type to
     // report rather than a failure. A response that DID say JSON and then

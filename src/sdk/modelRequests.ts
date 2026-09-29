@@ -346,8 +346,8 @@ export interface SubscribeOptions extends SubmitOptions {
    * (carrying `maxBytes`, and the queued request's id as `queuedRequestId`,
    * on `details`) and is not retried. The request stays collectable, but this
    * call returns no handle, so collect it with
-   * `comfy.models.handle(model, details.queuedRequestId).get({ maxBytes })`
-   * and a larger cap. It is NOT cancelled: the generation is already paid for.
+   * `comfy.models.handle(model, err.details?.queuedRequestId as string)
+   * .get({ maxBytes })` and a larger cap. It is NOT cancelled: the generation is already paid for.
    */
   maxBytes?: number | null;
 }
@@ -386,8 +386,15 @@ function invalidResponse(
   requestId: string | null,
   httpStatus?: number,
   cause?: unknown,
+  details: Record<string, unknown> | null = null,
 ) {
-  return new ComfyError(message, { code: "invalid_response", httpStatus, requestId, cause });
+  return new ComfyError(message, {
+    code: "invalid_response",
+    httpStatus,
+    requestId,
+    cause,
+    details,
+  });
 }
 
 /**
@@ -671,20 +678,23 @@ async function send(call: QueueCall): Promise<QueueResponse> {
         bodyText = "";
       } else if (call.bytes === undefined) {
         bodyText = await response.text();
+      } else if (response.ok && response.status !== 200) {
+        // Only a 200 is a result. Any other 2xx — a 202 control answer — is
+        // diagnosed from its status line alone, so its body is dropped unread
+        // rather than downloaded, or refused with advice to raise a cap its
+        // result never reached.
+        await response.body?.cancel().catch(() => undefined);
+        bodyText = "";
+        bodyBytes = new Uint8Array(0);
       } else {
+        // An error envelope is truncated rather than refused (see
+        // `readBodyWithin`), so it still raises the typed error it carries.
         bodyBytes = await readBodyWithin(
           response,
           call.bytes.maxBytes,
           call.bytes.subject,
           call.idempotencyKey ?? null,
-          {
-            // Only a 200 is a result. Any other status — a 202 control answer,
-            // an error envelope — is truncated at the cap rather than refused,
-            // so the caller gets the diagnosis that status carries instead of
-            // advice to raise a cap its result never reached.
-            truncate: response.status !== 200,
-            details: call.bytes.details,
-          },
+          { details: call.bytes.details },
         );
         bodyText = response.ok ? "" : decodeUtf8(bodyBytes);
       }
@@ -990,6 +1000,9 @@ export class RequestHandle<TData = unknown> {
         details: { queuedRequestId: this.requestId },
       },
     });
+    // On every invalid answer below too: the request may well still be
+    // collectable later, and a `subscribe` caller has no handle to do it with.
+    const queued = { queuedRequestId: this.requestId };
     if (response.status === 202) {
       // The status read said COMPLETED and the result route says otherwise.
       // Reporting it is the point: returning the 202's status body typed as a
@@ -999,6 +1012,8 @@ export class RequestHandle<TData = unknown> {
           "answered 202 (accepted, not finished)",
         response.headers.get(REQUEST_ID_HEADER),
         202,
+        undefined,
+        queued,
       );
     }
     const requestId = response.headers.get(REQUEST_ID_HEADER);
@@ -1007,15 +1022,17 @@ export class RequestHandle<TData = unknown> {
     if (response.status !== 200) {
       // A non-2xx raises the typed router error from its (UTF-8-decoded)
       // envelope; any other 2xx is not the result the contract promises.
-      decode(response, [200]);
-      // `decode` always throws for a non-200 today; this makes that an
-      // enforced invariant rather than an incidental one, so a change there
-      // cannot fall through into code that reports `httpStatus: 200`.
+      // `decode` always throws for a non-2xx today; falling through to the
+      // throw below makes that an enforced invariant rather than an incidental
+      // one, so a change there cannot reach code that reports `httpStatus: 200`.
+      if (!(response.status >= 200 && response.status < 300)) decode(response, [200]);
       throw invalidResponse(
         `the result route for request ${this.requestId} answered ${String(response.status)} ` +
           "where 200 was expected",
         requestId,
         response.status,
+        undefined,
+        queued,
       );
     }
     const bytes = response.body ?? new Uint8Array(0);
@@ -1026,6 +1043,8 @@ export class RequestHandle<TData = unknown> {
         `the result route for request ${this.requestId} answered 200 with an empty body`,
         requestId,
         200,
+        undefined,
+        queued,
       );
     }
 
@@ -1076,6 +1095,7 @@ export class RequestHandle<TData = unknown> {
         requestId,
         200,
         exc,
+        queued,
       );
     }
     // Checked again on the result body: which of the two responses carries the

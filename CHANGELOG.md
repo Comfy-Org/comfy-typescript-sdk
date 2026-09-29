@@ -62,8 +62,15 @@ entry. See CONTRIBUTING.md.
   `subscribe()` caller — who gets no handle back — reaches it. `get()` takes
   the new `GetOptions` (`WaitOptions` plus `maxBytes`), so `events()` no
   longer accepts a cap it would ignore. The cap applies to the result `200`
-  only: a `202` or error answer from the result route is truncated at it
-  rather than refused, so it still reports its own diagnosis.
+  only: a `202` from the result route is diagnosed without reading its body,
+  and an error answer is truncated rather than refused, so it still reports
+  its own diagnosis.
+- **An error body under a `maxBytes` smaller than 1 MiB is now read to 1 MiB
+  before it is truncated**, on `models.run` and the queued result read alike,
+  so a small result cap no longer cuts the envelope a body-only `error_type`
+  or a validation `detail[]` is parsed from. `models.run` also drops the body
+  of a `2xx` other than `200` unread, so an oversized `202` reports
+  `unexpected_response` rather than `response_too_large`.
 
 ## [0.3.0] - 2026-09-14
 
