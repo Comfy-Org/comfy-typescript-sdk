@@ -358,10 +358,14 @@ export interface RunJsonResult<TData = unknown> {
    *
    * Success-only, and that is the contract's own word rather than this SDK's
    * choice: `RouterCreditsUsedHeader` says it "is written only on the path
-   * that returns a result, which a refused call never reaches". So a run that
-   * was priced and then failed does not carry a cost here to be dropped —
-   * there is nothing on the throwing paths to lift, and {@link ComfyError}
-   * carrying no credits field is the contract's shape, not an omission.
+   * that returns a result, which a refused call never reaches". That covers
+   * Router's own refusals: an error response carries no cost to lift. It does
+   * NOT cover a `200` that Router priced and this SDK then refuses
+   * client-side — a body over the size cap (`response_too_large`), a
+   * body-read timeout, or an empty or non-JSON body. That call throws a
+   * {@link ComfyError}, which carries no credits field, so its cost is not
+   * reported to the caller even though Router charged it. Reconcile such a
+   * failure against the workspace ledger rather than assuming it was free.
    *
    * `string | null` rather than `number | null` on purpose, the same way
    * {@link droppedParams} keeps the server's own shape: the wire value is
@@ -674,9 +678,13 @@ export interface Models {
    * call.
    *
    * The ergonomic form for a caller who does want to wait but also wants to
-   * show progress while waiting. It resolves to `RunResult<TData>`, identical
-   * to what {@link Models.run} would have returned for the same model and
-   * input.
+   * show progress while waiting. It resolves to `RunResult<TData>`, the same
+   * shape {@link Models.run} returns for the same model and input — with one
+   * difference in what it carries: {@link RunJsonResult.creditsUsed}. The
+   * Router contract declares `X-Comfy-Credits-Used` on the synchronous run
+   * route but not on the queued result route, so the queued value is
+   * unpinned and a caller should expect `null` ("not reported", never
+   * "free") here. Reconcile spend from {@link Models.run} if it matters.
    *
    * ```ts
    * const { data } = await comfy.models.subscribe(

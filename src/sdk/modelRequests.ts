@@ -903,9 +903,14 @@ export class RequestHandle<TData = unknown> {
     //
     // `X-Comfy-Credits-Used` is read on the same reasoning, and the contract
     // does not declare it on this route yet either: `getRouterModelRequestResult`'s
-    // `200` names no credits header, so a queued result reads `null` ("not
-    // reported", never "free") until Router stamps it here. The rot guard in
-    // router-spec-contract.test.ts fires the day the contract declares it.
+    // `200` names no credits header, so on this route the value is NOT
+    // DECLARED, THEREFORE UNPINNED — expect `null` ("not reported", never
+    // "free"), but a stamped header is passed through as-is. This is a claim
+    // about the document, not the wire: Router can serve what the one-way sync
+    // strips (the `MODEL_REQUEST*` routes themselves are the precedent). The
+    // rot guard in router-spec-contract.test.ts fires the day the contract
+    // declares it. Reached by `get()` and therefore by `Models.subscribe`,
+    // whose TSDoc carries the same caveat.
     //
     // Typed as the internal `BuiltRunResult` so omitting a field here fails
     // `tsc`; returned as the public `RunResult`, the same type `run` returns.

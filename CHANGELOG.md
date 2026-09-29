@@ -32,9 +32,11 @@ entry. See CONTRIBUTING.md.
   surface does not accept them.
 - **`creditsUsed` on a run result — what Router priced the call at.** Both
   arms of `RunResult` (`RunJsonResult` and `RunBinaryResult`) now carry the
-  `X-Comfy-Credits-Used` response header. The queued `RequestHandle.get()`
-  result reads it too, but the contract does not declare it on the queued
-  result route yet, so there it is `null` until Router stamps it. Typed `string | null`, verbatim off the wire:
+  `X-Comfy-Credits-Used` response header. The queued result
+  (`RequestHandle.get()`, and so `comfy.models.subscribe`) reads it too, but
+  the contract does not declare it on the queued result route, so there it is
+  unpinned: expect `null`, and reconcile spend from `run` if it matters.
+  Typed `string | null`, verbatim off the wire:
   the value is decimal and a caller reconciling money should parse it
   deliberately rather than receive a float this SDK chose the rounding of.
   Three caveats it is worth reading the TSDoc for — it is a price rather than
@@ -47,7 +49,10 @@ entry. See CONTRIBUTING.md.
   literal — a test double written against `0.4.0`, which shipped these
   interfaces without it — keeps compiling; every result this SDK returns sets
   it. Success-only, per the Router contract: the header is written on the path
-  that returns a result, so a call that throws carries no cost to report.
+  that returns a result, so a Router refusal carries no cost. A priced `200`
+  that the SDK then refuses client-side (`response_too_large`, a body-read
+  timeout, an empty or non-JSON body) throws a `ComfyError` with no cost on
+  it, so reconcile those failures against the workspace ledger.
 - **Three queue-tier `routerErrors` classes — `Cancelled`, `QueueTimeout`
   and `RequestNotFound`** — for the `cancelled`, `queue_timeout` and
   `request_not_found` buckets the vendored Router contract now declares, so a

@@ -162,15 +162,27 @@ export async function readRouterRouteContract(specPath = ROUTER_SPEC_PATH) {
  *
  * Unlike {@link retryAfterStatuses} this does NOT fail on an empty result: a
  * `200` legitimately need not declare headers, so reporting the empty set is a
- * truthful read. The caller is where that becomes an assertion — the pin
+ * truthful read. It DOES fail when there is no `200` to read at all. The caller is where that becomes an assertion — the pin
  * demands the credits header be present AND spelled the way the SDK spells it,
  * so a sync that drops the header reddens there rather than passing vacuously
  * here.
  */
 export function runSuccessHeaderNames(doc, pathItem) {
-  const responses = deref(doc, pathItem.post.responses ?? {});
-  const ok = deref(doc, responses["200"] ?? {});
-  if (ok === null || typeof ok !== "object") return [];
+  return okHeaderNames(doc, pathItem.post, "`runRouterModel`");
+}
+
+/**
+ * The header names a declared `200` carries, lowercased and sorted. An
+ * operation that declares NO `200` — a sync that moved success to `201` or to
+ * the `2XX` range form — is refused rather than read as "declares no
+ * headers", which would let an absent success response pass as agreement.
+ */
+function okHeaderNames(doc, operation, label) {
+  const responses = deref(doc, operation.responses ?? {});
+  const ok = deref(doc, responses["200"]);
+  if (ok === null || typeof ok !== "object") {
+    fail(`spec/router-openapi.yaml: ${label} declares no \`200\` response`);
+  }
   return Object.keys(deref(doc, ok.headers ?? {}))
     .map((name) => name.toLowerCase())
     .sort();
@@ -344,8 +356,10 @@ export async function readRouterOperations(specPath = ROUTER_SPEC_PATH) {
  * (`getRouterModelRequestResult`) uses it: `RequestHandle.collect` lifts the
  * same `X-Comfy-Credits-Used` header off that `200`, and the contract test
  * watches whether the contract declares it there. An operation that is not
- * declared at all is refused rather than read as "no headers", for the same
- * reason every extractor here refuses an empty read.
+ * declared at all, or that declares no `200`, is refused rather than read as
+ * "no headers", for the same reason every extractor here refuses an empty
+ * read. (A duplicated `operationId` never reaches here: {@link
+ * routerOperations} already refuses it, naming both declarations.)
  */
 export function successHeaderNames(doc, operationId) {
   const matches = routerOperations(doc).filter(
@@ -356,12 +370,7 @@ export function successHeaderNames(doc, operationId) {
   }
   const { path, method } = matches[0];
   const operation = deref(doc, doc.paths[path])[method];
-  const responses = deref(doc, operation.responses ?? {});
-  const ok = deref(doc, responses["200"] ?? {});
-  if (ok === null || typeof ok !== "object") return [];
-  return Object.keys(deref(doc, ok.headers ?? {}))
-    .map((name) => name.toLowerCase())
-    .sort();
+  return okHeaderNames(doc, operation, `\`${operationId}\``);
 }
 
 /** {@link successHeaderNames} for the vendored contract on disk. */

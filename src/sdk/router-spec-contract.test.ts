@@ -41,6 +41,8 @@ import {
   readRouterRouteContract,
   readSuccessHeaderNames,
   routerOperations,
+  runSuccessHeaderNames,
+  successHeaderNames,
   templatePlaceholders,
 } from "../../scripts/router-route-contract.mjs";
 import { withRouterStub } from "../../test/support/router-stub-server.js";
@@ -385,6 +387,24 @@ describe("the operation extractor the coverage check reads through", () => {
     expect(() => routerOperations({ paths: { "/v2/models": { get: { responses: {} } } } })).toThrow(
       "declares no operationId",
     );
+  });
+
+  it("refuses an operation that declares no `200`, rather than reading it as no headers", () => {
+    // A sync that moved success to `201` or to `2XX` would otherwise read as
+    // "declares no credits header" — an absent response passing as agreement.
+    const moved = { operationId: "runRouterModel", responses: { "201": { headers: {} } } };
+    const doc = { paths: { "/v2/models/{model_id}": { post: moved } } };
+    expect(() => successHeaderNames(doc, "runRouterModel")).toThrow(
+      "`runRouterModel` declares no `200` response",
+    );
+    expect(() => runSuccessHeaderNames(doc, doc.paths["/v2/models/{model_id}"])).toThrow(
+      "declares no `200` response",
+    );
+    // A declared `200` with no headers is still a truthful empty read.
+    const bare = {
+      paths: { "/v2/models/{model_id}": { post: { ...moved, responses: { "200": {} } } } },
+    };
+    expect(successHeaderNames(bare, "runRouterModel")).toEqual([]);
   });
 });
 
