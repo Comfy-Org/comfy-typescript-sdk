@@ -173,9 +173,9 @@ export class Comfy {
    *
    * Pass `metadata` to label the job (for example, which of your customers
    * it is for); find it again later with {@link Comfy.listJobs}. It is sent
-   * as is: the server checks its limits and rejects a bad map with
-   * `InvalidWorkflow`, whose message names the key. Omit it and the request
-   * is the same as before.
+   * as is: the server checks its limits and rejects a bad map with a
+   * `ComfyError` of code `metadata_invalid`, whose message names the key.
+   * Omit it and the request is the same as before.
    */
   async submit(
     workflow: Workflow,

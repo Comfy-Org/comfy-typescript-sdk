@@ -198,7 +198,7 @@ describe("Comfy", () => {
     expect(job.metadata).toEqual({});
   });
 
-  it("submit() surfaces a 422 metadata_invalid as InvalidWorkflow, with the server's message naming the key", async () => {
+  it("submit() surfaces a 422 metadata_invalid as a ComfyError carrying that code, with the server's message naming the key", async () => {
     server.state.jobError = {
       status: 422,
       code: "metadata_invalid",
@@ -207,10 +207,13 @@ describe("Comfy", () => {
     const wf = client.workflows.fromJson({ "1": {} });
     const err = await client.submit(wf, { metadata: { "bad key": "x" } }).catch((e: unknown) => e);
 
-    expect(err).toBeInstanceOf(InvalidWorkflow);
-    expect((err as InvalidWorkflow).code).toBe("metadata_invalid");
-    expect((err as InvalidWorkflow).httpStatus).toBe(422);
-    expect((err as InvalidWorkflow).message).toContain('"bad key"');
+    // Labels are not the workflow: the base class, not InvalidWorkflow,
+    // matching the Python SDK.
+    expect(err).toBeInstanceOf(ComfyError);
+    expect(err).not.toBeInstanceOf(InvalidWorkflow);
+    expect((err as ComfyError).code).toBe("metadata_invalid");
+    expect((err as ComfyError).httpStatus).toBe(422);
+    expect((err as ComfyError).message).toContain('"bad key"');
     expect(server.state.submitCount).toBe(1);
   });
 
@@ -321,15 +324,20 @@ describe("Comfy", () => {
     expect(Date.now() - start).toBeLessThan(500);
   }, 2000);
 
-  it("listJobs() surfaces a server error as a typed SDK error carrying its code", async () => {
-    server.state.jobListPages = {}; // the first page's request now 400s
+  it("listJobs() surfaces a 400 invalid_metadata_filter as a ComfyError carrying that code", async () => {
+    server.state.jobListError = {
+      status: 400,
+      code: "invalid_metadata_filter",
+      message: "at most 3 metadata filters",
+    };
     const err = await client
-      .listJobs()
+      .listJobs({ metadata: { a: "1", b: "2", c: "3", d: "4" } })
       .next()
       .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ComfyError);
+    expect(err).not.toBeInstanceOf(InvalidWorkflow);
     expect((err as ComfyError).httpStatus).toBe(400);
-    expect((err as ComfyError).code).toBe("invalid_cursor");
+    expect((err as ComfyError).code).toBe("invalid_metadata_filter");
   });
 
   it("downloads a byte range of an output", async () => {

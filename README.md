@@ -818,8 +818,9 @@ summary (`id`, `status`, `createTime`, `updateTime`, `deploymentId`,
 
 Labels are fixed at submit. A job without labels has `metadata` as an empty
 object. The SDK sends the map as is and leaves the limits to the server, which
-rejects a bad map with `InvalidWorkflow` (code `metadata_invalid`) naming the
-key at fault.
+rejects a bad map with a `ComfyError` of code `metadata_invalid` naming the
+key at fault. A bad filter on `listJobs()` raises a `ComfyError` of code
+`invalid_metadata_filter`.
 
 ## The workflow behind a job
 
@@ -884,8 +885,7 @@ are only exposed by direct `ComfyLow` calls.
 
 - `Unauthorized`, `Forbidden`, `NotFound`
 - `InvalidWorkflow` (and `WorkflowFormatUi`, for submitting a UI-export
-  instead of an API-format graph). Also raised, with code `metadata_invalid`,
-  when the server rejects a submit's `metadata`.
+  instead of an API-format graph)
 - `MissingAsset` — a `core/ASSET` reference the server couldn't resolve
 - `HashMismatch` — uploaded bytes didn't match the declared hash
 - `BlobNotFound`

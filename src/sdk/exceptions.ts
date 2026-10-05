@@ -90,9 +90,7 @@ export class Unauthorized extends ComfyError {}
 export class Forbidden extends ComfyError {}
 export class NotFound extends ComfyError {}
 
-/** Structural/validation failure; `details` carries per-node errors. Also
- * raised when the server rejects a submit's `metadata` (code
- * `metadata_invalid`); the message names the key. */
+/** Structural/validation failure; `details` carries per-node errors. */
 export class InvalidWorkflow extends ComfyError {}
 
 /** UI-export JSON was submitted instead of the API-format graph. */
@@ -160,7 +158,6 @@ type ComfyErrorClass = new (message: string, options: ComfyErrorOptions) => Comf
 const BY_CODE: Record<string, ComfyErrorClass> = {
   invalid_workflow: InvalidWorkflow,
   workflow_format_ui: WorkflowFormatUi,
-  metadata_invalid: InvalidWorkflow,
   missing_asset: MissingAsset,
   hash_mismatch: HashMismatch,
   blob_not_found: BlobNotFound,

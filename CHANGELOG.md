@@ -25,7 +25,7 @@ entry. See CONTRIBUTING.md.
   as before. `job.metadata` returns the labels (an empty object when there
   are none). `client.listJobs({ metadata, limit, signal })` lists your jobs
   newest first, filtered by up to three labels, as an async iterator that
-  fetches page by page. A rejected map raises `InvalidWorkflow` with code
+  fetches page by page. A rejected map raises `ComfyError` with code
   `metadata_invalid`. Needs a server that supports job metadata.
 - **Comfy Router alt-provider controls on `comfy.models.run` —
   `modelProvider`, `strictMode` and `fallbackProvider`.** Three optional

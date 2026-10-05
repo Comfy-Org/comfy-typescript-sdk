@@ -66,6 +66,8 @@ export interface ServerState {
   jobListQueries: URLSearchParams[];
   /** When true, `GET /jobs` never responds — for the abort test. */
   hangJobList: boolean;
+  /** `GET /jobs` returns this error envelope instead of a page. */
+  jobListError: { status: number; code: string; message: string } | null;
   /** Number of GET /jobs/{id} polls before the job reports terminal. */
   pollsToSucceed: number;
   /** Terminal status the job reaches. */
@@ -185,6 +187,7 @@ function defaultState(): ServerState {
     jobListPages: { "": { jobs: [] } },
     jobListQueries: [],
     hangJobList: false,
+    jobListError: null,
     pollsToSucceed: 1,
     terminalStatus: "succeeded",
     sseMode: "normal",
@@ -530,6 +533,11 @@ export class StubServer {
     const state = this.state;
     state.jobListQueries.push(query);
     if (state.hangJobList) return; // never respond; the caller must abort client-side
+    if (state.jobListError !== null) {
+      const { status, code, message } = state.jobListError;
+      sendError(res, status, code, message);
+      return;
+    }
     const page = state.jobListPages[query.get("cursor") ?? ""];
     if (page === undefined) {
       sendError(res, 400, "invalid_cursor", "unknown cursor");
