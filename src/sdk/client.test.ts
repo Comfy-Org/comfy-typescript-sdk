@@ -217,6 +217,23 @@ describe("Comfy", () => {
     expect(server.state.submitCount).toBe(1);
   });
 
+  it("submit() surfaces Comfy Cloud's 422 metadata_not_supported as a ComfyError carrying that code, not InvalidWorkflow", async () => {
+    server.state.jobError = {
+      status: 422,
+      code: "metadata_not_supported",
+      message: "job metadata is not supported here",
+    };
+    const wf = client.workflows.fromJson({ "1": {} });
+    const err = await client
+      .submit(wf, { metadata: { customer: "acme" } })
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ComfyError);
+    expect(err).not.toBeInstanceOf(InvalidWorkflow);
+    expect((err as ComfyError).code).toBe("metadata_not_supported");
+    expect((err as ComfyError).httpStatus).toBe(422);
+  });
+
   it("listJobs() sends each metadata pair and the limit, and follows next_cursor until it is absent", async () => {
     server.state.jobListPages = {
       "": {

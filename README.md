@@ -816,6 +816,11 @@ the page size, not a total: stop iterating to stop fetching. Each item is a
 summary (`id`, `status`, `createTime`, `updateTime`, `deploymentId`,
 `metadata`) without outputs; read the full job with `client.jobs.get(id)`.
 
+Labels work on jobs sent to a deployment: point the client at the
+deployment's address (see [Targeting another deployment](#targeting-another-deployment)).
+Comfy Cloud refuses a submit with labels for now, with a `ComfyError` of code
+`metadata_not_supported`.
+
 Labels are fixed at submit. A job without labels has `metadata` as an empty
 object. The SDK sends the map as is and leaves the limits to the server, which
 rejects a bad map with a `ComfyError` of code `metadata_invalid` naming the
