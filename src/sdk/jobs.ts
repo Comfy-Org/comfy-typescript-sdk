@@ -284,11 +284,12 @@ export function jobSummary(item: JobListItem): JobSummary {
  */
 function readMetadata(raw: unknown): JobMetadata {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return {};
-  const labels: JobMetadata = {};
-  for (const [key, value] of Object.entries(raw)) {
-    if (typeof value === "string") labels[key] = value;
-  }
-  return labels;
+  // Built by Object.fromEntries, not by assignment: a label keyed
+  // `__proto__` (a valid key) would otherwise hit the prototype setter and
+  // be dropped.
+  return Object.fromEntries(
+    Object.entries(raw).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+  );
 }
 
 /**

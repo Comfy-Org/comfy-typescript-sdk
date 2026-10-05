@@ -56,6 +56,9 @@ export const COMFY_CLOUD_BASE_URL = "https://cloud.comfy.org";
 export const BASE_URL_ENV_VAR = "COMFY_BASE_URL";
 
 const DEFAULT_RETRY_AFTER_S = 2;
+// The shortest pause before re-sending a 429: a `Retry-After: 0` must not
+// turn the retry into a tight loop for the whole budget.
+const MIN_RETRY_PAUSE_MS = 1_000;
 
 /**
  * Comfy Cloud, unless `COMFY_BASE_URL` names another deployment.
@@ -228,7 +231,8 @@ export class Comfy {
         // it — the loop-entry check alone doesn't bound the sleep itself.
         const remainingMs = deadline - performance.now();
         if (exc.httpStatus === 429 && retryDelayS !== null && remainingMs > 0) {
-          await abortableSleep(Math.min(retryDelayS * 1000, remainingMs), signal);
+          const pauseMs = Math.max(retryDelayS * 1000, MIN_RETRY_PAUSE_MS);
+          await abortableSleep(Math.min(pauseMs, remainingMs), signal);
           continue;
         }
         throw err;
@@ -237,16 +241,18 @@ export class Comfy {
   }
 
   /**
-   * Every job this client can see, newest first, fetched page by page as you
-   * iterate. Pass `metadata` to keep only the jobs whose labels match every
-   * pair given. `limit` is the page size, not a total: stop iterating to stop
-   * fetching. An aborted `signal` stops the request in flight. A 429 on any
+   * Your jobs, newest first, fetched page by page as you iterate. Pass
+   * `metadata` to keep only the jobs whose labels match every pair given. The
+   * SDK checks each job against the filter too, so a server that ignores it
+   * still yields only matching jobs. `limit` is the page size, not a total:
+   * stop iterating to stop fetching. An aborted `signal` stops the request in flight. A 429 on any
    * page is retried as {@link Comfy.submit} retries one, so the walk carries
    * on from that page. A bad filter raises a `ComfyError` of code
    * `invalid_metadata_filter`, and a cursor the server did not issue one of
    * code `invalid_cursor`. Comfy Cloud does not list jobs yet: it answers
    * with a `ComfyError` of code `not_implemented` (HTTP 501). A self-hosted
-   * proxy does not keep labels, so there `metadata` is empty on every job.
+   * proxy does not keep labels, so there `metadata` is empty on every job and
+   * a filtered list yields nothing.
    *
    * @example
    * ```ts
@@ -270,7 +276,10 @@ export class Comfy {
           }),
         options.signal,
       );
-      for (const item of page.jobs ?? []) yield jobSummary(item);
+      for (const item of page.jobs ?? []) {
+        const summary = jobSummary(item);
+        if (matchesLabels(summary.metadata, options.metadata)) yield summary;
+      }
       cursor = page.next_cursor || undefined;
     } while (cursor !== undefined);
   }
@@ -285,6 +294,13 @@ export class Comfy {
       ? job.result(options.signal)
       : runWithTimeout(job, options.timeoutMs, options.signal);
   }
+}
+
+/** Whether `labels` holds every pair of `filter` (an absent filter matches all). */
+function matchesLabels(labels: JobMetadata, filter: JobMetadata | undefined): boolean {
+  return Object.entries(filter ?? {}).every(
+    ([key, value]) => Object.hasOwn(labels, key) && labels[key] === value,
+  );
 }
 
 async function runWithTimeout(job: Job, timeoutMs: number, signal?: AbortSignal): Promise<Job> {

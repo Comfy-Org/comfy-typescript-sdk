@@ -136,6 +136,18 @@ describe("Comfy", () => {
     },
   );
 
+  it("submit() waits at least a second on a 429 with Retry-After: 0, instead of re-sending at once", async () => {
+    server.state.queueFullTimes = 1;
+    server.state.retryAfterHeader = "0";
+    vi.mocked(abortableSleep).mockImplementationOnce(() => Promise.resolve());
+    const wf = client.workflows.fromJson({ "1": {} });
+
+    await client.submit(wf);
+
+    expect(abortableSleep).toHaveBeenCalledWith(1_000, undefined);
+    expect(server.state.submitCount).toBe(2);
+  });
+
   it("submit() clamps a 429 Retry-After far larger than the retry budget, instead of sleeping past it", async () => {
     server.state.queueFullTimes = 1;
     server.state.retryAfterHeader = "86400"; // 24h — a malicious/misbehaving server value
@@ -377,6 +389,18 @@ describe("Comfy", () => {
     expect(server.state.jobListQueries.map((q) => q.get("cursor"))).toEqual([null, "c2", "c2"]);
   });
 
+  it("listJobs() waits at least a second on a 429 with Retry-After: 0, instead of re-sending at once", async () => {
+    server.state.jobListThrottle = { cursor: "", times: 1, retryAfter: "0" };
+    vi.mocked(abortableSleep).mockImplementationOnce(() => Promise.resolve());
+
+    for await (const _ of client.listJobs()) {
+      // the default first page is empty
+    }
+
+    expect(abortableSleep).toHaveBeenCalledWith(1_000, undefined);
+    expect(server.state.jobListQueries).toHaveLength(2);
+  });
+
   it("listJobs() keeps the server's Retry-After on an error it surfaces", async () => {
     server.state.jobListError = {
       status: 503,
@@ -391,6 +415,52 @@ describe("Comfy", () => {
     expect(err).toBeInstanceOf(ComfyError);
     expect((err as ComfyError).httpStatus).toBe(503);
     expect((err as ComfyError).retryAfter).toBe(2);
+  });
+
+  it("listJobs() keeps a label keyed __proto__ as an own key", async () => {
+    server.state.jobListPages = {
+      "": {
+        jobs: [
+          {
+            id: "job_01",
+            status: "succeeded",
+            // JSON.parse makes "__proto__" an own key, as a server's JSON would.
+            metadata: JSON.parse('{"__proto__":"tenant-7","customer":"acme"}'),
+          },
+        ],
+      },
+    };
+
+    const jobs = [];
+    for await (const job of client.listJobs()) jobs.push(job);
+
+    expect(Object.entries(jobs[0].metadata)).toEqual([
+      ["__proto__", "tenant-7"],
+      ["customer", "acme"],
+    ]);
+  });
+
+  it("listJobs() with a filter skips any item whose labels do not hold every pair, for a server that ignores the filter", async () => {
+    // A self-hosted proxy, or a gateway without label support, answers a
+    // filtered list with every job.
+    server.state.jobListPages = {
+      "": {
+        jobs: [
+          { id: "job_05", status: "succeeded", metadata: { customer: "acme", tier: "pro" } },
+          { id: "job_04", status: "succeeded", metadata: { customer: "other", tier: "pro" } },
+          { id: "job_03", status: "succeeded", metadata: { customer: "acme" } },
+          { id: "job_02", status: "succeeded", metadata: "a proxy string" },
+          { id: "job_01", status: "succeeded" },
+        ],
+      },
+    };
+
+    const ids: string[] = [];
+    for await (const job of client.listJobs({ metadata: { customer: "acme", tier: "pro" } })) {
+      ids.push(job.id);
+    }
+
+    expect(ids).toEqual(["job_05"]);
   });
 
   it("listJobs() reads a metadata that is not an object as empty, and drops values that are not strings", async () => {

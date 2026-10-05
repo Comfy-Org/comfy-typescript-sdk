@@ -26,11 +26,13 @@ entry. See CONTRIBUTING.md.
   are none). `client.listJobs({ metadata, limit, signal })` lists your jobs
   newest first, filtered by up to three labels, as an async iterator that
   fetches page by page; a 429 on a page is retried as `submit()` retries one.
+  The SDK also checks each listed job against the filter, so a server that
+  ignores it yields only matching jobs.
   A rejected map raises `ComfyError` with code `metadata_invalid`. Needs a
   server that supports job metadata: Comfy Cloud answers a labelled submit
   with `metadata_not_supported` and the list with `not_implemented` (501),
-  and a self-hosted proxy keeps no labels (`metadata` reads as an empty
-  object there).
+  and a self-hosted proxy keeps no labels (a filtered list yields nothing
+  there).
 - **Comfy Router alt-provider controls on `comfy.models.run` —
   `modelProvider`, `strictMode` and `fallbackProvider`.** Three optional
   `RunOptions` fields, sent as the `model_provider`, `strict_mode` and
@@ -54,6 +56,9 @@ entry. See CONTRIBUTING.md.
   `client.jobs.get()`, asset and output calls) now carries the server's
   `Retry-After` on every error. Only `QueueFull` kept it before; every other
   error had `null` even when the header was sent.
+- `submit()` waits at least one second before re-sending after a 429. A
+  `Retry-After: 0` used to re-send at once, over and over, for the whole
+  one-minute retry budget.
 
 ## [0.3.0] - 2026-09-14
 

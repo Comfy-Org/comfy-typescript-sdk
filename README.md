@@ -811,7 +811,9 @@ for await (const summary of client.listJobs({ metadata: { customer: "acme" } }))
 
 `listJobs()` yields your jobs, newest first, and fetches the next page only
 when you iterate past the current one. Give it up to three labels;
-a job matches when it carries every one with exactly that value. `limit` sets
+a job matches when it carries every one with exactly that value. The SDK
+also checks each job against the labels itself, so a server that ignores the
+filter still yields only matching jobs. `limit` sets
 the page size, not a total: stop iterating to stop fetching. Each item is a
 summary (`id`, `status`, `createTime`, `updateTime`, `deploymentId`,
 `metadata`) without outputs; read the full job with `client.jobs.get(id)`.
@@ -826,9 +828,9 @@ Elsewhere:
   `ComfyError` of code `metadata_not_supported`, and `listJobs()` raises one
   of code `not_implemented` (HTTP 501).
 - **A self-hosted proxy** does not keep labels. It rejects a submit with
-  labels (a `ComfyError` of code `invalid_request`), and its job list ignores
-  the label filter, so `listJobs()` yields every job it recorded, each with
-  `metadata` as an empty object.
+  labels (a `ComfyError` of code `invalid_request`). `listJobs()` with a label
+  filter yields nothing there, and without one every job has `metadata` as an
+  empty object.
 
 Labels are fixed at submit. A job without labels has `metadata` as an empty
 object. The SDK sends the map as is and leaves the limits to the server, which

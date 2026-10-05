@@ -58,6 +58,16 @@ describe("Job", () => {
     expect(job.metadata).toEqual({});
   });
 
+  it("keeps a label keyed __proto__ as an own key", async () => {
+    // JSON.parse makes "__proto__" an own key; the stub sends it as one.
+    server.state.jobMetadata = JSON.parse('{"__proto__":"tenant-7","customer":"acme"}');
+    const job = await jobs.get("job_01");
+    expect(Object.entries(job.metadata)).toEqual([
+      ["__proto__", "tenant-7"],
+      ["customer", "acme"],
+    ]);
+  });
+
   it("drops metadata values that are not strings", async () => {
     server.state.jobMetadata = { customer: "acme", run: 7, nested: { a: "b" } };
     const job = await jobs.get("job_01");
