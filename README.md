@@ -794,6 +794,33 @@ key of their own. On a self-hosted proxy it's the content endpoint (normal auth
 still applies) and `expiresAt` is `null`. It works on every backend and never
 downloads the bytes first.
 
+## Labeling jobs and finding them again
+
+Pass `metadata` to `submit()` to label a job with your own string keys and
+values, such as which of your customers it is for. Then list the jobs that
+carry a label:
+
+```ts
+const job = await client.submit(wf, { metadata: { customer: "acme" } });
+console.log(job.metadata); // { customer: "acme" }
+
+for await (const summary of client.listJobs({ metadata: { customer: "acme" } })) {
+  console.log(summary.id, summary.status, summary.metadata);
+}
+```
+
+`listJobs()` yields every job you can see, newest first, and fetches the next
+page only when you iterate past the current one. Give it up to three labels;
+a job matches when it carries every one with exactly that value. `limit` sets
+the page size, not a total: stop iterating to stop fetching. Each item is a
+summary (`id`, `status`, `createTime`, `updateTime`, `deploymentId`,
+`metadata`) without outputs; read the full job with `client.jobs.get(id)`.
+
+Labels are fixed at submit. A job without labels has `metadata` as an empty
+object. The SDK sends the map as is and leaves the limits to the server, which
+rejects a bad map with `InvalidWorkflow` (code `metadata_invalid`) naming the
+key at fault.
+
 ## The workflow behind a job
 
 A job handle rehydrated by ID alone — `await client.jobs.get(jobId)` — has
@@ -857,7 +884,8 @@ are only exposed by direct `ComfyLow` calls.
 
 - `Unauthorized`, `Forbidden`, `NotFound`
 - `InvalidWorkflow` (and `WorkflowFormatUi`, for submitting a UI-export
-  instead of an API-format graph)
+  instead of an API-format graph). Also raised, with code `metadata_invalid`,
+  when the server rejects a submit's `metadata`.
 - `MissingAsset` — a `core/ASSET` reference the server couldn't resolve
 - `HashMismatch` — uploaded bytes didn't match the declared hash
 - `BlobNotFound`

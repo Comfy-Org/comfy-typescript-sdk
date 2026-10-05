@@ -14,7 +14,9 @@ import { ApiError } from "../low/index.js";
 import type {
   ComfyLow,
   Job as LowJob,
+  JobListItem,
   JobLogs,
+  JobMetadata,
   JobWorkflowResult,
   Output as LowOutput,
 } from "../low/index.js";
@@ -71,6 +73,11 @@ export class Job {
   /** Failure detail when the job ended `failed`, otherwise `null`. */
   get error(): LowJob["error"] {
     return this.model.error;
+  }
+
+  /** The labels attached at submit. An empty object when the job has none. */
+  get metadata(): JobMetadata {
+    return (this.model as LowJob & { metadata?: JobMetadata }).metadata ?? {};
   }
 
   /**
@@ -236,6 +243,34 @@ export class Job {
       await abortableSleep(reconnectPauseMs, signal);
     }
   }
+}
+
+/**
+ * One job as `client.listJobs()` yields it. A list item carries no outputs:
+ * read the full job with `client.jobs.get(summary.id)`.
+ */
+export interface JobSummary {
+  readonly id: string;
+  readonly status: string;
+  /** When the job was created, as the server sent it; `null` if it sent none. */
+  readonly createTime: string | null;
+  /** When the job last changed, as the server sent it; `null` if it sent none. */
+  readonly updateTime: string | null;
+  /** The deployment that ran the job; `null` for a job outside one. */
+  readonly deploymentId: string | null;
+  /** The labels attached at submit. An empty object when the job has none. */
+  readonly metadata: JobMetadata;
+}
+
+export function jobSummary(item: JobListItem): JobSummary {
+  return {
+    id: item.id,
+    status: item.status,
+    createTime: item.create_time ?? null,
+    updateTime: item.update_time ?? null,
+    deploymentId: item.deployment_id ?? null,
+    metadata: item.metadata ?? {},
+  };
 }
 
 /**

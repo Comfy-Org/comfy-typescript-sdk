@@ -31,7 +31,7 @@
  * ```
  */
 
-import type { AssetReference } from "../low/index.js";
+import type { AssetReference, JobMetadata } from "../low/index.js";
 import { ApiError, ComfyLow, type ComfyLowOptions } from "../low/index.js";
 import { abortableSleep } from "./abortable-sleep.js";
 import { AssetFactory } from "./assets.js";
@@ -43,8 +43,8 @@ import {
   SUCCESS,
 } from "./core.js";
 import type { AssetHandleLike } from "./core.js";
-import { JobFailed, QueueFull, WorkflowFormatUi, toSdkError } from "./exceptions.js";
-import { Job, JobFactory } from "./jobs.js";
+import { JobFailed, QueueFull, WorkflowFormatUi, toSdkError, translate } from "./exceptions.js";
+import { Job, JobFactory, jobSummary, type JobSummary } from "./jobs.js";
 import type { Workflow, WorkflowGraph } from "./workflows.js";
 import { WorkflowFactory } from "./workflows.js";
 
@@ -170,10 +170,21 @@ export class Comfy {
    * alongside the workflow, and is unrelated to the `Idempotency-Key`: it
    * does not affect idempotency and is never persisted or logged by this
    * SDK. Omit it and no `extra_data` is sent at all.
+   *
+   * Pass `metadata` to label the job (for example, which of your customers
+   * it is for); find it again later with {@link Comfy.listJobs}. It is sent
+   * as is: the server checks its limits and rejects a bad map with
+   * `InvalidWorkflow`, whose message names the key. Omit it and the request
+   * is the same as before.
    */
   async submit(
     workflow: Workflow,
-    options: { idempotencyKey?: string; apiKey?: string; signal?: AbortSignal } = {},
+    options: {
+      idempotencyKey?: string;
+      apiKey?: string;
+      metadata?: JobMetadata;
+      signal?: AbortSignal;
+    } = {},
   ): Promise<Job> {
     guardUiFormat(workflow);
     const graph = await this.materialize(workflow, options.signal);
@@ -187,6 +198,7 @@ export class Comfy {
         const job = await this.low.postJobs(graph, {
           idempotencyKey: key,
           extraData,
+          metadata: options.metadata,
           signal: options.signal,
         });
         return new Job(this.low, job);
@@ -209,6 +221,37 @@ export class Comfy {
         throw err;
       }
     }
+  }
+
+  /**
+   * Every job this client can see, newest first, fetched page by page as you
+   * iterate. Pass `metadata` to keep only the jobs whose labels match every
+   * pair given. `limit` is the page size, not a total: stop iterating to stop
+   * fetching. An aborted `signal` stops the request in flight.
+   *
+   * @example
+   * ```ts
+   * for await (const job of client.listJobs({ metadata: { customer: "acme" } })) {
+   *   console.log(job.id, job.status, job.metadata);
+   * }
+   * ```
+   */
+  async *listJobs(
+    options: { metadata?: JobMetadata; limit?: number; signal?: AbortSignal } = {},
+  ): AsyncGenerator<JobSummary, void, void> {
+    let cursor: string | undefined;
+    do {
+      const page = await translate(() =>
+        this.low.listJobs({
+          metadata: options.metadata,
+          limit: options.limit,
+          cursor,
+          signal: options.signal,
+        }),
+      );
+      for (const item of page.jobs ?? []) yield jobSummary(item);
+      cursor = page.next_cursor || undefined;
+    } while (cursor !== undefined);
   }
 
   /** Submit, then poll to terminal (authoritative). Throws on failure. */

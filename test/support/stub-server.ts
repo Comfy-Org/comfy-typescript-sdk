@@ -51,8 +51,21 @@ export interface ServerState {
   omitQueueFullRetryAfter: boolean;
   /** When true, an SSE 429 omits its `Retry-After` header. */
   omitEventsRetryAfter: boolean;
-  /** POST /jobs returns this error envelope instead of 201. */
-  jobError: { status: number; code: string } | null;
+  /** POST /jobs returns this error envelope instead of 201; `message`
+   * defaults to `job error <code>`. */
+  jobError: { status: number; code: string; message?: string } | null;
+  /** `metadata` on the job `GET /jobs/{id}` serves; omitted when `null`. */
+  jobMetadata: Record<string, string> | null;
+  /**
+   * `GET /jobs` pages, keyed by the `cursor` query param that fetches each
+   * (`""` for the first page, sent with no cursor). An unknown cursor 400s.
+   */
+  jobListPages: Record<string, { jobs: unknown[]; next_cursor?: string }>;
+  /** Every `GET /jobs` query string, in order, so a test can assert on the
+   * filters and cursors sent. */
+  jobListQueries: URLSearchParams[];
+  /** When true, `GET /jobs` never responds — for the abort test. */
+  hangJobList: boolean;
   /** Number of GET /jobs/{id} polls before the job reports terminal. */
   pollsToSucceed: number;
   /** Terminal status the job reaches. */
@@ -168,6 +181,10 @@ function defaultState(): ServerState {
     omitQueueFullRetryAfter: false,
     omitEventsRetryAfter: false,
     jobError: null,
+    jobMetadata: null,
+    jobListPages: { "": { jobs: [] } },
+    jobListQueries: [],
+    hangJobList: false,
     pollsToSucceed: 1,
     terminalStatus: "succeeded",
     sseMode: "normal",
@@ -224,9 +241,12 @@ function jobJson(
   outputs: unknown[] = [],
   urlsOrigin: string | null = null,
   includeLogsUrl = true,
+  metadata: unknown = null,
 ) {
   const prefix = urlsOrigin ?? "";
   return {
+    // Omitted, not null, when the job has none — as the server sends it.
+    ...(metadata ? { metadata } : {}),
     id,
     status,
     created_at: "2026-07-10T18:20:00Z",
@@ -392,6 +412,10 @@ export class StubServer {
         this.serveJob(m[1], res);
         return;
       }
+      if (path === "/api/v2/jobs") {
+        this.serveJobList(url.searchParams, res);
+        return;
+      }
       sendError(res, 404, "not_found");
       return;
     }
@@ -491,8 +515,27 @@ export class StubServer {
     sendJson(
       res,
       200,
-      jobJson(jobId, status, outputs, state.jobUrlsOrigin, state.jobUrlsIncludeLogs),
+      jobJson(
+        jobId,
+        status,
+        outputs,
+        state.jobUrlsOrigin,
+        state.jobUrlsIncludeLogs,
+        state.jobMetadata,
+      ),
     );
+  }
+
+  private serveJobList(query: URLSearchParams, res: ServerResponse): void {
+    const state = this.state;
+    state.jobListQueries.push(query);
+    if (state.hangJobList) return; // never respond; the caller must abort client-side
+    const page = state.jobListPages[query.get("cursor") ?? ""];
+    if (page === undefined) {
+      sendError(res, 400, "invalid_cursor", "unknown cursor");
+      return;
+    }
+    sendJson(res, 200, page);
   }
 
   private serveJobLogs(path: string, res: ServerResponse): void {
@@ -623,14 +666,14 @@ export class StubServer {
         res,
         state.jobError.status,
         state.jobError.code,
-        `job error ${state.jobError.code}`,
+        state.jobError.message ?? `job error ${state.jobError.code}`,
       );
       return;
     }
 
     const jobId = `job_${String(state.submitCount).padStart(2, "0")}`;
     if (typeof key === "string") state.idempotency.set(key, jobId);
-    sendJson(res, 201, jobJson(jobId, "queued", [], state.jobUrlsOrigin));
+    sendJson(res, 201, jobJson(jobId, "queued", [], state.jobUrlsOrigin, true, body.metadata));
   }
 }
 

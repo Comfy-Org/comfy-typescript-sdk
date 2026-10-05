@@ -19,6 +19,14 @@ entry. See CONTRIBUTING.md.
 
 ### Added
 
+- **Job labels: `submit()` takes `metadata`, and `client.listJobs()` finds
+  jobs by it.** `metadata` is a map of your own string keys to string values,
+  sent as the body's `metadata`; a submit without it sends the same request
+  as before. `job.metadata` returns the labels (an empty object when there
+  are none). `client.listJobs({ metadata, limit, signal })` lists your jobs
+  newest first, filtered by up to three labels, as an async iterator that
+  fetches page by page. A rejected map raises `InvalidWorkflow` with code
+  `metadata_invalid`. Needs a server that supports job metadata.
 - **Comfy Router alt-provider controls on `comfy.models.run` —
   `modelProvider`, `strictMode` and `fallbackProvider`.** Three optional
   `RunOptions` fields, sent as the `model_provider`, `strict_mode` and

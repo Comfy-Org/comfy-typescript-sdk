@@ -38,6 +38,17 @@ describe("Job", () => {
     expect(server.state.eventsConnectCount).toBe(0);
   });
 
+  it("exposes the metadata the server sent with the job", async () => {
+    server.state.jobMetadata = { customer: "acme" };
+    const job = await jobs.get("job_01");
+    expect(job.metadata).toEqual({ customer: "acme" });
+  });
+
+  it("exposes an empty metadata object when the server sent none", async () => {
+    const job = await jobs.get("job_01");
+    expect(job.metadata).toEqual({});
+  });
+
   it("result() throws JobFailed for a non-success terminal state", async () => {
     server.state.terminalStatus = "failed";
     const job = await jobs.get("job_01");

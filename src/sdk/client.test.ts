@@ -3,7 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StubServer } from "../../test/support/stub-server.js";
 import { abortableSleep } from "./abortable-sleep.js";
 import { BASE_URL_ENV_VAR, Comfy } from "./client.js";
-import { IdempotencyKeyReuse, QueueFull, WorkflowFormatUi } from "./exceptions.js";
+import {
+  ComfyError,
+  IdempotencyKeyReuse,
+  InvalidWorkflow,
+  QueueFull,
+  WorkflowFormatUi,
+} from "./exceptions.js";
 
 // Spies on (not replaces) abortableSleep by default, so every other test
 // here still sleeps for real; only the clamp test below overrides a single
@@ -172,6 +178,158 @@ describe("Comfy", () => {
     // A deadline shorter than the first poll backoff step (500ms) so it
     // trips on the very first check, keeping the test fast.
     await expect(client.run(wf, { timeoutMs: 50 })).rejects.toThrow(/not terminal after 50ms/);
+  });
+
+  it("submit() with metadata sends it as the body's metadata, and the job exposes it", async () => {
+    const wf = client.workflows.fromJson({ "1": {} });
+    const job = await client.submit(wf, { metadata: { customer: "acme", run: "7" } });
+
+    expect(server.state.lastPostJobsBody).toMatchObject({
+      metadata: { customer: "acme", run: "7" },
+    });
+    expect(job.metadata).toEqual({ customer: "acme", run: "7" });
+  });
+
+  it("submit() without metadata sends the same body as before: the workflow and nothing else", async () => {
+    const wf = client.workflows.fromJson({ "1": {} });
+    const job = await client.submit(wf);
+
+    expect(Object.keys(server.state.lastPostJobsBody ?? {})).toEqual(["workflow"]);
+    expect(job.metadata).toEqual({});
+  });
+
+  it("submit() surfaces a 422 metadata_invalid as InvalidWorkflow, with the server's message naming the key", async () => {
+    server.state.jobError = {
+      status: 422,
+      code: "metadata_invalid",
+      message: 'metadata key "bad key" may only use A-Z a-z 0-9 _ - .',
+    };
+    const wf = client.workflows.fromJson({ "1": {} });
+    const err = await client.submit(wf, { metadata: { "bad key": "x" } }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(InvalidWorkflow);
+    expect((err as InvalidWorkflow).code).toBe("metadata_invalid");
+    expect((err as InvalidWorkflow).httpStatus).toBe(422);
+    expect((err as InvalidWorkflow).message).toContain('"bad key"');
+    expect(server.state.submitCount).toBe(1);
+  });
+
+  it("listJobs() sends each metadata pair and the limit, and follows next_cursor until it is absent", async () => {
+    server.state.jobListPages = {
+      "": {
+        jobs: [
+          { id: "job_03", status: "running", metadata: { customer: "acme", tier: "pro" } },
+          { id: "job_02", status: "succeeded", metadata: { customer: "acme", tier: "pro" } },
+        ],
+        next_cursor: "c2",
+      },
+      c2: {
+        jobs: [{ id: "job_01", status: "failed", metadata: { customer: "acme", tier: "pro" } }],
+      },
+    };
+
+    const ids: string[] = [];
+    for await (const job of client.listJobs({
+      metadata: { customer: "acme", tier: "pro" },
+      limit: 2,
+    })) {
+      ids.push(job.id);
+    }
+
+    expect(ids).toEqual(["job_03", "job_02", "job_01"]);
+    const [first, second] = server.state.jobListQueries;
+    expect(server.state.jobListQueries).toHaveLength(2);
+    expect(first.get("metadata[customer]")).toBe("acme");
+    expect(first.get("metadata[tier]")).toBe("pro");
+    expect(first.get("limit")).toBe("2");
+    expect(first.has("cursor")).toBe(false);
+    // Every page repeats the filters and limit; only the cursor moves.
+    expect(second.get("metadata[customer]")).toBe("acme");
+    expect(second.get("metadata[tier]")).toBe("pro");
+    expect(second.get("limit")).toBe("2");
+    expect(second.get("cursor")).toBe("c2");
+  });
+
+  it("listJobs() with no options sends no query at all", async () => {
+    for await (const _ of client.listJobs()) {
+      // the default first page is empty
+    }
+    expect(server.state.jobListQueries).toHaveLength(1);
+    expect([...server.state.jobListQueries[0].keys()]).toEqual([]);
+  });
+
+  it("listJobs() yields summaries: metadata is an empty object and missing fields are null when the server omits them", async () => {
+    server.state.jobListPages = {
+      "": {
+        jobs: [
+          {
+            id: "job_02",
+            status: "succeeded",
+            create_time: "2026-10-05T18:00:00Z",
+            update_time: "2026-10-05T18:01:00Z",
+            deployment_id: "dep_01",
+            metadata: { customer: "acme" },
+          },
+          { id: "job_01", status: "queued" },
+        ],
+      },
+    };
+
+    const jobs = [];
+    for await (const job of client.listJobs()) jobs.push(job);
+
+    expect(jobs).toEqual([
+      {
+        id: "job_02",
+        status: "succeeded",
+        createTime: "2026-10-05T18:00:00Z",
+        updateTime: "2026-10-05T18:01:00Z",
+        deploymentId: "dep_01",
+        metadata: { customer: "acme" },
+      },
+      {
+        id: "job_01",
+        status: "queued",
+        createTime: null,
+        updateTime: null,
+        deploymentId: null,
+        metadata: {},
+      },
+    ]);
+  });
+
+  it("listJobs() stops fetching when the caller stops iterating", async () => {
+    server.state.jobListPages = {
+      "": { jobs: [{ id: "job_02", status: "queued" }], next_cursor: "c2" },
+      c2: { jobs: [{ id: "job_01", status: "queued" }] },
+    };
+
+    for await (const job of client.listJobs()) {
+      expect(job.id).toBe("job_02");
+      break;
+    }
+    expect(server.state.jobListQueries).toHaveLength(1);
+  });
+
+  it("listJobs() rejects promptly when its signal aborts a request in flight", async () => {
+    server.state.hangJobList = true; // never responds; only an abort ends this
+    const controller = new AbortController();
+    const iterator = client.listJobs({ signal: controller.signal });
+    setTimeout(() => controller.abort(), 30);
+    const start = Date.now();
+    await expect(iterator.next()).rejects.toBeTruthy();
+    expect(Date.now() - start).toBeLessThan(500);
+  }, 2000);
+
+  it("listJobs() surfaces a server error as a typed SDK error carrying its code", async () => {
+    server.state.jobListPages = {}; // the first page's request now 400s
+    const err = await client
+      .listJobs()
+      .next()
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ComfyError);
+    expect((err as ComfyError).httpStatus).toBe(400);
+    expect((err as ComfyError).code).toBe("invalid_cursor");
   });
 
   it("downloads a byte range of an output", async () => {
