@@ -256,7 +256,11 @@ export interface JobSummary {
   readonly createTime: string | null;
   /** When the job last changed, as the server sent it; `null` if it sent none. */
   readonly updateTime: string | null;
-  /** The deployment that ran the job; `null` for a job outside one. */
+  /**
+   * The id of the deployment copy that ran the job; `null` for a job outside
+   * one. After a deployment moves to a new release this can differ from the
+   * deployment's own id, so it is not the address the job was sent to.
+   */
   readonly deploymentId: string | null;
   /** The labels attached at submit. An empty object when the job has none. */
   readonly metadata: JobMetadata;
