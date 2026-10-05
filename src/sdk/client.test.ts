@@ -417,6 +417,19 @@ describe("Comfy", () => {
     expect((err as ComfyError).retryAfter).toBe(2);
   });
 
+  it("listJobs() matches a filter value that is not a string by the text it sends, for an untyped caller", async () => {
+    server.state.jobListPages = {
+      "": { jobs: [{ id: "job_01", status: "succeeded", metadata: { run: "7" } }] },
+    };
+
+    const ids: string[] = [];
+    // A JavaScript caller can pass a number; it goes out as metadata[run]=7.
+    for await (const job of client.listJobs({ metadata: { run: 7 } as never })) ids.push(job.id);
+
+    expect(server.state.jobListQueries[0].get("metadata[run]")).toBe("7");
+    expect(ids).toEqual(["job_01"]);
+  });
+
   it("listJobs() keeps a label keyed __proto__ as an own key", async () => {
     server.state.jobListPages = {
       "": {

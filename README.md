@@ -813,8 +813,9 @@ for await (const summary of client.listJobs({ metadata: { customer: "acme" } }))
 when you iterate past the current one. Give it up to three labels;
 a job matches when it carries every one with exactly that value. The SDK
 also checks each job against the labels itself, so a server that ignores the
-filter still yields only matching jobs. `limit` sets
-the page size, not a total: stop iterating to stop fetching. Each item is a
+filter still yields only matching jobs. On such a server one step of the loop
+can fetch several pages, or every page, before it yields a job or ends.
+`limit` sets the page size, not a total: stop iterating to stop fetching. Each item is a
 summary (`id`, `status`, `createTime`, `updateTime`, `deploymentId`,
 `metadata`) without outputs; read the full job with `client.jobs.get(id)`.
 A 429 on any page is retried the way `submit()` retries one, so the walk

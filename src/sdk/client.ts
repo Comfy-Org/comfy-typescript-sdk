@@ -244,7 +244,8 @@ export class Comfy {
    * Your jobs, newest first, fetched page by page as you iterate. Pass
    * `metadata` to keep only the jobs whose labels match every pair given. The
    * SDK checks each job against the filter too, so a server that ignores it
-   * still yields only matching jobs. `limit` is the page size, not a total:
+   * still yields only matching jobs; there one step of the loop can fetch
+   * several pages, or all of them, before it yields or ends. `limit` is the page size, not a total:
    * stop iterating to stop fetching. An aborted `signal` stops the request in flight. A 429 on any
    * page is retried as {@link Comfy.submit} retries one, so the walk carries
    * on from that page. A bad filter raises a `ComfyError` of code
@@ -296,10 +297,14 @@ export class Comfy {
   }
 }
 
-/** Whether `labels` holds every pair of `filter` (an absent filter matches all). */
+/**
+ * Whether `labels` holds every pair of `filter` (an absent filter matches
+ * all). A value is compared as the text the query sent, so an untyped
+ * caller's number still matches the label the server matched.
+ */
 function matchesLabels(labels: JobMetadata, filter: JobMetadata | undefined): boolean {
   return Object.entries(filter ?? {}).every(
-    ([key, value]) => Object.hasOwn(labels, key) && labels[key] === value,
+    ([key, value]) => Object.hasOwn(labels, key) && labels[key] === String(value),
   );
 }
 
