@@ -227,7 +227,9 @@ export class Comfy {
    * Every job this client can see, newest first, fetched page by page as you
    * iterate. Pass `metadata` to keep only the jobs whose labels match every
    * pair given. `limit` is the page size, not a total: stop iterating to stop
-   * fetching. An aborted `signal` stops the request in flight.
+   * fetching. An aborted `signal` stops the request in flight. A bad filter
+   * raises a `ComfyError` of code `invalid_metadata_filter`, and a cursor the
+   * server did not issue one of code `invalid_cursor`.
    *
    * @example
    * ```ts

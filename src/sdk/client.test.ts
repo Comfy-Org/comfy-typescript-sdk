@@ -324,6 +324,21 @@ describe("Comfy", () => {
     expect(Date.now() - start).toBeLessThan(500);
   }, 2000);
 
+  it("listJobs() surfaces a 400 invalid_cursor, for a cursor the list did not issue, as a ComfyError carrying that code", async () => {
+    // The stub 400s invalid_cursor for any cursor without a page.
+    server.state.jobListPages = { "": { jobs: [], next_cursor: "not-issued" } };
+    const err = await (async () => {
+      for await (const _ of client.listJobs()) {
+        // the first page is empty; the second request carries the bad cursor
+      }
+    })().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ComfyError);
+    expect(err).not.toBeInstanceOf(InvalidWorkflow);
+    expect((err as ComfyError).httpStatus).toBe(400);
+    expect((err as ComfyError).code).toBe("invalid_cursor");
+    expect(server.state.jobListQueries[1].get("cursor")).toBe("not-issued");
+  });
+
   it("listJobs() surfaces a 400 invalid_metadata_filter as a ComfyError carrying that code", async () => {
     server.state.jobListError = {
       status: 400,
