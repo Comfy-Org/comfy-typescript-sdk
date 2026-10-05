@@ -54,8 +54,13 @@ export interface ServerState {
   /** POST /jobs returns this error envelope instead of 201; `message`
    * defaults to `job error <code>`. */
   jobError: { status: number; code: string; message?: string } | null;
-  /** `metadata` on the job `GET /jobs/{id}` serves; omitted when `null`. */
-  jobMetadata: Record<string, string> | null;
+  /** POST /jobs returns this error envelope only when the body carries
+   * `metadata`, as the server's own metadata check does. */
+  metadataError: { status: number; code: string; message: string } | null;
+  /** `metadata` on the job `GET /jobs/{id}` serves; omitted when `null`.
+   * Not typed as labels, so a test can serve what a non-conforming server
+   * sends (a self-hosted proxy's plain string). */
+  jobMetadata: unknown;
   /**
    * `GET /jobs` pages, keyed by the `cursor` query param that fetches each
    * (`""` for the first page, sent with no cursor). An unknown cursor 400s.
@@ -66,8 +71,13 @@ export interface ServerState {
   jobListQueries: URLSearchParams[];
   /** When true, `GET /jobs` never responds — for the abort test. */
   hangJobList: boolean;
-  /** `GET /jobs` returns this error envelope instead of a page. */
-  jobListError: { status: number; code: string; message: string } | null;
+  /** `GET /jobs` returns this error envelope instead of a page, with
+   * `retryAfter` as its `Retry-After` header when set. */
+  jobListError: { status: number; code: string; message: string; retryAfter?: string } | null;
+  /** `GET /jobs` with this `cursor` (`""` for the first page) answers 429
+   * `rate_limited`, with `retryAfter` as its `Retry-After`, `times` times
+   * before serving the page. */
+  jobListThrottle: { cursor: string; times: number; retryAfter: string } | null;
   /** Number of GET /jobs/{id} polls before the job reports terminal. */
   pollsToSucceed: number;
   /** Terminal status the job reaches. */
@@ -183,11 +193,13 @@ function defaultState(): ServerState {
     omitQueueFullRetryAfter: false,
     omitEventsRetryAfter: false,
     jobError: null,
+    metadataError: null,
     jobMetadata: null,
     jobListPages: { "": { jobs: [] } },
     jobListQueries: [],
     hangJobList: false,
     jobListError: null,
+    jobListThrottle: null,
     pollsToSucceed: 1,
     terminalStatus: "succeeded",
     sseMode: "normal",
@@ -534,11 +546,20 @@ export class StubServer {
     state.jobListQueries.push(query);
     if (state.hangJobList) return; // never respond; the caller must abort client-side
     if (state.jobListError !== null) {
-      const { status, code, message } = state.jobListError;
-      sendError(res, status, code, message);
+      const { status, code, message, retryAfter } = state.jobListError;
+      const headers = retryAfter === undefined ? {} : { "Retry-After": retryAfter };
+      sendJson(res, status, { error: { code, message } }, headers);
       return;
     }
-    const page = state.jobListPages[query.get("cursor") ?? ""];
+    const cursor = query.get("cursor") ?? "";
+    const throttle = state.jobListThrottle;
+    if (throttle !== null && throttle.cursor === cursor && throttle.times > 0) {
+      throttle.times -= 1;
+      const error = { code: "rate_limited", message: "slow down" };
+      sendJson(res, 429, { error }, { "Retry-After": throttle.retryAfter });
+      return;
+    }
+    const page = state.jobListPages[cursor];
     if (page === undefined) {
       sendError(res, 400, "invalid_cursor", "unknown cursor");
       return;
@@ -666,6 +687,12 @@ export class StubServer {
         ? {}
         : { "Retry-After": state.retryAfterHeader };
       sendJson(res, 429, { error: { code: state.queueFullCode, message: "full" } }, headers);
+      return;
+    }
+
+    if (state.metadataError !== null && body.metadata !== undefined) {
+      const { status, code, message } = state.metadataError;
+      sendError(res, status, code, message);
       return;
     }
 

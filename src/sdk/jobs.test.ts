@@ -49,6 +49,21 @@ describe("Job", () => {
     expect(job.metadata).toEqual({});
   });
 
+  it.each([
+    ["a self-hosted proxy's plain string", "customer=acme"],
+    ["an array", ["customer", "acme"]],
+  ])("reads metadata that is %s as an empty object", async (_, raw) => {
+    server.state.jobMetadata = raw;
+    const job = await jobs.get("job_01");
+    expect(job.metadata).toEqual({});
+  });
+
+  it("drops metadata values that are not strings", async () => {
+    server.state.jobMetadata = { customer: "acme", run: 7, nested: { a: "b" } };
+    const job = await jobs.get("job_01");
+    expect(job.metadata).toEqual({ customer: "acme" });
+  });
+
   it("result() throws JobFailed for a non-success terminal state", async () => {
     server.state.terminalStatus = "failed";
     const job = await jobs.get("job_01");

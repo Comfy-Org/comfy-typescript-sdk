@@ -77,7 +77,7 @@ export class Job {
 
   /** The labels attached at submit. An empty object when the job has none. */
   get metadata(): JobMetadata {
-    return (this.model as LowJob & { metadata?: JobMetadata }).metadata ?? {};
+    return readMetadata((this.model as LowJob & { metadata?: unknown }).metadata);
   }
 
   /**
@@ -273,8 +273,22 @@ export function jobSummary(item: JobListItem): JobSummary {
     createTime: item.create_time ?? null,
     updateTime: item.update_time ?? null,
     deploymentId: item.deployment_id ?? null,
-    metadata: item.metadata ?? {},
+    metadata: readMetadata(item.metadata),
   };
+}
+
+/**
+ * The string pairs of a job's `metadata`, read leniently: anything that is
+ * not an object (a self-hosted proxy sends its own metadata as a plain
+ * string) reads as `{}`, and a value that is not a string is dropped.
+ */
+function readMetadata(raw: unknown): JobMetadata {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return {};
+  const labels: JobMetadata = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (typeof value === "string") labels[key] = value;
+  }
+  return labels;
 }
 
 /**

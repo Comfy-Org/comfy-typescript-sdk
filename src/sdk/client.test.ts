@@ -199,7 +199,8 @@ describe("Comfy", () => {
   });
 
   it("submit() surfaces a 422 metadata_invalid as a ComfyError carrying that code, with the server's message naming the key", async () => {
-    server.state.jobError = {
+    // The stub answers this only to a body that carries metadata.
+    server.state.metadataError = {
       status: 422,
       code: "metadata_invalid",
       message: 'metadata key "bad key" may only use A-Z a-z 0-9 _ - .',
@@ -207,6 +208,7 @@ describe("Comfy", () => {
     const wf = client.workflows.fromJson({ "1": {} });
     const err = await client.submit(wf, { metadata: { "bad key": "x" } }).catch((e: unknown) => e);
 
+    expect(server.state.lastPostJobsBody).toMatchObject({ metadata: { "bad key": "x" } });
     // Labels are not the workflow: the base class, not InvalidWorkflow,
     // matching the Python SDK.
     expect(err).toBeInstanceOf(ComfyError);
@@ -218,7 +220,8 @@ describe("Comfy", () => {
   });
 
   it("submit() surfaces Comfy Cloud's 422 metadata_not_supported as a ComfyError carrying that code, not InvalidWorkflow", async () => {
-    server.state.jobError = {
+    // The stub answers this only to a body that carries metadata.
+    server.state.metadataError = {
       status: 422,
       code: "metadata_not_supported",
       message: "job metadata is not supported here",
@@ -228,6 +231,7 @@ describe("Comfy", () => {
       .submit(wf, { metadata: { customer: "acme" } })
       .catch((e: unknown) => e);
 
+    expect(server.state.lastPostJobsBody).toMatchObject({ metadata: { customer: "acme" } });
     expect(err).toBeInstanceOf(ComfyError);
     expect(err).not.toBeInstanceOf(InvalidWorkflow);
     expect((err as ComfyError).code).toBe("metadata_not_supported");
@@ -354,6 +358,57 @@ describe("Comfy", () => {
     expect((err as ComfyError).httpStatus).toBe(400);
     expect((err as ComfyError).code).toBe("invalid_cursor");
     expect(server.state.jobListQueries[1].get("cursor")).toBe("not-issued");
+  });
+
+  it("listJobs() retries a 429 on a later page after its Retry-After, and resumes at that page", async () => {
+    server.state.jobListPages = {
+      "": { jobs: [{ id: "job_02", status: "queued" }], next_cursor: "c2" },
+      c2: { jobs: [{ id: "job_01", status: "queued" }] },
+    };
+    server.state.jobListThrottle = { cursor: "c2", times: 1, retryAfter: "2" };
+    vi.mocked(abortableSleep).mockImplementationOnce(() => Promise.resolve());
+
+    const ids: string[] = [];
+    for await (const job of client.listJobs()) ids.push(job.id);
+
+    expect(ids).toEqual(["job_02", "job_01"]);
+    expect(abortableSleep).toHaveBeenCalledWith(2_000, undefined);
+    // Page 1 once, then page 2 twice: never back to the start.
+    expect(server.state.jobListQueries.map((q) => q.get("cursor"))).toEqual([null, "c2", "c2"]);
+  });
+
+  it("listJobs() keeps the server's Retry-After on an error it surfaces", async () => {
+    server.state.jobListError = {
+      status: 503,
+      code: "service_unavailable",
+      message: "try later",
+      retryAfter: "2",
+    };
+    const err = await client
+      .listJobs()
+      .next()
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ComfyError);
+    expect((err as ComfyError).httpStatus).toBe(503);
+    expect((err as ComfyError).retryAfter).toBe(2);
+  });
+
+  it("listJobs() reads a metadata that is not an object as empty, and drops values that are not strings", async () => {
+    server.state.jobListPages = {
+      "": {
+        jobs: [
+          // A self-hosted proxy sends its own metadata as a plain string.
+          { id: "job_03", status: "succeeded", metadata: "a proxy string" },
+          { id: "job_02", status: "succeeded", metadata: ["customer", "acme"] },
+          { id: "job_01", status: "succeeded", metadata: { customer: "acme", run: 7, x: null } },
+        ],
+      },
+    };
+
+    const metadata = [];
+    for await (const job of client.listJobs()) metadata.push(job.metadata);
+
+    expect(metadata).toEqual([{}, {}, { customer: "acme" }]);
   });
 
   it("listJobs() surfaces a 400 invalid_metadata_filter as a ComfyError carrying that code", async () => {

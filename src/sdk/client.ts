@@ -43,7 +43,7 @@ import {
   SUCCESS,
 } from "./core.js";
 import type { AssetHandleLike } from "./core.js";
-import { JobFailed, QueueFull, WorkflowFormatUi, toSdkError, translate } from "./exceptions.js";
+import { JobFailed, QueueFull, WorkflowFormatUi, toSdkError } from "./exceptions.js";
 import { Job, JobFactory, jobSummary, type JobSummary } from "./jobs.js";
 import type { Workflow, WorkflowGraph } from "./workflows.js";
 import { WorkflowFactory } from "./workflows.js";
@@ -192,16 +192,29 @@ export class Comfy {
     // A falsy apiKey (undefined or "") means "no key" — send no extra_data,
     // matching the Python SDK's behavior so the two stay in lockstep.
     const extraData = options.apiKey ? { api_key_comfy_org: options.apiKey } : undefined;
-    const deadline = performance.now() + QUEUE_RETRY_BUDGET_MS;
-    for (;;) {
-      try {
-        const job = await this.low.postJobs(graph, {
+    const job = await this.retryThrottled(
+      () =>
+        this.low.postJobs(graph, {
           idempotencyKey: key,
           extraData,
           metadata: options.metadata,
           signal: options.signal,
-        });
-        return new Job(this.low, job);
+        }),
+      options.signal,
+    );
+    return new Job(this.low, job);
+  }
+
+  /**
+   * Run one request, retrying any 429 that carries `Retry-After` (and
+   * `queue_full` without one) for up to a minute. Every other failure is
+   * raised as its SDK exception.
+   */
+  private async retryThrottled<T>(send: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    const deadline = performance.now() + QUEUE_RETRY_BUDGET_MS;
+    for (;;) {
+      try {
+        return await send();
       } catch (exc) {
         if (!(exc instanceof ApiError)) throw exc;
         const err = toSdkError(exc);
@@ -215,7 +228,7 @@ export class Comfy {
         // it — the loop-entry check alone doesn't bound the sleep itself.
         const remainingMs = deadline - performance.now();
         if (exc.httpStatus === 429 && retryDelayS !== null && remainingMs > 0) {
-          await abortableSleep(Math.min(retryDelayS * 1000, remainingMs), options.signal);
+          await abortableSleep(Math.min(retryDelayS * 1000, remainingMs), signal);
           continue;
         }
         throw err;
@@ -227,9 +240,13 @@ export class Comfy {
    * Every job this client can see, newest first, fetched page by page as you
    * iterate. Pass `metadata` to keep only the jobs whose labels match every
    * pair given. `limit` is the page size, not a total: stop iterating to stop
-   * fetching. An aborted `signal` stops the request in flight. A bad filter
-   * raises a `ComfyError` of code `invalid_metadata_filter`, and a cursor the
-   * server did not issue one of code `invalid_cursor`.
+   * fetching. An aborted `signal` stops the request in flight. A 429 on any
+   * page is retried as {@link Comfy.submit} retries one, so the walk carries
+   * on from that page. A bad filter raises a `ComfyError` of code
+   * `invalid_metadata_filter`, and a cursor the server did not issue one of
+   * code `invalid_cursor`. Comfy Cloud does not list jobs yet: it answers
+   * with a `ComfyError` of code `not_implemented` (HTTP 501). A self-hosted
+   * proxy does not keep labels, so there `metadata` is empty on every job.
    *
    * @example
    * ```ts
@@ -243,13 +260,15 @@ export class Comfy {
   ): AsyncGenerator<JobSummary, void, void> {
     let cursor: string | undefined;
     do {
-      const page = await translate(() =>
-        this.low.listJobs({
-          metadata: options.metadata,
-          limit: options.limit,
-          cursor,
-          signal: options.signal,
-        }),
+      const page = await this.retryThrottled(
+        () =>
+          this.low.listJobs({
+            metadata: options.metadata,
+            limit: options.limit,
+            cursor,
+            signal: options.signal,
+          }),
+        options.signal,
       );
       for (const item of page.jobs ?? []) yield jobSummary(item);
       cursor = page.next_cursor || undefined;
