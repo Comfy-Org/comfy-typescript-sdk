@@ -43,7 +43,7 @@ import {
   SUCCESS,
 } from "./core.js";
 import type { AssetHandleLike } from "./core.js";
-import { JobFailed, QueueFull, WorkflowFormatUi, toSdkError } from "./exceptions.js";
+import { ComfyError, JobFailed, QueueFull, WorkflowFormatUi, toSdkError } from "./exceptions.js";
 import { Job, JobFactory, jobSummary, type JobSummary } from "./jobs.js";
 import type { Workflow, WorkflowGraph } from "./workflows.js";
 import { WorkflowFactory } from "./workflows.js";
@@ -250,7 +250,9 @@ export class Comfy {
    * page is retried as {@link Comfy.submit} retries one, so the walk carries
    * on from that page. A bad filter raises a `ComfyError` of code
    * `invalid_metadata_filter`, and a cursor the server did not issue one of
-   * code `invalid_cursor`. Comfy Cloud does not list jobs yet: it answers
+   * code `invalid_cursor`. A `next_cursor` the walk has already followed
+   * would fetch the same pages forever, so it raises a `ComfyError` of code
+   * `unexpected_response`, as `comfy.models.list()` does. Comfy Cloud does not list jobs yet: it answers
    * with a `ComfyError` of code `not_implemented` (HTTP 501). A self-hosted
    * proxy does not keep labels, so there `metadata` is empty on every job and
    * a filtered list yields nothing.
@@ -266,6 +268,7 @@ export class Comfy {
     options: { metadata?: JobMetadata; limit?: number; signal?: AbortSignal } = {},
   ): AsyncGenerator<JobSummary, void, void> {
     let cursor: string | undefined;
+    const followed = new Set<string>();
     do {
       const page = await this.retryThrottled(
         () =>
@@ -282,6 +285,16 @@ export class Comfy {
         if (matchesLabels(summary.metadata, options.metadata)) yield summary;
       }
       cursor = page.next_cursor || undefined;
+      if (cursor !== undefined) {
+        if (followed.has(cursor)) {
+          throw new ComfyError(
+            "listJobs() was handed a `next_cursor` it had already followed, which would " +
+              "walk the same pages forever",
+            { code: "unexpected_response" },
+          );
+        }
+        followed.add(cursor);
+      }
     } while (cursor !== undefined);
   }
 
@@ -299,13 +312,23 @@ export class Comfy {
 
 /**
  * Whether `labels` holds every pair of `filter` (an absent filter matches
- * all). A value is compared as the text the query sent, so an untyped
- * caller's number still matches the label the server matched.
+ * all). A key and a value are compared as the text the query sent, so an
+ * untyped caller's number, or a lone surrogate (which the query sends as
+ * U+FFFD), still matches the label the server matched.
  */
 function matchesLabels(labels: JobMetadata, filter: JobMetadata | undefined): boolean {
-  return Object.entries(filter ?? {}).every(
-    ([key, value]) => Object.hasOwn(labels, key) && labels[key] === String(value),
-  );
+  return Object.entries(filter ?? {}).every(([key, value]) => {
+    const sentKey = asQuerySends(key);
+    return Object.hasOwn(labels, sentKey) && labels[sentKey] === asQuerySends(value);
+  });
+}
+
+/**
+ * `value` as `URLSearchParams` sends it: as a string, with each lone
+ * surrogate replaced by U+FFFD.
+ */
+function asQuerySends(value: unknown): string {
+  return new URLSearchParams([["", String(value)]]).get("") ?? "";
 }
 
 async function runWithTimeout(job: Job, timeoutMs: number, signal?: AbortSignal): Promise<Job> {

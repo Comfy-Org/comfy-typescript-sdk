@@ -838,7 +838,9 @@ object. The SDK sends the map as is and leaves the limits to the server, which
 rejects a bad map with a `ComfyError` of code `metadata_invalid` naming the
 key at fault. A bad filter on `listJobs()` raises a `ComfyError` of code
 `invalid_metadata_filter`, and a page cursor the server did not issue raises
-one of code `invalid_cursor`.
+one of code `invalid_cursor`. A server that hands back a `next_cursor` the walk
+has already followed raises a `ComfyError` of code `unexpected_response`, since
+following it would fetch the same pages forever.
 
 ## The workflow behind a job
 

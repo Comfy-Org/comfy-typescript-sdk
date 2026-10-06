@@ -27,7 +27,9 @@ entry. See CONTRIBUTING.md.
   newest first, filtered by up to three labels, as an async iterator that
   fetches page by page; a 429 on a page is retried as `submit()` retries one.
   The SDK also checks each listed job against the filter, so a server that
-  ignores it yields only matching jobs.
+  ignores it yields only matching jobs. A `next_cursor` the walk has already
+  followed raises `ComfyError` with code `unexpected_response` instead of
+  fetching the same pages forever.
   A rejected map raises `ComfyError` with code `metadata_invalid`. Needs a
   server that supports job metadata: Comfy Cloud answers a labelled submit
   with `metadata_not_supported` and the list with `not_implemented` (501),

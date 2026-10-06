@@ -372,6 +372,37 @@ describe("Comfy", () => {
     expect(server.state.jobListQueries[1].get("cursor")).toBe("not-issued");
   });
 
+  it("listJobs() rejects a next_cursor equal to the cursor it just sent, instead of fetching that page forever", async () => {
+    server.state.jobListPages = {
+      "": { jobs: [], next_cursor: "c2" },
+      c2: { jobs: [{ id: "job_01", status: "queued" }], next_cursor: "c2" },
+    };
+    const ids: string[] = [];
+    const err = await (async () => {
+      for await (const job of client.listJobs()) ids.push(job.id);
+    })().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ComfyError);
+    expect((err as ComfyError).code).toBe("unexpected_response");
+    expect(ids).toEqual(["job_01"]);
+    expect(server.state.jobListQueries.map((q) => q.get("cursor"))).toEqual([null, "c2"]);
+  });
+
+  it("listJobs() rejects a next_cursor it followed pages ago, so a cycle of cursors ends too", async () => {
+    server.state.jobListPages = {
+      "": { jobs: [], next_cursor: "c2" },
+      c2: { jobs: [], next_cursor: "c3" },
+      c3: { jobs: [], next_cursor: "c2" },
+    };
+    const err = await (async () => {
+      for await (const _ of client.listJobs({ metadata: { customer: "acme" } })) {
+        // no job matches; without the check this would never yield or end
+      }
+    })().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ComfyError);
+    expect((err as ComfyError).code).toBe("unexpected_response");
+    expect(server.state.jobListQueries.map((q) => q.get("cursor"))).toEqual([null, "c2", "c3"]);
+  });
+
   it("listJobs() retries a 429 on a later page after its Retry-After, and resumes at that page", async () => {
     server.state.jobListPages = {
       "": { jobs: [{ id: "job_02", status: "queued" }], next_cursor: "c2" },
@@ -427,6 +458,20 @@ describe("Comfy", () => {
     for await (const job of client.listJobs({ metadata: { run: 7 } as never })) ids.push(job.id);
 
     expect(server.state.jobListQueries[0].get("metadata[run]")).toBe("7");
+    expect(ids).toEqual(["job_01"]);
+  });
+
+  it("listJobs() matches a filter key or value holding a lone surrogate by the U+FFFD the query sends", async () => {
+    server.state.jobListPages = {
+      "": { jobs: [{ id: "job_01", status: "succeeded", metadata: { "k\uFFFD": "\uFFFD" } }] },
+    };
+
+    const ids: string[] = [];
+    for await (const job of client.listJobs({ metadata: { "k\uD800": "\uD800" } })) {
+      ids.push(job.id);
+    }
+
+    expect(server.state.jobListQueries[0].get("metadata[k\uFFFD]")).toBe("\uFFFD");
     expect(ids).toEqual(["job_01"]);
   });
 
