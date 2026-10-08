@@ -798,20 +798,21 @@ downloads the bytes first.
 
 A `Job` handle reads whatever state it currently holds — nothing re-fetches implicitly, so `await job.refresh()` (or `wait()`/`result()`, which poll for you) is what advances it:
 
-| Accessor            | Type                                          | What it is                                                                                       |
-| ------------------- | --------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| `job.id`            | `string`                                      | Server-assigned ID; enough on its own to rebuild the handle via `client.jobs.get(id)`            |
-| `job.status`        | `string`                                      | `queued`, `running`, `canceling`, `succeeded`, `canceled`, `failed`, `expired`                   |
-| `job.outputs`       | `Output[]`                                    | Every output across all nodes; empty until the job succeeds                                      |
-| `job.error`         | `JobError \| null`                            | Failure detail when the job ended `failed`                                                       |
-| `job.createdAt`     | `Date`                                        | When the server accepted the job                                                                 |
-| `job.startedAt`     | `Date \| null`                                | When it started executing; `null` while still queued                                             |
-| `job.completedAt`   | `Date \| null`                                | When it reached a terminal state; `null` before it did                                           |
-| `job.expiresAt`     | `Date`                                        | Retention deadline — after this the job and its outputs are gone                                 |
-| `job.progress`      | `Progress \| null`                            | Latest progress snapshot the handle holds (see the caveat below)                                 |
-| `job.queuePosition` | `number \| null`                              | Place in the queue as of the state the handle holds                                              |
-| `job.metrics`       | `Record<string, number \| null> \| undefined` | Per-run measurements (`queue_ms`, `execution_ms`, …); `undefined` on a surface that reports none |
-| `job.urls`          | `JobUrls`                                     | The job's own `self` / `events` / `cancel` links, plus `logs` where the surface captures logs    |
+| Accessor            | Type                                          | What it is                                                                                                       |
+| ------------------- | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `job.id`            | `string`                                      | Server-assigned ID; enough on its own to rebuild the handle via `client.jobs.get(id)`                            |
+| `job.status`        | `string`                                      | `queued`, `running`, `canceling`, `succeeded`, `canceled`, `failed`, `expired`                                   |
+| `job.outputs`       | `Output[]`                                    | Every output across all nodes; empty until the job succeeds                                                      |
+| `job.error`         | `JobError \| null`                            | Failure detail when the job ended `failed`                                                                       |
+| `job.createdAt`     | `Date`                                        | When the server accepted the job                                                                                 |
+| `job.startedAt`     | `Date \| null`                                | When it started executing; `null` while still queued                                                             |
+| `job.completedAt`   | `Date \| null`                                | When it reached a terminal state; `null` before it did                                                           |
+| `job.expiresAt`     | `Date`                                        | Retention deadline — after this the job and its outputs are gone                                                 |
+| `job.progress`      | `Progress \| null`                            | Latest progress snapshot the handle holds (see the caveat below)                                                 |
+| `job.queuePosition` | `number \| null`                              | Place in the queue as of the state the handle holds                                                              |
+| `job.metrics`       | `Record<string, number \| null> \| undefined` | Per-run measurements (`queue_ms`, `execution_ms`, …); `undefined` on a surface that reports none                 |
+| `job.urls`          | `JobUrls`                                     | The job's own `self` / `events` / `cancel` links, plus `logs` where the surface captures logs                    |
+| `job.metadata`      | `Record<string, string>`                      | Labels attached at submit (see [Labeling jobs](#labeling-jobs-and-finding-them-again)); `{}` when there are none |
 
 How long a run took is `completedAt` minus `startedAt`:
 
@@ -826,6 +827,54 @@ if (job.startedAt && job.completedAt) {
 Three things worth knowing. `JobError`, `Progress` and `JobUrls` above are the **generated wire models**, exported from `@comfyorg/sdk/low` — so `job.progress` is the snake_case snapshot (`value`, `nodes_done`, `nodes_total`, `current_node`, `step`, `steps`, `message`), not the camelCase `Progress` _event_ of the same name that `job.events()` yields. Second, `job.progress` is whatever the last poll carried. The contract says a poll returns the latest snapshot — the same data the SSE stream pushes — but Comfy Cloud has been reported to send `null` there even for a running job, so read a `null` as "this state carries no snapshot", not as "not running", and take live progress from `job.events()` (see [Live progress](#live-progress)). Third, the object-valued accessors (`progress`, `metrics`, `urls`) hand back a snapshot copy, so editing what you get back does not rewrite the handle's own state — `job.error` is the exception, handing back the handle's own object by reference, so treat it as read-only.
 
 The two `Date` accessors and `job.urls` are non-nullable because the wire contract makes those fields required. Responses are not validated at runtime, so if a surface breaks that contract and omits one, reading it raises `ComfyError` with `code: "unexpected_response"` naming the field — better than an `Invalid Date` whose every comparison is false, or a `job.urls` that promises `self` as a `string` and hands back `undefined`. The nullable accessors take the other route: an absent or unusable value reads as `null` (or `undefined` for `metrics`), never as a half-built object.
+
+## Labeling jobs and finding them again
+
+Pass `metadata` to `submit()` to label a job with your own string keys and
+values, such as which of your customers it is for. Then list the jobs that
+carry a label:
+
+```ts
+const job = await client.submit(wf, { metadata: { customer: "acme" } });
+console.log(job.metadata); // { customer: "acme" }
+
+for await (const summary of client.listJobs({ metadata: { customer: "acme" } })) {
+  console.log(summary.id, summary.status, summary.metadata);
+}
+```
+
+`listJobs()` yields your jobs, newest first, and fetches the next page only
+when you iterate past the current one. Give it up to three labels;
+a job matches when it carries every one with exactly that value. The SDK
+also checks each job against the labels itself, so a server that ignores the
+filter still yields only matching jobs. On such a server one step of the loop
+can fetch several pages, or every page, before it yields a job or ends.
+`limit` sets the page size, not a total: stop iterating to stop fetching. Each item is a
+summary (`id`, `status`, `createTime`, `updateTime`, `deploymentId`,
+`metadata`) without outputs; read the full job with `client.jobs.get(id)`.
+A 429 on any page is retried the way `submit()` retries one, so the walk
+carries on from that page.
+
+Labels work on jobs sent to a deployment: point the client at the
+deployment's address (see [Targeting another deployment](#targeting-another-deployment)).
+Elsewhere:
+
+- **Comfy Cloud** does not support labels yet. A submit with labels raises a
+  `ComfyError` of code `metadata_not_supported`, and `listJobs()` raises one
+  of code `not_implemented` (HTTP 501).
+- **A self-hosted proxy** does not keep labels. It rejects a submit with
+  labels (a `ComfyError` of code `invalid_request`). `listJobs()` with a label
+  filter yields nothing there, and without one every job has `metadata` as an
+  empty object.
+
+Labels are fixed at submit. A job without labels has `metadata` as an empty
+object. The SDK sends the map as is and leaves the limits to the server, which
+rejects a bad map with a `ComfyError` of code `metadata_invalid` naming the
+key at fault. A bad filter on `listJobs()` raises a `ComfyError` of code
+`invalid_metadata_filter`, and a page cursor the server did not issue raises
+one of code `invalid_cursor`. A server that hands back a `next_cursor` the walk
+has already followed raises a `ComfyError` of code `unexpected_response`, since
+following it would fetch the same pages forever.
 
 ## The workflow behind a job
 

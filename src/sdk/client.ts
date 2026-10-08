@@ -31,7 +31,7 @@
  * ```
  */
 
-import type { AssetReference } from "../low/index.js";
+import type { AssetReference, JobMetadata } from "../low/index.js";
 import { ApiError, ComfyLow, type ComfyLowOptions } from "../low/index.js";
 import { abortableSleep } from "./abortable-sleep.js";
 import { AssetFactory } from "./assets.js";
@@ -43,8 +43,8 @@ import {
   SUCCESS,
 } from "./core.js";
 import type { AssetHandleLike } from "./core.js";
-import { JobFailed, QueueFull, WorkflowFormatUi, toSdkError } from "./exceptions.js";
-import { Job, JobFactory } from "./jobs.js";
+import { ComfyError, JobFailed, QueueFull, WorkflowFormatUi, toSdkError } from "./exceptions.js";
+import { Job, JobFactory, jobSummary, type JobSummary } from "./jobs.js";
 import type { Workflow, WorkflowGraph } from "./workflows.js";
 import { WorkflowFactory } from "./workflows.js";
 
@@ -56,6 +56,9 @@ export const COMFY_CLOUD_BASE_URL = "https://cloud.comfy.org";
 export const BASE_URL_ENV_VAR = "COMFY_BASE_URL";
 
 const DEFAULT_RETRY_AFTER_S = 2;
+// The shortest pause before re-sending a 429: a `Retry-After: 0` must not
+// turn the retry into a tight loop for the whole budget.
+const MIN_RETRY_PAUSE_MS = 1_000;
 
 /**
  * Comfy Cloud, unless `COMFY_BASE_URL` names another deployment.
@@ -170,10 +173,21 @@ export class Comfy {
    * alongside the workflow, and is unrelated to the `Idempotency-Key`: it
    * does not affect idempotency and is never persisted or logged by this
    * SDK. Omit it and no `extra_data` is sent at all.
+   *
+   * Pass `metadata` to label the job (for example, which of your customers
+   * it is for); find it again later with {@link Comfy.listJobs}. It is sent
+   * as is: the server checks its limits and rejects a bad map with a
+   * `ComfyError` of code `metadata_invalid`, whose message names the key.
+   * Omit it and the request is the same as before.
    */
   async submit(
     workflow: Workflow,
-    options: { idempotencyKey?: string; apiKey?: string; signal?: AbortSignal } = {},
+    options: {
+      idempotencyKey?: string;
+      apiKey?: string;
+      metadata?: JobMetadata;
+      signal?: AbortSignal;
+    } = {},
   ): Promise<Job> {
     guardUiFormat(workflow);
     const graph = await this.materialize(workflow, options.signal);
@@ -181,15 +195,29 @@ export class Comfy {
     // A falsy apiKey (undefined or "") means "no key" — send no extra_data,
     // matching the Python SDK's behavior so the two stay in lockstep.
     const extraData = options.apiKey ? { api_key_comfy_org: options.apiKey } : undefined;
+    const job = await this.retryThrottled(
+      () =>
+        this.low.postJobs(graph, {
+          idempotencyKey: key,
+          extraData,
+          metadata: options.metadata,
+          signal: options.signal,
+        }),
+      options.signal,
+    );
+    return new Job(this.low, job);
+  }
+
+  /**
+   * Run one request, retrying any 429 that carries `Retry-After` (and
+   * `queue_full` without one) for up to a minute. Every other failure is
+   * raised as its SDK exception.
+   */
+  private async retryThrottled<T>(send: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     const deadline = performance.now() + QUEUE_RETRY_BUDGET_MS;
     for (;;) {
       try {
-        const job = await this.low.postJobs(graph, {
-          idempotencyKey: key,
-          extraData,
-          signal: options.signal,
-        });
-        return new Job(this.low, job);
+        return await send();
       } catch (exc) {
         if (!(exc instanceof ApiError)) throw exc;
         const err = toSdkError(exc);
@@ -203,12 +231,71 @@ export class Comfy {
         // it — the loop-entry check alone doesn't bound the sleep itself.
         const remainingMs = deadline - performance.now();
         if (exc.httpStatus === 429 && retryDelayS !== null && remainingMs > 0) {
-          await abortableSleep(Math.min(retryDelayS * 1000, remainingMs), options.signal);
+          const pauseMs = Math.max(retryDelayS * 1000, MIN_RETRY_PAUSE_MS);
+          await abortableSleep(Math.min(pauseMs, remainingMs), signal);
           continue;
         }
         throw err;
       }
     }
+  }
+
+  /**
+   * Your jobs, newest first, fetched page by page as you iterate. Pass
+   * `metadata` to keep only the jobs whose labels match every pair given. The
+   * SDK checks each job against the filter too, so a server that ignores it
+   * still yields only matching jobs; there one step of the loop can fetch
+   * several pages, or all of them, before it yields or ends. `limit` is the page size, not a total:
+   * stop iterating to stop fetching. An aborted `signal` stops the request in flight. A 429 on any
+   * page is retried as {@link Comfy.submit} retries one, so the walk carries
+   * on from that page. A bad filter raises a `ComfyError` of code
+   * `invalid_metadata_filter`, and a cursor the server did not issue one of
+   * code `invalid_cursor`. A `next_cursor` the walk has already followed
+   * would fetch the same pages forever, so it raises a `ComfyError` of code
+   * `unexpected_response`, as `comfy.models.list()` does. Comfy Cloud does not list jobs yet: it answers
+   * with a `ComfyError` of code `not_implemented` (HTTP 501). A self-hosted
+   * proxy does not keep labels, so there `metadata` is empty on every job and
+   * a filtered list yields nothing.
+   *
+   * @example
+   * ```ts
+   * for await (const job of client.listJobs({ metadata: { customer: "acme" } })) {
+   *   console.log(job.id, job.status, job.metadata);
+   * }
+   * ```
+   */
+  async *listJobs(
+    options: { metadata?: JobMetadata; limit?: number; signal?: AbortSignal } = {},
+  ): AsyncGenerator<JobSummary, void, void> {
+    let cursor: string | undefined;
+    const followed = new Set<string>();
+    do {
+      const page = await this.retryThrottled(
+        () =>
+          this.low.listJobs({
+            metadata: options.metadata,
+            limit: options.limit,
+            cursor,
+            signal: options.signal,
+          }),
+        options.signal,
+      );
+      for (const item of page.jobs ?? []) {
+        const summary = jobSummary(item);
+        if (matchesLabels(summary.metadata, options.metadata)) yield summary;
+      }
+      cursor = page.next_cursor || undefined;
+      if (cursor !== undefined) {
+        if (followed.has(cursor)) {
+          throw new ComfyError(
+            "listJobs() was handed a `next_cursor` it had already followed, which would " +
+              "walk the same pages forever",
+            { code: "unexpected_response" },
+          );
+        }
+        followed.add(cursor);
+      }
+    } while (cursor !== undefined);
   }
 
   /** Submit, then poll to terminal (authoritative). Throws on failure. */
@@ -221,6 +308,27 @@ export class Comfy {
       ? job.result(options.signal)
       : runWithTimeout(job, options.timeoutMs, options.signal);
   }
+}
+
+/**
+ * Whether `labels` holds every pair of `filter` (an absent filter matches
+ * all). A key and a value are compared as the text the query sent, so an
+ * untyped caller's number, or a lone surrogate (which the query sends as
+ * U+FFFD), still matches the label the server matched.
+ */
+function matchesLabels(labels: JobMetadata, filter: JobMetadata | undefined): boolean {
+  return Object.entries(filter ?? {}).every(([key, value]) => {
+    const sentKey = asQuerySends(key);
+    return Object.hasOwn(labels, sentKey) && labels[sentKey] === asQuerySends(value);
+  });
+}
+
+/**
+ * `value` as `URLSearchParams` sends it: as a string, with each lone
+ * surrogate replaced by U+FFFD.
+ */
+function asQuerySends(value: unknown): string {
+  return new URLSearchParams([["", String(value)]]).get("") ?? "";
 }
 
 async function runWithTimeout(job: Job, timeoutMs: number, signal?: AbortSignal): Promise<Job> {

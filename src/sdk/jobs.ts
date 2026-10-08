@@ -14,7 +14,9 @@ import { ApiError } from "../low/index.js";
 import type {
   ComfyLow,
   Job as LowJob,
+  JobListItem,
   JobLogs,
+  JobMetadata,
   JobWorkflowResult,
   Output as LowOutput,
 } from "../low/index.js";
@@ -206,6 +208,11 @@ export class Job {
     return { ...urls };
   }
 
+  /** The labels attached at submit. An empty object when the job has none. */
+  get metadata(): JobMetadata {
+    return readMetadata((this.model as LowJob & { metadata?: unknown }).metadata);
+  }
+
   /**
    * The outputs produced by one node, in server order.
    *
@@ -369,6 +376,53 @@ export class Job {
       await abortableSleep(reconnectPauseMs, signal);
     }
   }
+}
+
+/**
+ * One job as `client.listJobs()` yields it. A list item carries no outputs:
+ * read the full job with `client.jobs.get(summary.id)`.
+ */
+export interface JobSummary {
+  readonly id: string;
+  readonly status: string;
+  /** When the job was created, as the server sent it; `null` if it sent none. */
+  readonly createTime: string | null;
+  /** When the job last changed, as the server sent it; `null` if it sent none. */
+  readonly updateTime: string | null;
+  /**
+   * The id of the deployment copy that ran the job; `null` for a job outside
+   * one. After a deployment moves to a new release this can differ from the
+   * deployment's own id, so it is not the address the job was sent to.
+   */
+  readonly deploymentId: string | null;
+  /** The labels attached at submit. An empty object when the job has none. */
+  readonly metadata: JobMetadata;
+}
+
+export function jobSummary(item: JobListItem): JobSummary {
+  return {
+    id: item.id,
+    status: item.status,
+    createTime: item.create_time ?? null,
+    updateTime: item.update_time ?? null,
+    deploymentId: item.deployment_id ?? null,
+    metadata: readMetadata(item.metadata),
+  };
+}
+
+/**
+ * The string pairs of a job's `metadata`, read leniently: anything that is
+ * not an object (a self-hosted proxy sends its own metadata as a plain
+ * string) reads as `{}`, and a value that is not a string is dropped.
+ */
+function readMetadata(raw: unknown): JobMetadata {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return {};
+  // Built by Object.fromEntries, not by assignment: a label keyed
+  // `__proto__` (a valid key) would otherwise hit the prototype setter and
+  // be dropped.
+  return Object.fromEntries(
+    Object.entries(raw).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+  );
 }
 
 /**

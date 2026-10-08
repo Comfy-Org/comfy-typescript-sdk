@@ -38,6 +38,42 @@ describe("Job", () => {
     expect(server.state.eventsConnectCount).toBe(0);
   });
 
+  it("exposes the metadata the server sent with the job", async () => {
+    server.state.jobMetadata = { customer: "acme" };
+    const job = await jobs.get("job_01");
+    expect(job.metadata).toEqual({ customer: "acme" });
+  });
+
+  it("exposes an empty metadata object when the server sent none", async () => {
+    const job = await jobs.get("job_01");
+    expect(job.metadata).toEqual({});
+  });
+
+  it.each([
+    ["a self-hosted proxy's plain string", "customer=acme"],
+    ["an array", ["customer", "acme"]],
+  ])("reads metadata that is %s as an empty object", async (_, raw) => {
+    server.state.jobMetadata = raw;
+    const job = await jobs.get("job_01");
+    expect(job.metadata).toEqual({});
+  });
+
+  it("keeps a label keyed __proto__ as an own key", async () => {
+    // JSON.parse makes "__proto__" an own key; the stub sends it as one.
+    server.state.jobMetadata = JSON.parse('{"__proto__":"tenant-7","customer":"acme"}');
+    const job = await jobs.get("job_01");
+    expect(Object.entries(job.metadata)).toEqual([
+      ["__proto__", "tenant-7"],
+      ["customer", "acme"],
+    ]);
+  });
+
+  it("drops metadata values that are not strings", async () => {
+    server.state.jobMetadata = { customer: "acme", run: 7, nested: { a: "b" } };
+    const job = await jobs.get("job_01");
+    expect(job.metadata).toEqual({ customer: "acme" });
+  });
+
   it("result() throws JobFailed for a non-success terminal state", async () => {
     server.state.terminalStatus = "failed";
     const job = await jobs.get("job_01");
