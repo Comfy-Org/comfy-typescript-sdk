@@ -66,13 +66,16 @@ import { requireCredentials, resolveBaseUrl } from "./credentials.js";
 import { ComfyError } from "./exceptions.js";
 import { fillRoute, parseModelId, parseRequestId } from "./modelRoutes.js";
 import {
+  type BuiltRunResult,
   CONTENT_TYPE_HEADER,
+  CREDITS_USED_HEADER,
   decodeUtf8,
   DROPPED_PARAMS_HEADER,
   FALLBACK_PROVIDER_HEADER,
   isJsonMediaType,
   isTooLarge,
   mediaTypeOf,
+  parseCreditsUsed,
   parseDroppedParams,
   readBodyWithin,
   resolveMaxBytes,
@@ -1021,6 +1024,7 @@ export class RequestHandle<TData = unknown> {
     const requestId = response.headers.get(REQUEST_ID_HEADER);
     const servingProvider = response.headers.get(FALLBACK_PROVIDER_HEADER);
     const droppedParams = parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER));
+    const creditsUsed = parseCreditsUsed(response.headers.get(CREDITS_USED_HEADER));
     if (response.status !== 200) {
       // A non-2xx raises the typed router error from its (UTF-8-decoded)
       // envelope; any other 2xx is not the result the contract promises.
@@ -1058,14 +1062,16 @@ export class RequestHandle<TData = unknown> {
     const contentType = response.headers.get(CONTENT_TYPE_HEADER)?.trim() ?? "";
     const mediaType = mediaTypeOf(contentType);
     if (mediaType !== "" && !isJsonMediaType(mediaType)) {
-      return {
+      const binary: BuiltRunResult<TData> = {
         kind: "binary",
         data: bytes,
         contentType,
         requestId,
         servingProvider,
         droppedParams,
+        creditsUsed,
       };
+      return binary;
     }
     let body: unknown;
     try {
@@ -1084,14 +1090,16 @@ export class RequestHandle<TData = unknown> {
       // the bytes arm with no media type to report. A declared JSON body that
       // does not parse is the server contradicting its own header.
       if (mediaType === "" && (exc instanceof SyntaxError || exc instanceof TypeError)) {
-        return {
+        const binary: BuiltRunResult<TData> = {
           kind: "binary",
           data: bytes,
           contentType: "",
           requestId,
           servingProvider,
           droppedParams,
+          creditsUsed,
         };
+        return binary;
       }
       throw invalidResponse(
         "the queue answered 200 with a body that is not JSON",
@@ -1116,7 +1124,29 @@ export class RequestHandle<TData = unknown> {
     // queued run cannot address an alternate provider and has nothing to
     // disclose — but reading them keeps the two result shapes identical and
     // means this path needs no edit on the day that route does gain them.
-    return { kind: "json", data: body as TData, requestId, servingProvider, droppedParams };
+    //
+    // `X-Comfy-Credits-Used` is read on the same reasoning, and the contract
+    // does not declare it on this route yet either: `getRouterModelRequestResult`'s
+    // `200` names no credits header, so on this route the value is NOT
+    // DECLARED, THEREFORE UNPINNED — expect `null` ("not reported", never
+    // "free"), but a stamped header is passed through as-is. This is a claim
+    // about the document, not the wire: Router can serve what the one-way sync
+    // strips (the `MODEL_REQUEST*` routes themselves are the precedent). The
+    // rot guard in router-spec-contract.test.ts fires the day the contract
+    // declares it. Reached by `get()` and therefore by `Models.subscribe`,
+    // whose TSDoc carries the same caveat.
+    //
+    // Typed as the internal `BuiltRunResult` so omitting a field here fails
+    // `tsc`; returned as the public `RunResult`, the same type `run` returns.
+    const result: BuiltRunResult<TData> = {
+      kind: "json",
+      data: body as TData,
+      requestId,
+      servingProvider,
+      droppedParams,
+      creditsUsed,
+    };
+    return result;
   }
 
   /**
