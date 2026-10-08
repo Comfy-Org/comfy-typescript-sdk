@@ -19,6 +19,22 @@ entry. See CONTRIBUTING.md.
 
 ### Added
 
+- **Job labels: `submit()` takes `metadata`, and `client.listJobs()` finds
+  jobs by it.** `metadata` is a map of your own string keys to string values,
+  sent as the body's `metadata`; a submit without it sends the same request
+  as before. `job.metadata` returns the labels (an empty object when there
+  are none). `client.listJobs({ metadata, limit, signal })` lists your jobs
+  newest first, filtered by up to three labels, as an async iterator that
+  fetches page by page; a 429 on a page is retried as `submit()` retries one.
+  The SDK also checks each listed job against the filter, so a server that
+  ignores it yields only matching jobs. A `next_cursor` the walk has already
+  followed raises `ComfyError` with code `unexpected_response` instead of
+  fetching the same pages forever.
+  A rejected map raises `ComfyError` with code `metadata_invalid`. Needs a
+  server that supports job metadata: Comfy Cloud answers a labelled submit
+  with `metadata_not_supported` and the list with `not_implemented` (501),
+  and a self-hosted proxy keeps no labels (a filtered list yields nothing
+  there).
 - **Comfy Router alt-provider controls on `comfy.models.run` —
   `modelProvider`, `strictMode` and `fallbackProvider`.** Three optional
   `RunOptions` fields, sent as the `model_provider`, `strict_mode` and
@@ -59,6 +75,16 @@ entry. See CONTRIBUTING.md.
   `request_not_found` buckets the vendored Router contract now declares, so a
   queued failure carrying one of them is a typed `catch` rather than a bare
   `RouterError`.
+
+### Fixed
+
+- `retryAfter` on a `ComfyError` from a `Comfy` method (`submit()`,
+  `client.jobs.get()`, asset and output calls) now carries the server's
+  `Retry-After` on every error. Only `QueueFull` kept it before; every other
+  error had `null` even when the header was sent.
+- `submit()` waits at least one second before re-sending after a 429. A
+  `Retry-After: 0` used to re-send at once, over and over, for the whole
+  one-minute retry budget.
 
 ## [0.3.0] - 2026-09-14
 
