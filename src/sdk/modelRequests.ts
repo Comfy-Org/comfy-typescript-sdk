@@ -66,9 +66,12 @@ import { requireCredentials, resolveBaseUrl } from "./credentials.js";
 import { ComfyError } from "./exceptions.js";
 import { fillRoute, parseModelId, parseRequestId } from "./modelRoutes.js";
 import {
+  type BuiltRunResult,
+  CREDITS_USED_HEADER,
   DROPPED_PARAMS_HEADER,
   FALLBACK_PROVIDER_HEADER,
   IDEMPOTENT_REPLAYED_HEADER,
+  parseCreditsUsed,
   parseDroppedParams,
   parseReplayed,
   type RunResult,
@@ -907,14 +910,30 @@ export class RequestHandle<TData = unknown> {
     // route carries no replay marker, and this route's own re-collection is
     // deduplicated by `requestId` rather than by a header — but writing the
     // literal would bake that in where a header read simply stays correct.
-    return {
+    //
+    // `X-Comfy-Credits-Used` is read on the same reasoning, and the contract
+    // does not declare it on this route yet either: `getRouterModelRequestResult`'s
+    // `200` names no credits header, so on this route the value is NOT
+    // DECLARED, THEREFORE UNPINNED — expect `null` ("not reported", never
+    // "free"), but a stamped header is passed through as-is. This is a claim
+    // about the document, not the wire: Router can serve what the one-way sync
+    // strips (the `MODEL_REQUEST*` routes themselves are the precedent). The
+    // rot guard in router-spec-contract.test.ts fires the day the contract
+    // declares it. Reached by `get()` and therefore by `Models.subscribe`,
+    // whose TSDoc carries the same caveat.
+    //
+    // Typed as the internal `BuiltRunResult` so omitting a field here fails
+    // `tsc`; returned as the public `RunResult`, the same type `run` returns.
+    const result: BuiltRunResult<TData> = {
       kind: "json",
       data: body as TData,
       requestId: response.headers.get(REQUEST_ID_HEADER),
       servingProvider: response.headers.get(FALLBACK_PROVIDER_HEADER),
       droppedParams: parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER)),
       replayed: parseReplayed(response.headers.get(IDEMPOTENT_REPLAYED_HEADER)),
+      creditsUsed: parseCreditsUsed(response.headers.get(CREDITS_USED_HEADER)),
     };
+    return result;
   }
 
   /**

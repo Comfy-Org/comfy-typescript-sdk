@@ -40,7 +40,33 @@ entry. See CONTRIBUTING.md.
   re-send after a paced `409`/`504`) and on a caller's own retry under a
   supplied `idempotencyKey`. Always `false` from `RequestHandle.get()` — the
   queued result route carries no replay marker — so deduplicate re-collection
-  by `RequestHandle.requestId` instead.
+  by `RequestHandle.requestId` instead. OPTIONAL on both interfaces for the
+  same source-compatibility reason as `creditsUsed` below; every result this
+  SDK returns sets it.
+- **`creditsUsed` on a run result — what Router priced the call at.** Both
+  arms of `RunResult` (`RunJsonResult` and `RunBinaryResult`) now carry the
+  `X-Comfy-Credits-Used` response header. The queued result
+  (`RequestHandle.get()`, and so `comfy.models.subscribe`) reads it too, but
+  the contract does not declare it on the queued result route, so there it is
+  unpinned: expect `null`, and reconcile spend against the workspace ledger if
+  it matters (calling `run` for the price is a second, billed generation).
+  Typed `string | null`, verbatim off the wire:
+  the value is decimal and a caller reconciling money should parse it
+  deliberately rather than receive a float this SDK chose the rounding of.
+  Three caveats it is worth reading the TSDoc for — it is a price rather than
+  a settled ledger entry, `null` means "not reported" and never "free", and a
+  reported `"0"` is a real cost, so branch on presence (`creditsUsed != null`)
+  rather than on the value being non-zero. A blank header is normalized to
+  `null` for that last reason: passed through, `""` would clear a presence
+  check and then read as a cost of zero. The field is OPTIONAL on both
+  interfaces so that a consumer's own `RunJsonResult`/`RunBinaryResult`
+  literal — a test double written against `0.4.0`, which shipped these
+  interfaces without it — keeps compiling; every result this SDK returns sets
+  it. Success-only, per the Router contract: the header is written on the path
+  that returns a result, so a Router refusal carries no cost. A priced `200`
+  that the SDK then refuses client-side (`response_too_large`, a body-read
+  timeout, an empty or non-JSON body) throws a `ComfyError` with no cost on
+  it, so reconcile those failures against the workspace ledger.
 - **Three queue-tier `routerErrors` classes — `Cancelled`, `QueueTimeout`
   and `RequestNotFound`** — for the `cancelled`, `queue_timeout` and
   `request_not_found` buckets the vendored Router contract now declares, so a
