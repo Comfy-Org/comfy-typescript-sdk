@@ -654,6 +654,8 @@ describe("RequestHandle.get", () => {
         expect(err.code).toBe("invalid_response");
         expect(err.details?.queuedRequestId).toBe(REQUEST_ID);
         expect(err.cause).toBeInstanceOf(RangeError);
+        expect(err.message).not.toContain("is not JSON");
+        expect(err.message).toContain("ran out of resources");
       });
     } finally {
       spy.mockRestore();
@@ -1085,6 +1087,9 @@ describe("RequestHandle on a binary result", () => {
       await expect(comfy.models.handle(MODEL, REQUEST_ID).get({ maxBytes: -1 })).rejects.toThrow(
         /RequestHandle\.get\(options\.maxBytes\)/,
       );
+      await expect(
+        comfy.models.handle(MODEL, REQUEST_ID).get({ maxBytes: 100.5 }),
+      ).rejects.toBeInstanceOf(TypeError);
       expect(server.state.requests).toEqual([]);
     });
   });

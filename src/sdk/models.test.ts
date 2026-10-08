@@ -1,5 +1,7 @@
 /** `comfy.models.run` against a stubbed router: the call, the result shape,
  * the headers it sends and reads, its deadline, and its failures. */
+import { gzipSync } from "node:zlib";
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { attachedDispatcher } from "../../test/support/dispatchers.js";
@@ -701,6 +703,9 @@ describe("comfy.models.run failures", () => {
         expect(err.requestId).toBe("6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21");
         expect(err.idempotencyKey).toEqual(expect.any(String));
         expect(err.cause).toBeInstanceOf(RangeError);
+        // Not blamed on the body, which may well be a valid document.
+        expect(err.message).not.toContain("is not JSON");
+        expect(err.message).toContain("ran out of resources");
       });
     } finally {
       spy.mockRestore();
@@ -1103,6 +1108,44 @@ describe("comfy.models.run response size cap", () => {
     });
   });
 
+  it("measures a compressed body by its decoded bytes, not its Content-Length", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      // Eleven decoded bytes whose gzip framing alone puts the declared
+      // (encoded) length past a 20-byte cap. `fetch` hands over the decoded
+      // body, which is what the cap governs, so this is not a breach.
+      const small = gzipSync(Buffer.from('{"ok":true}'));
+      expect(small.byteLength).toBeGreaterThan(20);
+      server.state.respond = () => ({
+        status: 200,
+        body: small,
+        contentType: "application/json",
+        headers: { "Content-Encoding": "gzip" },
+      });
+      const result = await comfy.models.run(MODEL, {}, { maxBytes: 20 });
+      expect(result.kind).toBe("json");
+      expect(result.data).toEqual({ ok: true });
+
+      // And the converse: a body declared well inside the cap that decodes
+      // past it is still refused, by the count rather than the header.
+      const large = gzipSync(Buffer.from(JSON.stringify({ caption: "a".repeat(10_000) })));
+      expect(large.byteLength).toBeLessThan(512);
+      server.state.respond = () => ({
+        status: 200,
+        body: large,
+        contentType: "application/json",
+        headers: { "Content-Encoding": "gzip" },
+      });
+      const err = (await comfy.models
+        .run(MODEL, {}, { maxBytes: 512 })
+        .catch((e: unknown) => e)) as ComfyError;
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("response_too_large");
+      expect(err.details?.maxBytes).toBe(512);
+      expect(err.details?.bytesRead).toBeGreaterThan(512);
+    });
+  });
+
   it("holds a body delivered as many small chunks without breaching on overhead", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
@@ -1224,6 +1267,11 @@ describe("comfy.models.run response size cap", () => {
       TypeError,
     );
     await expect(comfy.models.run(MODEL, {}, { maxBytes: -1 })).rejects.toBeInstanceOf(TypeError);
+    // A fraction is no allocation size: unchecked, it fails inside the read as
+    // a cap breach advising a lower cap, which cannot fix it.
+    await expect(comfy.models.run(MODEL, {}, { maxBytes: 100.5 })).rejects.toBeInstanceOf(
+      TypeError,
+    );
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 

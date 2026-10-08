@@ -1102,7 +1102,10 @@ export class RequestHandle<TData = unknown> {
         return binary;
       }
       throw invalidResponse(
-        "the queue answered 200 with a body that is not JSON",
+        exc instanceof SyntaxError || exc instanceof TypeError
+          ? "the queue answered 200 with a body that is not JSON"
+          : "the queue answered 200 with a body this process ran out of resources parsing " +
+              "(see cause); the body itself may be valid JSON",
         requestId,
         200,
         exc,

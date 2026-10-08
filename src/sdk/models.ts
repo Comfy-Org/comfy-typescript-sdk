@@ -209,8 +209,8 @@ const MAX_PRESIZED_CAPACITY = 16 * INITIAL_BODY_CAPACITY;
  * Its own literal rather than an alias of MAX_PRESIZED_CAPACITY, which answers
  * a different question (how much a stalling peer's `Content-Length` may
  * pre-commit): tuning that one down must not silently shrink this floor, which
- * `GetOptions.maxBytes`, `SubscribeOptions.maxBytes` and the CHANGELOG
- * promise as 1 MiB.
+ * `RunOptions.maxBytes` and the CHANGELOG promise as 1 MiB (and the queued
+ * reads take on by inheriting `RunOptions.maxBytes`'s semantics).
  */
 const MIN_ERROR_BODY_BYTES = 1_048_576;
 
@@ -545,7 +545,9 @@ export interface RunOptions {
    * all** and the connection is dropped — the cheap exit, and the one that
    * avoids the download rather than merely the allocation. The bytes actually
    * read are then counted against the same cap, since `Content-Length` is
-   * absent on a chunked response and is not a promise on any of them.
+   * absent on a chunked response, counts the compressed size on one with a
+   * `Content-Encoding` (and is not consulted there), and is not a promise on
+   * any of them.
    *
    * A breach raises a {@link ComfyError} with `code: "response_too_large"`,
    * carrying `maxBytes` and the offending size on `details`. It is NOT
@@ -943,9 +945,13 @@ export function resolveMaxBytes(
 ): number | null {
   if (maxBytes === undefined) return DEFAULT_MAX_RESPONSE_BYTES;
   if (maxBytes === null) return null;
-  if (typeof maxBytes !== "number" || !Number.isFinite(maxBytes) || maxBytes < 0) {
+  // `Number.isInteger` also refuses `NaN` and the infinities. A fraction is
+  // refused here too: it would otherwise reach `new Uint8Array(...)` in the
+  // read and leave as a `RangeError` reported as a cap breach, whose "lower
+  // maxBytes" advice cannot fix an argument that is simply not a size.
+  if (typeof maxBytes !== "number" || !Number.isInteger(maxBytes) || maxBytes < 0) {
     throw new TypeError(
-      `${caller}(options.maxBytes): expected a non-negative number of bytes, ` +
+      `${caller}(options.maxBytes): expected a non-negative whole number of bytes, ` +
         // A number renders raw and everything else keeps its quoting:
         // `JSON.stringify` writes `NaN` as `null`, which is the one value the
         // same sentence calls valid, so the rejection would name what it
@@ -966,8 +972,18 @@ export function resolveMaxBytes(
  * proxy can send something that is not a number at all. Neither is a length to
  * refuse a response over, and neither needs to be: an undeclared length is
  * exactly what the read-side count below exists for.
+ *
+ * Nor is the length of an ENCODED body. `Content-Length` counts the bytes on
+ * the wire, but `fetch` undoes a `gzip`/`br`/`deflate` `Content-Encoding`
+ * before the reader sees anything, and the cap governs those decoded bytes —
+ * so a compressed body declared past the cap can still decode to one inside
+ * it (a small one, whose fixed compression overhead outweighs what it saves),
+ * and one declared inside it can decode to far more. Either way the count is
+ * the only honest measure, so an encoded response declares nothing here.
  */
 function declaredLength(response: Response): number | null {
+  const encoding = response.headers.get("Content-Encoding")?.trim().toLowerCase() ?? "";
+  if (encoding !== "" && encoding !== "identity") return null;
   const raw = response.headers.get("Content-Length");
   if (raw === null) return null;
   const value = raw.trim();
@@ -1642,7 +1658,10 @@ function finish<TData>(
       };
     }
     throw new ComfyError(
-      `models.run("${model}") returned a ${String(response.status)} whose body is not JSON`,
+      exc instanceof SyntaxError || exc instanceof TypeError
+        ? `models.run("${model}") returned a ${String(response.status)} whose body is not JSON`
+        : `models.run("${model}") returned a ${String(response.status)} whose body this ` +
+            "process ran out of resources parsing (see cause); the body itself may be valid JSON",
       {
         code: "unexpected_response",
         httpStatus: response.status,
@@ -2161,9 +2180,14 @@ function list(options: ListOptions = {}): ModelList {
  * `submit`, `subscribe` and `handle` are imported from `./modelRequests.ts`
  * rather than declared here: the queued surface is a file's worth of polling,
  * pacing and completion handling, and folding it into this module would bury
- * `run` in it. The dependency runs ONE WAY — that module imports nothing from
- * this one at run time, only `RunResult` as an erased type — which is what
- * keeps reading these three at module-evaluation time safe.
+ * `run` in it. The two modules import each other — that one reads header
+ * names, the body reader and the media-type helpers back from this one — so
+ * this initializer, the one top-level read on either side of the cycle, is
+ * safe for a narrower reason than the absence of a cycle: `submit`,
+ * `subscribe` and `handle` are function DECLARATIONS, bound before either
+ * module evaluates, so this reads them under either import order. Turning
+ * any of the three into a `const` would make this a TDZ `ReferenceError`
+ * whenever `./modelRequests.ts` is imported first.
  */
 export const models: Models = Object.freeze({
   run,

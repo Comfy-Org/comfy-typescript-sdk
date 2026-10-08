@@ -95,6 +95,13 @@ entry. See CONTRIBUTING.md.
   or a validation `detail[]` is parsed from. `models.run` also drops the body
   of a `2xx` other than `200` unread, so an oversized `202` reports
   `unexpected_response` rather than `response_too_large`.
+- **A compressed response is measured by its decoded bytes.** The
+  `Content-Length` of a body sent with a `Content-Encoding` counts the encoded
+  bytes, while `maxBytes` caps the decoded ones, so it no longer refuses such
+  a response before reading it; the bytes read are counted against the cap as
+  before. `maxBytes` also now rejects a fraction with a `TypeError` at the
+  call, as it already did `NaN` and negatives, rather than failing inside the
+  read as `response_too_large`.
 
 ## [0.3.0] - 2026-09-14
 
