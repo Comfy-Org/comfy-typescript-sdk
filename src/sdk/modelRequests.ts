@@ -701,7 +701,9 @@ async function send(call: QueueCall): Promise<QueueResponse> {
           call.idempotencyKey ?? null,
           { details: call.bytes.details },
         );
-        bodyText = response.ok ? "" : decodeUtf8(bodyBytes);
+        // Decoded after this `try`, not in it: a decode failure is a fact
+        // about the body, not a transport failure to retry.
+        bodyText = "";
       }
     } catch (exc) {
       // A body this call would not buffer is a verdict about the response,
@@ -716,7 +718,12 @@ async function send(call: QueueCall): Promise<QueueResponse> {
         // the finished generation by.
         throw new ComfyError(
           `the model queue's ${call.what} call exceeded the deadline left for it`,
-          { code: "request_timeout", cause: exc, details: call.bytes?.details ?? null },
+          {
+            code: "request_timeout",
+            cause: exc,
+            idempotencyKey: call.idempotencyKey ?? null,
+            details: call.bytes?.details ?? null,
+          },
         );
       }
       const delay = nextAttemptDelayMs(attempt, retry, clock());
@@ -730,6 +737,17 @@ async function send(call: QueueCall): Promise<QueueResponse> {
       await abortableSleep(repeatAfterMs, call.signal);
       attempt += 1;
       continue;
+    }
+    if (bodyBytes !== undefined && !response.ok) {
+      try {
+        bodyText = decodeUtf8(bodyBytes);
+      } catch {
+        // An error page too long to hold as a string — reachable with
+        // `maxBytes: null`, or a cap past V8's string limit. Its envelope is
+        // out of reach, so the typed error is diagnosed from the status line
+        // and `X-Comfy-Error-Type` alone, as for an empty error body.
+        bodyText = "";
+      }
     }
     return { status: response.status, headers: response.headers, text: bodyText, body: bodyBytes };
   }
@@ -1099,15 +1117,12 @@ export class RequestHandle<TData = unknown> {
       // the bytes arm with no media type to report. A declared JSON body that
       // does not parse is the server contradicting its own header.
       //
-      // As in `finish`: ANY decode failure is "not JSON" — invalid UTF-8, or
-      // a body too long to hold as a string, which nothing has parsed and so
-      // which the bytes are the one lossless answer for. From the parse only
-      // a `SyntaxError` is. A `RangeError` there — a nesting too deep for the
-      // stack — is this process failing on a body that may well be a
-      // document, and the binary arm would hand back bytes the caller was owed
-      // parsed; it leaves as the `invalid_response` below, carrying
-      // `queuedRequestId`.
-      if (mediaType === "" && (!decoded || exc instanceof SyntaxError)) {
+      // As in `finish`: with no type declared ANY throw is "not JSON" —
+      // invalid UTF-8, a body too long to hold as a string, a nesting too deep
+      // for the parser — since nothing claimed a document and a re-collect
+      // fails the same way. A declared-JSON body that fails without a
+      // `SyntaxError` is this process out of room, and says so.
+      if (mediaType === "") {
         const binary: BuiltRunResult<TData> = {
           kind: "binary",
           data: bytes,
@@ -1122,8 +1137,9 @@ export class RequestHandle<TData = unknown> {
       throw invalidResponse(
         exc instanceof SyntaxError
           ? "the queue answered 200 with a body that is not JSON"
-          : "the queue answered 200 with a body this process ran out of resources parsing " +
-              "(see cause); the body itself may be valid JSON",
+          : `the queue answered 200 with a body this process ran out of resources ${
+              decoded ? "parsing" : "decoding"
+            } (see cause); the body itself may be valid JSON`,
         requestId,
         200,
         exc,

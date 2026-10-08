@@ -959,6 +959,65 @@ describe("comfy.models.run on a binary result", () => {
     }
   });
 
+  it("returns a headerless 200 the parser ran out of room on as bytes, not as an error", async () => {
+    // Nothing declared a document, and a re-collect fails the same way, so
+    // the bytes are the one lossless answer — as for a decode failure.
+    const marker = '{"rangeErrorMarker":true}';
+    const realParse = JSON.parse;
+    const spy = vi.spyOn(JSON, "parse").mockImplementation((text: string, reviver?) => {
+      if (text === marker) throw new RangeError("Maximum call stack size exceeded");
+      return realParse(text, reviver) as unknown;
+    });
+    try {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.contentType = null;
+        server.state.body = marker;
+
+        const result = await comfy.models.run(AUDIO_MODEL, {});
+
+        expect(result.kind).toBe("binary");
+        if (result.kind !== "binary") throw new Error("unreachable");
+        expect(new TextDecoder().decode(result.data)).toBe(marker);
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("says decoding, not parsing, when a declared-JSON 200 is too long to decode", async () => {
+    const bytes = new Uint8Array([0x7b, 0x7d, 0x20, 0x20, 0x20]);
+    const realDecode = TextDecoder.prototype.decode;
+    const spy = vi
+      .spyOn(TextDecoder.prototype, "decode")
+      .mockImplementation(function (this: TextDecoder, input, options) {
+        if (
+          input instanceof Uint8Array &&
+          input.byteLength === bytes.byteLength &&
+          input.every((b, i) => b === bytes[i])
+        ) {
+          throw new RangeError("Invalid string length");
+        }
+        return realDecode.call(this, input, options);
+      });
+    try {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.contentType = "application/json";
+        server.state.body = bytes;
+
+        const err = await comfy.models.run(AUDIO_MODEL, {}).catch((e: unknown) => e);
+
+        if (!(err instanceof ComfyError)) throw err;
+        expect(err.code).toBe("unexpected_response");
+        expect(err.cause).toBeInstanceOf(RangeError);
+        expect(err.message).toContain("ran out of resources decoding");
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("still refuses a 202, whatever the body's media type says", async () => {
     await withRouterStub(async (server) => {
       useStub(server);

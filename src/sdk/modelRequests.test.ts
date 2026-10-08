@@ -695,6 +695,73 @@ describe("RequestHandle.get", () => {
     }
   });
 
+  it("returns a headerless result the parser ran out of room on as bytes, not as an error", async () => {
+    // Nothing declared a document, and a re-collect would fail the same way,
+    // so the bytes are the one lossless answer.
+    const marker = '{"rangeErrorMarker":true}';
+    const realParse = JSON.parse;
+    const spy = vi.spyOn(JSON, "parse").mockImplementation((text: string, reviver?) => {
+      if (text === marker) throw new RangeError("Maximum call stack size exceeded");
+      return realParse(text, reviver) as unknown;
+    });
+    try {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.respond = (request) => {
+          if (request.path === STATUS_PATH) return { status: 200, body: DONE };
+          return { status: 200, body: marker, contentType: null };
+        };
+        const result = await comfy.models.handle(MODEL, REQUEST_ID).get();
+
+        expect(result.kind).toBe("binary");
+        if (result.kind !== "binary") throw new Error("unreachable");
+        expect(new TextDecoder().decode(result.data)).toBe(marker);
+        expect(result.contentType).toBe("");
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("raises an error body too long to decode as its typed error, without retrying", async () => {
+    // A decode failure is a fact about the body, not a transport failure:
+    // retrying would re-download it every attempt.
+    const page = new Uint8Array([0x3c, 0x68, 0x31, 0x3e, 0x00, 0x02]);
+    const realDecode = TextDecoder.prototype.decode;
+    const spy = vi
+      .spyOn(TextDecoder.prototype, "decode")
+      .mockImplementation(function (this: TextDecoder, input, options) {
+        if (
+          input instanceof Uint8Array &&
+          input.byteLength === page.byteLength &&
+          input.every((b, i) => b === page[i])
+        ) {
+          throw new RangeError("Invalid string length");
+        }
+        return realDecode.call(this, input, options);
+      });
+    try {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        let resultCalls = 0;
+        server.state.respond = (request) => {
+          if (request.path === STATUS_PATH) return { status: 200, body: DONE };
+          resultCalls += 1;
+          return { status: 403, body: page, contentType: "text/html", errorType: "not_enabled" };
+        };
+        const err = await comfy.models
+          .handle(MODEL, REQUEST_ID)
+          .get({ retry: { baseDelayMs: 1 }, timeoutMs: 5_000 })
+          .catch((e: unknown) => e);
+
+        expect(err).toBeInstanceOf(routerErrors.NotEnabled);
+        expect(resultCalls).toBe(1);
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("does not blame a status body's shape for a parse that ran out of resources", async () => {
     const marker = '{"rangeErrorMarker":true}';
     const realParse = JSON.parse;

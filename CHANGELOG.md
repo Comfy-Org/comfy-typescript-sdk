@@ -112,10 +112,12 @@ entry. See CONTRIBUTING.md.
   of a `2xx` other than `200` unread, so an oversized `202` reports
   `unexpected_response` rather than `response_too_large`.
 - **A compressed response is measured by its decoded bytes.** The
-  `Content-Length` of a body sent with a `Content-Encoding` counts the encoded
-  bytes, while `maxBytes` caps the decoded ones, so it no longer refuses such
-  a response before reading it; the bytes read are counted against the cap as
-  before. `maxBytes` also now rejects a fraction with a `TypeError` at the
+  `Content-Length` of a body whose `Content-Encoding` `fetch` decodes (`gzip`,
+  `deflate`, `br`, `zstd`) counts the encoded bytes, while `maxBytes` caps the
+  decoded ones, so it no longer refuses such a response before reading it; the
+  bytes read are counted against the cap as before. Any other coding,
+  `identity` included, reaches the reader undecoded, so its `Content-Length`
+  still refuses before the read. `maxBytes` also now rejects a fraction with a `TypeError` at the
   call, as it already did `NaN` and negatives, rather than failing inside the
   read as `response_too_large`.
 

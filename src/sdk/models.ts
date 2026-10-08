@@ -545,9 +545,10 @@ export interface RunOptions {
    * all** and the connection is dropped — the cheap exit, and the one that
    * avoids the download rather than merely the allocation. The bytes actually
    * read are then counted against the same cap, since `Content-Length` is
-   * absent on a chunked response, counts the compressed size on one with a
-   * `Content-Encoding` (and is not consulted there), and is not a promise on
-   * any of them.
+   * absent on a chunked response, counts the compressed size on one whose
+   * `Content-Encoding` `fetch` decodes (`gzip`, `deflate`, `br`, `zstd` — it
+   * is not consulted there; any other coding, `identity` included, leaves the
+   * body raw and the header in force), and is not a promise on any of them.
    *
    * A breach raises a {@link ComfyError} with `code: "response_too_large"`,
    * carrying `maxBytes` and the offending size on `details`. It is NOT
@@ -1671,19 +1672,16 @@ function finish<TData>(
     // contradicting its own header, which no caller can do anything useful
     // with a `Uint8Array` of.
     //
-    // Which throws count as "not JSON" depends on where they came from. ANY
-    // decode failure does — invalid UTF-8, or a body too long to hold as a
-    // string, which `maxBytes: null` makes reachable: nothing was parsed, so
-    // it says nothing about whether the body was a document, and the bytes
-    // are the one lossless answer (raising would make a billed generation
-    // uncollectable, since a re-collect fails the same way). From the parse,
-    // only a `SyntaxError` does. A `RangeError` there — a nesting too deep
-    // for the stack — is this process failing on a body that may well be a
-    // document, and the binary arm would hand back bytes the caller was owed
-    // parsed. It leaves as the `ComfyError` below rather than bare, so it
-    // keeps the `requestId` and `idempotencyKey` a caller needs to re-collect
-    // a generation Router already billed.
-    if (mediaType === "" && (!decoded || exc instanceof SyntaxError)) {
+    // With no type declared, ANY throw counts as "not JSON": invalid UTF-8,
+    // a body too long to hold as a string (which `maxBytes: null` makes
+    // reachable), or a nesting too deep for the parser's stack. Nothing
+    // claimed a document, and a re-collect fails the same way, so the bytes
+    // are the one lossless answer — raising would make a billed generation
+    // uncollectable. A declared-JSON body that fails without a `SyntaxError`
+    // is this process running out of room, not the server contradicting its
+    // header, and the message says so; it keeps the `requestId` and
+    // `idempotencyKey` a caller needs to re-collect.
+    if (mediaType === "") {
       return {
         kind: "binary",
         data: responseBody,
@@ -1698,7 +1696,8 @@ function finish<TData>(
       exc instanceof SyntaxError
         ? `models.run("${model}") returned a ${String(response.status)} whose body is not JSON`
         : `models.run("${model}") returned a ${String(response.status)} whose body this ` +
-            "process ran out of resources parsing (see cause); the body itself may be valid JSON",
+            `process ran out of resources ${decoded ? "parsing" : "decoding"} (see cause); ` +
+            "the body itself may be valid JSON",
       {
         code: "unexpected_response",
         httpStatus: response.status,
