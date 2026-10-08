@@ -827,6 +827,54 @@ key of their own. On a self-hosted proxy it's the content endpoint (normal auth
 still applies) and `expiresAt` is `null`. It works on every backend and never
 downloads the bytes first.
 
+## Labeling jobs and finding them again
+
+Pass `metadata` to `submit()` to label a job with your own string keys and
+values, such as which of your customers it is for. Then list the jobs that
+carry a label:
+
+```ts
+const job = await client.submit(wf, { metadata: { customer: "acme" } });
+console.log(job.metadata); // { customer: "acme" }
+
+for await (const summary of client.listJobs({ metadata: { customer: "acme" } })) {
+  console.log(summary.id, summary.status, summary.metadata);
+}
+```
+
+`listJobs()` yields your jobs, newest first, and fetches the next page only
+when you iterate past the current one. Give it up to three labels;
+a job matches when it carries every one with exactly that value. The SDK
+also checks each job against the labels itself, so a server that ignores the
+filter still yields only matching jobs. On such a server one step of the loop
+can fetch several pages, or every page, before it yields a job or ends.
+`limit` sets the page size, not a total: stop iterating to stop fetching. Each item is a
+summary (`id`, `status`, `createTime`, `updateTime`, `deploymentId`,
+`metadata`) without outputs; read the full job with `client.jobs.get(id)`.
+A 429 on any page is retried the way `submit()` retries one, so the walk
+carries on from that page.
+
+Labels work on jobs sent to a deployment: point the client at the
+deployment's address (see [Targeting another deployment](#targeting-another-deployment)).
+Elsewhere:
+
+- **Comfy Cloud** does not support labels yet. A submit with labels raises a
+  `ComfyError` of code `metadata_not_supported`, and `listJobs()` raises one
+  of code `not_implemented` (HTTP 501).
+- **A self-hosted proxy** does not keep labels. It rejects a submit with
+  labels (a `ComfyError` of code `invalid_request`). `listJobs()` with a label
+  filter yields nothing there, and without one every job has `metadata` as an
+  empty object.
+
+Labels are fixed at submit. A job without labels has `metadata` as an empty
+object. The SDK sends the map as is and leaves the limits to the server, which
+rejects a bad map with a `ComfyError` of code `metadata_invalid` naming the
+key at fault. A bad filter on `listJobs()` raises a `ComfyError` of code
+`invalid_metadata_filter`, and a page cursor the server did not issue raises
+one of code `invalid_cursor`. A server that hands back a `next_cursor` the walk
+has already followed raises a `ComfyError` of code `unexpected_response`, since
+following it would fetch the same pages forever.
+
 ## The workflow behind a job
 
 A job handle rehydrated by ID alone — `await client.jobs.get(jobId)` — has

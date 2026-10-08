@@ -184,7 +184,12 @@ export function toSdkError(exc: ApiError): ComfyError {
     });
   }
   const cls = BY_CODE[exc.code] ?? ComfyError;
-  return new cls(exc.message, { code: exc.code, httpStatus: exc.httpStatus, details: exc.details });
+  return new cls(exc.message, {
+    code: exc.code,
+    httpStatus: exc.httpStatus,
+    details: exc.details,
+    retryAfter: exc.retryAfter,
+  });
 }
 
 /**
