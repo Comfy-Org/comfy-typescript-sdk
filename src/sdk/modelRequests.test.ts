@@ -54,6 +54,7 @@ function queueScript(options: {
   statuses: Record<string, unknown>[];
   result?: unknown;
   statusHeaders?: Record<string, string>;
+  resultHeaders?: Record<string, string>;
 }) {
   let polls = 0;
   return (request: RecordedRequest) => {
@@ -70,7 +71,7 @@ function queueScript(options: {
       };
     }
     if (request.method === "GET" && request.path === REQUEST_PATH) {
-      return { status: 200, body: options.result ?? PAYLOAD };
+      return { status: 200, body: options.result ?? PAYLOAD, headers: options.resultHeaders };
     }
     if (request.method === "PUT" && request.path === CANCEL_PATH) {
       return { status: 202, body: { request_id: REQUEST_ID, status: "CANCELLATION_REQUESTED" } };
@@ -468,6 +469,56 @@ describe("RequestHandle.get", () => {
         `GET ${STATUS_PATH}`,
         `GET ${REQUEST_PATH}`,
       ]);
+    });
+  });
+
+  it("lifts X-Comfy-Credits-Used off the RESULT response, not off the status poll", async () => {
+    // The queued route costs what the synchronous one does, so Router has
+    // every reason to stamp a price here too — and this path builds its
+    // `RunResult` by hand rather than through `finish`, so it is its own
+    // chance to drop the header on the floor.
+    //
+    // The two responses carry DIFFERENT values on purpose. `get()` polls to
+    // completion and then fetches the result, so it holds two stamped
+    // responses and could lift the price off either; the queued route's
+    // pricing header is an assumption (no spec declares it), which makes
+    // WHICH response it came off worth pinning rather than assuming. Stamping
+    // both with one value — which is what `server.state.creditsUsed` alone
+    // does, since the stub spreads it across every scripted response — passes
+    // whichever one the SDK read, and so pins nothing.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = queueScript({
+        statuses: [DONE],
+        result: PAYLOAD,
+        resultHeaders: { "X-Comfy-Credits-Used": "2.75" },
+        statusHeaders: { "X-Comfy-Credits-Used": "9.99" },
+      });
+
+      expect((await comfy.models.handle(MODEL, REQUEST_ID).get()).creditsUsed).toBe("2.75");
+    });
+
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = queueScript({ statuses: [DONE], result: PAYLOAD });
+      server.state.creditsUsed = null;
+
+      // "Not reported", not "free".
+      expect((await comfy.models.handle(MODEL, REQUEST_ID).get()).creditsUsed).toBeNull();
+    });
+
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = queueScript({
+        statuses: [DONE],
+        result: PAYLOAD,
+        resultHeaders: { "X-Comfy-Credits-Used": "   " },
+      });
+
+      // Blank is "not reported" here too — the queued path normalizes through
+      // the same `parseCreditsUsed` the synchronous one does, so `""` cannot
+      // reach a caller and read as a cost of zero.
+      expect((await comfy.models.handle(MODEL, REQUEST_ID).get()).creditsUsed).toBeNull();
     });
   });
 
