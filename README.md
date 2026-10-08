@@ -102,7 +102,10 @@ A runtime with no `process` (a browser) never sees the variable, so there the
 `apiKey` option is the only source. `comfy.config({ credentials })` configures
 the `comfy.*` namespace only — deliberately, so a process-global credential
 cannot leak into a multi-tenant server's per-request clients — and does **not**
-configure a class client.
+configure a class client. `COMFY_API_KEY` is process-global too, though: a
+blank or whitespace-only `apiKey` counts as unset (as in the Python SDK) and
+falls through to it, so a per-request client in a process that sets
+`COMFY_API_KEY` should reject an empty tenant key before constructing.
 
 The client only attaches the `Authorization` header to requests aimed at its
 own target deployment's origin. If the server hands back an absolute URL on a

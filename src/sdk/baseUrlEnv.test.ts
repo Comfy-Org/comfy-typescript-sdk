@@ -88,6 +88,11 @@ describe("base URL from the environment", () => {
     "http://127.0.0.1:99999",
     "https://cloud.comfy.org?x=1",
     "https://cloud.comfy.org#frag",
+    // A bare delimiter: `URL.search` / `URL.hash` read "" for these, but the
+    // transport would append the API path after the `?` or `#`.
+    "https://cloud.comfy.org?",
+    "https://cloud.comfy.org#",
+    "https://cloud.comfy.org/?",
     "not a url",
   ])("rejects a malformed value (%j)", (bad) => {
     vi.stubEnv(BASE_URL_ENV_VAR, bad);

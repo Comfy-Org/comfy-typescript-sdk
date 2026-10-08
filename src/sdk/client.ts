@@ -97,11 +97,14 @@ function resolveBaseUrl(): string {
   }
   // A query or fragment would land in the middle of every request URL, since
   // the transport builds those by appending the API path to this string.
+  // `search` and `hash` read `""` for a bare `?` or `#` too, so the raw string
+  // is checked as well: an unencoded `?` or `#` can only start one of them.
   const valid =
     parsed !== undefined &&
     (parsed.protocol === "http:" || parsed.protocol === "https:") &&
     parsed.search === "" &&
-    parsed.hash === "";
+    parsed.hash === "" &&
+    !/[?#]/.test(raw);
   if (!valid) {
     throw new TypeError(
       `${BASE_URL_ENV_VAR} must be an http(s) URL with no query or fragment (e.g. "http://127.0.0.1:8189"), got ${JSON.stringify(raw)}`,

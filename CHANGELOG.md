@@ -92,7 +92,10 @@ entry. See CONTRIBUTING.md.
   deployment too, as the Python SDK does — unset it for a keyless target. The `new Comfy({ apiKey: process.env.COMFY_API_KEY })`
   workaround in the README is gone. **Note for callers who relied on the old
   behaviour:** `new Comfy()` against Comfy Cloud with no key anywhere now
-  throws locally instead of failing on the first call.
+  throws locally instead of failing on the first call, and an `apiKey` that is
+  not a string — including `null`, as a JSON config file spells "absent" —
+  now throws a `TypeError` at construction. Pass `undefined` (or omit the
+  field) to fall back to the environment.
 
 ### Fixed
 

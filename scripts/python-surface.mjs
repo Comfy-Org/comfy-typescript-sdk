@@ -82,7 +82,8 @@ function functionBody(source, functionName) {
   const body = [];
   for (let i = start + 1; i < lines.length; i += 1) {
     const line = lines[i];
-    if (line.trim() !== "" && !/^\s/.test(line)) break;
+    // A comment at column 0 is valid inside a body; only code ends it.
+    if (line.trim() !== "" && !/^\s/.test(line) && !line.startsWith("#")) break;
     body.push(line);
   }
   return body;
@@ -372,8 +373,9 @@ export function extractCredentialResolution(source) {
   // tuple's order is the precedence, so it is read rather than assumed.
   // The opening is found by regex and the closing by a depth scan, so a
   // candidate with nested calls (`os.environ.get(VAR, default())`) is one
-  // candidate rather than a truncated tuple.
-  const opening = /for\s+\w+\s+in\s+\(/.exec(text);
+  // candidate rather than a truncated tuple. Anchored to a statement line, so
+  // a commented-out loop or a prose mention is not read as the live one.
+  const opening = /^[ \t]*for\s+\w+\s+in\s+\(/m.exec(text);
   const close = opening ? matchingClose(text, opening.index + opening[0].length) : -1;
   const sequence =
     close !== -1 && /^\)\s*:/.test(text.slice(close))
@@ -391,7 +393,9 @@ export function extractCredentialResolution(source) {
     .filter(Boolean)
     .map((expr) => {
       if (expr === "explicit") return "explicit";
-      if (expr.includes("API_KEY_ENV_VAR")) return "environment";
+      // The exact constant, as the first argument: a substring match would
+      // read `LEGACY_API_KEY_ENV_VAR` as the same source.
+      if (/^os\.environ\.get\(\s*API_KEY_ENV_VAR\s*[,)]/.test(expr)) return "environment";
       fail(
         `${PYTHON_SOURCE_FILES.client}: \`${PYTHON_API_KEY_RESOLVER}\` tries an unrecognized ` +
           `credential source \`${expr}\`. Teach this extractor what it is — a source it cannot ` +
@@ -405,6 +409,13 @@ export function extractCredentialResolution(source) {
         "credential source(s). Fewer than two is a broken extraction, not a precedence.",
     );
   }
+  if (new Set(order).size !== order.length) {
+    fail(
+      `${PYTHON_SOURCE_FILES.client}: \`${PYTHON_API_KEY_RESOLVER}\` tries the same credential ` +
+        `source twice (${order.join(", ")}). Teach this extractor to tell them apart — two ` +
+        "sources read as one kind would claim a parity the check never verified.",
+    );
+  }
 
   if (!/raise\s+\w+\(/.test(text)) {
     fail(
@@ -416,10 +427,7 @@ export function extractCredentialResolution(source) {
   // block — not merely the first one after some mention of the check. A
   // negated guard (`if not ...`), a mention in a comment or docstring, or an
   // earlier type-check raise would otherwise read as the cloud-guarded error.
-  const guard = /^([ \t]*)if\s+_same_deployment\([^)]*COMFY_CLOUD_BASE_URL[^)]*\)\s*:[ \t]*$/m.exec(
-    text,
-  );
-  const raise = guard ? guardedRaise(text.slice(guard.index + guard[0].length), guard[1]) : null;
+  const raise = cloudGuardedRaise(text);
   if (!raise) {
     fail(
       `${PYTHON_SOURCE_FILES.client}: \`${PYTHON_API_KEY_RESOLVER}\` does not guard its raise ` +
@@ -446,15 +454,43 @@ export function extractCredentialResolution(source) {
 }
 
 /**
- * The first `raise X(` in the block that follows an `if` indented by
- * `indent`, or null. The block ends at the first non-blank line indented no
- * deeper than the `if`, so a raise after it does not count.
+ * The `raise X(` directly inside an `if _same_deployment(..., COMFY_CLOUD_BASE_URL):`
+ * block, or null.
+ *
+ * The call's close is found by depth (so `base_url.rstrip("/")` is one
+ * argument) and the header may carry a trailing comment, but nothing else: a
+ * condition extended with `and ...` no longer means "on Comfy Cloud".
+ */
+function cloudGuardedRaise(text) {
+  for (const header of text.matchAll(/^([ \t]*)if\s+_same_deployment\(/gm)) {
+    const argsStart = header.index + header[0].length;
+    const close = matchingClose(text, argsStart);
+    if (close === -1) continue;
+    if (!text.slice(argsStart, close).includes("COMFY_CLOUD_BASE_URL")) continue;
+    const tail = /^\)\s*:[ \t]*(?:#[^\n]*)?(?:\n|$)/.exec(text.slice(close));
+    if (!tail) continue;
+    const raise = guardedRaise(text.slice(close + tail[0].length), header[1]);
+    if (raise) return raise;
+  }
+  return null;
+}
+
+/**
+ * The first `raise X(` at the direct indentation of the block that follows an
+ * `if` indented by `indent`, or null. Blank and comment lines are skipped, as
+ * Python does; the block ends at the first other line indented no deeper than
+ * the `if`. A raise nested under a further condition inside the block only
+ * fires under that condition too, so it does not count.
  */
 function guardedRaise(rest, indent) {
-  for (const line of rest.split("\n").slice(1)) {
-    if (line.trim() === "") continue;
+  let blockIndent = null;
+  for (const line of rest.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed.startsWith("#")) continue;
     const lineIndent = /^[ \t]*/.exec(line)[0];
     if (lineIndent.length <= indent.length) return null;
+    blockIndent ??= lineIndent.length;
+    if (lineIndent.length !== blockIndent) continue;
     const raise = /^\s*raise\s+(\w+)\(/.exec(line);
     if (raise) return raise;
   }

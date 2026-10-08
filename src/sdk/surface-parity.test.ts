@@ -798,6 +798,85 @@ describe("python surface extraction", () => {
     expect(() => extractCredentialResolution(mentionOnly)).toThrow(/Comfy Cloud check/);
   });
 
+  it("reads the live candidate loop, not a commented-out one, and each source exactly", () => {
+    const source = [
+      'COMFY_CLOUD_BASE_URL = "https://cloud.comfy.org"',
+      'BASE_URL_ENV_VAR = "COMFY_BASE_URL"',
+      'API_KEY_ENV_VAR = "COMFY_API_KEY"',
+      "def _resolve_api_key(explicit: str | None, base_url: str) -> str | None:",
+      "    for candidate in (explicit, os.environ.get(API_KEY_ENV_VAR)):",
+      "        if candidate and candidate.strip():",
+      "            return candidate.strip()",
+      "    if _same_deployment(base_url, COMFY_CLOUD_BASE_URL):",
+      '        raise MissingApiKey("no API key")',
+      "    return None",
+    ].join("\n");
+
+    // A stale loop left in a comment above the live one is not the precedence.
+    const commentedOut = source.replace(
+      "    for candidate",
+      "    # for candidate in (os.environ.get(API_KEY_ENV_VAR), explicit):\n    for candidate",
+    );
+    expect(extractCredentialResolution(commentedOut).order).toEqual(["explicit", "environment"]);
+
+    // A different variable is a different source, not `environment`.
+    const legacy = source.replace(
+      "os.environ.get(API_KEY_ENV_VAR)",
+      "os.environ.get(LEGACY_API_KEY_ENV_VAR)",
+    );
+    expect(() => extractCredentialResolution(legacy)).toThrow(/unrecognized credential source/);
+
+    // Two sources read as the same kind would claim a parity nobody checked.
+    const twice = source.replace(
+      "os.environ.get(API_KEY_ENV_VAR))",
+      "os.environ.get(API_KEY_ENV_VAR), os.environ.get(API_KEY_ENV_VAR, None))",
+    );
+    expect(() => extractCredentialResolution(twice)).toThrow(/same credential source twice/);
+  });
+
+  it("reads the cloud guard through nested calls, comments and pragmas", () => {
+    const guarded = [
+      'COMFY_CLOUD_BASE_URL = "https://cloud.comfy.org"',
+      'BASE_URL_ENV_VAR = "COMFY_BASE_URL"',
+      'API_KEY_ENV_VAR = "COMFY_API_KEY"',
+      "def _resolve_api_key(explicit: str | None, base_url: str) -> str | None:",
+      "    for candidate in (explicit, os.environ.get(API_KEY_ENV_VAR)):",
+      "        if candidate and candidate.strip():",
+      "            return candidate.strip()",
+      "    if _same_deployment(base_url, COMFY_CLOUD_BASE_URL):",
+      '        raise MissingApiKey("no API key")',
+      "    return None",
+    ].join("\n");
+
+    // A nested call in the guard and a trailing pragma keep it a guard.
+    const nested = guarded.replace(
+      "if _same_deployment(base_url, COMFY_CLOUD_BASE_URL):",
+      'if _same_deployment(base_url.rstrip("/"), COMFY_CLOUD_BASE_URL):  # type: ignore',
+    );
+    expect(extractCredentialResolution(nested).missingKeyError).toBe("MissingApiKey");
+
+    // A comment at any indentation inside the block is skipped, as Python does.
+    const commented = guarded.replace(
+      "        raise MissingApiKey",
+      "# Comfy Cloud always requires a key.\n        raise MissingApiKey",
+    );
+    expect(extractCredentialResolution(commented).missingKeyError).toBe("MissingApiKey");
+
+    // A raise under a FURTHER condition only fires under that condition.
+    const conditional = guarded.replace(
+      '        raise MissingApiKey("no API key")',
+      '        if strict_mode:\n            raise MissingApiKey("no API key")',
+    );
+    expect(() => extractCredentialResolution(conditional)).toThrow(/Comfy Cloud check/);
+
+    // A guard narrowed with `and ...` no longer means "on Comfy Cloud".
+    const narrowed = guarded.replace(
+      "COMFY_CLOUD_BASE_URL):",
+      "COMFY_CLOUD_BASE_URL) and strict_mode:",
+    );
+    expect(() => extractCredentialResolution(narrowed)).toThrow(/Comfy Cloud check/);
+  });
+
   it("reads every entry of the status fallback table", () => {
     expect(
       extractErrorTypeByStatus(
