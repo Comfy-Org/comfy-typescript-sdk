@@ -923,6 +923,42 @@ describe("comfy.models.run on a binary result", () => {
     });
   });
 
+  it("returns headerless bytes too long to decode as bytes, not as an error", async () => {
+    // A string past V8's length limit, which `maxBytes: null` makes
+    // reachable, fails the DECODE rather than the parse — nothing was parsed,
+    // so it says nothing about whether the body was JSON, and the bytes are
+    // the one lossless answer. Simulated, since the real size is ~512 MiB.
+    const bytes = new Uint8Array([0x7b, 0x7d, 0x00, 0x01]);
+    const realDecode = TextDecoder.prototype.decode;
+    const spy = vi
+      .spyOn(TextDecoder.prototype, "decode")
+      .mockImplementation(function (this: TextDecoder, input, options) {
+        if (
+          input instanceof Uint8Array &&
+          input.byteLength === bytes.byteLength &&
+          input.every((b, i) => b === bytes[i])
+        ) {
+          throw new RangeError("Invalid string length");
+        }
+        return realDecode.call(this, input, options);
+      });
+    try {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.contentType = null;
+        server.state.body = bytes;
+
+        const result = await comfy.models.run(AUDIO_MODEL, {});
+
+        expect(result.kind).toBe("binary");
+        if (result.kind !== "binary") throw new Error("unreachable");
+        expect(Array.from(result.data)).toEqual(Array.from(bytes));
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("still refuses a 202, whatever the body's media type says", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
@@ -1144,6 +1180,30 @@ describe("comfy.models.run response size cap", () => {
       expect(err.details?.maxBytes).toBe(512);
       expect(err.details?.bytesRead).toBeGreaterThan(512);
     });
+  });
+
+  it("still refuses on Content-Length when fetch does not decode the coding", async () => {
+    // `fetch` decodes a coding list only when every token is one it knows;
+    // any other token hands over the encoded bytes, which `Content-Length`
+    // then measures honestly. A bogus coding must not switch off the cheap
+    // pre-read refusal.
+    for (const encoding of ["x-unknown", "gzip, x-unknown", "identity", "identity, identity"]) {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.respond = () => ({
+          status: 200,
+          body: "a".repeat(100),
+          contentType: "audio/mpeg",
+          headers: { "Content-Encoding": encoding },
+        });
+        const err = (await comfy.models
+          .run(MODEL, {}, { maxBytes: 20 })
+          .catch((e: unknown) => e)) as ComfyError;
+        expect(err, encoding).toBeInstanceOf(ComfyError);
+        expect(err.code, encoding).toBe("response_too_large");
+        expect(err.details?.contentLength, encoding).toBe(100);
+      });
+    }
   });
 
   it("holds a body delivered as many small chunks without breaching on overhead", async () => {

@@ -979,16 +979,47 @@ export function resolveMaxBytes(
  * so a compressed body declared past the cap can still decode to one inside
  * it (a small one, whose fixed compression overhead outweighs what it saves),
  * and one declared inside it can decode to far more. Either way the count is
- * the only honest measure, so an encoded response declares nothing here.
+ * the only honest measure, so a response `fetch` decodes declares nothing here.
+ *
+ * Only one `fetch` decodes, though. It undoes a coding list only when EVERY
+ * token is one it knows; any other token — an unknown coding, `identity`, the
+ * empty entry a trailing comma leaves — makes it hand over the encoded bytes
+ * untouched, and then `Content-Length` IS the size the cap governs. Treating
+ * those as undeclared would let one bogus header switch off the cheap refusal
+ * and buy a full `maxBytes` download. `zstd` is listed although not every
+ * runtime decodes it: wrongly calling a body decoded only skips the cheap
+ * refusal, while wrongly calling it raw would refuse a body that decodes
+ * inside the cap.
  */
 function declaredLength(response: Response): number | null {
-  const encoding = response.headers.get("Content-Encoding")?.trim().toLowerCase() ?? "";
-  if (encoding !== "" && encoding !== "identity") return null;
+  if (isDecodedByFetch(response.headers.get("Content-Encoding"))) return null;
   const raw = response.headers.get("Content-Length");
   if (raw === null) return null;
   const value = raw.trim();
   if (!/^\d+$/.test(value)) return null;
   return Number(value);
+}
+
+/** The content codings `fetch` undoes before the reader sees the body. */
+const FETCH_DECODED_CODINGS: ReadonlySet<string> = new Set([
+  "gzip",
+  "x-gzip",
+  "deflate",
+  "br",
+  "zstd",
+]);
+
+/**
+ * Does `fetch` hand over this body decoded? Only when the header names at
+ * least one coding and every one of them is a coding it undoes — the rule
+ * undici applies, which drops the whole decoder chain on any other token.
+ */
+function isDecodedByFetch(contentEncoding: string | null): boolean {
+  if (contentEncoding === null || contentEncoding.trim() === "") return false;
+  return contentEncoding
+    .toLowerCase()
+    .split(",")
+    .every((coding) => FETCH_DECODED_CODINGS.has(coding.trim()));
 }
 
 /**
@@ -1622,31 +1653,37 @@ function finish<TData>(
   }
 
   let data: unknown;
+  // Set once the body is a string: a throw before that is the decode's.
+  let decoded = false;
   try {
     // Strictly when nothing declared a type: invalid UTF-8 is then a fact
     // about the body rather than a field of U+FFFDs, and JSON has to be
     // valid UTF-8 anyway, so refusing it costs no document that would have
     // parsed.
-    data = JSON.parse(
-      mediaType === "" ? UTF8_STRICT.decode(responseBody) : decodeUtf8(responseBody),
-    );
+    const text = mediaType === "" ? UTF8_STRICT.decode(responseBody) : decodeUtf8(responseBody);
+    decoded = true;
+    data = JSON.parse(text);
   } catch (exc) {
-    // Only a failed parse (`SyntaxError`) or invalid UTF-8 (`TypeError`) says
-    // anything about the body's shape. A `RangeError` — a nesting too deep for
-    // the stack, a string too long to allocate, which `maxBytes: null` makes
-    // reachable — is this process failing on a body that may well be a
-    // document, and reporting it as the binary arm would hand back bytes the
-    // caller was owed parsed. It still leaves as the `ComfyError` below
-    // rather than bare, so it keeps the `requestId` and `idempotencyKey` a
-    // caller needs to re-collect a generation Router already billed.
-    //
     // No `Content-Type` at all and a body that is not JSON: nothing claimed
     // this was a document, so it is the binary branch with no media type to
     // report rather than a failure. A response that DID say JSON and then
     // wasn't is still the error it always was — that is the server
     // contradicting its own header, which no caller can do anything useful
     // with a `Uint8Array` of.
-    if (mediaType === "" && (exc instanceof SyntaxError || exc instanceof TypeError)) {
+    //
+    // Which throws count as "not JSON" depends on where they came from. ANY
+    // decode failure does — invalid UTF-8, or a body too long to hold as a
+    // string, which `maxBytes: null` makes reachable: nothing was parsed, so
+    // it says nothing about whether the body was a document, and the bytes
+    // are the one lossless answer (raising would make a billed generation
+    // uncollectable, since a re-collect fails the same way). From the parse,
+    // only a `SyntaxError` does. A `RangeError` there — a nesting too deep
+    // for the stack — is this process failing on a body that may well be a
+    // document, and the binary arm would hand back bytes the caller was owed
+    // parsed. It leaves as the `ComfyError` below rather than bare, so it
+    // keeps the `requestId` and `idempotencyKey` a caller needs to re-collect
+    // a generation Router already billed.
+    if (mediaType === "" && (!decoded || exc instanceof SyntaxError)) {
       return {
         kind: "binary",
         data: responseBody,
@@ -1658,7 +1695,7 @@ function finish<TData>(
       };
     }
     throw new ComfyError(
-      exc instanceof SyntaxError || exc instanceof TypeError
+      exc instanceof SyntaxError
         ? `models.run("${model}") returned a ${String(response.status)} whose body is not JSON`
         : `models.run("${model}") returned a ${String(response.status)} whose body this ` +
             "process ran out of resources parsing (see cause); the body itself may be valid JSON",

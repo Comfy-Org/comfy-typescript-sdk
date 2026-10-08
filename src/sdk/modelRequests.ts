@@ -395,7 +395,9 @@ function invalidResponse(
     code: "invalid_response",
     httpStatus,
     requestId,
-    cause,
+    // Spread only when given: `ComfyError` tests `"cause" in options`, and an
+    // own `cause: undefined` on every other `invalid_response` reads as one.
+    ...(cause === undefined ? {} : { cause }),
     details,
   });
 }
@@ -708,9 +710,13 @@ async function send(call: QueueCall): Promise<QueueResponse> {
       // A caller's abort is theirs: never retried, never re-dressed.
       if (call.signal?.aborted) throw exc;
       if (isTimeout(exc, call.signal)) {
+        // With the caller's identifiers when the call has any: a deadline
+        // that expires while a COMPLETED result is streaming leaves a
+        // `subscribe` caller, who holds no handle, only this error to find
+        // the finished generation by.
         throw new ComfyError(
           `the model queue's ${call.what} call exceeded the deadline left for it`,
-          { code: "request_timeout", cause: exc },
+          { code: "request_timeout", cause: exc, details: call.bytes?.details ?? null },
         );
       }
       const delay = nextAttemptDelayMs(attempt, retry, clock());
@@ -751,8 +757,14 @@ function decode(response: QueueResponse, accepted: readonly number[]): unknown {
     throw toRouterError(response.status, response.headers, body);
   }
   if (!parsed) {
+    // Blamed on the body only for a `SyntaxError`, as the result read does: a
+    // `RangeError` here is this process running out of room on a body that
+    // may well be valid JSON.
     throw invalidResponse(
-      `the queue answered ${String(response.status)} with a body that is not JSON`,
+      parseError instanceof SyntaxError
+        ? `the queue answered ${String(response.status)} with a body that is not JSON`
+        : `the queue answered ${String(response.status)} with a body this process ran out ` +
+            "of resources parsing (see cause); the body itself may be valid JSON",
       response.headers.get(REQUEST_ID_HEADER),
       response.status,
       parseError,
@@ -1074,22 +1086,28 @@ export class RequestHandle<TData = unknown> {
       return binary;
     }
     let body: unknown;
+    // Set once the body is a string: a throw before that is the decode's.
+    let decoded = false;
     try {
       // Strict when nothing declared a type, as in `finish`: a lossy decode
       // could turn bytes into a JSON string of U+FFFDs.
-      body = JSON.parse(mediaType === "" ? UTF8_STRICT.decode(bytes) : decodeUtf8(bytes));
+      const text = mediaType === "" ? UTF8_STRICT.decode(bytes) : decodeUtf8(bytes);
+      decoded = true;
+      body = JSON.parse(text);
     } catch (exc) {
-      // Only a failed parse (`SyntaxError`) or invalid UTF-8 (`TypeError`)
-      // says anything about the body's shape. A `RangeError` — a nesting too
-      // deep for the stack, a string too long to allocate — is this process
-      // failing on a body that may well be a document, and reporting it as the
-      // binary arm would hand back bytes the caller was owed parsed; it still
-      // leaves as the `invalid_response` below, carrying `queuedRequestId`.
-      //
       // No `Content-Type` and not JSON: nothing claimed a document, so it is
       // the bytes arm with no media type to report. A declared JSON body that
       // does not parse is the server contradicting its own header.
-      if (mediaType === "" && (exc instanceof SyntaxError || exc instanceof TypeError)) {
+      //
+      // As in `finish`: ANY decode failure is "not JSON" — invalid UTF-8, or
+      // a body too long to hold as a string, which nothing has parsed and so
+      // which the bytes are the one lossless answer for. From the parse only
+      // a `SyntaxError` is. A `RangeError` there — a nesting too deep for the
+      // stack — is this process failing on a body that may well be a
+      // document, and the binary arm would hand back bytes the caller was owed
+      // parsed; it leaves as the `invalid_response` below, carrying
+      // `queuedRequestId`.
+      if (mediaType === "" && (!decoded || exc instanceof SyntaxError)) {
         const binary: BuiltRunResult<TData> = {
           kind: "binary",
           data: bytes,
@@ -1102,7 +1120,7 @@ export class RequestHandle<TData = unknown> {
         return binary;
       }
       throw invalidResponse(
-        exc instanceof SyntaxError || exc instanceof TypeError
+        exc instanceof SyntaxError
           ? "the queue answered 200 with a body that is not JSON"
           : "the queue answered 200 with a body this process ran out of resources parsing " +
               "(see cause); the body itself may be valid JSON",

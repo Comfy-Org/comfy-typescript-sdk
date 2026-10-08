@@ -662,6 +662,88 @@ describe("RequestHandle.get", () => {
     }
   });
 
+  it("returns headerless result bytes too long to decode as bytes, not as an error", async () => {
+    const bytes = new Uint8Array([0x7b, 0x7d, 0x00, 0x01]);
+    const realDecode = TextDecoder.prototype.decode;
+    const spy = vi
+      .spyOn(TextDecoder.prototype, "decode")
+      .mockImplementation(function (this: TextDecoder, input, options) {
+        if (
+          input instanceof Uint8Array &&
+          input.byteLength === bytes.byteLength &&
+          input.every((b, i) => b === bytes[i])
+        ) {
+          throw new RangeError("Invalid string length");
+        }
+        return realDecode.call(this, input, options);
+      });
+    try {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.respond = (request) => {
+          if (request.path === STATUS_PATH) return { status: 200, body: DONE };
+          return { status: 200, body: bytes, contentType: null };
+        };
+        const result = await comfy.models.handle(MODEL, REQUEST_ID).get();
+
+        expect(result.kind).toBe("binary");
+        if (result.kind !== "binary") throw new Error("unreachable");
+        expect(Array.from(result.data)).toEqual(Array.from(bytes));
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("does not blame a status body's shape for a parse that ran out of resources", async () => {
+    const marker = '{"rangeErrorMarker":true}';
+    const realParse = JSON.parse;
+    const spy = vi.spyOn(JSON, "parse").mockImplementation((text: string, reviver?) => {
+      if (text === marker) throw new RangeError("Maximum call stack size exceeded");
+      return realParse(text, reviver) as unknown;
+    });
+    try {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.respond = () => ({ status: 200, body: marker });
+        const err = await comfy.models
+          .handle(MODEL, REQUEST_ID)
+          .status()
+          .catch((e: unknown) => e);
+
+        if (!(err instanceof ComfyError)) throw err;
+        expect(err.code).toBe("invalid_response");
+        expect(err.cause).toBeInstanceOf(RangeError);
+        expect(err.message).not.toContain("is not JSON");
+        expect(err.message).toContain("ran out of resources");
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("names the queued request on a deadline that expires while the result streams", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = (request) => {
+        if (request.path === STATUS_PATH) return { status: 200, body: DONE };
+        return null;
+      };
+      const handle = comfy.models.handle(MODEL, REQUEST_ID);
+      const completion = await handle.status();
+      // Headers arrive, then the body stalls: the deadline fires mid-read.
+      server.state.stallBody = true;
+
+      const err = (await handle
+        .collect(completion, { budgetMs: 300, retry: false })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("request_timeout");
+      expect(err.details?.queuedRequestId).toBe(REQUEST_ID);
+    });
+  });
+
   it("reports a 202 on the result route rather than typing it as a result", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
@@ -678,6 +760,8 @@ describe("RequestHandle.get", () => {
       expect(err).toBeInstanceOf(ComfyError);
       expect(err.code).toBe("invalid_response");
       expect(err.message).toContain("202");
+      // No cause was given, so none is set — not an own `cause: undefined`.
+      expect("cause" in err).toBe(false);
     });
   });
 
