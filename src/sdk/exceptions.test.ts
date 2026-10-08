@@ -54,6 +54,13 @@ describe("toSdkError", () => {
     expect(sdkError).toBeInstanceOf(QueueFull);
     expect((sdkError as QueueFull).retryAfter).toBeNull();
   });
+
+  it("carries retryAfter onto every error, not only QueueFull", () => {
+    const apiError = new ApiError("busy", { code: "not_found", httpStatus: 503, retryAfter: 2 });
+    const sdkError = toSdkError(apiError);
+    expect(sdkError).toBeInstanceOf(NotFound);
+    expect(sdkError.retryAfter).toBe(2);
+  });
 });
 
 describe("translate", () => {

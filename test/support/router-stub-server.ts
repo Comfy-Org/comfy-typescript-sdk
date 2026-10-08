@@ -140,6 +140,14 @@ export interface RouterServerState {
    */
   idempotentReplayed: boolean;
   /**
+   * `X-Comfy-Credits-Used` on the ordinary response, or `null` to omit the
+   * header entirely. Present-and-absent are different fixture shapes, not a
+   * detail: the client reads ABSENCE as "Router reported no cost" and a
+   * present `"0"` as a reported cost of zero, so a stub that defaulted this
+   * to `"0"` could not tell the two apart.
+   */
+  creditsUsed: string | null;
+  /**
    * Destroy the socket of the first N requests without answering at all — a
    * transport failure rather than an HTTP one, which the client sees as a
    * fetch rejection and not a status.
@@ -231,6 +239,7 @@ function defaultState(): RouterServerState {
     failErrorType: null,
     failRetryAfter: null,
     idempotentReplayed: false,
+    creditsUsed: null,
     resetTimes: 0,
     respond: null,
     resetAfterFail: false,
@@ -446,6 +455,7 @@ export class RouterStubServer {
     // anything.
     if (state.retryAfter !== null) headers["Retry-After"] = state.retryAfter;
     if (state.idempotentReplayed) headers["Idempotent-Replayed"] = "true";
+    if (state.creditsUsed !== null) headers["X-Comfy-Credits-Used"] = state.creditsUsed;
 
     if (state.stallBody) {
       // A Content-Length the body never reaches, so the client keeps reading.
