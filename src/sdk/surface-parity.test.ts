@@ -875,6 +875,16 @@ describe("python surface extraction", () => {
       "COMFY_CLOUD_BASE_URL) and strict_mode:",
     );
     expect(() => extractCredentialResolution(narrowed)).toThrow(/Comfy Cloud check/);
+
+    // A guard nested under a further condition only fires under it, so Comfy
+    // Cloud can still fall through to `return None` — even though the raise
+    // sits directly inside its own block.
+    const nestedGuard = guarded.replace(
+      '    if _same_deployment(base_url, COMFY_CLOUD_BASE_URL):\n        raise MissingApiKey("no API key")',
+      '    if strict_mode:\n        if _same_deployment(base_url, COMFY_CLOUD_BASE_URL):\n            raise MissingApiKey("no API key")',
+    );
+    expect(nestedGuard).not.toBe(guarded);
+    expect(() => extractCredentialResolution(nestedGuard)).toThrow(/Comfy Cloud check/);
   });
 
   it("reads every entry of the status fallback table", () => {

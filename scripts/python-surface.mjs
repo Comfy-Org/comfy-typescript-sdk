@@ -459,10 +459,15 @@ export function extractCredentialResolution(source) {
  *
  * The call's close is found by depth (so `base_url.rstrip("/")` is one
  * argument) and the header may carry a trailing comment, but nothing else: a
- * condition extended with `and ...` no longer means "on Comfy Cloud".
+ * condition extended with `and ...` no longer means "on Comfy Cloud". The
+ * guard must also sit at the resolver body's own indentation: one nested
+ * under a further condition (`if strict_mode:`) only fires under that
+ * condition, so Cloud could still fall through to `return None`.
  */
 function cloudGuardedRaise(text) {
+  const bodyIndent = directIndent(text);
   for (const header of text.matchAll(/^([ \t]*)if\s+_same_deployment\(/gm)) {
+    if (header[1].length !== bodyIndent) continue;
     const argsStart = header.index + header[0].length;
     const close = matchingClose(text, argsStart);
     if (close === -1) continue;
@@ -473,6 +478,19 @@ function cloudGuardedRaise(text) {
     if (raise) return raise;
   }
   return null;
+}
+
+/**
+ * The indentation of the first code line in `text` — a function body's own
+ * statement level — or -1 if it has none. Blank and comment lines are skipped.
+ */
+function directIndent(text) {
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed.startsWith("#")) continue;
+    return /^[ \t]*/.exec(line)[0].length;
+  }
+  return -1;
 }
 
 /**
