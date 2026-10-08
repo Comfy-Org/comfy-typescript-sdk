@@ -93,7 +93,10 @@ uses, and the same variable `comfy.models.*` reads:
 
 Point `COMFY_BASE_URL` at another deployment and step 3 changes: an unresolved
 key is not an error there, and means "send no credentials at all" — a
-self-hosted ComfyUI behind `comfy-api-proxy` legitimately has none.
+self-hosted ComfyUI behind `comfy-api-proxy` legitimately has none. Steps 1
+and 2 do **not** change: a `COMFY_API_KEY` in the environment is sent to
+whatever `COMFY_BASE_URL` names, as the Python SDK does. For a keyless
+deployment, leave `COMFY_API_KEY` unset in that process.
 
 A runtime with no `process` (a browser) never sees the variable, so there the
 `apiKey` option is the only source. `comfy.config({ credentials })` configures

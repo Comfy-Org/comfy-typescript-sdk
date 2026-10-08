@@ -765,6 +765,39 @@ describe("python surface extraction", () => {
     expect(() => extractCredentialResolution(unguarded)).toThrow(/Comfy Cloud check/);
   });
 
+  it("reads the raise INSIDE the cloud guard, not the first raise after a mention of it", () => {
+    const guarded = [
+      'COMFY_CLOUD_BASE_URL = "https://cloud.comfy.org"',
+      'BASE_URL_ENV_VAR = "COMFY_BASE_URL"',
+      'API_KEY_ENV_VAR = "COMFY_API_KEY"',
+      "def _resolve_api_key(explicit: str | None, base_url: str) -> str | None:",
+      "    for candidate in (explicit, os.environ.get(API_KEY_ENV_VAR)):",
+      "        if candidate and candidate.strip():",
+      "            return candidate.strip()",
+      "    if _same_deployment(base_url, COMFY_CLOUD_BASE_URL):",
+      '        raise MissingApiKey("no API key")',
+      "    return None",
+    ].join("\n");
+
+    // An earlier type-check raise is not the missing-key error.
+    const typeCheckFirst = guarded.replace(
+      "    for candidate",
+      '    if not isinstance(explicit, (str, type(None))):\n        raise TypeError("api_key")\n    for candidate',
+    );
+    expect(extractCredentialResolution(typeCheckFirst).missingKeyError).toBe("MissingApiKey");
+
+    // A negated guard raises OFF Comfy Cloud — the opposite rule.
+    const negated = guarded.replace("if _same_deployment", "if not _same_deployment");
+    expect(() => extractCredentialResolution(negated)).toThrow(/Comfy Cloud check/);
+
+    // A mention in a comment, followed by an unconditional raise, is no guard.
+    const mentionOnly = guarded.replace(
+      "    if _same_deployment(base_url, COMFY_CLOUD_BASE_URL):\n        raise",
+      "    # if _same_deployment(base_url, COMFY_CLOUD_BASE_URL): ...\n    raise",
+    );
+    expect(() => extractCredentialResolution(mentionOnly)).toThrow(/Comfy Cloud check/);
+  });
+
   it("reads every entry of the status fallback table", () => {
     expect(
       extractErrorTypeByStatus(

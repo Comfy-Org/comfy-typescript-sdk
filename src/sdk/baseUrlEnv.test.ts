@@ -63,6 +63,23 @@ describe("base URL from the environment", () => {
     expect(await requestOrigin()).toBe(LOCAL);
   });
 
+  it.each([`${LOCAL}/`, `${LOCAL}//`])(
+    "drops every trailing slash (%j) before building request paths",
+    async (spelled) => {
+      vi.stubEnv(BASE_URL_ENV_VAR, spelled);
+      let seen = "";
+      const client = new Comfy({
+        apiKey: KEY,
+        fetch: (input) => {
+          seen = input instanceof Request ? input.url : String(input);
+          return Promise.reject(new Error("captured"));
+        },
+      });
+      await client.jobs.get("j1").catch(() => {});
+      expect(seen.startsWith(`${LOCAL}/api/`)).toBe(true);
+    },
+  );
+
   it.each([
     "cloud.comfy.org",
     "ftp://cloud.comfy.org",

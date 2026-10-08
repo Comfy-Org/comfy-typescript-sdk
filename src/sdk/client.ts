@@ -107,7 +107,10 @@ function resolveBaseUrl(): string {
       `${BASE_URL_ENV_VAR} must be an http(s) URL with no query or fragment (e.g. "http://127.0.0.1:8189"), got ${JSON.stringify(raw)}`,
     );
   }
-  return raw;
+  // Every trailing slash, once, here: the transport appends `/api/v2/...` to
+  // this string, so `https://cloud.comfy.org//` would otherwise request
+  // `//api/v2/...` while {@link sameDeployment} reads it as Comfy Cloud.
+  return stripTrailingSlashes(raw);
 }
 
 /**

@@ -86,9 +86,10 @@ entry. See CONTRIBUTING.md.
   to supply it, before any request. `comfy.models.*` already read that
   variable; the class client did not, so `new Comfy()` used to send no
   `Authorization` header and come back with a bare `401` from the server.
-  Pointing `COMFY_BASE_URL` at another deployment keeps today's keyless flow
-  exactly as it was: an unresolved key there is not an error and means "send no
-  credentials". The `new Comfy({ apiKey: process.env.COMFY_API_KEY })`
+  Pointing `COMFY_BASE_URL` at another deployment keeps the keyless flow: an
+  unresolved key there is not an error and means "send no credentials". A
+  `COMFY_API_KEY` set in the environment, though, is now sent to that
+  deployment too, as the Python SDK does — unset it for a keyless target. The `new Comfy({ apiKey: process.env.COMFY_API_KEY })`
   workaround in the README is gone. **Note for callers who relied on the old
   behaviour:** `new Comfy()` against Comfy Cloud with no key anywhere now
   throws locally instead of failing on the first call.

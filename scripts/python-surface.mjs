@@ -406,15 +406,21 @@ export function extractCredentialResolution(source) {
     );
   }
 
-  const raise = /raise\s+(\w+)\(/.exec(text);
-  if (!raise) {
+  if (!/raise\s+\w+\(/.test(text)) {
     fail(
       `${PYTHON_SOURCE_FILES.client}: \`${PYTHON_API_KEY_RESOLVER}\` raises nothing. Comfy ` +
         "Cloud always requires a key, so exhausting every source there is a local error.",
     );
   }
-  const guardIndex = text.search(/_same_deployment\([^)]*COMFY_CLOUD_BASE_URL[^)]*\)/);
-  if (guardIndex === -1 || guardIndex > raise.index) {
+  // The raise that counts is the one INSIDE the `if _same_deployment(...):`
+  // block — not merely the first one after some mention of the check. A
+  // negated guard (`if not ...`), a mention in a comment or docstring, or an
+  // earlier type-check raise would otherwise read as the cloud-guarded error.
+  const guard = /^([ \t]*)if\s+_same_deployment\([^)]*COMFY_CLOUD_BASE_URL[^)]*\)\s*:[ \t]*$/m.exec(
+    text,
+  );
+  const raise = guard ? guardedRaise(text.slice(guard.index + guard[0].length), guard[1]) : null;
+  if (!raise) {
     fail(
       `${PYTHON_SOURCE_FILES.client}: \`${PYTHON_API_KEY_RESOLVER}\` does not guard its raise ` +
         "with a Comfy Cloud check. An unguarded one would make a keyless self-hosted " +
@@ -437,6 +443,22 @@ export function extractCredentialResolution(source) {
     order,
     missingKeyError: raise[1],
   };
+}
+
+/**
+ * The first `raise X(` in the block that follows an `if` indented by
+ * `indent`, or null. The block ends at the first non-blank line indented no
+ * deeper than the `if`, so a raise after it does not count.
+ */
+function guardedRaise(rest, indent) {
+  for (const line of rest.split("\n").slice(1)) {
+    if (line.trim() === "") continue;
+    const lineIndent = /^[ \t]*/.exec(line)[0];
+    if (lineIndent.length <= indent.length) return null;
+    const raise = /^\s*raise\s+(\w+)\(/.exec(line);
+    if (raise) return raise;
+  }
+  return null;
 }
 
 /**
