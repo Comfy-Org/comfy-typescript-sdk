@@ -598,19 +598,34 @@ describe("credential resolution", () => {
     // Derived by CONSTRUCTING clients rather than by reading the resolver,
     // for the same reason the status fallback table is derived by CALLING
     // `toRouterError`: the table and the answer can part company.
-    expect(SHARED_CREDENTIAL_ORDER, "the shared order is not declared").toEqual([
-      "explicit",
-      "environment",
-    ]);
+    // The allowlist must name each source exactly once; WHICH order it names
+    // is what the constructions below check, so it is not restated here.
+    expect(
+      [...SHARED_CREDENTIAL_ORDER].sort(),
+      "the shared order must name each source exactly once",
+    ).toEqual(["environment", "explicit"]);
 
+    const credentials = {
+      explicit: "comfyui-explicit",
+      environment: "comfyui-from-environment",
+    } as const;
     vi.stubEnv(BASE_URL_ENV_VAR, undefined);
-    vi.stubEnv(CREDENTIALS_ENV_VAR, "comfyui-from-environment");
-    // Both sources available: the earlier one in the declared order wins.
-    expect(await credentialSent("comfyui-explicit")).toBe("comfyui-explicit");
-    // Only the later one: it is reached rather than ignored. This is the half
-    // the class client used to skip, which is what let the two SDKs disagree
-    // about the most common first line of code an integrator writes.
-    expect(await credentialSent()).toBe("comfyui-from-environment");
+    // Offer every source from position `i` onwards: the one at `i` must win.
+    // At `i = 0` that is "the earliest declared source beats the rest"; at the
+    // last position it is "a later source is reached rather than ignored" —
+    // the half the class client used to skip, which is what let the two SDKs
+    // disagree about the most common first line of code an integrator writes.
+    for (let i = 0; i < SHARED_CREDENTIAL_ORDER.length; i += 1) {
+      const offered = new Set(SHARED_CREDENTIAL_ORDER.slice(i));
+      vi.stubEnv(
+        CREDENTIALS_ENV_VAR,
+        offered.has("environment") ? credentials.environment : undefined,
+      );
+      expect(
+        await credentialSent(offered.has("explicit") ? credentials.explicit : undefined),
+        `offered ${[...offered].join(" + ")}`,
+      ).toBe(credentials[SHARED_CREDENTIAL_ORDER[i]]);
+    }
   });
 
   it("reads the environment variable the Python client names", () => {
@@ -694,6 +709,25 @@ describe("python surface extraction", () => {
       order: ["explicit", "environment"],
       missingKeyError: "MissingApiKey",
     });
+  });
+
+  it("reads a candidate with more than one nested call as ONE candidate", () => {
+    // The tuple's closing paren is found by depth, not by a regex that allows
+    // a single nested `)` — a second one used to truncate the tuple and report
+    // a false "unrecognized credential source".
+    const source = [
+      'COMFY_CLOUD_BASE_URL = "https://cloud.comfy.org"',
+      'BASE_URL_ENV_VAR = "COMFY_BASE_URL"',
+      'API_KEY_ENV_VAR = "COMFY_API_KEY"',
+      "def _resolve_api_key(explicit: str | None, base_url: str) -> str | None:",
+      "    for candidate in (explicit, os.environ.get(API_KEY_ENV_VAR, _default(base_url))):",
+      "        if candidate and candidate.strip():",
+      "            return candidate.strip()",
+      "    if _same_deployment(base_url, COMFY_CLOUD_BASE_URL):",
+      '        raise MissingApiKey("no API key")',
+      "    return None",
+    ].join("\n");
+    expect(extractCredentialResolution(source).order).toEqual(["explicit", "environment"]);
   });
 
   it("refuses a resolver it cannot read, rather than reporting a shorter order", () => {

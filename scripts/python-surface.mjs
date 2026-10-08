@@ -370,7 +370,15 @@ export function extractCredentialResolution(source) {
 
   // `for candidate in (explicit, os.environ.get(API_KEY_ENV_VAR)):` — the
   // tuple's order is the precedence, so it is read rather than assumed.
-  const sequence = /for\s+\w+\s+in\s+\(([^)]*\)?[^)]*)\)\s*:/.exec(text);
+  // The opening is found by regex and the closing by a depth scan, so a
+  // candidate with nested calls (`os.environ.get(VAR, default())`) is one
+  // candidate rather than a truncated tuple.
+  const opening = /for\s+\w+\s+in\s+\(/.exec(text);
+  const close = opening ? matchingClose(text, opening.index + opening[0].length) : -1;
+  const sequence =
+    close !== -1 && /^\)\s*:/.test(text.slice(close))
+      ? [null, text.slice(opening.index + opening[0].length, close)]
+      : null;
   if (!sequence) {
     fail(
       `${PYTHON_SOURCE_FILES.client}: \`${PYTHON_API_KEY_RESOLVER}\` declares no ` +
@@ -429,6 +437,23 @@ export function extractCredentialResolution(source) {
     order,
     missingKeyError: raise[1],
   };
+}
+
+/**
+ * The index of the bracket closing the one opened just before `start`, or -1
+ * if it never closes. The same depth tracking as {@link splitTopLevel}.
+ */
+function matchingClose(text, start) {
+  let depth = 0;
+  for (let i = start; i < text.length; i += 1) {
+    const char = text[i];
+    if (char === "(" || char === "[") depth += 1;
+    else if (char === ")" || char === "]") {
+      if (depth === 0) return i;
+      depth -= 1;
+    }
+  }
+  return -1;
 }
 
 /** Split a Python tuple's text on its own commas, ignoring nested calls. */
