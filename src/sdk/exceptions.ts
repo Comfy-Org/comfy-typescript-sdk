@@ -274,6 +274,17 @@ function isSharedAcrossCalls(
   return typeof existing === "string" && existing !== idempotencyKey;
 }
 
+/** The prototypes of the built-in error classes, which carry no hidden state. */
+const NATIVE_ERROR_PROTOTYPES: ReadonlySet<object> = new Set([
+  Error.prototype,
+  TypeError.prototype,
+  RangeError.prototype,
+  ReferenceError.prototype,
+  SyntaxError.prototype,
+  EvalError.prototype,
+  URIError.prototype,
+]);
+
 /**
  * A private stand-in for a throwable this call must not mutate: same
  * prototype, same message, same stack, same own properties — everything a
@@ -323,11 +334,20 @@ function replicate(exc: object): object | null {
     return replica;
   }
   const prototype = Object.getPrototypeOf(exc) as object | null;
-  // An `Error` (its `message` is an own data property, so the descriptor copy
-  // carries it, and the prototype carries the class) or a plain object — the
-  // other thing `controller.abort(reason)` is routinely handed. Both are
-  // faithfully reproduced by copying own descriptors onto a fresh object.
-  if (exc instanceof Error || prototype === Object.prototype || prototype === null) {
+  // A built-in `Error` (its `message` is an own data property, so the
+  // descriptor copy carries it, and the prototype carries the class), one of
+  // this SDK's own `ComfyError`s (every field an own data property), or a plain
+  // object — the other thing `controller.abort(reason)` is routinely handed.
+  // All are faithfully reproduced by copying own descriptors onto a fresh
+  // object. A caller's OWN `Error` subclass is not: it may keep `#private`
+  // state a descriptor copy never initialises, so a method reading it would
+  // throw on the stand-in. It falls through to the untouched path below.
+  if (
+    (prototype !== null && NATIVE_ERROR_PROTOTYPES.has(prototype)) ||
+    exc instanceof ComfyError ||
+    prototype === Object.prototype ||
+    prototype === null
+  ) {
     const replica = Object.create(prototype) as object;
     Object.defineProperties(replica, descriptors);
     pinStack(replica);

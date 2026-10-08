@@ -236,6 +236,48 @@ describe("stampIdempotencyKey", () => {
     expect((reason as unknown as Record<string, unknown>).idempotencyKey).toBeUndefined();
   });
 
+  it("leaves a caller's own Error subclass untouched rather than faking a stand-in", () => {
+    // A descriptor copy never runs the constructor, so `#private` state is
+    // missing on the copy and any method reading it throws.
+    class Gave extends Error {
+      readonly #why: string;
+      constructor(why: string) {
+        super("gave up");
+        this.#why = why;
+      }
+      get why(): string {
+        return this.#why;
+      }
+    }
+    const controller = new AbortController();
+    controller.abort(new Gave("user cancelled"));
+    const reason = controller.signal.reason as Gave;
+
+    const returned = stampIdempotencyKey(reason, "k-custom", {
+      callerSignal: controller.signal,
+    }) as Gave;
+
+    expect(returned).toBe(reason);
+    expect(returned.why).toBe("user cancelled");
+    expect((reason as unknown as Record<string, unknown>).idempotencyKey).toBeUndefined();
+  });
+
+  it("stands in for a shared ComfyError, whose fields are all own data", () => {
+    const controller = new AbortController();
+    controller.abort(new ComfyError("stop", { code: "caller_stop" }));
+    const reason = controller.signal.reason as ComfyError;
+
+    const standIn = stampIdempotencyKey(reason, "k-comfy", {
+      callerSignal: controller.signal,
+    }) as ComfyError;
+
+    expect(standIn).not.toBe(reason);
+    expect(standIn).toBeInstanceOf(ComfyError);
+    expect(standIn.code).toBe("caller_stop");
+    expect(standIn.idempotencyKey).toBe("k-comfy");
+    expect(reason.idempotencyKey).toBeNull();
+  });
+
   it("passes a throwable whose key cannot be written through, rather than raising", () => {
     // `Object.isExtensible` passing does not make the write safe: a getter-only
     // accessor reading `undefined` slips past the value guard and then throws
