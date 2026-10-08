@@ -191,8 +191,6 @@ export function toSdkError(exc: ApiError): ComfyError {
     code: exc.code,
     httpStatus: exc.httpStatus,
     details: exc.details,
-    // Not just `QueueFull`'s: a `503` or a `rate_limited` `429` that named a
-    // pace carries it too (see `ComfyError.retryAfter`).
     retryAfter: exc.retryAfter,
   });
 }
