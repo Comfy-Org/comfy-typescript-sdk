@@ -42,7 +42,7 @@ const client = new Comfy({ apiKey: "..." }); // Comfy Cloud
 
 const wf = await client.workflows.fromFile("workflow_api.json");
 const asset = client.assets.fromFile("photo.png"); // lazy; hashed + uploaded on first use
-wf.setInput("10", "image", asset);
+wf.setInput("10", "image", asset); // "10" is a LoadImage node: bind handles to a loader's file widget
 
 const job = await client.run(wf); // submit, then poll to a terminal state
 await job.getOutputs("13")[0].toFile("out.png");
@@ -656,7 +656,23 @@ handle is actually used. Embed the handle directly in a workflow input with
 
 ```ts
 const asset = client.assets.fromFile("photo.png");
+wf.setInput("10", "image", asset); // "10" is a LoadImage node: see below
+```
+
+An asset handle resolves to a **filename** on the server, not to decoded
+media. Bind it only to an input that takes a filename: the file widget of a
+loader node (`LoadImage.image`, `LoadVideo.file`, `LoadAudio.audio`,
+`Load3D.model_file`, or a custom node's own filename widget), then link that
+loader's output into the node that needs the tensor. Binding a handle directly
+to an `IMAGE`, `VIDEO`, `AUDIO` or `MASK` socket, including grouped
+partner-node inputs such as `model.reference_images.image_1`, is accepted at
+submit but fails at execution because the node receives a string.
+
+```ts
+// "10" is a LoadImage node: its `image` widget takes a filename, so bind the handle there.
 wf.setInput("10", "image", asset);
+// "11" is the consumer: link LoadImage's decoded IMAGE output ([nodeId, outputIndex]) into it.
+wf.setInput("11", "image", ["10", 0]);
 ```
 
 On submit, the SDK walks the workflow graph, finds every embedded handle,
