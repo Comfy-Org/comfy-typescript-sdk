@@ -82,6 +82,15 @@ describe("translate", () => {
   });
 });
 
+describe("ComfyError.refusalSubject", () => {
+  it("defaults to null and round-trips the option", () => {
+    expect(new ComfyError("x").refusalSubject).toBeNull();
+    expect(new ComfyError("x", { refusalSubject: "output_audio" }).refusalSubject).toBe(
+      "output_audio",
+    );
+  });
+});
+
 describe("stampIdempotencyKey", () => {
   // The TS twin of comfy-python-sdk
   // tests/test_error_contract.py::test_a_stamped_transport_error_reads_every_attribute_as_none.

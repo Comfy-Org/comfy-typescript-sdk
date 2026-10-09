@@ -117,8 +117,12 @@ entry. See CONTRIBUTING.md.
   queued surface raises `RouterError` — `submit`, and a refused completion
   from `subscribe` or `RequestHandle.get()`; `RequestHandle.status()` and
   `RequestHandle.events()` report a refused completion as data on
-  `QueueUpdate` rather than throwing. `models.run`'s `ComfyError` does not
-  carry the subject yet.
+  `QueueUpdate` rather than throwing. `models.run` carries the same value on
+  `ComfyError.refusalSubject`.
+- **`ComfyError.refusalSubject`** — `comfy.models.run`'s
+  `content_policy_violation` now names the refused input/output, read from
+  `X-Comfy-Refusal-Subject` with a fallback to the body's `refusal_subject`;
+  `null` when unnamed.
 
 ### Changed
 
