@@ -472,6 +472,32 @@ describe("RequestHandle.get", () => {
     });
   });
 
+  it("reports replayed: false, and again on a second collection of the same handle", async () => {
+    // The queued result route carries no `Idempotent-Replayed` — a replay
+    // marker belongs to the synchronous route's same-key re-send — so this
+    // path's `replayed` is `false` on every real response, INCLUDING the
+    // second collection of a request that has already completed. That is the
+    // trap the field could set for a spend tracker: collecting twice is cheap
+    // and explicitly supported, and nothing about the second result says it is
+    // a repeat. `requestId` on the HANDLE is what identifies the one request,
+    // so it is what deduplication has to key on.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = queueScript({ statuses: [DONE], result: PAYLOAD });
+
+      const handle = comfy.models.handle<typeof PAYLOAD>(MODEL, REQUEST_ID);
+      const first = await handle.get();
+      const second = await handle.get();
+
+      expect(first.replayed).toBe(false);
+      expect(second.replayed).toBe(false);
+      // Same request, collected twice — told apart from two runs by the
+      // handle's id and by nothing on the results themselves.
+      expect(handle.requestId).toBe(REQUEST_ID);
+      expect(second.data).toEqual(first.data);
+    });
+  });
+
   it("lifts X-Comfy-Credits-Used off the RESULT response, not off the status poll", async () => {
     // The queued route costs what the synchronous one does, so Router has
     // every reason to stamp a price here too — and this path builds its

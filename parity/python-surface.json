@@ -13,15 +13,19 @@
   "modelsMethods": {
     "Models": [
       "handle",
+      "list",
       "run",
       "run_detailed",
+      "schema",
       "submit",
       "subscribe"
     ],
     "AsyncModels": [
       "handle",
+      "list",
       "run",
       "run_detailed",
+      "schema",
       "submit",
       "subscribe"
     ]

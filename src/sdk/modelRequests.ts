@@ -70,8 +70,10 @@ import {
   CREDITS_USED_HEADER,
   DROPPED_PARAMS_HEADER,
   FALLBACK_PROVIDER_HEADER,
+  IDEMPOTENT_REPLAYED_HEADER,
   parseCreditsUsed,
   parseDroppedParams,
+  parseReplayed,
   type RunResult,
 } from "./models.js";
 import {
@@ -824,7 +826,9 @@ export class RequestHandle<TData = unknown> {
    *
    * Calling it on a request that has already completed is one status poll and
    * one fetch, so collecting a result twice — or from a second process — costs
-   * no more than the first time.
+   * no more than the first time. The second collection carries `replayed:
+   * false` — this route has no replay marker — so deduplicate spend by
+   * {@link RequestHandle.requestId}, not by `replayed`.
    */
   async get(options: WaitOptions = {}): Promise<RunResult<TData>> {
     const timeoutMs = options.timeoutMs ?? null;
@@ -901,6 +905,12 @@ export class RequestHandle<TData = unknown> {
     // disclose — but reading them keeps the two result shapes identical and
     // means this path needs no edit on the day that route does gain them.
     //
+    // `Idempotent-Replayed` is read rather than hard-coded `false` for that
+    // same reason. It reads `false` on every real response — the queued result
+    // route carries no replay marker, and this route's own re-collection is
+    // deduplicated by `requestId` rather than by a header — but writing the
+    // literal would bake that in where a header read simply stays correct.
+    //
     // `X-Comfy-Credits-Used` is read on the same reasoning, and the contract
     // does not declare it on this route yet either: `getRouterModelRequestResult`'s
     // `200` names no credits header, so on this route the value is NOT
@@ -920,6 +930,7 @@ export class RequestHandle<TData = unknown> {
       requestId: response.headers.get(REQUEST_ID_HEADER),
       servingProvider: response.headers.get(FALLBACK_PROVIDER_HEADER),
       droppedParams: parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER)),
+      replayed: parseReplayed(response.headers.get(IDEMPOTENT_REPLAYED_HEADER)),
       creditsUsed: parseCreditsUsed(response.headers.get(CREDITS_USED_HEADER)),
     };
     return result;

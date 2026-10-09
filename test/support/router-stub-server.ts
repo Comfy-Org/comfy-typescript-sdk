@@ -135,8 +135,11 @@ export interface RouterServerState {
    * When true, the response that finally succeeds carries
    * `Idempotent-Replayed: true` — what a real Router sends when the answer came
    * off the record held against the `Idempotency-Key` rather than from running
-   * the model again. Nothing in the SDK branches on it; it is here so a collect
-   * test can assert the fixture really is the replay it claims to be.
+   * the model again. The SDK reads it as `RunResult.replayed`, so a collect
+   * test asserts both that the fixture really is the replay it claims to be and
+   * that the flag reached the caller. Only `true` is expressible here because
+   * only `true` is what Router sends; a test that needs the header carrying
+   * some OTHER value scripts it through {@link RouterServerState.respond}.
    */
   idempotentReplayed: boolean;
   /**

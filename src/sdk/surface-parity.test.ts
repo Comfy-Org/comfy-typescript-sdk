@@ -168,7 +168,10 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
       "method, class or error_type name differs because of it — and this check compares " +
       "names, so the entry suppresses nothing. It is declared anyway: a future reviewer " +
       "who notices the difference should find it listed as a decision, not wonder whether " +
-      "the check simply cannot see it.",
+      "the check simply cannot see it. Because `run` already returns that envelope — " +
+      "`data`, `requestId`, `servingProvider`, `droppedParams`, `replayed` — Python's opt-in " +
+      "`run_detailed` has no counterpart here; see " +
+      "`detailed-run-is-the-python-spelling-of-the-envelope`.",
   },
   {
     id: "credential-resolution",
@@ -196,18 +199,6 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
       "is what stops a suffixed `run_async` from becoming a Python-only method nobody " +
       "notices is missing here.",
     pythonAsyncModelsClasses: ["AsyncModels"],
-  },
-  {
-    id: "discovery-methods-land-first-in-typescript",
-    why:
-      "`comfy.models.schema` and `comfy.models.list` reach Router's two discovery routes — the " +
-      "per-model OpenAPI document and the paginated model catalog — which the contract has " +
-      "declared all along and neither SDK called. The shape is settled here first, on purpose: " +
-      "the same two methods belong on `comfy_sdk.models.Models`/`AsyncModels` and are a " +
-      "follow-up on the Python SDK, so the naming is negotiated once rather than twice. This " +
-      "is a LAG, not a divergence — the entry fails the moment the Python snapshot grows " +
-      "either name, which is when it should be deleted rather than kept.",
-    modelsMethodsAheadOfPython: ["schema", "list"],
   },
   {
     id: "detailed-run-is-the-python-spelling-of-the-envelope",
