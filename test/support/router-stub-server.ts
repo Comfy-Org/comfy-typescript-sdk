@@ -136,10 +136,21 @@ export interface RouterServerState {
    * When true, the response that finally succeeds carries
    * `Idempotent-Replayed: true` — what a real Router sends when the answer came
    * off the record held against the `Idempotency-Key` rather than from running
-   * the model again. Nothing in the SDK branches on it; it is here so a collect
-   * test can assert the fixture really is the replay it claims to be.
+   * the model again. The SDK reads it as `RunResult.replayed`, so a collect
+   * test asserts both that the fixture really is the replay it claims to be and
+   * that the flag reached the caller. Only `true` is expressible here because
+   * only `true` is what Router sends; a test that needs the header carrying
+   * some OTHER value scripts it through {@link RouterServerState.respond}.
    */
   idempotentReplayed: boolean;
+  /**
+   * `X-Comfy-Credits-Used` on the ordinary response, or `null` to omit the
+   * header entirely. Present-and-absent are different fixture shapes, not a
+   * detail: the client reads ABSENCE as "Router reported no cost" and a
+   * present `"0"` as a reported cost of zero, so a stub that defaulted this
+   * to `"0"` could not tell the two apart.
+   */
+  creditsUsed: string | null;
   /**
    * Destroy the socket of the first N requests without answering at all — a
    * transport failure rather than an HTTP one, which the client sees as a
@@ -232,6 +243,7 @@ function defaultState(): RouterServerState {
     failErrorType: null,
     failRetryAfter: null,
     idempotentReplayed: false,
+    creditsUsed: null,
     resetTimes: 0,
     respond: null,
     resetAfterFail: false,
@@ -447,6 +459,7 @@ export class RouterStubServer {
     // anything.
     if (state.retryAfter !== null) headers["Retry-After"] = state.retryAfter;
     if (state.idempotentReplayed) headers["Idempotent-Replayed"] = "true";
+    if (state.creditsUsed !== null) headers["X-Comfy-Credits-Used"] = state.creditsUsed;
 
     if (state.stallBody) {
       // A Content-Length the body never reaches, so the client keeps reading.

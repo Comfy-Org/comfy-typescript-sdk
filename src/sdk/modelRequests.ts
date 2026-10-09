@@ -63,12 +63,17 @@ import { buildUserAgent } from "../low/index.js";
 import { abortableSleep } from "./abortable-sleep.js";
 import { backoffSchedule, newIdempotencyKey } from "./core.js";
 import { requireCredentials, resolveBaseUrl } from "./credentials.js";
-import { ComfyError } from "./exceptions.js";
+import { ComfyError, stamping } from "./exceptions.js";
 import { fillRoute, parseModelId, parseRequestId } from "./modelRoutes.js";
 import {
+  type BuiltRunResult,
+  CREDITS_USED_HEADER,
   DROPPED_PARAMS_HEADER,
   FALLBACK_PROVIDER_HEADER,
+  IDEMPOTENT_REPLAYED_HEADER,
+  parseCreditsUsed,
   parseDroppedParams,
+  parseReplayed,
   type RunResult,
 } from "./models.js";
 import {
@@ -596,7 +601,7 @@ async function send(call: QueueCall): Promise<QueueResponse> {
       if (isTimeout(exc, call.signal)) {
         throw new ComfyError(
           `the model queue's ${call.what} call exceeded the deadline left for it`,
-          { code: "request_timeout", cause: exc },
+          { code: "request_timeout", cause: exc, idempotencyKey: call.idempotencyKey ?? null },
         );
       }
       const delay = nextAttemptDelayMs(attempt, retry, clock());
@@ -821,7 +826,9 @@ export class RequestHandle<TData = unknown> {
    *
    * Calling it on a request that has already completed is one status poll and
    * one fetch, so collecting a result twice — or from a second process — costs
-   * no more than the first time.
+   * no more than the first time. The second collection carries `replayed:
+   * false` — this route has no replay marker — so deduplicate spend by
+   * {@link RequestHandle.requestId}, not by `replayed`.
    */
   async get(options: WaitOptions = {}): Promise<RunResult<TData>> {
     const timeoutMs = options.timeoutMs ?? null;
@@ -893,17 +900,41 @@ export class RequestHandle<TData = unknown> {
     // The two alt-provider disclosure headers are read here for the same
     // reason the discriminant is written rather than inferred: one union, both
     // paths, narrowed the same way. They are expected to be absent on this
-    // route — the queued `/requests` path takes no `model_provider` parameter,
-    // so a queued run cannot address an alternate provider and has nothing to
-    // disclose — but reading them keeps the two result shapes identical and
-    // means this path needs no edit on the day that route does gain them.
-    return {
+    // route — `submitRouterModelRequest` takes neither `model_provider` nor
+    // `fallback_provider`, and `getRouterModelRequestResult`'s `200` declares
+    // neither header, so the contract gives a queued run nothing to disclose
+    // — but reading them keeps the two result shapes identical and means this
+    // path needs no edit on the day that route does gain them.
+    //
+    // `Idempotent-Replayed` is read rather than hard-coded `false` for that
+    // same reason. It reads `false` on every real response — the queued result
+    // route carries no replay marker, and this route's own re-collection is
+    // deduplicated by `requestId` rather than by a header — but writing the
+    // literal would bake that in where a header read simply stays correct.
+    //
+    // `X-Comfy-Credits-Used` is read on the same reasoning, and the contract
+    // does not declare it on this route yet either: `getRouterModelRequestResult`'s
+    // `200` names no credits header, so on this route the value is NOT
+    // DECLARED, THEREFORE UNPINNED — expect `null` ("not reported", never
+    // "free"), but a stamped header is passed through as-is. This is a claim
+    // about the document, not the wire: Router can serve what the one-way sync
+    // strips (the `MODEL_REQUEST*` routes themselves are the precedent). The
+    // rot guard in router-spec-contract.test.ts fires the day the contract
+    // declares it. Reached by `get()` and therefore by `Models.subscribe`,
+    // whose TSDoc carries the same caveat.
+    //
+    // Typed as the internal `BuiltRunResult` so omitting a field here fails
+    // `tsc`; returned as the public `RunResult`, the same type `run` returns.
+    const result: BuiltRunResult<TData> = {
       kind: "json",
       data: body as TData,
       requestId: response.headers.get(REQUEST_ID_HEADER),
       servingProvider: response.headers.get(FALLBACK_PROVIDER_HEADER),
       droppedParams: parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER)),
+      replayed: parseReplayed(response.headers.get(IDEMPOTENT_REPLAYED_HEADER)),
+      creditsUsed: parseCreditsUsed(response.headers.get(CREDITS_USED_HEADER)),
     };
+    return result;
   }
 
   /**
@@ -987,18 +1018,35 @@ export async function submit<TData = unknown>(
   // response replays the original acceptance rather than queueing — and
   // billing — a second generation. A fresh `submit` mints a fresh key.
   const idempotencyKey = options.idempotencyKey ?? newIdempotencyKey();
-  const response = await send({
-    method: "POST",
-    url: queueUrl(MODEL_REQUESTS_ROUTE_TEMPLATE, model, null, "submit"),
-    body: JSON.stringify(input),
+  // Everything from here leaves stamped with the key: `send`'s raw transport
+  // re-throw carries no request id (comfy-api never minted one for a call that
+  // never landed), and the `RouterError` `decode` raises on a non-2xx is a bare
+  // `Error` subclass with no `idempotencyKey` of its own — the key is the only
+  // value that correlates either failure to the server-side record. `subscribe`
+  // reaches this through its own `submit` call and inherits the stamp.
+  return stamping(
     idempotencyKey,
-    signal: options.signal,
-    budgetMs: options.timeoutMs === undefined ? DEFAULT_SUBMIT_TIMEOUT_MS : options.timeoutMs,
-    retry: options.retry ?? {},
-    what: "submit",
-  });
-  const body = decode(response, [200, 201, 202]);
-  return new RequestHandle<TData>(model, requestIdOf(body, response), options.retry ?? {});
+    async () => {
+      const response = await send({
+        method: "POST",
+        url: queueUrl(MODEL_REQUESTS_ROUTE_TEMPLATE, model, null, "submit"),
+        body: JSON.stringify(input),
+        idempotencyKey,
+        signal: options.signal,
+        budgetMs: options.timeoutMs === undefined ? DEFAULT_SUBMIT_TIMEOUT_MS : options.timeoutMs,
+        retry: options.retry ?? {},
+        what: "submit",
+      });
+      const body = decode(response, [200, 201, 202]);
+      return new RequestHandle<TData>(model, requestIdOf(body, response), options.retry ?? {});
+    },
+    {
+      // See `models.run`: one `AbortController` shared across concurrent calls
+      // rejects every one of them with the SAME `signal.reason`, so the stamp
+      // gives this call a private stand-in rather than writing our key onto it.
+      callerSignal: options.signal,
+    },
+  );
 }
 
 /**
