@@ -34,12 +34,22 @@ describe("toSdkError", () => {
     ["asset_not_found", NotFound],
     ["unauthorized", Unauthorized],
     ["forbidden", Forbidden],
+    ["credential_expired", Unauthorized],
   ];
 
   it.each(cases)("maps protocol code %s to the idiomatic %s", (code, expectedClass) => {
     const apiError = new ApiError("boom", { code, httpStatus: 400 });
     expect(toSdkError(apiError)).toBeInstanceOf(expectedClass);
   });
+
+  it.each(["constructor", "toString", "valueOf"])(
+    "does not resolve the server code %s through Object.prototype",
+    (code) => {
+      const sdkError = toSdkError(new ApiError("boom", { code, httpStatus: 400 }));
+      expect(sdkError.constructor).toBe(ComfyError);
+      expect(sdkError.code).toBe(code);
+    },
+  );
 
   it("carries retryAfter onto QueueFull", () => {
     const apiError = new ApiError("full", { code: "queue_full", httpStatus: 429, retryAfter: 5 });

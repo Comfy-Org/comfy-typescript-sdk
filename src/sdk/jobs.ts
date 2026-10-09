@@ -338,13 +338,18 @@ export class Job {
     for (;;) {
       let terminalSeen = false;
       let reconnectPauseMs: number = RECONNECT_PAUSE_MS;
+      let terminalError: ApiError | null = null;
       try {
         for await (const raw of this.low.getJobEvents(eventsUrl, { signal })) {
           if (raw.event === "error") {
             // Terminal frame: the server is ending the stream for a reason other
             // than the job finishing (credential_expired / forbidden / job_not_found).
             // No status follows it, so surface it and stop — never reconnect.
-            throw sseErrorFromFrame(raw.data);
+            // Thrown after the try, so the reconnect dispatch below (and its
+            // abort check, which would let the untranslated low error escape)
+            // never sees it.
+            terminalError = sseErrorFromFrame(raw.data);
+            break;
           }
           const event = eventFromRaw(raw, (data) => this.bindOutput(data as unknown as LowOutput));
           if (event === null) continue;
@@ -377,6 +382,7 @@ export class Job {
         }
         // Connection dropped mid-stream (or the server returned 429) — reconnect below.
       }
+      if (terminalError !== null) throw toSdkError(terminalError);
       if (terminalSeen) return;
       // Stream ended without a terminal frame. Poll the authoritative
       // state: stop if already terminal, else reconnect for fresh frames.

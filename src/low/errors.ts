@@ -142,7 +142,9 @@ export function errorFromEnvelope(
     message = `HTTP ${httpStatus}`;
   }
 
-  const cls = BY_CODE[code] ?? ApiError;
+  // Own-property lookup: `code` is server-controlled, and a code such as
+  // `constructor` must not resolve through `Object.prototype`.
+  const cls = Object.hasOwn(BY_CODE, code) ? BY_CODE[code] : ApiError;
   return new cls(message, {
     code,
     httpStatus,
@@ -155,11 +157,17 @@ export function errorFromEnvelope(
  * The HTTP status each terminal SSE `error` frame code stands in for. The
  * frame arrives inside a `200` stream, so there is no response status to read;
  * this keeps `httpStatus` meaningful on the typed error the frame becomes.
+ * Covers every code `BY_CODE` maps to `Unauthorized`, `Forbidden` or
+ * `NotFound`, so a frame naming the generic `unauthorized` / `not_found`
+ * carries the same status as the specific one.
  */
 const SSE_STATUS_BY_CODE: Record<string, number> = {
+  unauthorized: 401,
   credential_expired: 401,
   forbidden: 403,
+  not_found: 404,
   job_not_found: 404,
+  asset_not_found: 404,
 };
 
 /**
@@ -167,11 +175,17 @@ const SSE_STATUS_BY_CODE: Record<string, number> = {
  * `GET /jobs/{id}/events`, whose `data` is an error envelope. The server sends
  * it when it ends the stream for a reason other than the job finishing. The
  * envelope's `code` is kept verbatim; a code with no known status yields a bare
- * {@link ApiError} with `httpStatus` `0`.
+ * {@link ApiError} with `httpStatus` `0`. A frame with no message keeps its raw
+ * payload (or names the frame) rather than reporting a nonexistent `HTTP 0`.
  */
 export function sseErrorFromFrame(data: Record<string, unknown>): ApiError {
-  const err = (data as ErrorEnvelopeBody).error;
-  const code = err && typeof err === "object" ? err.code : undefined;
-  const httpStatus = (typeof code === "string" && SSE_STATUS_BY_CODE[code]) || 0;
-  return errorFromEnvelope(httpStatus, data as ErrorEnvelopeBody);
+  const raw = (data as ErrorEnvelopeBody).error;
+  const err = raw && typeof raw === "object" ? raw : undefined;
+  const code = typeof err?.code === "string" && err.code ? err.code : "error";
+  const httpStatus = Object.hasOwn(SSE_STATUS_BY_CODE, code) ? SSE_STATUS_BY_CODE[code] : 0;
+  const message =
+    (typeof err?.message === "string" && err.message) ||
+    (typeof data.raw === "string" && data.raw) ||
+    `event stream ended with an \`error\` frame (${code})`;
+  return errorFromEnvelope(httpStatus, { error: { code, message, details: err?.details ?? null } });
 }

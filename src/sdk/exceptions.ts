@@ -193,7 +193,8 @@ export function toSdkError(exc: ApiError): ComfyError {
       details: exc.details,
     });
   }
-  const cls = BY_CODE[exc.code] ?? ComfyError;
+  // Own-property lookup: the code is server-controlled (see low/errors.ts).
+  const cls = Object.hasOwn(BY_CODE, exc.code) ? BY_CODE[exc.code] : ComfyError;
   return new cls(exc.message, {
     code: exc.code,
     httpStatus: exc.httpStatus,

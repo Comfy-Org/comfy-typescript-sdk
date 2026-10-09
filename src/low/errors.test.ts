@@ -68,6 +68,8 @@ describe("sseErrorFromFrame", () => {
     ["credential_expired", 401, Unauthorized],
     ["forbidden", 403, Forbidden],
     ["job_not_found", 404, NotFound],
+    ["unauthorized", 401, Unauthorized],
+    ["not_found", 404, NotFound],
   ] as const)("maps %s to its typed error at status %i", (code, status, cls) => {
     const err = sseErrorFromFrame({ error: { code, message: "x" } });
     expect(err).toBeInstanceOf(cls);
@@ -83,10 +85,39 @@ describe("sseErrorFromFrame", () => {
     expect(err.code).toBe("stream_gone");
   });
 
-  it("still yields an ApiError for a frame that is not an envelope", () => {
+  it("still yields an ApiError for a frame that is not an envelope, keeping its payload", () => {
     const err = sseErrorFromFrame({ raw: "not json" });
     expect(err.constructor).toBe(ApiError);
     expect(err.httpStatus).toBe(0);
     expect(err.code).toBe("error");
+    expect(err.message).toBe("not json");
   });
+
+  it("names the frame, not a nonexistent HTTP 0, when the envelope has no message", () => {
+    const err = sseErrorFromFrame({ error: { code: "forbidden" } });
+    expect(err).toBeInstanceOf(Forbidden);
+    expect(err.message).not.toContain("HTTP 0");
+    expect(err.message).toContain("forbidden");
+  });
+
+  it.each(["constructor", "toString", "valueOf", "__proto__"])(
+    "does not resolve the code %s through Object.prototype",
+    (code) => {
+      const err = sseErrorFromFrame({ error: { code, message: "x" } });
+      expect(err.constructor).toBe(ApiError);
+      expect(err.httpStatus).toBe(0);
+      expect(err.code).toBe(code);
+    },
+  );
+});
+
+describe("errorFromEnvelope prototype keys", () => {
+  it.each(["constructor", "toString", "valueOf", "hasOwnProperty"])(
+    "maps the server code %s to a bare ApiError",
+    (code) => {
+      const err = errorFromEnvelope(400, { error: { code, message: "x" } });
+      expect(err.constructor).toBe(ApiError);
+      expect(err.code).toBe(code);
+    },
+  );
 });
