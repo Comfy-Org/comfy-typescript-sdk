@@ -37,7 +37,7 @@
 
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { PYTHON_SOURCE_FILES, extractPythonSurface } from "./python-surface.mjs";
 
@@ -61,16 +61,66 @@ function parseArgs(argv) {
   return args;
 }
 
-async function fetchSource(ref, path) {
+/**
+ * How hard to try before calling a fetch a real failure.
+ *
+ * This is the only job in CI that leaves the runner, and a transient
+ * `ECONNRESET` from `raw.githubusercontent.com` reddens it in exactly the same
+ * way a genuine Python-side rename does. That is worse than noise: the whole
+ * value of this job is that a red means "the sibling SDK moved", so a red that
+ * means "the network blinked" trains a reader to re-run instead of to look,
+ * and the next real drift is read as a flake too.
+ *
+ * Four attempts with a widening backoff, which costs under two seconds on a
+ * healthy run and rides out the blips that actually happen here.
+ */
+const FETCH_ATTEMPTS = 4;
+const FETCH_BACKOFF_MS = [200, 500, 1200];
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * A 5xx is the server saying "not now"; a 4xx is it saying "not this". Only
+ * the first is worth a second attempt — retrying a 404 just spends four
+ * attempts arriving at the same answer, and that answer (the file moved) is
+ * one the caller needs promptly and unambiguously.
+ */
+function isRetryableStatus(status) {
+  return status >= 500 || status === 408 || status === 429;
+}
+
+export async function fetchSource(ref, path) {
   const url = `https://raw.githubusercontent.com/${REPO}/${ref}/${path}`;
-  const response = await fetch(url, { headers: { accept: "text/plain" } });
-  if (!response.ok) {
-    throw new Error(
-      `GET ${url} -> ${String(response.status)} ${response.statusText}. ` +
-        "If the file moved, update PYTHON_SOURCE_FILES in scripts/python-surface.mjs.",
-    );
+
+  let lastError;
+  for (let attempt = 1; attempt <= FETCH_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await fetch(url, { headers: { accept: "text/plain" } });
+      if (response.ok) return await response.text();
+
+      const error = new Error(
+        `GET ${url} -> ${String(response.status)} ${response.statusText}. ` +
+          "If the file moved, update PYTHON_SOURCE_FILES in scripts/python-surface.mjs.",
+      );
+      if (!isRetryableStatus(response.status)) throw error;
+      lastError = error;
+    } catch (error) {
+      // A transport failure (`TypeError: fetch failed`, with an ECONNRESET or
+      // a TLS reset underneath) arrives as a throw rather than a status, and
+      // is the case this loop exists for.
+      lastError = error;
+      if (error instanceof Error && error.message.startsWith(`GET ${url} ->`)) throw error;
+    }
+
+    if (attempt < FETCH_ATTEMPTS) await sleep(FETCH_BACKOFF_MS[attempt - 1]);
   }
-  return await response.text();
+
+  throw new Error(
+    `GET ${url} failed after ${String(FETCH_ATTEMPTS)} attempts: ${String(lastError)}. ` +
+      "If this persists it is not a blip — check whether the file moved, and update " +
+      "PYTHON_SOURCE_FILES in scripts/python-surface.mjs.",
+    { cause: lastError },
+  );
 }
 
 /** Stable, human-diffable JSON — this file is reviewed, not just parsed. */
@@ -122,4 +172,9 @@ async function main() {
   console.log(`OK: parity/python-surface.json matches ${REPO}@${args.ref}`);
 }
 
-await main();
+// Run only as a CLI. Exported for `src/sdk/sync-python-surface.test.ts`, which
+// exercises the retry against a stubbed `fetch` — importing this module must
+// not reach the network or rewrite the snapshot as a side effect.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  await main();
+}
