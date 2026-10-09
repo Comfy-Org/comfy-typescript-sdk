@@ -36,6 +36,27 @@ export const PYTHON_SOURCE_FILES = {
 /** The two `models` namespace classes: the sync client's, then the async client's. */
 export const PYTHON_MODELS_CLASSES = ["Models", "AsyncModels"];
 
+/**
+ * Public classes in `models.py` that are DATA, not a namespace surface.
+ *
+ * The unknown-class guard in {@link extractModelsMethods} exists to catch a
+ * third namespace appearing — a surface this check would otherwise quietly not
+ * look at. A result envelope is not that: `RouterRunResult` is what
+ * `Models.run_detailed` returns, a record of what Router disclosed about a run
+ * (serving provider, dropped params, replay, credits), and it carries no
+ * methods to compare. Listing it here says "recognized, and deliberately not a
+ * method surface" rather than weakening the guard for everything.
+ *
+ * Its TypeScript counterpart is the `{ data, requestId }` envelope
+ * `comfy.models.run` already returns — the `result-envelope` asymmetry
+ * declared in `src/sdk/surface-parity.test.ts`.
+ *
+ * Kept honest by {@link extractModelsMethods}, which fails on an entry the
+ * Python module no longer defines, so this list cannot rot into a blanket
+ * exemption any more than the parity test's allowlist can.
+ */
+export const PYTHON_MODELS_DATA_CLASSES = ["RouterRunResult"];
+
 class ExtractionError extends Error {}
 
 function fail(message) {
@@ -114,13 +135,26 @@ function publicMethods(body) {
  */
 export function extractModelsMethods(source) {
   const declared = [...source.matchAll(/^class\s+([A-Za-z]\w*)\s*[(:]/gm)].map((m) => m[1]);
-  const unknown = declared.filter((name) => !PYTHON_MODELS_CLASSES.includes(name));
+  const known = [...PYTHON_MODELS_CLASSES, ...PYTHON_MODELS_DATA_CLASSES];
+  const unknown = declared.filter((name) => !known.includes(name));
   if (unknown.length > 0) {
     fail(
       `${PYTHON_SOURCE_FILES.models}: unrecognized public class(es) ${unknown.join(", ")}. ` +
         "If one of them is part of the `models` namespace surface, add it to " +
-        "PYTHON_MODELS_CLASSES (and declare any intentional asymmetry in " +
-        "src/sdk/surface-parity.test.ts).",
+        "PYTHON_MODELS_CLASSES; if it is a result or data type with no methods to " +
+        "compare, add it to PYTHON_MODELS_DATA_CLASSES (and declare any intentional " +
+        "asymmetry in src/sdk/surface-parity.test.ts).",
+    );
+  }
+
+  // A data class that no longer exists is rot, not tolerance: the entry would
+  // go on excusing a name nothing declares and hide the next real one.
+  const goneDataClasses = PYTHON_MODELS_DATA_CLASSES.filter((name) => !declared.includes(name));
+  if (goneDataClasses.length > 0) {
+    fail(
+      `${PYTHON_SOURCE_FILES.models}: PYTHON_MODELS_DATA_CLASSES names ` +
+        `${goneDataClasses.join(", ")}, which the module no longer defines. Delete the ` +
+        "entry rather than leaving it to excuse a class that is gone.",
     );
   }
 
@@ -319,21 +353,57 @@ function dunderAll(source, file) {
 }
 
 /**
- * Error classes the package root re-exports — the intersection of the classes
- * defined in `comfy_sdk/exceptions.py` and the names in `comfy_sdk.__all__`.
+ * Public names a module re-exports through a RELATIVE import.
  *
- * The router errors are deliberately not in here: the Python SDK does not
- * re-export `router_exceptions` from its root, because three of those names
- * are already taken at the root by the workflow-API exceptions. The
- * TypeScript SDK resolves the same collision the same way, with a
- * `routerErrors` namespace.
+ * `exceptions.py` is the root's supplier of error names, and it supplies some
+ * of them without defining them: `ComfyError` comes from `._errors`, and
+ * `Forbidden` / `InsufficientCredits` / `Unauthorized` / `RouterError` from
+ * `.router_exceptions`, which is how the Python SDK made the two modules share
+ * ONE class object per name instead of two classes wearing one name.
+ *
+ * Reading only `class` statements missed all of those the day they moved, and
+ * the miss did not read as a broken extraction — it read as "the Python root
+ * dropped four error classes", which the parity test then reported as this SDK
+ * leading. A false divergence is worse than a loud failure: it is the shape a
+ * real one would take.
+ *
+ * Relative imports only. `from comfy_low...` reaches into the low-level
+ * package for machinery (`ApiError`, `JobError`) that the SDK root does not
+ * publish, and the `__all__` intersection below would drop those anyway — but
+ * scoping to the SDK's own modules says so in the extraction rather than
+ * relying on a filter downstream. Underscore-prefixed names are private.
+ */
+function relativeReexports(source) {
+  const names = [];
+  for (const [, block] of source.matchAll(/^from \.[\w.]*\s*import\s+\(([\s\S]*?)^\)/gm)) {
+    names.push(...block.split(","));
+  }
+  for (const [, line] of source.matchAll(/^from \.[\w.]*\s*import\s+([^(\n]+)$/gm)) {
+    names.push(...line.split(","));
+  }
+  return names.map((name) => name.trim()).filter((name) => /^[A-Za-z]\w*$/.test(name));
+}
+
+/**
+ * Error classes the package root re-exports — the names `comfy_sdk.__all__`
+ * publishes that `comfy_sdk/exceptions.py` supplies, whether by defining them
+ * or by re-exporting them from a sibling module (see {@link relativeReexports}).
+ *
+ * The router errors are NOT categorically excluded, and the note that used to
+ * say so is why this needed fixing. The Python SDK now flattens the shared
+ * buckets — `Forbidden`, `InsufficientCredits`, `Unauthorized`, plus
+ * `RouterError` itself — into its root through this module. The TypeScript SDK
+ * keeps them in a `routerErrors` namespace instead; that divergence is real,
+ * and it belongs in the asymmetry allowlist in `src/sdk/surface-parity.test.ts`
+ * where a reviewer can see it, not hidden in an extractor that cannot look.
  */
 export function extractExportedErrorClasses(exceptionsSource, initSource) {
   const defined = [...exceptionsSource.matchAll(/^class\s+(\w+)\s*\(/gm)].map((m) => m[1]);
   if (defined.length === 0) fail(`${PYTHON_SOURCE_FILES.exceptions}: no classes found.`);
 
+  const supplied = new Set([...defined, ...relativeReexports(exceptionsSource)]);
   const exported = new Set(dunderAll(initSource, PYTHON_SOURCE_FILES.packageInit));
-  const names = defined.filter((name) => exported.has(name)).sort();
+  const names = [...supplied].filter((name) => exported.has(name)).sort();
   if (names.length === 0) {
     fail(
       `${PYTHON_SOURCE_FILES.exceptions}: none of its classes appear in ` +
