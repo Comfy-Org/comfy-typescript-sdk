@@ -297,14 +297,17 @@ export interface CostEstimate {
   credits: number | null;
   /**
    * Why there is no figure, on an unknown quote — `"not_quotable"`,
-   * `"unpriced_model"`, or a newer value, verbatim. `null` when absent.
+   * `"unpriced_model"`, or a newer value, verbatim. `null` when absent. The
+   * contract reads any value other than those two as `"not_quotable"`, so
+   * branch on `reason === "unpriced_model"` rather than on `"not_quotable"`.
    */
   reason: string | null;
   /**
    * The decoded `estimate` object, unmodified — the escape hatch for a field
-   * this interface does not model yet.
+   * this interface does not model yet. A frozen copy, not the response body
+   * itself.
    */
-  raw: Record<string, unknown>;
+  raw: Readonly<Record<string, unknown>>;
 }
 
 /** Options accepted by {@link Models.submit}. */
@@ -420,6 +423,9 @@ function text(value: unknown): string | null {
   return trimmed === "" ? null : trimmed;
 }
 
+/** A Router dollar figure: `"0.04"`, `"12"` — digits, an optional fraction, nothing else. */
+const DOLLARS = /^\d+(?:\.\d+)?$/;
+
 function invalidResponse(message: string, requestId: string | null, httpStatus?: number) {
   return new ComfyError(message, { code: "invalid_response", httpStatus, requestId });
 }
@@ -517,13 +523,19 @@ function requestIdOf(body: unknown, response: QueueResponse): string {
  * has already accepted, so a quote this SDK cannot read must not turn a
  * queued (and possibly billed) request into a failed call that lost its
  * handle. Any malformed shape — not an object, a required field missing or
- * not a non-empty string, an optional field present with the wrong type —
- * reads as `null`, "no quote available", rather than as a partial quote whose
- * missing figure a caller could mistake for zero.
+ * not a non-empty string, an optional field present with the wrong type, a
+ * dollar figure that is not a decimal numeral, an `exact` quote with no
+ * `amount` or an `estimated` one missing a bound — reads as `null`, "no quote
+ * available", rather than as a partial quote whose missing figure a caller
+ * could mistake for zero.
  */
 export function costEstimateOf(value: unknown): CostEstimate | null {
   if (!isRecord(value)) return null;
-  const source = text(value.source);
+  // Verbatim, NOT through `text()`: trimming would read `" exact "` as a
+  // trusted exact quote, where the contract says an unrecognised spelling is
+  // `unknown`.
+  const source =
+    typeof value.source === "string" && value.source.trim() !== "" ? value.source : null;
   const currency = text(value.currency);
   const provider = text(value.provider);
   const model = text(value.model);
@@ -547,9 +559,16 @@ export function costEstimateOf(value: unknown): CostEstimate | null {
       : typeof field === "number" && Number.isFinite(field)
         ? field
         : undefined;
-  const amount = optionalText(value.amount);
-  const minAmount = optionalText(value.min_amount);
-  const maxAmount = optionalText(value.max_amount);
+  // The contract's dollar string: a plain decimal, no sign and no exponent. An
+  // empty or non-numeric one would print as a bare `$`, or as `0` through
+  // `Number("")`.
+  const optionalDollars = (field: unknown): string | null | undefined => {
+    const read = optionalText(field);
+    return typeof read === "string" && !DOLLARS.test(read) ? undefined : read;
+  };
+  const amount = optionalDollars(value.amount);
+  const minAmount = optionalDollars(value.min_amount);
+  const maxAmount = optionalDollars(value.max_amount);
   const reason = optionalText(value.reason);
   const amountCents = optionalNumber(value.amount_cents);
   const minAmountCents = optionalNumber(value.min_amount_cents);
@@ -569,6 +588,10 @@ export function costEstimateOf(value: unknown): CostEstimate | null {
   }
   const isExact = source === "exact";
   const isEstimated = source === "estimated";
+  // The figure the source promises must be there: an `exact` quote without its
+  // `amount`, or a range missing a bound, is the partial quote rejected above.
+  if (isExact && amount === null) return null;
+  if (isEstimated && (minAmount === null || maxAmount === null)) return null;
   return Object.freeze({
     source,
     isExact,
@@ -587,7 +610,10 @@ export function costEstimateOf(value: unknown): CostEstimate | null {
     maxAmountCents,
     credits,
     reason,
-    raw: value,
+    // A copy, so freezing it does not freeze the caller's decoded body and
+    // nothing holding the estimate can change what it reports. Every field the
+    // contract declares is a scalar, so one level is the whole object.
+    raw: Object.freeze({ ...value }),
   });
 }
 

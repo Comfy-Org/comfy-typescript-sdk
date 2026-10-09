@@ -376,12 +376,43 @@ describe("RequestHandle.estimate", () => {
       { ...BASE, source: "exact", amount: "0.04", credits: "8.44" },
       { ...BASE, source: "estimated", min_amount: 0, max_amount: "1" },
       { ...BASE, source: "unknown", reason: 7 },
+      // The figure the source promises is missing.
+      { ...BASE, source: "exact" },
+      { ...BASE, source: "exact", amount: null, amount_cents: 4 },
+      { ...BASE, source: "estimated", min_amount: "0.01" },
+      { ...BASE, source: "estimated", max_amount: "0.05" },
+      // A dollar figure that is not a decimal numeral.
+      { ...BASE, source: "exact", amount: "" },
+      { ...BASE, source: "exact", amount: " " },
+      { ...BASE, source: "exact", amount: "abc" },
+      { ...BASE, source: "exact", amount: "1e-2" },
+      { ...BASE, source: "exact", amount: "-0.04" },
+      { ...BASE, source: "estimated", min_amount: "0.01", max_amount: "$0.05" },
     ];
     for (const estimate of malformed) {
       const handle = await submitWith(estimate);
       expect(handle.requestId, JSON.stringify(estimate)).toBe(REQUEST_ID);
       expect(handle.estimate, JSON.stringify(estimate)).toBeNull();
     }
+  });
+
+  it("keeps an unrecognised spelling of source unrecognised rather than trimming it", async () => {
+    const handle = await submitWith({ ...BASE, source: " exact ", amount: "0.04" });
+    expect(handle.estimate).toMatchObject({
+      source: " exact ",
+      isExact: false,
+      isEstimated: false,
+      isUnknown: true,
+    });
+  });
+
+  it("holds raw as a frozen copy, not the decoded body itself", () => {
+    const wire = { ...BASE, source: "exact", amount: "0.04" };
+    const estimate = costEstimateOf(wire);
+    expect(estimate?.raw).toEqual(wire);
+    expect(estimate?.raw).not.toBe(wire);
+    expect(Object.isFrozen(estimate?.raw)).toBe(true);
+    expect(Object.isFrozen(wire)).toBe(false);
   });
 
   it("reads a non-finite number as malformed, and never throws on any input", () => {

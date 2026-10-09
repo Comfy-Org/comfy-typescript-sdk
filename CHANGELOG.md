@@ -20,8 +20,8 @@ entry. See CONTRIBUTING.md.
 ### Added
 
 - **A queued submit's cost quote is on the handle.** When Router quotes a
-  request on admission, `comfy.models.submit` (and so `subscribe`) now reads it
-  into `RequestHandle.estimate`, a new exported `CostEstimate`: `source` as the
+  request on admission, `comfy.models.submit` now reads it into
+  `RequestHandle.estimate`, a new exported `CostEstimate`: `source` as the
   server's open string, `isExact` / `isEstimated` / `isUnknown` to branch on (an
   unrecognised source reads as unknown), the dollar figures `amount` /
   `minAmount` / `maxAmount` as decimal strings, their `*Cents` and `credits`
