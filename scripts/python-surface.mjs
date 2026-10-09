@@ -31,7 +31,11 @@ export const PYTHON_SOURCE_FILES = {
   exceptions: "src/comfy_sdk/exceptions.py",
   packageInit: "src/comfy_sdk/__init__.py",
   retry: "src/comfy_sdk/retry.py",
+  client: "src/comfy_sdk/client.py",
 };
+
+/** The Python resolver whose order the class client here has to match. */
+export const PYTHON_API_KEY_RESOLVER = "_resolve_api_key";
 
 /** The two `models` namespace classes: the sync client's, then the async client's. */
 export const PYTHON_MODELS_CLASSES = ["Models", "AsyncModels"];
@@ -81,6 +85,26 @@ function classBody(source, className) {
   for (let i = start + 1; i < lines.length; i += 1) {
     const line = lines[i];
     if (line.trim() !== "" && !/^\s/.test(line)) break;
+    body.push(line);
+  }
+  return body;
+}
+
+/**
+ * The lines of a top-level `def <name>` body, or `null` if there is no such
+ * function. Ends the same way {@link classBody} does — at the next line that
+ * starts in column 0 with something other than whitespace.
+ */
+function functionBody(source, functionName) {
+  const lines = source.split("\n");
+  const start = lines.findIndex((line) => new RegExp(`^def ${functionName}\\b`).test(line));
+  if (start === -1) return null;
+
+  const body = [];
+  for (let i = start + 1; i < lines.length; i += 1) {
+    const line = lines[i];
+    // A comment at column 0 is valid inside a body; only code ends it.
+    if (line.trim() !== "" && !/^\s/.test(line) && !line.startsWith("#")) break;
     body.push(line);
   }
   return body;
@@ -343,6 +367,223 @@ export function extractRetryPolicyFields(source) {
   return fields;
 }
 
+/**
+ * How the Python client resolves its API key: the two environment variable
+ * names, the Comfy Cloud base URL, the order the sources are tried in, the
+ * error raised when they are exhausted against Comfy Cloud, and whether an
+ * unresolved key stays legal off it.
+ *
+ * A BEHAVIOUR rather than a name, like the status fallback table: the two SDKs
+ * can spell every symbol identically and still disagree about the single most
+ * common first line of code. `new Comfy()` reading no environment while
+ * `comfy_sdk.Comfy()` reads `COMFY_API_KEY` is precisely the drift this
+ * records, so the parity test can derive the same facts from this SDK by
+ * CONSTRUCTING clients and compare the two.
+ *
+ * The shapes read here are the resolver's contract rather than incidental
+ * formatting — the candidate sequence IS the documented precedence, and the
+ * cloud-guarded raise IS the "Comfy Cloud always requires a key" rule.
+ *
+ * `src/sdk/surface-parity.test.ts` compares each field against this SDK's
+ * constants and its live constructions ("credential resolution").
+ */
+export function extractCredentialResolution(source) {
+  const constant = (name) => {
+    const match = new RegExp(`^${name}\\s*(?::[^=\\n]+)?=\\s*"([^"]+)"`, "m").exec(source);
+    if (!match) {
+      fail(`${PYTHON_SOURCE_FILES.client}: no \`${name}\` string constant found.`);
+    }
+    return match[1];
+  };
+
+  const body = functionBody(source, PYTHON_API_KEY_RESOLVER);
+  if (body === null) {
+    fail(`${PYTHON_SOURCE_FILES.client}: no \`def ${PYTHON_API_KEY_RESOLVER}\` found.`);
+  }
+  const text = body.join("\n");
+
+  // `for candidate in (explicit, os.environ.get(API_KEY_ENV_VAR)):` — the
+  // tuple's order is the precedence, so it is read rather than assumed.
+  // The opening is found by regex and the closing by a depth scan, so a
+  // candidate with nested calls (`os.environ.get(VAR, default())`) is one
+  // candidate rather than a truncated tuple. Anchored to a statement line, so
+  // a commented-out loop or a prose mention is not read as the live one.
+  const opening = /^[ \t]*for\s+\w+\s+in\s+\(/m.exec(text);
+  const close = opening ? matchingClose(text, opening.index + opening[0].length) : -1;
+  const sequence =
+    close !== -1 && /^\)\s*:/.test(text.slice(close))
+      ? [null, text.slice(opening.index + opening[0].length, close)]
+      : null;
+  if (!sequence) {
+    fail(
+      `${PYTHON_SOURCE_FILES.client}: \`${PYTHON_API_KEY_RESOLVER}\` declares no ` +
+        "`for ... in (...)` candidate sequence. That tuple IS the documented precedence; " +
+        "an unread one would let the two SDKs try their sources in different orders.",
+    );
+  }
+  const order = splitTopLevel(sequence[1])
+    .map((expr) => expr.trim())
+    .filter(Boolean)
+    .map((expr) => {
+      if (expr === "explicit") return "explicit";
+      // The exact constant, as the first argument: a substring match would
+      // read `LEGACY_API_KEY_ENV_VAR` as the same source.
+      if (/^os\.environ\.get\(\s*API_KEY_ENV_VAR\s*[,)]/.test(expr)) return "environment";
+      fail(
+        `${PYTHON_SOURCE_FILES.client}: \`${PYTHON_API_KEY_RESOLVER}\` tries an unrecognized ` +
+          `credential source \`${expr}\`. Teach this extractor what it is — a source it cannot ` +
+          "name is a source the parity check cannot compare.",
+      );
+      return expr;
+    });
+  if (order.length < 2) {
+    fail(
+      `${PYTHON_SOURCE_FILES.client}: \`${PYTHON_API_KEY_RESOLVER}\` yielded ${String(order.length)} ` +
+        "credential source(s). Fewer than two is a broken extraction, not a precedence.",
+    );
+  }
+  if (new Set(order).size !== order.length) {
+    fail(
+      `${PYTHON_SOURCE_FILES.client}: \`${PYTHON_API_KEY_RESOLVER}\` tries the same credential ` +
+        `source twice (${order.join(", ")}). Teach this extractor to tell them apart — two ` +
+        "sources read as one kind would claim a parity the check never verified.",
+    );
+  }
+
+  if (!/raise\s+\w+\(/.test(text)) {
+    fail(
+      `${PYTHON_SOURCE_FILES.client}: \`${PYTHON_API_KEY_RESOLVER}\` raises nothing. Comfy ` +
+        "Cloud always requires a key, so exhausting every source there is a local error.",
+    );
+  }
+  // The raise that counts is the one INSIDE the `if _same_deployment(...):`
+  // block — not merely the first one after some mention of the check. A
+  // negated guard (`if not ...`), a mention in a comment or docstring, or an
+  // earlier type-check raise would otherwise read as the cloud-guarded error.
+  const raise = cloudGuardedRaise(text);
+  if (!raise) {
+    fail(
+      `${PYTHON_SOURCE_FILES.client}: \`${PYTHON_API_KEY_RESOLVER}\` does not guard its raise ` +
+        "with a Comfy Cloud check. An unguarded one would make a keyless self-hosted " +
+        "deployment an error, which is the flow both SDKs promise to keep working.",
+    );
+  }
+  if (!/return\s+None\s*$/.test(text.trimEnd())) {
+    fail(
+      `${PYTHON_SOURCE_FILES.client}: \`${PYTHON_API_KEY_RESOLVER}\` does not end by returning ` +
+        "`None`. Off Comfy Cloud an unresolved key means `send no credentials`, and a " +
+        "resolver that stopped saying so would be a divergence this check must see.",
+    );
+  }
+
+  return {
+    resolver: PYTHON_API_KEY_RESOLVER,
+    apiKeyEnvVar: constant("API_KEY_ENV_VAR"),
+    baseUrlEnvVar: constant("BASE_URL_ENV_VAR"),
+    cloudBaseUrl: constant("COMFY_CLOUD_BASE_URL"),
+    order,
+    missingKeyError: raise[1],
+  };
+}
+
+/**
+ * The `raise X(` directly inside an `if _same_deployment(..., COMFY_CLOUD_BASE_URL):`
+ * block, or null.
+ *
+ * The call's close is found by depth (so `base_url.rstrip("/")` is one
+ * argument) and the header may carry a trailing comment, but nothing else: a
+ * condition extended with `and ...` no longer means "on Comfy Cloud". The
+ * guard must also sit at the resolver body's own indentation: one nested
+ * under a further condition (`if strict_mode:`) only fires under that
+ * condition, so Cloud could still fall through to `return None`.
+ */
+function cloudGuardedRaise(text) {
+  const bodyIndent = directIndent(text);
+  for (const header of text.matchAll(/^([ \t]*)if\s+_same_deployment\(/gm)) {
+    if (header[1].length !== bodyIndent) continue;
+    const argsStart = header.index + header[0].length;
+    const close = matchingClose(text, argsStart);
+    if (close === -1) continue;
+    if (!text.slice(argsStart, close).includes("COMFY_CLOUD_BASE_URL")) continue;
+    const tail = /^\)\s*:[ \t]*(?:#[^\n]*)?(?:\n|$)/.exec(text.slice(close));
+    if (!tail) continue;
+    const raise = guardedRaise(text.slice(close + tail[0].length), header[1]);
+    if (raise) return raise;
+  }
+  return null;
+}
+
+/**
+ * The indentation of the first code line in `text` — a function body's own
+ * statement level — or -1 if it has none. Blank and comment lines are skipped.
+ */
+function directIndent(text) {
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed.startsWith("#")) continue;
+    return /^[ \t]*/.exec(line)[0].length;
+  }
+  return -1;
+}
+
+/**
+ * The first `raise X(` at the direct indentation of the block that follows an
+ * `if` indented by `indent`, or null. Blank and comment lines are skipped, as
+ * Python does; the block ends at the first other line indented no deeper than
+ * the `if`. A raise nested under a further condition inside the block only
+ * fires under that condition too, so it does not count.
+ */
+function guardedRaise(rest, indent) {
+  let blockIndent = null;
+  for (const line of rest.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed.startsWith("#")) continue;
+    const lineIndent = /^[ \t]*/.exec(line)[0];
+    if (lineIndent.length <= indent.length) return null;
+    blockIndent ??= lineIndent.length;
+    if (lineIndent.length !== blockIndent) continue;
+    const raise = /^\s*raise\s+(\w+)\(/.exec(line);
+    if (raise) return raise;
+  }
+  return null;
+}
+
+/**
+ * The index of the bracket closing the one opened just before `start`, or -1
+ * if it never closes. The same depth tracking as {@link splitTopLevel}.
+ */
+function matchingClose(text, start) {
+  let depth = 0;
+  for (let i = start; i < text.length; i += 1) {
+    const char = text[i];
+    if (char === "(" || char === "[") depth += 1;
+    else if (char === ")" || char === "]") {
+      if (depth === 0) return i;
+      depth -= 1;
+    }
+  }
+  return -1;
+}
+
+/** Split a Python tuple's text on its own commas, ignoring nested calls. */
+function splitTopLevel(text) {
+  const parts = [];
+  let depth = 0;
+  let current = "";
+  for (const char of text) {
+    if (char === "(" || char === "[") depth += 1;
+    else if (char === ")" || char === "]") depth -= 1;
+    if (char === "," && depth === 0) {
+      parts.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  parts.push(current);
+  return parts;
+}
+
 /** The names in a module's `__all__`, in declaration order. */
 function dunderAll(source, file) {
   const block = /^__all__[^=]*=\s*\[([\s\S]*?)^\]/m.exec(source);
@@ -414,7 +655,7 @@ export function extractExportedErrorClasses(exceptionsSource, initSource) {
 }
 
 /**
- * Build the whole manifest from the four Python source files.
+ * Build the whole manifest from the Python source files.
  *
  * `sources` is keyed by the keys of {@link PYTHON_SOURCE_FILES}.
  */
@@ -436,5 +677,6 @@ export function extractPythonSurface(sources, { repo, ref }) {
     routerErrorTypeByStatus: extractErrorTypeByStatus(sources.routerExceptions),
     exportedErrorClasses: extractExportedErrorClasses(sources.exceptions, sources.packageInit),
     retryPolicyFields: extractRetryPolicyFields(sources.retry),
+    credentialResolution: extractCredentialResolution(sources.client),
   };
 }

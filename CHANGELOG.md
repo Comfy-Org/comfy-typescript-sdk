@@ -108,6 +108,28 @@ entry. See CONTRIBUTING.md.
   queued failure carrying one of them is a typed `catch` rather than a bare
   `RouterError`.
 
+### Changed
+
+- **Breaking:** `new Comfy()` now resolves `COMFY_API_KEY`, matching the Python
+  SDK. The class client takes its credential from the explicit `apiKey` option,
+  then from `COMFY_API_KEY` in the environment (trimmed; blank counts as unset,
+  and it is read per construction), then — targeting Comfy Cloud, which always
+  requires one — throws `MissingCredentials` at construction naming both ways to
+  supply it, before any request. `comfy.models.*` already read that variable;
+  the class client did not, so `new Comfy()` used to send no `Authorization`
+  header and come back with a bare `401` from the server. Pointing
+  `COMFY_BASE_URL` at another deployment keeps the keyless flow: an unresolved
+  key there is not an error and means "send no credentials". A `COMFY_API_KEY`
+  set in the environment, though, is now sent to that deployment too, as the
+  Python SDK does — unset it for a keyless target. The
+  `new Comfy({ apiKey: process.env.COMFY_API_KEY })` workaround in the README
+  is gone. **Note for callers who relied on the old behaviour:** `new Comfy()`
+  against Comfy Cloud with no key anywhere now throws locally instead of failing
+  on the first call, and an `apiKey` that is not a string — including `null`, as
+  a JSON config file spells "absent" — now throws a `TypeError` at
+  construction. Pass `undefined` (or omit the field) to fall back to the
+  environment.
+
 ### Fixed
 
 - **The `droppedParams` doc comments now match the vendored Router contract.**

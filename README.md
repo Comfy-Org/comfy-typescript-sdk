@@ -38,6 +38,8 @@ JavaScript is async-native).
 import { Comfy } from "@comfyorg/sdk";
 
 const client = new Comfy({ apiKey: "..." }); // Comfy Cloud
+// ...or set COMFY_API_KEY and write `new Comfy()` — the key is optional, the
+// environment variable is the fallback.
 // COMFY_BASE_URL=http://127.0.0.1:8189 targets a local proxy instead (no key needed)
 
 const wf = await client.workflows.fromFile("workflow_api.json");
@@ -68,11 +70,42 @@ await job.getOutputs("13")[0].toFile("out.png");
 
 ## Auth, per surface
 
-| Surface                                                            | Auth                                   |
-| ------------------------------------------------------------------ | -------------------------------------- |
-| Self-hosted proxy (`comfy-api-proxy` in front of your own ComfyUI) | none — do **not** pass `apiKey`        |
-| Comfy Cloud                                                        | `new Comfy({ apiKey: "comfyui-..." })` |
-| Serverless                                                         | `new Comfy({ apiKey: "comfyui-..." })` |
+| Surface                                                            | Auth                                                       |
+| ------------------------------------------------------------------ | ---------------------------------------------------------- |
+| Self-hosted proxy (`comfy-api-proxy` in front of your own ComfyUI) | none — do **not** pass `apiKey`                            |
+| Comfy Cloud                                                        | `new Comfy({ apiKey: "comfyui-..." })`, or `COMFY_API_KEY` |
+| Serverless                                                         | `new Comfy({ apiKey: "comfyui-..." })`, or `COMFY_API_KEY` |
+
+`new Comfy()` resolves its credential at construction, in this order — the same
+order and the same variable the [Python SDK](https://github.com/Comfy-Org/comfy-python-sdk)
+uses, and the same variable `comfy.models.*` reads:
+
+1. The explicit `apiKey` option, when it is a non-blank string.
+2. Otherwise `COMFY_API_KEY` from the environment. Surrounding whitespace is
+   stripped and a blank value counts as unset, so `COMFY_API_KEY=` in a shell
+   profile is not an error, and a key read out of a file brings its trailing
+   newline along harmlessly. It is read **per construction**, so a process can
+   build successive clients under different credentials.
+3. Otherwise, targeting Comfy Cloud — which always requires a key — a
+   `MissingCredentials` thrown **at construction**, naming both ways to supply
+   one. No request is made: a missing credential reported as a server `401`
+   sends you looking at your key's validity instead of at its absence.
+
+Point `COMFY_BASE_URL` at another deployment and step 3 changes: an unresolved
+key is not an error there, and means "send no credentials at all" — a
+self-hosted ComfyUI behind `comfy-api-proxy` legitimately has none. Steps 1
+and 2 do **not** change: a `COMFY_API_KEY` in the environment is sent to
+whatever `COMFY_BASE_URL` names, as the Python SDK does. For a keyless
+deployment, leave `COMFY_API_KEY` unset in that process.
+
+A runtime with no `process` (a browser) never sees the variable, so there the
+`apiKey` option is the only source. `comfy.config({ credentials })` configures
+the `comfy.*` namespace only — deliberately, so a process-global credential
+cannot leak into a multi-tenant server's per-request clients — and does **not**
+configure a class client. `COMFY_API_KEY` is process-global too, though: a
+blank or whitespace-only `apiKey` counts as unset (as in the Python SDK) and
+falls through to it, so a per-request client in a process that sets
+`COMFY_API_KEY` should reject an empty tenant key before constructing.
 
 The client only attaches the `Authorization` header to requests aimed at its
 own target deployment's origin. If the server hands back an absolute URL on a
@@ -396,9 +429,9 @@ asset and handing the model the asset's download URL:
 ```ts
 import { Comfy, comfy } from "@comfyorg/sdk";
 
-// `comfy.models` reads COMFY_API_KEY from the environment; the class client
-// takes its key explicitly, so hand it the same one.
-const client = new Comfy({ apiKey: process.env.COMFY_API_KEY });
+// Both surfaces read COMFY_API_KEY when nothing was passed, so one variable
+// in the environment configures this whole snippet.
+const client = new Comfy();
 
 // 1. Upload the local image (dedup-aware; a re-run re-uploads nothing) and
 //    resolve a short-lived, self-authorizing signed URL for it.
@@ -561,6 +594,12 @@ export COMFY_BASE_URL="http://127.0.0.1:8189"               # self-hosted proxy
 
 It is read each time a client is constructed, must be an `http(s)` URL, and
 an unset or blank value (including whitespace-only) means Comfy Cloud.
+
+It also decides whether a missing credential is an error: see "Auth, per
+surface" above. Comfy Cloud is matched by normalized origin and path rather
+than by string, so `https://cloud.comfy.org:443` is still Comfy Cloud, while a
+deployment mounted under that host (`https://cloud.comfy.org/self-hosted`) is a
+different target and may go keyless.
 
 Upgrading from an earlier version: `new Comfy(url, opts)` becomes
 `new Comfy(opts)` with `COMFY_BASE_URL` set. A positional string now throws a
