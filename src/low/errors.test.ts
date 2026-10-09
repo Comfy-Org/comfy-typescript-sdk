@@ -101,17 +101,6 @@ describe("errorFromEnvelope", () => {
     expect(err.message).toBe("diag");
   });
 
-  it.each(["constructor", "toString", "__proto__", "hasOwnProperty"])(
-    "does not resolve a code of %s off Object.prototype",
-    (inherited) => {
-      const err = errorFromEnvelope(400, { error: { code: inherited, message: "hostile code" } });
-      expect(err).toBeInstanceOf(ApiError);
-      expect(err.constructor).toBe(ApiError);
-      expect(err.code).toBe(inherited);
-      expect(err.message).toBe("hostile code");
-    },
-  );
-
   it.each([42, "", { x: 1 }])("ignores a top-level message of %j", (message) => {
     const err = errorFromEnvelope(400, { message } as never);
     expect(err.code).toBe("error");

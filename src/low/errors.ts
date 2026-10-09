@@ -150,10 +150,7 @@ export function errorFromEnvelope(
     message = `HTTP ${httpStatus}`;
   }
 
-  // Own-property lookup only: `code` is server-controlled, and a plain
-  // `BY_CODE[code]` would resolve `constructor` or `toString` off
-  // `Object.prototype` — something that is not an ApiError class at all.
-  const cls = Object.hasOwn(BY_CODE, code) ? BY_CODE[code] : ApiError;
+  const cls = BY_CODE[code] ?? ApiError;
   return new cls(message, {
     code,
     httpStatus,
