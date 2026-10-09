@@ -237,6 +237,17 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
     exportedErrorClassesBehindPython: ["AlreadyCompleted", "CancelRefused"],
   },
   {
+    id: "queue-backlog-bucket-lands-first-in-typescript",
+    why:
+      "The vendored Router contract grew a fourth queue-tier bucket, `queue_backlog_full` (a " +
+      "queued submit refused because the caller already has too many requests waiting), and " +
+      "this SDK's spec-coverage gate requires a class per bucket the moment the spec declares " +
+      "one. The Python SDK has not reconciled the same spec sync yet, so its surface snapshot " +
+      "does not carry it. This is a LEAD, not a divergence: the rot guard below fails the " +
+      "moment the Python snapshot grows it, which is the signal to delete this entry.",
+    routerErrorClassesAheadOfPython: [["QueueBacklogFull", "queue_backlog_full"]],
+  },
+  {
     id: "collect-switched-off-by-budget",
     why:
       "Python switches the collect loop off with a BOOLEAN (`RetryPolicy.retry_collectable=False`) " +
