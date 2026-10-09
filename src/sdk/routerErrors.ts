@@ -354,7 +354,9 @@ export class RouterError extends Error {
    * ```
    *
    * Only the surfaces that raise `routerErrors.*` carry it — the queued
-   * `submit` / `subscribe` / `handle`. `comfy.models.run` maps its failures into
+   * `submit`, and a refused completion from `subscribe` or
+   * `RequestHandle.get()` (`status()` and `events()` report a completion as
+   * data and do not throw). `comfy.models.run` maps its failures into
    * the `ComfyError` family instead (a refusal there is a `ComfyError` with
    * `code: "content_policy_violation"`), and that error does not carry the
    * subject yet.

@@ -114,8 +114,11 @@ entry. See CONTRIBUTING.md.
   to the body's `refusal_subject`, so a caller can drop the one refused part
   and retry. `null` when the response names none. It is not narrowed to the
   ten documented values: treat an unknown value as unspecified. Only the
-  queued `submit` / `subscribe` / `handle` surface raises `RouterError`;
-  `models.run`'s `ComfyError` does not carry the subject yet.
+  queued surface raises `RouterError` — `submit`, and a refused completion
+  from `subscribe` or `RequestHandle.get()`; `RequestHandle.status()` and
+  `RequestHandle.events()` report a refused completion as data on
+  `QueueUpdate` rather than throwing. `models.run`'s `ComfyError` does not
+  carry the subject yet.
 
 ### Changed
 
