@@ -347,7 +347,9 @@ export class Job {
             // No status follows it, so surface it and stop — never reconnect.
             // Thrown after the try, so the reconnect dispatch below (and its
             // abort check, which would let the untranslated low error escape)
-            // never sees it.
+            // never sees it. The catch re-checks it too: `break` closes the
+            // iterator inside the try, and a rejection from that close (an
+            // already-errored body) would otherwise land there.
             terminalError = sseErrorFromFrame(raw.data);
             break;
           }
@@ -365,6 +367,7 @@ export class Job {
           yield event;
         }
       } catch (exc) {
+        if (terminalError !== null) throw toSdkError(terminalError);
         // A caller abort must propagate (and stop the loop), not be
         // swallowed as an ordinary mid-stream drop.
         if (signal?.aborted) throw exc;

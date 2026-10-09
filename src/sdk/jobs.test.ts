@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { StubServer } from "../../test/support/stub-server.js";
+import { ApiError } from "../low/errors.js";
 import { ComfyLow } from "../low/index.js";
+import type { RawEvent } from "../low/sse.js";
 import { abortableSleep } from "./abortable-sleep.js";
 import { ComfyError, Forbidden, JobFailed, NotFound, Unauthorized } from "./exceptions.js";
 import { JobFactory } from "./jobs.js";
@@ -324,6 +326,57 @@ describe("Job", () => {
       expect(abortableSleep).not.toHaveBeenCalled();
     }, 2000);
   });
+
+  it.each([
+    ["501", new ApiError("x", { code: "not_implemented", httpStatus: 501 })],
+    ["403", new ApiError("x", { code: "forbidden", httpStatus: 403 })],
+  ])(
+    "events() still rejects with the terminal frame when closing the iterator rejects with a %s",
+    async (_status, closeError) => {
+      // `break` closes the iterator inside the try; a rejection from that close
+      // lands in the catch, which must not swallow or replace the frame.
+      const job = await jobs.get("job_01");
+      vi.spyOn(low, "getJobEvents").mockImplementation(() => {
+        let sent = false;
+        const iterator: AsyncGenerator<RawEvent, void, void> = {
+          next: async () => {
+            if (sent) return { done: true, value: undefined };
+            sent = true;
+            return {
+              done: false,
+              value: { event: "error", data: { error: { code: "credential_expired" } } },
+            };
+          },
+          return: async () => {
+            throw closeError;
+          },
+          throw: async (e: unknown) => {
+            throw e;
+          },
+          [Symbol.asyncIterator]() {
+            return iterator;
+          },
+          [Symbol.asyncDispose]: async () => {},
+        };
+        return iterator;
+      });
+      const pollBefore = server.state.jobPollCount;
+
+      const err = await (async () => {
+        for await (const _event of job.events()) {
+          // drain
+        }
+      })().then(
+        () => null,
+        (exc: unknown) => exc,
+      );
+      expect(err).toBeInstanceOf(Unauthorized);
+      expect((err as ComfyError).code).toBe("credential_expired");
+      expect(server.state.jobPollCount).toBe(pollBefore);
+      expect(abortableSleep).not.toHaveBeenCalled();
+    },
+    2000,
+  );
 
   it("events() clamps an absurd SSE 429 Retry-After to MAX_RECONNECT_PAUSE_MS, instead of pausing for it verbatim", async () => {
     server.state.eventsStatus = 429;

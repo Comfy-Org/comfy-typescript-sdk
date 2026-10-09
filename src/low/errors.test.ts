@@ -100,6 +100,30 @@ describe("sseErrorFromFrame", () => {
     expect(err.message).toContain("forbidden");
   });
 
+  it.each([
+    ["a string `error`", { error: "gateway timeout" }, "gateway timeout"],
+    ["a non-object JSON string", { value: "credential expired" }, "credential expired"],
+    ["a non-object JSON number", { value: 42 }, "42"],
+    ["an object with no envelope", { reason: "gone" }, '{"reason":"gone"}'],
+  ])("keeps the server's reason from %s", (_label, data, message) => {
+    const err = sseErrorFromFrame(data);
+    expect(err.constructor).toBe(ApiError);
+    expect(err.code).toBe("error");
+    expect(err.message).toBe(message);
+  });
+
+  it("names the frame when its payload is empty", () => {
+    const err = sseErrorFromFrame({ raw: "" });
+    expect(err.message).toBe("event stream ended with an `error` frame (error)");
+  });
+
+  it("flattens line breaks and bounds the length of a server-stated reason", () => {
+    const err = sseErrorFromFrame({ raw: `forged\r\nline ${"x".repeat(10_000)}` });
+    expect(err.message).not.toMatch(/[\r\n]/);
+    expect(err.message.startsWith("forged line x")).toBe(true);
+    expect(err.message.length).toBe(501);
+  });
+
   it.each(["constructor", "toString", "valueOf", "__proto__"])(
     "does not resolve the code %s through Object.prototype",
     (code) => {

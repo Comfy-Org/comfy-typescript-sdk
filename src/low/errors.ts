@@ -179,13 +179,45 @@ const SSE_STATUS_BY_CODE: Record<string, number> = {
  * payload (or names the frame) rather than reporting a nonexistent `HTTP 0`.
  */
 export function sseErrorFromFrame(data: Record<string, unknown>): ApiError {
-  const raw = (data as ErrorEnvelopeBody).error;
-  const err = raw && typeof raw === "object" ? raw : undefined;
+  const raw: unknown = (data as ErrorEnvelopeBody).error;
+  const err =
+    raw && typeof raw === "object" ? (raw as NonNullable<ErrorEnvelopeBody["error"]>) : undefined;
   const code = typeof err?.code === "string" && err.code ? err.code : "error";
   const httpStatus = Object.hasOwn(SSE_STATUS_BY_CODE, code) ? SSE_STATUS_BY_CODE[code] : 0;
-  const message =
+  // With no envelope message, keep whatever the server did say: a string
+  // `error`, a non-JSON line (`raw`), a non-object JSON value (`value`), or
+  // failing those the payload itself.
+  const stated =
     (typeof err?.message === "string" && err.message) ||
-    (typeof data.raw === "string" && data.raw) ||
-    `event stream ended with an \`error\` frame (${code})`;
+    (typeof raw === "string" && raw) ||
+    (err === undefined ? framePayloadText(data) : "");
+  const message =
+    sanitizeFrameMessage(stated) || `event stream ended with an \`error\` frame (${code})`;
   return errorFromEnvelope(httpStatus, { error: { code, message, details: err?.details ?? null } });
+}
+
+function framePayloadText(data: Record<string, unknown>): string {
+  const payload = Object.hasOwn(data, "raw")
+    ? data.raw
+    : Object.hasOwn(data, "value")
+      ? data.value
+      : data;
+  if (typeof payload === "string") return payload;
+  if (payload && typeof payload === "object" && Object.keys(payload).length === 0) return "";
+  return JSON.stringify(payload) ?? "";
+}
+
+/** Longest server-stated reason an SSE `error` frame may put in `Error.message`. */
+const MAX_FRAME_MESSAGE_LENGTH = 500;
+
+/**
+ * The server's stated reason, made safe for a log line: line breaks (a
+ * multi-line `data:` field arrives joined with `\n`) collapse to a space, and
+ * the text is bounded so a frame cannot pin megabytes on the error.
+ */
+function sanitizeFrameMessage(text: string): string {
+  const flat = text.replace(/[\r\n]+/g, " ").trim();
+  return flat.length > MAX_FRAME_MESSAGE_LENGTH
+    ? `${flat.slice(0, MAX_FRAME_MESSAGE_LENGTH)}…`
+    : flat;
 }
