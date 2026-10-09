@@ -217,6 +217,28 @@ export const FALLBACK_PROVIDER_HEADER = "X-Comfy-Router-Fallback-Provider";
 export const DROPPED_PARAMS_HEADER = "X-Comfy-Router-Dropped-Params";
 
 /**
+ * `Idempotent-Replayed` — present (and `true`) only when Router served this
+ * response from an `Idempotency-Key`'s record instead of running the model
+ * again. See {@link RunJsonResult.replayed}. Pinned against the vendored
+ * contract's `RouterIdempotentReplayedHeader` in `router-spec-contract.test.ts`.
+ */
+export const IDEMPOTENT_REPLAYED_HEADER = "Idempotent-Replayed";
+
+/**
+ * Whether the `Idempotent-Replayed` header was present.
+ *
+ * Presence, not value: Router omits the header on a fresh run rather than
+ * sending `false`, and its own contract says so in as many words ("branch on
+ * its presence"). So a `false` on the wire — which nothing is documented to
+ * send, but which a proxy or a future server could — still reads as a replay,
+ * because the only thing the header's arrival can mean is that this answer
+ * came off the record.
+ */
+export function parseReplayed(raw: string | null): boolean {
+  return raw !== null;
+}
+
+/**
  * `X-Comfy-Credits-Used` — what Router priced this call at, in credits. See
  * {@link RunJsonResult.creditsUsed}.
  *
@@ -335,6 +357,33 @@ export interface RunJsonResult<TData = unknown> {
    */
   droppedParams: readonly string[] | null;
   /**
+   * `Idempotent-Replayed`: `true` when Router answered this call from the
+   * record held against its `Idempotency-Key` rather than by running the model
+   * again.
+   *
+   * A replay is not charged a second time. It happens on this SDK's own
+   * collect loop (a same-key re-send after a `409 concurrency_limit_exceeded`
+   * or `504 deadline_exceeded`) and on a caller's own retry under a supplied
+   * `idempotencyKey`. On a replay every disclosure field RESTATES the original
+   * run rather than describing a second one, so a spend tracker must SKIP a
+   * result with `replayed: true` instead of adding its cost up again.
+   *
+   * Derived from the header's PRESENCE, exactly as the Python SDK's
+   * `RouterRunResult.replayed` is: Router omits the header on a fresh run
+   * rather than sending `false`. Always `false` on a result from
+   * {@link RequestHandle.get}: the queued result route never carries the
+   * header, and re-collecting the same handle is deduplicated by
+   * `RequestHandle.requestId` instead.
+   *
+   * OPTIONAL only for source compatibility, on the same terms as
+   * {@link creditsUsed}: every result this SDK constructs sets it, and the `?`
+   * keeps a consumer's own result literal written against 0.4.0 compiling. A
+   * hand-built literal that omits it reads as `undefined`, which is falsy —
+   * "not a replay" — so `if (result.replayed)` needs no extra care.
+   */
+  replayed?: boolean;
+
+  /**
    * `X-Comfy-Credits-Used`: what Router priced this call at, verbatim — a
    * decimal string (`"12.5"`). The contract does not fix its scale, so do not
    * round or store it at a fixed number of places.
@@ -415,6 +464,8 @@ export interface RunBinaryResult {
   servingProvider: string | null;
   /** As {@link RunJsonResult.droppedParams}. */
   droppedParams: readonly string[] | null;
+  /** As {@link RunJsonResult.replayed}, optional for the same reason. */
+  replayed?: boolean;
   /** As {@link RunJsonResult.creditsUsed}, optional for the same reason. */
   creditsUsed?: string | null;
 }
@@ -444,7 +495,7 @@ export type RunResult<TData = unknown> = RunJsonResult<TData> | RunBinaryResult;
 /**
  * A {@link RunResult} as this SDK CONSTRUCTS one: every optional field set.
  *
- * `creditsUsed` is optional on the two published interfaces purely so a
+ * `replayed` and `creditsUsed` are optional on the two published interfaces purely so a
  * consumer's own result literal still compiles against them (see
  * {@link RunJsonResult.creditsUsed}). Inside this package the opposite rule
  * has to hold: a return site that omits it answers `undefined`, which a
@@ -456,8 +507,8 @@ export type RunResult<TData = unknown> = RunJsonResult<TData> | RunBinaryResult;
  * that went missing.
  */
 export type BuiltRunResult<TData = unknown> =
-  | (RunJsonResult<TData> & Required<Pick<RunJsonResult<TData>, "creditsUsed">>)
-  | (RunBinaryResult & Required<Pick<RunBinaryResult, "creditsUsed">>);
+  | (RunJsonResult<TData> & Required<Pick<RunJsonResult<TData>, "replayed" | "creditsUsed">>)
+  | (RunBinaryResult & Required<Pick<RunBinaryResult, "replayed" | "creditsUsed">>);
 
 export interface RunOptions {
   /**
@@ -1432,6 +1483,10 @@ function finish<TData>(
   // cannot tell an alt-provider run from a native one.
   const servingProvider = response.headers.get(FALLBACK_PROVIDER_HEADER);
   const droppedParams = parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER));
+  // Read here for the same reason: whether this answer came off the
+  // `Idempotency-Key`'s record or from a run that really happened is not
+  // recoverable from the body, which a replay restates verbatim.
+  const replayed = parseReplayed(response.headers.get(IDEMPOTENT_REPLAYED_HEADER));
   // Read here for the same reason, and kept as the raw header string: what the
   // call COST is not recoverable from the body either, and `null` has to stay
   // distinguishable from a reported `"0"`.
@@ -1486,6 +1541,7 @@ function finish<TData>(
       requestId,
       servingProvider,
       droppedParams,
+      replayed,
       creditsUsed,
     };
   }
@@ -1514,6 +1570,7 @@ function finish<TData>(
         requestId,
         servingProvider,
         droppedParams,
+        replayed,
         creditsUsed,
       };
     }
@@ -1534,6 +1591,7 @@ function finish<TData>(
     requestId,
     servingProvider,
     droppedParams,
+    replayed,
     creditsUsed,
   };
 }

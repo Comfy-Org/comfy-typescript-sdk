@@ -152,7 +152,10 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
       "method, class or error_type name differs because of it — and this check compares " +
       "names, so the entry suppresses nothing. It is declared anyway: a future reviewer " +
       "who notices the difference should find it listed as a decision, not wonder whether " +
-      "the check simply cannot see it.",
+      "the check simply cannot see it. Because `run` already returns that envelope — " +
+      "`data`, `requestId`, `servingProvider`, `droppedParams`, `replayed` — Python's opt-in " +
+      "`run_detailed` has no counterpart here; see " +
+      "`detailed-run-is-the-python-spelling-of-the-envelope`.",
   },
   {
     id: "credential-resolution",
