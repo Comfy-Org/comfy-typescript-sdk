@@ -81,8 +81,9 @@ interface Asymmetry {
    *
    * No asymmetry declares one today. `deadline_exceeded`, `not_enabled`,
    * `service_unavailable` and `rate_limited` did until the Python SDK shipped
-   * all four, at which point the rot guard fired and the entry was deleted —
-   * which is the mechanism working, not a gap. The field stays because the
+   * all four, and `queue_backlog_full` did after them; each time the rot guard
+   * fired and the entry was deleted — which is the mechanism working, not a
+   * gap. The field stays because the
    * next bucket will land on one side first too.
    */
   readonly routerErrorClassesAheadOfPython?: readonly (readonly [string, string])[];
