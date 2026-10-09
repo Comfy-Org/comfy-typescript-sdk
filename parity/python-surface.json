@@ -7,19 +7,26 @@
       "src/comfy_sdk/router_exceptions.py",
       "src/comfy_sdk/exceptions.py",
       "src/comfy_sdk/__init__.py",
-      "src/comfy_sdk/retry.py"
+      "src/comfy_sdk/retry.py",
+      "src/comfy_sdk/client.py"
     ]
   },
   "modelsMethods": {
     "Models": [
       "handle",
+      "list",
       "run",
+      "run_detailed",
+      "schema",
       "submit",
       "subscribe"
     ],
     "AsyncModels": [
       "handle",
+      "list",
       "run",
+      "run_detailed",
+      "schema",
       "submit",
       "subscribe"
     ]
@@ -40,7 +47,10 @@
     "DeadlineExceeded",
     "NotEnabled",
     "ServiceUnavailable",
-    "RateLimited"
+    "RateLimited",
+    "Cancelled",
+    "QueueTimeout",
+    "RequestNotFound"
   ],
   "routerErrorTypes": {
     "RouterError": "",
@@ -58,7 +68,10 @@
     "DeadlineExceeded": "deadline_exceeded",
     "NotEnabled": "not_enabled",
     "ServiceUnavailable": "service_unavailable",
-    "RateLimited": "rate_limited"
+    "RateLimited": "rate_limited",
+    "Cancelled": "cancelled",
+    "QueueTimeout": "queue_timeout",
+    "RequestNotFound": "request_not_found"
   },
   "routerErrorTypeOrder": [
     "invalid_input",
@@ -75,7 +88,10 @@
     "deadline_exceeded",
     "not_enabled",
     "service_unavailable",
-    "rate_limited"
+    "rate_limited",
+    "cancelled",
+    "queue_timeout",
+    "request_not_found"
   ],
   "routerErrorTypeByStatus": {
     "401": "unauthorized",
@@ -88,7 +104,9 @@
     "504": "provider_timeout"
   },
   "exportedErrorClasses": [
+    "AlreadyCompleted",
     "BlobNotFound",
+    "CancelRefused",
     "ComfyError",
     "Forbidden",
     "HashMismatch",
@@ -100,6 +118,7 @@
     "MissingAsset",
     "NotFound",
     "QueueFull",
+    "RouterError",
     "Unauthorized",
     "WorkflowFormatUi"
   ],
@@ -112,5 +131,16 @@
     "retry_possibly_in_flight": "False",
     "retry_collectable": "True",
     "collect_max_elapsed": "1200.0"
+  },
+  "credentialResolution": {
+    "resolver": "_resolve_api_key",
+    "apiKeyEnvVar": "COMFY_API_KEY",
+    "baseUrlEnvVar": "COMFY_BASE_URL",
+    "cloudBaseUrl": "https://cloud.comfy.org",
+    "order": [
+      "explicit",
+      "environment"
+    ],
+    "missingKeyError": "MissingApiKey"
   }
 }

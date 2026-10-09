@@ -19,6 +19,25 @@ entry. See CONTRIBUTING.md.
 
 ### Added
 
+- **The rest of a job's state is readable off the handle.** `Job` held the
+  whole v2 job model privately and re-exported four fields, so a caller who
+  wanted a run's duration had to cast past `private` to reach the timestamps.
+  Eight read-only accessors now cover the remainder of the wire contract:
+  `createdAt` and `expiresAt` (`Date`), `startedAt` and `completedAt`
+  (`Date | null` — both are nullable on the wire, and a duration is
+  `completedAt` minus `startedAt`), `progress`, `queuePosition`, `metrics` and
+  `urls`. They read whatever state the handle currently holds, exactly like
+  `id`/`status` — nothing re-fetches implicitly — and the object-valued three
+  hand back a snapshot copy so editing the result cannot rewrite the handle's
+  own links. `progress` is the same `Progress` the event stream yields (which
+  now also carries `currentNodeClass`). Comfy Cloud's poll response has been
+  reported to carry `progress: null` even for a running job, so
+  `job.events()` remains the live-progress source there. Where the wire field is nullable, an absent or unusable value
+  reads as "none" rather than as an `Invalid Date` or an empty snapshot; where
+  it is required and non-nullable (`createdAt`, `expiresAt`, `urls`) a
+  response that omits it raises `ComfyError` (`unexpected_response`) instead
+  of handing back a `Date` that silently compares false against everything, or
+  a `{}` typed as a full set of links.
 - **Job labels: `submit()` takes `metadata`, and `client.listJobs()` finds
   jobs by it.** `metadata` is a map of your own string keys to string values,
   sent as the body's `metadata`; a submit without it sends the same request
@@ -46,6 +65,19 @@ entry. See CONTRIBUTING.md.
   set, so a run that names none of the three is byte-for-byte the request it
   always was. These are run-route only — the queued `submit`/`subscribe`
   surface does not accept them.
+- **`RunJsonResult.replayed` / `RunBinaryResult.replayed`** — `true` when
+  Router served the call from its `Idempotency-Key` record (`Idempotent-Replayed`)
+  rather than by running the model again, so a replayed result can be told from
+  a fresh charge: a replay restates the original run and is not billed a second
+  time, so a spend tracker must skip it rather than add it up again. Derived
+  from the header's PRESENCE, because Router omits it on a fresh run rather
+  than sending `false`. It happens on this SDK's own collect loop (the same-key
+  re-send after a paced `409`/`504`) and on a caller's own retry under a
+  supplied `idempotencyKey`. Always `false` from `RequestHandle.get()` — the
+  queued result route carries no replay marker — so deduplicate re-collection
+  by `RequestHandle.requestId` instead. OPTIONAL on both interfaces for the
+  same source-compatibility reason as `creditsUsed` below; every result this
+  SDK returns sets it.
 - **`creditsUsed` on a run result — what Router priced the call at.** Both
   arms of `RunResult` (`RunJsonResult` and `RunBinaryResult`) now carry the
   `X-Comfy-Credits-Used` response header. The queued result
@@ -78,6 +110,25 @@ entry. See CONTRIBUTING.md.
 
 ### Changed
 
+- **Breaking:** `new Comfy()` now resolves `COMFY_API_KEY`, matching the Python
+  SDK. The class client takes its credential from the explicit `apiKey` option,
+  then from `COMFY_API_KEY` in the environment (trimmed; blank counts as unset,
+  and it is read per construction), then — targeting Comfy Cloud, which always
+  requires one — throws `MissingCredentials` at construction naming both ways to
+  supply it, before any request. `comfy.models.*` already read that variable;
+  the class client did not, so `new Comfy()` used to send no `Authorization`
+  header and come back with a bare `401` from the server. Pointing
+  `COMFY_BASE_URL` at another deployment keeps the keyless flow: an unresolved
+  key there is not an error and means "send no credentials". A `COMFY_API_KEY`
+  set in the environment, though, is now sent to that deployment too, as the
+  Python SDK does — unset it for a keyless target. The
+  `new Comfy({ apiKey: process.env.COMFY_API_KEY })` workaround in the README
+  is gone. **Note for callers who relied on the old behaviour:** `new Comfy()`
+  against Comfy Cloud with no key anywhere now throws locally instead of failing
+  on the first call, and an `apiKey` that is not a string — including `null`, as
+  a JSON config file spells "absent" — now throws a `TypeError` at
+  construction. Pass `undefined` (or omit the field) to fall back to the
+  environment.
 - **`RequestHandle.get()` / `models.subscribe()` now return the `binary` arm
   of `RunResult` when the queued result route answers a non-JSON
   `Content-Type`**, matching `models.run` and the Router spec's `*/*` arm. The
@@ -123,6 +174,16 @@ entry. See CONTRIBUTING.md.
 
 ### Fixed
 
+- **The `droppedParams` doc comments now match the vendored Router contract.**
+  The TSDoc on `parseDroppedParams` and `RunJsonResult.droppedParams` still
+  described the pre-sync spec: it called the declared
+  `X-Comfy-Router-Dropped-Params` schema a defect that would be reverted, and
+  said only an explicit `modelProvider` translation could populate the field.
+  The spec declares that header as one JSON-encoded string deliberately — each
+  entry is a sentence carrying commas of its own — and names an automatic
+  `fallback_provider` retry as a second producer, so a call that never set
+  `modelProvider` can still come back with a non-null `droppedParams`. Comments
+  only; the parsing and the header handling are unchanged.
 - `retryAfter` on a `ComfyError` from a `Comfy` method (`submit()`,
   `client.jobs.get()`, asset and output calls) now carries the server's
   `Retry-After` on every error. Only `QueueFull` kept it before; every other

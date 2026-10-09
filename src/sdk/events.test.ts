@@ -10,7 +10,15 @@ describe("eventFromRaw", () => {
   it("lifts a progress frame", () => {
     const raw: RawEvent = {
       event: "progress",
-      data: { value: 0.5, nodes_done: 5, nodes_total: 10, current_node: "3", step: 1, steps: 20 },
+      data: {
+        value: 0.5,
+        nodes_done: 5,
+        nodes_total: 10,
+        current_node: "3",
+        current_node_class: "KSampler",
+        step: 1,
+        steps: 20,
+      },
     };
     const event = eventFromRaw(raw, bindOutput);
     expect(event).toEqual({
@@ -20,6 +28,7 @@ describe("eventFromRaw", () => {
       nodesDone: 5,
       nodesTotal: 10,
       currentNode: "3",
+      currentNodeClass: "KSampler",
       step: 1,
       steps: 20,
     });

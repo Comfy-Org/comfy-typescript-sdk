@@ -72,11 +72,13 @@ import {
   decodeUtf8,
   DROPPED_PARAMS_HEADER,
   FALLBACK_PROVIDER_HEADER,
+  IDEMPOTENT_REPLAYED_HEADER,
   isJsonMediaType,
   isTooLarge,
   mediaTypeOf,
   parseCreditsUsed,
   parseDroppedParams,
+  parseReplayed,
   readBodyWithin,
   resolveMaxBytes,
   type RunResult,
@@ -969,7 +971,9 @@ export class RequestHandle<TData = unknown> {
    *
    * Calling it on a request that has already completed is one status poll and
    * one fetch, so collecting a result twice — or from a second process — costs
-   * no more than the first time.
+   * no more than the first time. The second collection carries `replayed:
+   * false` — this route has no replay marker — so deduplicate spend by
+   * {@link RequestHandle.requestId}, not by `replayed`.
    */
   async get(options: GetOptions = {}): Promise<RunResult<TData>> {
     // Before the first poll, so a bad cap is reported without spending a wait.
@@ -1054,6 +1058,7 @@ export class RequestHandle<TData = unknown> {
     const requestId = response.headers.get(REQUEST_ID_HEADER);
     const servingProvider = response.headers.get(FALLBACK_PROVIDER_HEADER);
     const droppedParams = parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER));
+    const replayed = parseReplayed(response.headers.get(IDEMPOTENT_REPLAYED_HEADER));
     const creditsUsed = parseCreditsUsed(response.headers.get(CREDITS_USED_HEADER));
     if (response.status !== 200) {
       // A non-2xx raises the typed router error from its (UTF-8-decoded)
@@ -1099,6 +1104,7 @@ export class RequestHandle<TData = unknown> {
         requestId,
         servingProvider,
         droppedParams,
+        replayed,
         creditsUsed,
       };
       return binary;
@@ -1130,6 +1136,7 @@ export class RequestHandle<TData = unknown> {
           requestId,
           servingProvider,
           droppedParams,
+          replayed,
           creditsUsed,
         };
         return binary;
@@ -1157,10 +1164,17 @@ export class RequestHandle<TData = unknown> {
     // The two alt-provider disclosure headers are read for the same reason the
     // discriminant is written rather than inferred: one union, both paths,
     // narrowed the same way. They are expected to be absent on this route —
-    // the queued `/requests` path takes no `model_provider` parameter, so a
-    // queued run cannot address an alternate provider and has nothing to
-    // disclose — but reading them keeps the two result shapes identical and
-    // means this path needs no edit on the day that route does gain them.
+    // `submitRouterModelRequest` takes neither `model_provider` nor
+    // `fallback_provider`, and `getRouterModelRequestResult`'s `200` declares
+    // neither header, so the contract gives a queued run nothing to disclose
+    // — but reading them keeps the two result shapes identical and means this
+    // path needs no edit on the day that route does gain them.
+    //
+    // `Idempotent-Replayed` is read rather than hard-coded `false` for that
+    // same reason. It reads `false` on every real response — the queued result
+    // route carries no replay marker, and this route's own re-collection is
+    // deduplicated by `requestId` rather than by a header — but writing the
+    // literal would bake that in where a header read simply stays correct.
     //
     // `X-Comfy-Credits-Used` is read on the same reasoning, and the contract
     // does not declare it on this route yet either: `getRouterModelRequestResult`'s
@@ -1181,6 +1195,7 @@ export class RequestHandle<TData = unknown> {
       requestId,
       servingProvider,
       droppedParams,
+      replayed,
       creditsUsed,
     };
     return result;
