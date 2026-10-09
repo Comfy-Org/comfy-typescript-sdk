@@ -96,6 +96,9 @@ const BY_CODE: Record<string, ApiErrorClass> = {
   job_not_found: NotFound,
   asset_not_found: NotFound,
   unauthorized: Unauthorized,
+  // The terminal SSE `error` frame on `GET /jobs/{id}/events` names an expired
+  // credential with its own code; it is still a 401-class failure.
+  credential_expired: Unauthorized,
   forbidden: Forbidden,
 };
 
@@ -146,4 +149,29 @@ export function errorFromEnvelope(
     details: details && typeof details === "object" ? details : null,
     retryAfter: options.retryAfter ?? null,
   });
+}
+
+/**
+ * The HTTP status each terminal SSE `error` frame code stands in for. The
+ * frame arrives inside a `200` stream, so there is no response status to read;
+ * this keeps `httpStatus` meaningful on the typed error the frame becomes.
+ */
+const SSE_STATUS_BY_CODE: Record<string, number> = {
+  credential_expired: 401,
+  forbidden: 403,
+  job_not_found: 404,
+};
+
+/**
+ * Build the typed exception for the terminal `error` frame of
+ * `GET /jobs/{id}/events`, whose `data` is an error envelope. The server sends
+ * it when it ends the stream for a reason other than the job finishing. The
+ * envelope's `code` is kept verbatim; a code with no known status yields a bare
+ * {@link ApiError} with `httpStatus` `0`.
+ */
+export function sseErrorFromFrame(data: Record<string, unknown>): ApiError {
+  const err = (data as ErrorEnvelopeBody).error;
+  const code = err && typeof err === "object" ? err.code : undefined;
+  const httpStatus = (typeof code === "string" && SSE_STATUS_BY_CODE[code]) || 0;
+  return errorFromEnvelope(httpStatus, data as ErrorEnvelopeBody);
 }

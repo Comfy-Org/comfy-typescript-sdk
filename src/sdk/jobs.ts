@@ -10,7 +10,7 @@
  * in the Python SDK — one async class since JS is async-native.
  */
 
-import { ApiError } from "../low/index.js";
+import { ApiError, sseErrorFromFrame } from "../low/index.js";
 import type {
   ComfyLow,
   Job as LowJob,
@@ -322,6 +322,11 @@ export class Job {
    * to polling to detect terminal status if the stream ends early. An
    * aborted `signal` stops both the current SSE connection/poll and the
    * pause between reconnect attempts.
+   *
+   * When the server cuts the stream with its terminal `error` event, the
+   * iterator rejects with `Unauthorized` (`code: "credential_expired"`),
+   * `Forbidden` or `NotFound` (`code: "job_not_found"`) and does
+   * not reconnect.
    */
   async *events(signal?: AbortSignal): AsyncGenerator<ComfyEvent, void, void> {
     const eventsUrl = this.model.urls.events || this.model.id;
@@ -335,6 +340,12 @@ export class Job {
       let reconnectPauseMs: number = RECONNECT_PAUSE_MS;
       try {
         for await (const raw of this.low.getJobEvents(eventsUrl, { signal })) {
+          if (raw.event === "error") {
+            // Terminal frame: the server is ending the stream for a reason other
+            // than the job finishing (credential_expired / forbidden / job_not_found).
+            // No status follows it, so surface it and stop — never reconnect.
+            throw sseErrorFromFrame(raw.data);
+          }
           const event = eventFromRaw(raw, (data) => this.bindOutput(data as unknown as LowOutput));
           if (event === null) continue;
           if (event.kind === "progress") {

@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StubServer } from "../../test/support/stub-server.js";
 import { ComfyLow } from "../low/index.js";
 import { abortableSleep } from "./abortable-sleep.js";
-import { ComfyError, Forbidden, JobFailed, NotFound } from "./exceptions.js";
+import { ComfyError, Forbidden, JobFailed, NotFound, Unauthorized } from "./exceptions.js";
 import { JobFactory } from "./jobs.js";
 
 // Spies on (not replaces) abortableSleep by default, so every other test
@@ -289,6 +289,40 @@ describe("Job", () => {
     await expect(job.events().next()).rejects.toBeInstanceOf(Forbidden);
     expect(server.state.eventsConnectCount).toBe(1);
     expect(server.state.jobPollCount).toBe(1);
+  });
+
+  describe.each([
+    ["forbidden", Forbidden],
+    ["job_not_found", NotFound],
+    ["credential_expired", Unauthorized],
+  ] as const)("events() on the terminal SSE error frame %s", (code, cls) => {
+    it("rejects with the typed error instead of reconnecting", async () => {
+      server.state.sseErrorFrameCode = code;
+      // GET /jobs/{id} keeps answering non-terminal, so a reconnect here would
+      // never end on its own — the cycle this frame exists to stop.
+      server.state.pollsToSucceed = 1_000_000;
+      const job = await jobs.get("job_01");
+      const pollBefore = server.state.jobPollCount;
+      const events: unknown[] = [];
+      const consume = async () => {
+        for await (const event of job.events()) {
+          events.push(event);
+        }
+      };
+
+      const err = await consume().then(
+        () => null,
+        (exc: unknown) => exc,
+      );
+      expect(err).toBeInstanceOf(cls);
+      expect((err as ComfyError).code).toBe(code);
+      // The frame before `error` is still delivered.
+      expect(events).toEqual([{ kind: "statusChange", status: "running", queuePosition: null }]);
+      // One connection, no poll backstop, no reconnect pause.
+      expect(server.state.eventsConnectCount).toBe(1);
+      expect(server.state.jobPollCount).toBe(pollBefore);
+      expect(abortableSleep).not.toHaveBeenCalled();
+    }, 2000);
   });
 
   it("events() clamps an absurd SSE 429 Retry-After to MAX_RECONNECT_PAUSE_MS, instead of pausing for it verbatim", async () => {

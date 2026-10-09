@@ -133,6 +133,7 @@ export function eventFromRaw(
       return logFrom(raw.data);
     case "output":
       return { kind: "outputReady", output: bindOutput(raw.data) };
+    // `error` is handled upstream in Job.events() and is deliberately not a ComfyEvent kind.
     default:
       return null;
   }

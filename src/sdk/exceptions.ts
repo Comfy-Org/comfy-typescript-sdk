@@ -177,6 +177,9 @@ const BY_CODE: Record<string, ComfyErrorClass> = {
   job_not_found: NotFound,
   asset_not_found: NotFound,
   unauthorized: Unauthorized,
+  // The code the terminal SSE `error` frame of job.events() uses for an
+  // expired credential.
+  credential_expired: Unauthorized,
   forbidden: Forbidden,
 };
 
