@@ -91,6 +91,16 @@ entry. See CONTRIBUTING.md.
 
 ### Fixed
 
+- **The `droppedParams` doc comments now match the vendored Router contract.**
+  The TSDoc on `parseDroppedParams` and `RunJsonResult.droppedParams` still
+  described the pre-sync spec: it called the declared
+  `X-Comfy-Router-Dropped-Params` schema a defect that would be reverted, and
+  said only an explicit `modelProvider` translation could populate the field.
+  The spec declares that header as one JSON-encoded string deliberately — each
+  entry is a sentence carrying commas of its own — and names an automatic
+  `fallback_provider` retry as a second producer, so a call that never set
+  `modelProvider` can still come back with a non-null `droppedParams`. Comments
+  only; the parsing and the header handling are unchanged.
 - `retryAfter` on a `ComfyError` from a `Comfy` method (`submit()`,
   `client.jobs.get()`, asset and output calls) now carries the server's
   `Retry-After` on every error. Only `QueueFull` kept it before; every other

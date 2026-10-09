@@ -900,10 +900,11 @@ export class RequestHandle<TData = unknown> {
     // The two alt-provider disclosure headers are read here for the same
     // reason the discriminant is written rather than inferred: one union, both
     // paths, narrowed the same way. They are expected to be absent on this
-    // route — the queued `/requests` path takes no `model_provider` parameter,
-    // so a queued run cannot address an alternate provider and has nothing to
-    // disclose — but reading them keeps the two result shapes identical and
-    // means this path needs no edit on the day that route does gain them.
+    // route — `submitRouterModelRequest` takes neither `model_provider` nor
+    // `fallback_provider`, and `getRouterModelRequestResult`'s `200` declares
+    // neither header, so the contract gives a queued run nothing to disclose
+    // — but reading them keeps the two result shapes identical and means this
+    // path needs no edit on the day that route does gain them.
     //
     // `Idempotent-Replayed` is read rather than hard-coded `false` for that
     // same reason. It reads `false` on every real response — the queued result
