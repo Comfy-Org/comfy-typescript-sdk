@@ -98,20 +98,48 @@ interface Asymmetry {
    */
   readonly modelsMethodsAheadOfPython?: readonly string[];
   /**
-   * Python `models` method names that TypeScript does not carry BY DESIGN,
-   * because the thing they add is already on TypeScript's default return
-   * shape. Filtered from the Python side of the name comparison. Guarded
-   * below: the entry fails if this SDK ever exposes the camelCase twin.
+   * Public `models` method names the Python SDK has and this one does not
+   * WANT — a divergence, not a lag.
    *
-   * Distinct from `modelsMethodsAheadOfPython`, which is a LAG that should end
-   * — this one never ends, because the method is not coming. The guard is
-   * therefore the mirror image: a lead's rot guard fires when Python GROWS the
-   * name, and this one fires when TypeScript grows the twin.
+   * Distinct from `modelsMethodsAheadOfPython` on purpose, and pointing the
+   * other way: that field says "this will converge, delete me when it does",
+   * while this one says "these two surfaces are shaped differently and the
+   * missing name is the consequence". Its rot guard is therefore the mirror
+   * image — an entry fails the day THIS SDK grows the name, because a
+   * divergence that converged is no longer a decision worth recording.
+   *
+   * It does not license a lag. An entry is only honest when the reason in
+   * `why` explains what a caller reaches for instead; "we have not got to it
+   * yet" is `modelsMethodsAheadOfPython` on the Python side's pull request,
+   * not an entry here.
    */
-  readonly pythonMethodsSubsumedByTypescript?: readonly (readonly [
-    pythonName: string,
-    typescriptTwin: string,
-  ])[];
+  readonly pythonOnlyModelsMethods?: readonly string[];
+  /**
+   * Error class names the Python package root exports that this SDK reaches
+   * through the `routerErrors` namespace instead.
+   *
+   * The two SDKs resolve the same name collision differently — see the
+   * `router-errors-namespaced` entry — so this is a divergence in where a name
+   * lives, not whether it exists. The rot guard below insists on exactly that:
+   * an entry must be absent from this SDK's ROOT and present in its
+   * `routerErrors` namespace, so an entry can never quietly come to mean "we
+   * do not have this class at all".
+   */
+  readonly pythonOnlyExportedErrorClasses?: readonly string[];
+  /**
+   * Error classes the Python SDK has and this one does not have YET, anywhere.
+   *
+   * The one field that records a LAG, and it is deliberately uncomfortable to
+   * use: its guard insists the name is absent from the root AND from
+   * `routerErrors`, so an entry is a written admission that this SDK cannot
+   * express something its sibling can. It exists because the alternative —
+   * leaving the lag out of the snapshot — is what let four root exports go
+   * missing unnoticed in the first place.
+   *
+   * An entry must name the follow-up that removes it. The guard deletes it for
+   * you: the day this SDK exports the class, the entry fails.
+   */
+  readonly exportedErrorClassesBehindPython?: readonly string[];
 }
 
 const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
@@ -124,12 +152,10 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
       "method, class or error_type name differs because of it — and this check compares " +
       "names, so the entry suppresses nothing. It is declared anyway: a future reviewer " +
       "who notices the difference should find it listed as a decision, not wonder whether " +
-      "the check simply cannot see it. Because TypeScript's `run` already returns that " +
-      "envelope — `data`, `requestId`, `servingProvider`, `droppedParams`, `replayed` — " +
-      "Python's opt-in `run_detailed` (its `RouterRunResult`) has no counterpart here: the " +
-      "fields it adds are what `run` returns by default. A `runDetailed` would be an envelope " +
-      "around an envelope.",
-    pythonMethodsSubsumedByTypescript: [["run_detailed", "runDetailed"]],
+      "the check simply cannot see it. Because `run` already returns that envelope — " +
+      "`data`, `requestId`, `servingProvider`, `droppedParams`, `replayed` — Python's opt-in " +
+      "`run_detailed` has no counterpart here; see " +
+      "`detailed-run-is-the-python-spelling-of-the-envelope`.",
   },
   {
     id: "credential-resolution",
@@ -165,20 +191,40 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
     modelsMethodsAheadOfPython: ["schema", "list"],
   },
   {
-    id: "queue-error-buckets-land-first-in-typescript",
+    id: "detailed-run-is-the-python-spelling-of-the-envelope",
     why:
-      "The vendored Router contract's most recent sync grew three queue-tier error buckets — " +
-      "`cancelled`, `queue_timeout` and `request_not_found` — and this SDK's spec-coverage gate " +
-      "requires a class per bucket the moment the spec declares one. The Python SDK's twin (its " +
-      "reconcile of the same spec sync, comfy-python-sdk#159) is still open, so its committed " +
-      "surface snapshot does not carry them yet. This is a LEAD, not a divergence: the rot guard " +
-      "below fails the moment the Python snapshot grows any of the three, which is the signal to " +
-      "delete this entry rather than keep it.",
-    routerErrorClassesAheadOfPython: [
-      ["Cancelled", "cancelled"],
-      ["QueueTimeout", "queue_timeout"],
-      ["RequestNotFound", "request_not_found"],
-    ],
+      "`Models.run_detailed` returns Python's `RouterRunResult` — the serving provider, the " +
+      "dropped params, the replay flag and the credits Router disclosed about a run. This SDK " +
+      "has no counterpart because it needs none: `comfy.models.run` ALREADY returns an " +
+      "envelope, so the disclosure rides the ordinary return value and a second method would " +
+      "be the same data behind a longer name. This is the `result-envelope` asymmetry showing " +
+      "up as a method name rather than a return type, which is exactly where a name-comparing " +
+      "check can see it — so it is declared rather than filtered out.",
+    pythonOnlyModelsMethods: ["run_detailed"],
+  },
+  {
+    id: "router-errors-namespaced",
+    why:
+      "`RouterError` is exported from the Python package ROOT: its `exceptions` module " +
+      "re-exports the router hierarchy from `router_exceptions`, so the two modules share one " +
+      "class object per name rather than two classes wearing one name. This SDK publishes the " +
+      "same class under the `routerErrors` namespace — `routerErrors.RouterError`, also " +
+      "reachable as `@comfyorg/sdk/errors` — because three of those names are already taken at " +
+      "its root by the workflow-API exceptions. Same class, different address: the rot guard " +
+      "below proves it is really in the namespace rather than missing.",
+    pythonOnlyExportedErrorClasses: ["RouterError"],
+  },
+  {
+    id: "cancel-refusal-classes-not-modelled-here-yet",
+    why:
+      "`AlreadyCompleted` and `CancelRefused` are how the Python SDK types a cancel the server " +
+      "refuses — a request that had already finished, or one the route declined — and this SDK " +
+      "has neither class, at the root or in `routerErrors`. `RequestHandle.cancel` exists here " +
+      "and its refusals surface untyped, so a caller cannot tell 'already done' from 'refused' " +
+      "without reading a status. That is a genuine LAG, recorded rather than filtered so it " +
+      "stays visible: the follow-up is to add both classes and delete this entry, which the rot " +
+      "guard below forces the moment either one lands.",
+    exportedErrorClassesBehindPython: ["AlreadyCompleted", "CancelRefused"],
   },
   {
     id: "collect-switched-off-by-budget",
@@ -206,10 +252,16 @@ const AHEAD_CLASS_NAMES = new Set(AHEAD_OF_PYTHON.map(([className]) => className
 const AHEAD_MODELS_METHODS = new Set(
   INTENTIONAL_ASYMMETRIES.flatMap((a) => a.modelsMethodsAheadOfPython ?? []),
 );
+const PYTHON_ONLY_MODELS_METHODS = new Set(
+  INTENTIONAL_ASYMMETRIES.flatMap((a) => a.pythonOnlyModelsMethods ?? []),
+);
+const PYTHON_ONLY_ERROR_CLASSES = new Set(
+  INTENTIONAL_ASYMMETRIES.flatMap((a) => a.pythonOnlyExportedErrorClasses ?? []),
+);
+const BEHIND_PYTHON_ERROR_CLASSES = new Set(
+  INTENTIONAL_ASYMMETRIES.flatMap((a) => a.exportedErrorClassesBehindPython ?? []),
+);
 const AHEAD_ERROR_TYPES = new Set(AHEAD_OF_PYTHON.map(([, errorType]) => errorType));
-const SUBSUMED_PYTHON_METHODS_PAIRS: readonly (readonly [string, string])[] =
-  INTENTIONAL_ASYMMETRIES.flatMap((a) => a.pythonMethodsSubsumedByTypescript ?? []);
-const SUBSUMED_PYTHON_METHODS = new Set(SUBSUMED_PYTHON_METHODS_PAIRS.map(([py]) => py));
 
 interface PythonSurface {
   source: { repo: string; ref: string; files: string[] };
@@ -367,39 +419,41 @@ describe("cross-SDK surface parity", () => {
     // Filtered on BOTH sides, so the day the Python SDK catches up produces
     // exactly ONE failure — the rot guard below, whose message says to delete
     // the entry — rather than a divergence line per method.
-    // `SUBSUMED_PYTHON_METHODS` is filtered on the PYTHON side only: those
-    // names are deliberately absent here, and the guard below is what keeps
-    // the entry honest by failing if the TypeScript twin ever appears.
+    const excused = (name: string) =>
+      AHEAD_MODELS_METHODS.has(name) || PYTHON_ONLY_MODELS_METHODS.has(name);
     expect(
       nameDivergences(
         "comfy.models",
-        pythonSync[0][1].filter(
-          (name) => !AHEAD_MODELS_METHODS.has(name) && !SUBSUMED_PYTHON_METHODS.has(name),
-        ),
-        methodNames(models).filter((name) => !AHEAD_MODELS_METHODS.has(name)),
+        pythonSync[0][1].filter((name) => !excused(name)),
+        methodNames(models).filter((name) => !excused(name)),
       ),
     ).toEqual([]);
   });
 
-  it("keeps every subsumed Python method subsumed", () => {
-    // The rot guard for `pythonMethodsSubsumedByTypescript`. An entry claims
-    // the Python method adds nothing TypeScript's default return shape does
-    // not already carry; the day this SDK grows the twin, that claim is over
-    // and the filter above is hiding a real comparison.
-    //
-    // Deliberately NOT asserted: that the Python snapshot still contains the
-    // method. `parity/python-surface.json` is refreshed by a separate job, and
-    // an entry that only becomes valid after the next refresh would make this
-    // change red before it and green after — so the guard is written on the
-    // side this repo controls.
-    const typescriptMethods = methodNames(models);
-    for (const [pythonName, typescriptTwin] of SUBSUMED_PYTHON_METHODS_PAIRS) {
+  it("keeps every declared Python-only `models` method live", async () => {
+    // The mirror of the lead's rot rule. An entry has to name a method the
+    // Python SDK really has — otherwise it excuses nothing — and it has to
+    // STOP naming one once this SDK grows it, because a divergence that
+    // converged is no longer a decision worth recording.
+    const python = await loadPythonSurface();
+    const pythonMethods = new Set(
+      Object.entries(python.modelsMethods)
+        .filter(([className]) => !ASYNC_MODELS_CLASSES.has(className))
+        .flatMap(([, methods]) => methods),
+    );
+    const typescriptMethods = new Set(methodNames(models));
+
+    for (const name of PYTHON_ONLY_MODELS_METHODS) {
       expect(
-        typescriptMethods,
-        `\`comfy.models.${typescriptTwin}\` now exists — delete the subsumed entry for ` +
-          `\`${pythonName}\` from INTENTIONAL_ASYMMETRIES so the two surfaces are compared ` +
-          "again",
-      ).not.toContain(typescriptTwin);
+        pythonMethods.has(name),
+        `the allowlist calls \`models.${name}\` Python-only, but the Python SDK does not ` +
+          "expose it — delete the entry",
+      ).toBe(true);
+      expect(
+        typescriptMethods.has(name),
+        `this SDK now exposes \`comfy.models.${name}\` — delete its entry from ` +
+          "INTENTIONAL_ASYMMETRIES so the two surfaces are compared again",
+      ).toBe(false);
     }
   });
 
@@ -563,8 +617,62 @@ describe("cross-SDK surface parity", () => {
 
   it("exports the same error class names from the package root", async () => {
     const python = await loadPythonSurface();
-    const expected = python.exportedErrorClasses.map((name) => RENAMES[name] ?? name);
+    const expected = python.exportedErrorClasses
+      .filter((name) => !PYTHON_ONLY_ERROR_CLASSES.has(name))
+      .filter((name) => !BEHIND_PYTHON_ERROR_CLASSES.has(name))
+      .map((name) => RENAMES[name] ?? name);
     expect(nameDivergences("package root", expected, errorClassNames(sdk))).toEqual([]);
+  });
+
+  it("keeps every root error class this SDK namespaces instead reachable", async () => {
+    // The entry claims a DIFFERENT ADDRESS, not a missing class, so the guard
+    // proves both halves: absent from this root, present in `routerErrors`.
+    // Without the second half the entry would decay into an exemption for a
+    // class this SDK simply does not have.
+    const python = await loadPythonSurface();
+    const pythonNames = new Set(python.exportedErrorClasses);
+    const rootNames = new Set(errorClassNames(sdk));
+    const namespacedNames = new Set(errorClassNames(routerErrors));
+
+    for (const name of PYTHON_ONLY_ERROR_CLASSES) {
+      expect(
+        pythonNames.has(name),
+        `the allowlist says the Python root exports \`${name}\`, which it no longer does`,
+      ).toBe(true);
+      expect(
+        rootNames.has(name),
+        `this SDK's root now exports \`${name}\` — delete its entry from ` +
+          "INTENTIONAL_ASYMMETRIES so the two roots are compared again",
+      ).toBe(false);
+      expect(
+        namespacedNames.has(name),
+        `the allowlist says \`${name}\` lives in \`routerErrors\` instead, but it is not ` +
+          "there either — this is a missing class, not a namespaced one",
+      ).toBe(true);
+    }
+  });
+
+  it("keeps every declared lag live, and closes it when the class lands", async () => {
+    // A lag entry is an admission, so it is held to the strictest rot rule of
+    // the three: the name must still be on the Python side, and must still be
+    // absent from BOTH of this SDK's addresses. Implementing the class is what
+    // deletes the entry.
+    const python = await loadPythonSurface();
+    const pythonNames = new Set(python.exportedErrorClasses);
+    const reachable = new Set([...errorClassNames(sdk), ...errorClassNames(routerErrors)]);
+
+    for (const name of BEHIND_PYTHON_ERROR_CLASSES) {
+      expect(
+        pythonNames.has(name),
+        `the allowlist records a lag behind \`${name}\`, which the Python SDK no longer ` +
+          "exports — delete the entry",
+      ).toBe(true);
+      expect(
+        reachable.has(name),
+        `this SDK now exports \`${name}\` — the lag is closed, so delete its entry from ` +
+          "INTENTIONAL_ASYMMETRIES",
+      ).toBe(false);
+    }
   });
 
   it("keeps every declared rename live", async () => {

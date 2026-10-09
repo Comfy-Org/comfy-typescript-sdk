@@ -14,12 +14,14 @@
     "Models": [
       "handle",
       "run",
+      "run_detailed",
       "submit",
       "subscribe"
     ],
     "AsyncModels": [
       "handle",
       "run",
+      "run_detailed",
       "submit",
       "subscribe"
     ]
@@ -40,7 +42,10 @@
     "DeadlineExceeded",
     "NotEnabled",
     "ServiceUnavailable",
-    "RateLimited"
+    "RateLimited",
+    "Cancelled",
+    "QueueTimeout",
+    "RequestNotFound"
   ],
   "routerErrorTypes": {
     "RouterError": "",
@@ -58,7 +63,10 @@
     "DeadlineExceeded": "deadline_exceeded",
     "NotEnabled": "not_enabled",
     "ServiceUnavailable": "service_unavailable",
-    "RateLimited": "rate_limited"
+    "RateLimited": "rate_limited",
+    "Cancelled": "cancelled",
+    "QueueTimeout": "queue_timeout",
+    "RequestNotFound": "request_not_found"
   },
   "routerErrorTypeOrder": [
     "invalid_input",
@@ -75,7 +83,10 @@
     "deadline_exceeded",
     "not_enabled",
     "service_unavailable",
-    "rate_limited"
+    "rate_limited",
+    "cancelled",
+    "queue_timeout",
+    "request_not_found"
   ],
   "routerErrorTypeByStatus": {
     "401": "unauthorized",
@@ -88,7 +99,9 @@
     "504": "provider_timeout"
   },
   "exportedErrorClasses": [
+    "AlreadyCompleted",
     "BlobNotFound",
+    "CancelRefused",
     "ComfyError",
     "Forbidden",
     "HashMismatch",
@@ -100,6 +113,7 @@
     "MissingAsset",
     "NotFound",
     "QueueFull",
+    "RouterError",
     "Unauthorized",
     "WorkflowFormatUi"
   ],
