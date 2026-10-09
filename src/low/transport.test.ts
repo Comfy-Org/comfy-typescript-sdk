@@ -59,6 +59,13 @@ describe("ComfyLow transport", () => {
     expect(err).toMatchObject({ code: "rate_limited", httpStatus: 429, retryAfter: null });
   });
 
+  it("headAssetByHash maps a bodiless 401 to Unauthorized", async () => {
+    server.state.headStatus = 401;
+    const err = await low.headAssetByHash("blake3:any").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Unauthorized);
+    expect(err).toMatchObject({ code: "unauthorized", httpStatus: 401, message: "Unauthorized" });
+  });
+
   it("headAssetByHash maps a bodiless 403 to Forbidden", async () => {
     server.state.headStatus = 403;
     const err = await low.headAssetByHash("blake3:any").catch((e: unknown) => e);

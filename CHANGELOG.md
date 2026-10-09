@@ -149,9 +149,10 @@ entry. See CONTRIBUTING.md.
   carries no body — and the status fallback read that as `queue_full`, so an
   asset `commit()` reported a full job queue when the caller had been rate
   limited. It now surfaces as a `ComfyError` with `code: "rate_limited"`,
-  carrying `retryAfter` when the server sent `Retry-After`. A bodiless `403` on
-  the same probe still raises `Forbidden`, now with the message `Forbidden`
-  rather than `HTTP 403`.
+  carrying `retryAfter` when the server sent `Retry-After`. A bodiless `401` or
+  `403` on the same probe still raises `Unauthorized` or `Forbidden`, now with
+  the message `Unauthorized` or `Forbidden` rather than `HTTP 401` /
+  `HTTP 403`.
 - `retryAfter` on a `ComfyError` from a `Comfy` method (`submit()`,
   `client.jobs.get()`, asset and output calls) now carries the server's
   `Retry-After` on every error. Only `QueueFull` kept it before; every other

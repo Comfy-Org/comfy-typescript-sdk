@@ -35,7 +35,7 @@ export interface ServerState {
    * JSON envelope is dropped). A 429 carries `retryAfterHeader` as its
    * `Retry-After` unless `omitHeadRetryAfter` is set.
    */
-  headStatus: 403 | 429 | null;
+  headStatus: 401 | 403 | 429 | null;
   /** When true, a `headStatus` 429 omits its `Retry-After` header. */
   omitHeadRetryAfter: boolean;
   /** POST /jobs returns a 429 (see `queueFullCode`) this many times before succeeding. */
