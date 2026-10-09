@@ -1005,7 +1005,9 @@ are only exposed by direct `ComfyLow` calls.
 - `Unauthorized`, `Forbidden`, `NotFound`. A `Forbidden` whose `code` is
   `sso_required` means the key is valid but its account must sign in through
   its organization's single sign-on; `organizationId` names that organization
-  (`null` when the server does not know it).
+  (`null` when the server does not know it). An SSO refusal of the `HEAD`
+  asset-dedup probe reads as plain `forbidden`, since a `HEAD` response has no
+  body to carry the code.
 - `InvalidWorkflow` (and `WorkflowFormatUi`, for submitting a UI-export
   instead of an API-format graph)
 - `MissingAsset` — a `core/ASSET` reference the server couldn't resolve

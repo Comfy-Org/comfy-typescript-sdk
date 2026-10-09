@@ -84,6 +84,15 @@ describe("toSdkError", () => {
     expect(toSdkError(apiError).organizationId).toBe("org_1");
   });
 
+  it.each(["constructor", "toString", "__proto__"])(
+    "falls back to a bare ComfyError for the inherited name %s",
+    (code) => {
+      const sdkError = toSdkError(new ApiError("?", { code, httpStatus: 500 }));
+      expect(sdkError).toBeInstanceOf(ComfyError);
+      expect(sdkError.constructor.name).toBe("ComfyError");
+    },
+  );
+
   it("defaults organizationId to null", () => {
     expect(
       toSdkError(new ApiError("no", { code: "forbidden", httpStatus: 403 })).organizationId,

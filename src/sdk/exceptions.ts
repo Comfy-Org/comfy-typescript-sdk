@@ -205,7 +205,7 @@ export function toSdkError(exc: ApiError): ComfyError {
       organizationId: exc.organizationId,
     });
   }
-  const cls = BY_CODE[exc.code] ?? ComfyError;
+  const cls = Object.hasOwn(BY_CODE, exc.code) ? BY_CODE[exc.code] : ComfyError;
   return new cls(exc.message, {
     code: exc.code,
     httpStatus: exc.httpStatus,

@@ -146,13 +146,7 @@ export function errorFromEnvelope(
   let code = err && typeof err === "object" ? err.code : undefined;
   let message = err && typeof err === "object" ? err.message : undefined;
   const details = err && typeof err === "object" ? err.details : undefined;
-  const organizationId =
-    err &&
-    typeof err === "object" &&
-    typeof err.organization_id === "string" &&
-    err.organization_id !== ""
-      ? err.organization_id
-      : null;
+  const rawOrganizationId = err && typeof err === "object" ? err.organization_id : undefined;
 
   if (!code) {
     code = CODE_BY_STATUS[httpStatus] ?? "error";
@@ -160,8 +154,18 @@ export function errorFromEnvelope(
   if (!message) {
     message = `HTTP ${httpStatus}`;
   }
+  // Read only on `sso_required`, so a gateway that stamps org context into
+  // every error body cannot make an unrelated failure look like an SSO prompt.
+  const organizationId =
+    code === "sso_required" &&
+    typeof rawOrganizationId === "string" &&
+    rawOrganizationId.trim() !== ""
+      ? rawOrganizationId
+      : null;
 
-  const cls = BY_CODE[code] ?? ApiError;
+  // `Object.hasOwn`, so a wire code like `constructor` falls back to ApiError
+  // instead of resolving an `Object.prototype` member.
+  const cls = Object.hasOwn(BY_CODE, code) ? BY_CODE[code] : ApiError;
   return new cls(message, {
     code,
     httpStatus,

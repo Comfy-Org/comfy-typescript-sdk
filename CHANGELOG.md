@@ -131,12 +131,15 @@ entry. See CONTRIBUTING.md.
   environment.
 - **`sso_required` (403) now raises `Forbidden` (code preserved) and carries
   `organizationId`, the organization to start SSO with.** A personal key whose
-  account an SSO organization holds is refused `403 sso_required` on every
-  operation; that used to surface as a bare `ComfyError` and drop the
+  account an SSO organization holds is refused `403 sso_required` by the
+  Comfy API; that used to surface as a bare `ComfyError` and drop the
   envelope's `organization_id`. It is now a `Forbidden` — so an auth `catch`
   sees it — whose `code` still reads `sso_required`, and both `ComfyError` and
   the low-level `ApiError` gained an `organizationId` field (`null` on every
-  other code, and when the server does not name one).
+  other code, and when the server does not name one). Two paths cannot see the
+  code: a `HEAD` response has no body, so the asset-dedup probe an asset
+  commit starts with reads a plain `forbidden`; and `comfy.models.*` errors come
+  from Comfy Router as a `RouterError`, which carries no `organizationId`.
 
 ### Fixed
 
