@@ -19,6 +19,25 @@ entry. See CONTRIBUTING.md.
 
 ### Added
 
+- **The rest of a job's state is readable off the handle.** `Job` held the
+  whole v2 job model privately and re-exported four fields, so a caller who
+  wanted a run's duration had to cast past `private` to reach the timestamps.
+  Eight read-only accessors now cover the remainder of the wire contract:
+  `createdAt` and `expiresAt` (`Date`), `startedAt` and `completedAt`
+  (`Date | null` — both are nullable on the wire, and a duration is
+  `completedAt` minus `startedAt`), `progress`, `queuePosition`, `metrics` and
+  `urls`. They read whatever state the handle currently holds, exactly like
+  `id`/`status` — nothing re-fetches implicitly — and the object-valued three
+  hand back a snapshot copy so editing the result cannot rewrite the handle's
+  own links. `progress` is the same `Progress` the event stream yields (which
+  now also carries `currentNodeClass`). Comfy Cloud's poll response has been
+  reported to carry `progress: null` even for a running job, so
+  `job.events()` remains the live-progress source there. Where the wire field is nullable, an absent or unusable value
+  reads as "none" rather than as an `Invalid Date` or an empty snapshot; where
+  it is required and non-nullable (`createdAt`, `expiresAt`, `urls`) a
+  response that omits it raises `ComfyError` (`unexpected_response`) instead
+  of handing back a `Date` that silently compares false against everything, or
+  a `{}` typed as a full set of links.
 - **Job labels: `submit()` takes `metadata`, and `client.listJobs()` finds
   jobs by it.** `metadata` is a map of your own string keys to string values,
   sent as the body's `metadata`; a submit without it sends the same request
