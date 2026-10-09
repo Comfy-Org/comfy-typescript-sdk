@@ -115,12 +115,18 @@ interface ErrorEnvelopeBody {
     message?: string;
     details?: Record<string, unknown> | null;
   };
+  /** Not part of the ErrorEnvelope contract: echo's `HTTPError` body shape,
+   * `{"message": "..."}`, which a request-decoder 400 or a BodyLimit 413
+   * reaches the caller as instead of an envelope. */
+  message?: string;
 }
 
 /**
  * Build the typed exception for an error response. Falls back to a
  * status-derived code when the body is missing or not a well-formed
- * envelope, so a bare 401 with no JSON still maps to `Unauthorized`.
+ * envelope, so a bare 401 with no JSON still maps to `Unauthorized`; a bare
+ * `{message}` body (echo's HTTPError shape, e.g. a request-decoder 400 or a
+ * BodyLimit 413) still contributes its message.
  */
 export function errorFromEnvelope(
   httpStatus: number,
@@ -131,6 +137,9 @@ export function errorFromEnvelope(
   let code = err && typeof err === "object" ? err.code : undefined;
   let message = err && typeof err === "object" ? err.message : undefined;
   const details = err && typeof err === "object" ? err.details : undefined;
+  if ((typeof message !== "string" || !message) && body && typeof body === "object") {
+    if (typeof body.message === "string" && body.message) message = body.message;
+  }
 
   if (!code) {
     code = CODE_BY_STATUS[httpStatus] ?? "error";

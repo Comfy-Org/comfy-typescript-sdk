@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  ApiError,
   BlobNotFound,
   Forbidden,
   HashMismatch,
@@ -58,5 +59,41 @@ describe("errorFromEnvelope", () => {
   it("falls back to a bare ApiError for an unmapped code", () => {
     const err = errorFromEnvelope(500, { error: { code: "weird_new_code", message: "?" } });
     expect(err.constructor.name).toBe("ApiError");
+  });
+
+  // echo's HTTPError body: what a request-decoder 400 or a BodyLimit 413
+  // writes instead of an ErrorEnvelope.
+  it("keeps the message of a bare {message} body", () => {
+    const decoder =
+      "Unmarshal type error: expected=map[string]interface {}, got=string, field=workflow, offset=12";
+    const err = errorFromEnvelope(400, { message: decoder });
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.constructor.name).toBe("ApiError");
+    expect(err.code).toBe("error");
+    expect(err.httpStatus).toBe(400);
+    expect(err.message).toBe(decoder);
+    expect(err.details).toBeNull();
+  });
+
+  it("keeps the message of a bare {message} 413", () => {
+    const err = errorFromEnvelope(413, { message: "Request Entity Too Large" });
+    expect(err.message).toBe("Request Entity Too Large");
+    expect(err.code).toBe("error");
+  });
+
+  it("prefers the envelope's message over a top-level one", () => {
+    const err = errorFromEnvelope(400, {
+      error: { code: "invalid_request", message: "metadata is not an object" },
+      message: "ignored",
+    });
+    expect(err.code).toBe("invalid_request");
+    expect(err.message).toBe("metadata is not an object");
+  });
+
+  it.each([42, "", { x: 1 }])("ignores a top-level message of %j", (message) => {
+    const err = errorFromEnvelope(400, { message } as never);
+    expect(err.code).toBe("error");
+    expect(err.message).toBe("HTTP 400");
+    expect(err.details).toBeNull();
   });
 });
