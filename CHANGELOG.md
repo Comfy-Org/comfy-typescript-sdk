@@ -29,9 +29,10 @@ entry. See CONTRIBUTING.md.
   `urls`. They read whatever state the handle currently holds, exactly like
   `id`/`status` — nothing re-fetches implicitly — and the object-valued three
   hand back a snapshot copy so editing the result cannot rewrite the handle's
-  own links. Note that Comfy Cloud's poll response carries `progress: null`
-  even for a running job today, so `job.events()` remains the live-progress
-  source there. Where the wire field is nullable, an absent or unusable value
+  own links. `progress` is the same `Progress` the event stream yields (which
+  now also carries `currentNodeClass`). Comfy Cloud's poll response has been
+  reported to carry `progress: null` even for a running job, so
+  `job.events()` remains the live-progress source there. Where the wire field is nullable, an absent or unusable value
   reads as "none" rather than as an `Invalid Date` or an empty snapshot; where
   it is required and non-nullable (`createdAt`, `expiresAt`, `urls`) a
   response that omits it raises `ComfyError` (`unexpected_response`) instead

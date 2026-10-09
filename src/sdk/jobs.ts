@@ -22,7 +22,13 @@ import type {
 } from "../low/index.js";
 import { abortableSleep } from "./abortable-sleep.js";
 import { backoffSchedule, isTerminal, SUCCESS } from "./core.js";
-import { eventFromRaw, type ComfyEvent, type StatusChange } from "./events.js";
+import {
+  eventFromRaw,
+  progressFrom,
+  type ComfyEvent,
+  type Progress,
+  type StatusChange,
+} from "./events.js";
 import { ComfyError, JobFailed, toSdkError, translate } from "./exceptions.js";
 import { Output } from "./outputs.js";
 
@@ -160,16 +166,16 @@ export class Job {
    * "this state carries no snapshot" rather than "not running" — take live
    * progress from {@link Job.events}.
    *
-   * This is the generated wire model (`Progress` from `@comfyorg/sdk/low`,
-   * snake_case), NOT the camelCase `Progress` event of the same name that
-   * {@link Job.events} yields.
+   * The same {@link Progress} the `progress` frames of {@link Job.events}
+   * carry, so a snapshot read off the handle and one received live are one
+   * type — matching `Job.progress` in the Python SDK.
    */
-  get progress(): LowJob["progress"] {
+  get progress(): Progress | null {
     const progress = this.model.progress;
-    // Absent reads as none, not as an empty snapshot: spreading `undefined`
-    // would hand back a `{}` typed as a `Progress` whose `value` and
-    // `nodes_total` are missing, and a percentage computed off those is `NaN`.
-    return progress == null ? null : { ...progress };
+    // Absent reads as none, not as an empty snapshot: lifting `undefined`
+    // would hand back a `Progress` whose `value` and `nodesTotal` were never
+    // sent, and a percentage computed off those is meaningless.
+    return progress == null ? null : progressFrom(progress as Record<string, unknown>);
   }
 
   /** Place in the queue as of the state this handle holds, or `null` when the server reports none. */

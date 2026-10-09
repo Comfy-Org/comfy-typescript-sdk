@@ -339,7 +339,13 @@ describe("Job", () => {
       started_at: "2026-07-10T18:20:30Z",
       completed_at: null,
       queue_position: 3,
-      progress: { value: 0.25, nodes_done: 1, nodes_total: 4, current_node: "13" },
+      progress: {
+        value: 0.25,
+        nodes_done: 1,
+        nodes_total: 4,
+        current_node: "13",
+        current_node_class: "KSampler",
+      },
     };
 
     it("exposes created_at and expires_at as Dates, not wire strings", async () => {
@@ -370,11 +376,18 @@ describe("Job", () => {
       expect(job.startedAt?.toISOString()).toBe("2026-07-10T18:20:30.000Z");
       expect(job.completedAt).toBeNull();
       expect(job.queuePosition).toBe(3);
+      // The same camelCase `Progress` the event stream yields, not the wire
+      // model, so one type covers both sources (as in the Python SDK).
       expect(job.progress).toEqual({
+        kind: "progress",
         value: 0.25,
-        nodes_done: 1,
-        nodes_total: 4,
-        current_node: "13",
+        message: null,
+        nodesDone: 1,
+        nodesTotal: 4,
+        currentNode: "13",
+        currentNodeClass: "KSampler",
+        step: null,
+        steps: null,
       });
     });
 
