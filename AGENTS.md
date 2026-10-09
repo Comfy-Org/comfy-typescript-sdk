@@ -266,7 +266,7 @@ Two things to know before you touch it:
   `modelsMethodsAheadOfPython` tolerate that in ONE direction — TypeScript
   leading — and each has a rot guard that fails the moment the Python snapshot
   grows the same name, which is the signal to delete the entry rather than to
-  grow it. Neither field carries an entry for a `models` method today. Do
+  grow it. Neither field carries an entry today. Do
   not reach for either field to excuse something this SDK invented:
   `router-spec-coverage.test.ts` only passes for a bucket the vendored Router
   contract actually declares.
