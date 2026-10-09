@@ -31,16 +31,19 @@ import {
 } from "./events.js";
 import { ComfyError, JobFailed, toSdkError, translate } from "./exceptions.js";
 import { Output } from "./outputs.js";
+import { MIN_RETRY_PAUSE_MS } from "./retry-pause.js";
 
 // Pause before reconnecting an SSE stream that dropped mid-job, without a
 // terminal frame having been seen.
 const RECONNECT_PAUSE_MS = 100;
 // Match submit()'s fallback when a 429 omits a usable Retry-After value.
 const DEFAULT_429_RECONNECT_PAUSE_MS = 2_000;
-// Ceiling on a server-supplied 429 Retry-After used as the reconnect pause —
-// this loop has no overall deadline of its own (only an optional caller
-// signal), so an unbounded value from a malicious/misbehaving server would
-// otherwise stall reconnection indefinitely.
+// A server-supplied 429 Retry-After used as the reconnect pause is bounded on
+// both sides — below by MIN_RETRY_PAUSE_MS, above by this ceiling. This loop
+// has no overall deadline or retry budget of its own (only an optional caller
+// signal), so a malicious/misbehaving server could otherwise stall
+// reconnection indefinitely with a huge value, or spin connect()+refresh()
+// with a `Retry-After: 0`.
 const MAX_RECONNECT_PAUSE_MS = 60_000;
 
 /**
@@ -359,7 +362,13 @@ export class Job {
           if (exc.httpStatus === 429) {
             const retryAfterMs =
               exc.retryAfter === null ? DEFAULT_429_RECONNECT_PAUSE_MS : exc.retryAfter * 1000;
-            reconnectPauseMs = Math.min(retryAfterMs, MAX_RECONNECT_PAUSE_MS);
+            // Floor as well as ceiling: a `Retry-After: 0` must not collapse the
+            // pause and spin connect()+refresh() against a server that is
+            // already shedding load; this loop has no retry budget.
+            reconnectPauseMs = Math.min(
+              Math.max(retryAfterMs, MIN_RETRY_PAUSE_MS),
+              MAX_RECONNECT_PAUSE_MS,
+            );
           } else {
             throw toSdkError(exc);
           }

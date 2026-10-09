@@ -63,6 +63,7 @@ import {
   toSdkError,
 } from "./exceptions.js";
 import { Job, JobFactory, jobSummary, type JobSummary } from "./jobs.js";
+import { MIN_RETRY_PAUSE_MS } from "./retry-pause.js";
 import type { Workflow, WorkflowGraph } from "./workflows.js";
 import { WorkflowFactory } from "./workflows.js";
 
@@ -74,9 +75,6 @@ export const COMFY_CLOUD_BASE_URL = "https://cloud.comfy.org";
 export const BASE_URL_ENV_VAR = "COMFY_BASE_URL";
 
 const DEFAULT_RETRY_AFTER_S = 2;
-// The shortest pause before re-sending a 429: a `Retry-After: 0` must not
-// turn the retry into a tight loop for the whole budget.
-const MIN_RETRY_PAUSE_MS = 1_000;
 
 /**
  * Comfy Cloud, unless `COMFY_BASE_URL` names another deployment.
