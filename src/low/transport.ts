@@ -98,6 +98,34 @@ export type JobWorkflowFormat = JobWorkflowResponse["format"];
 /** Return shape of {@link ComfyLow.getJobWorkflow} — the generated response schema. */
 export type JobWorkflowResult = JobWorkflowResponse;
 
+/**
+ * Labels a caller attached to a job at submit: string keys to string values.
+ * Hand-written until the vendored spec carries `metadata`; the server owns
+ * the limits on it, so none are checked here.
+ */
+export type JobMetadata = Record<string, string>;
+
+/**
+ * One item of `GET /api/v2/jobs`. Not the `Job` schema: a list item carries
+ * no outputs or follow-up links, and the server may send more fields than
+ * the stable ones named here.
+ */
+export interface JobListItem {
+  id: string;
+  status: string;
+  create_time?: string;
+  update_time?: string;
+  deployment_id?: string | null;
+  metadata?: JobMetadata;
+  [field: string]: unknown;
+}
+
+/** Return shape of {@link ComfyLow.listJobs} — one page; `next_cursor` is absent on the last. */
+export interface JobListPage {
+  jobs: JobListItem[];
+  next_cursor?: string;
+}
+
 function looksLikePath(value: string): boolean {
   return value.startsWith("http") || value.startsWith("/");
 }
@@ -495,13 +523,15 @@ export class ComfyLow {
   /**
    * `POST /api/v2/jobs`. `extraData` (e.g. the partner-node API key) is a
    * sibling of `workflow` on the wire, per the spec's closed `extra_data`
-   * object; omitted entirely when not provided, never sent empty.
+   * object; omitted entirely when not provided, never sent empty. `metadata`
+   * follows the same rule.
    */
   async postJobs(
     workflow: Record<string, unknown>,
     options: {
       idempotencyKey?: string;
       extraData?: PostJobsData["body"]["extra_data"];
+      metadata?: JobMetadata;
       signal?: AbortSignal;
     } = {},
   ): Promise<Job> {
@@ -509,14 +539,46 @@ export class ComfyLow {
     if (options.idempotencyKey) {
       headers["Idempotency-Key"] = options.idempotencyKey;
     }
-    const json: PostJobsData["body"] = { workflow };
+    const json: PostJobsData["body"] & { metadata?: JobMetadata } = { workflow };
     // Only attach a non-empty extra_data — never serialize an empty object onto
     // the wire (mirrors the Python low layer's truthy guard).
     if (options.extraData && Object.keys(options.extraData).length > 0) {
       json.extra_data = options.extraData;
     }
+    if (options.metadata && Object.keys(options.metadata).length > 0) {
+      json.metadata = options.metadata;
+    }
     const response = await this.request("POST", "/jobs", { headers, json, signal: options.signal });
     return this.parseOrRaise<Job>(response, [201]);
+  }
+
+  /**
+   * `GET /api/v2/jobs` — one page of the caller's jobs, newest first. Every
+   * `metadata` pair is sent as `metadata[key]=value` and must match exactly.
+   * Pass the previous page's `next_cursor` as `cursor` for the next page.
+   *
+   * Ahead of the vendored spec: the operation joins {@link OPERATION_IDS}
+   * when the spec sync that adds it lands.
+   */
+  async listJobs(
+    options: {
+      metadata?: JobMetadata;
+      limit?: number;
+      cursor?: string;
+      signal?: AbortSignal;
+    } = {},
+  ): Promise<JobListPage> {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(options.metadata ?? {})) {
+      query.append(`metadata[${key}]`, value);
+    }
+    if (options.limit !== undefined) query.set("limit", String(options.limit));
+    if (options.cursor !== undefined) query.set("cursor", options.cursor);
+    const qs = query.toString();
+    const response = await this.request("GET", qs ? `/jobs?${qs}` : "/jobs", {
+      signal: options.signal,
+    });
+    return this.parseOrRaise<JobListPage>(response, [200]);
   }
 
   /** `GET /api/v2/jobs/{id}` (or an absolute self link). */

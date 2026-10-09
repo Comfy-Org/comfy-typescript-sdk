@@ -42,7 +42,10 @@ import { describe, expect, it } from "vitest";
 import {
   readRouterOperations,
   readRouterRouteContract,
+  readSuccessHeaderNames,
   routerOperations,
+  runSuccessHeaderNames,
+  successHeaderNames,
   templatePlaceholders,
 } from "../../scripts/router-route-contract.mjs";
 import { withRouterStub } from "../../test/support/router-stub-server.js";
@@ -50,6 +53,10 @@ import { comfy } from "./comfy.js";
 import { COMFY_ROUTER_BASE_URL, config } from "./credentials.js";
 import {
   CATALOG_ROUTE_TEMPLATE,
+  CREDITS_USED_HEADER,
+  DROPPED_PARAMS_HEADER,
+  FALLBACK_PROVIDER_HEADER,
+  IDEMPOTENT_REPLAYED_HEADER,
   models,
   RUN_ROUTE_TEMPLATE,
   SCHEMA_ROUTE_TEMPLATE,
@@ -71,6 +78,96 @@ describe("router route contract (spec/router-openapi.yaml)", () => {
       "the vendored Router contract moved the runRouterModel path — update RUN_ROUTE_TEMPLATE " +
         "in src/sdk/models.ts to match it (comfy.models.run 404s until you do)",
     ).toBe(RUN_ROUTE_TEMPLATE);
+  });
+
+  it("spells IDEMPOTENT_REPLAYED_HEADER the replay marker the contract declares", async () => {
+    // The same pinning the route templates get, for the one header whose
+    // drift is SILENT in both directions. `parseReplayed` reads this header by
+    // its PRESENCE, so a constant wrong by one character reports
+    // `replayed: false` on every replay forever — indistinguishable from the
+    // fresh run the field is there to tell a replay apart from — and a
+    // contract that made the header `required: true` would mean its arrival no
+    // longer marks anything, which is the other half of the same assumption.
+    const { runSuccessHeaders } = await readRouterRouteContract();
+    const declared = runSuccessHeaders[IDEMPOTENT_REPLAYED_HEADER];
+    expect(
+      declared,
+      `the vendored Router contract's runRouterModel 200 no longer declares a ` +
+        `\`${IDEMPOTENT_REPLAYED_HEADER}\` header — update IDEMPOTENT_REPLAYED_HEADER in ` +
+        "src/sdk/models.ts to whatever it declares instead (every run reports replayed: false " +
+        "until you do, which reads as a fresh charge on a call that was not charged)",
+    ).toBeDefined();
+    expect(
+      declared?.component,
+      `${IDEMPOTENT_REPLAYED_HEADER} now resolves to a different header component`,
+    ).toBe("RouterIdempotentReplayedHeader");
+    expect(
+      declared?.required,
+      "the contract now declares the replay marker `required` — it would then be sent on a " +
+        "fresh run too, and parseReplayed in src/sdk/models.ts must stop reading it as a " +
+        "presence flag and read its VALUE instead",
+    ).toBe(false);
+  });
+
+  /**
+   * The pin for `CREDITS_USED_HEADER`, which until the sync that landed
+   * `RouterCreditsUsedHeader` was the one header constant in
+   * `src/sdk/models.ts` pinned to NOTHING.
+   *
+   * It matters more than the other two because its drift is SILENT. A route
+   * that moves 404s loudly; a credits header name wrong by one segment reports
+   * `creditsUsed: null` on every run forever, which is exactly the value the
+   * field is documented to carry when Router reported no cost. Nothing else in
+   * the repo could catch it: the stub hard-codes the same literal the SDK
+   * expects, so SDK and fixture agree with each other while both disagree with
+   * Router.
+   *
+   * This replaces the rot guard that stood here while the contract declared no
+   * credits header — it watched for the arrival, and the arrival happened. The
+   * name it brought MATCHES the constant, so the SDK was reading the right
+   * header all along; this is what keeps that true through the next sync.
+   */
+  it("spells CREDITS_USED_HEADER the credits header the contract declares on runRouterModel's 200", async () => {
+    const { runSuccessHeaderNames } = await readRouterRouteContract();
+    // Sanity: the read works at all. A selector that silently returned nothing
+    // would satisfy an "is it declared" check vacuously, which is the "empty
+    // set reads as agreement" failure this file exists to refuse.
+    expect(runSuccessHeaderNames).toContain(FALLBACK_PROVIDER_HEADER.toLowerCase());
+    expect(runSuccessHeaderNames).toContain(DROPPED_PARAMS_HEADER.toLowerCase());
+
+    const credits = runSuccessHeaderNames.filter((name) => name.includes("credits"));
+    expect(
+      credits,
+      "the vendored Router contract changed which credits headers runRouterModel's 200 " +
+        "declares. Exactly one is expected, and CREDITS_USED_HEADER in src/sdk/models.ts is " +
+        "the SDK's copy of its name. If the header was REMOVED, comfy.models.run now reports " +
+        "creditsUsed: null on every call and this pin is how you found out — do not delete it " +
+        "to go green.",
+    ).toEqual([CREDITS_USED_HEADER.toLowerCase()]);
+  });
+
+  /**
+   * The queued twin of the pin above — and a ROT GUARD, because today there
+   * is nothing to pin it to.
+   *
+   * `RequestHandle.collect` lifts `creditsUsed` off `getRouterModelRequestResult`'s
+   * `200` with the same `CREDITS_USED_HEADER`, but that response declares no
+   * credits header, so a queued result's `creditsUsed` is coupled to nothing
+   * the contract states and will read `null` until Router both stamps and
+   * declares it. This asserts that absence, so the sync that declares it
+   * reddens here: when it fires, replace this with the pin above's shape
+   * (exactly `[CREDITS_USED_HEADER.toLowerCase()]`) rather than deleting it.
+   */
+  it("still declares no credits header on the queued result read (rot guard)", async () => {
+    const declared = await readSuccessHeaderNames("getRouterModelRequestResult");
+    // Sanity: the read works at all, so an empty read cannot pass as "absent".
+    expect(declared).toContain("x-comfy-request-id");
+    expect(
+      declared.filter((name) => name.includes("credits")),
+      "getRouterModelRequestResult's 200 now declares a credits header. Replace this rot " +
+        "guard with a pin that its name equals CREDITS_USED_HEADER in src/sdk/models.ts, " +
+        "which RequestHandle.collect in src/sdk/modelRequests.ts already reads.",
+    ).toEqual([]);
   });
 
   it("spells COMFY_ROUTER_BASE_URL the host the contract declares", async () => {
@@ -324,6 +421,24 @@ describe("the operation extractor the coverage check reads through", () => {
     expect(() => routerOperations({ paths: { "/v2/models": { get: { responses: {} } } } })).toThrow(
       "declares no operationId",
     );
+  });
+
+  it("refuses an operation that declares no `200`, rather than reading it as no headers", () => {
+    // A sync that moved success to `201` or to `2XX` would otherwise read as
+    // "declares no credits header" — an absent response passing as agreement.
+    const moved = { operationId: "runRouterModel", responses: { "201": { headers: {} } } };
+    const doc = { paths: { "/v2/models/{model_id}": { post: moved } } };
+    expect(() => successHeaderNames(doc, "runRouterModel")).toThrow(
+      "`runRouterModel` declares no `200` response",
+    );
+    expect(() => runSuccessHeaderNames(doc, doc.paths["/v2/models/{model_id}"])).toThrow(
+      "declares no `200` response",
+    );
+    // A declared `200` with no headers is still a truthful empty read.
+    const bare = {
+      paths: { "/v2/models/{model_id}": { post: { ...moved, responses: { "200": {} } } } },
+    };
+    expect(successHeaderNames(bare, "runRouterModel")).toEqual([]);
   });
 });
 

@@ -3,7 +3,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StubServer } from "../../test/support/stub-server.js";
 import { abortableSleep } from "./abortable-sleep.js";
 import { BASE_URL_ENV_VAR, Comfy } from "./client.js";
-import { IdempotencyKeyReuse, QueueFull, WorkflowFormatUi } from "./exceptions.js";
+import { CREDENTIALS_ENV_VAR } from "./credentials.js";
+import {
+  ComfyError,
+  IdempotencyKeyReuse,
+  InvalidWorkflow,
+  QueueFull,
+  WorkflowFormatUi,
+} from "./exceptions.js";
 
 // Spies on (not replaces) abortableSleep by default, so every other test
 // here still sleeps for real; only the clamp test below overrides a single
@@ -18,8 +25,11 @@ describe("Comfy", () => {
     server = new StubServer();
     await server.start();
     // Clients read their target from the environment, so pointing them at the
-    // stub is part of standing it up.
+    // stub is part of standing it up. The credential comes from the same
+    // place, and the stub needs none — so it is cleared rather than left to
+    // whatever the ambient shell exports.
     vi.stubEnv(BASE_URL_ENV_VAR, server.baseUrl);
+    vi.stubEnv(CREDENTIALS_ENV_VAR, undefined);
     client = new Comfy();
   });
 
@@ -130,6 +140,18 @@ describe("Comfy", () => {
     },
   );
 
+  it("submit() waits at least a second on a 429 with Retry-After: 0, instead of re-sending at once", async () => {
+    server.state.queueFullTimes = 1;
+    server.state.retryAfterHeader = "0";
+    vi.mocked(abortableSleep).mockImplementationOnce(() => Promise.resolve());
+    const wf = client.workflows.fromJson({ "1": {} });
+
+    await client.submit(wf);
+
+    expect(abortableSleep).toHaveBeenCalledWith(1_000, undefined);
+    expect(server.state.submitCount).toBe(2);
+  });
+
   it("submit() clamps a 429 Retry-After far larger than the retry budget, instead of sleeping past it", async () => {
     server.state.queueFullTimes = 1;
     server.state.retryAfterHeader = "86400"; // 24h — a malicious/misbehaving server value
@@ -172,6 +194,369 @@ describe("Comfy", () => {
     // A deadline shorter than the first poll backoff step (500ms) so it
     // trips on the very first check, keeping the test fast.
     await expect(client.run(wf, { timeoutMs: 50 })).rejects.toThrow(/not terminal after 50ms/);
+  });
+
+  it("submit() with metadata sends it as the body's metadata, and the job exposes it", async () => {
+    const wf = client.workflows.fromJson({ "1": {} });
+    const job = await client.submit(wf, { metadata: { customer: "acme", run: "7" } });
+
+    expect(server.state.lastPostJobsBody).toMatchObject({
+      metadata: { customer: "acme", run: "7" },
+    });
+    expect(job.metadata).toEqual({ customer: "acme", run: "7" });
+  });
+
+  it("submit() without metadata sends the same body as before: the workflow and nothing else", async () => {
+    const wf = client.workflows.fromJson({ "1": {} });
+    const job = await client.submit(wf);
+
+    expect(Object.keys(server.state.lastPostJobsBody ?? {})).toEqual(["workflow"]);
+    expect(job.metadata).toEqual({});
+  });
+
+  it("submit() surfaces a 422 metadata_invalid as a ComfyError carrying that code, with the server's message naming the key", async () => {
+    // The stub answers this only to a body that carries metadata.
+    server.state.metadataError = {
+      status: 422,
+      code: "metadata_invalid",
+      message: 'metadata key "bad key" may only use A-Z a-z 0-9 _ - .',
+    };
+    const wf = client.workflows.fromJson({ "1": {} });
+    const err = await client.submit(wf, { metadata: { "bad key": "x" } }).catch((e: unknown) => e);
+
+    expect(server.state.lastPostJobsBody).toMatchObject({ metadata: { "bad key": "x" } });
+    // Labels are not the workflow: the base class, not InvalidWorkflow,
+    // matching the Python SDK.
+    expect(err).toBeInstanceOf(ComfyError);
+    expect(err).not.toBeInstanceOf(InvalidWorkflow);
+    expect((err as ComfyError).code).toBe("metadata_invalid");
+    expect((err as ComfyError).httpStatus).toBe(422);
+    expect((err as ComfyError).message).toContain('"bad key"');
+    expect(server.state.submitCount).toBe(1);
+  });
+
+  it("submit() surfaces Comfy Cloud's 422 metadata_not_supported as a ComfyError carrying that code, not InvalidWorkflow", async () => {
+    // The stub answers this only to a body that carries metadata.
+    server.state.metadataError = {
+      status: 422,
+      code: "metadata_not_supported",
+      message: "job metadata is not supported here",
+    };
+    const wf = client.workflows.fromJson({ "1": {} });
+    const err = await client
+      .submit(wf, { metadata: { customer: "acme" } })
+      .catch((e: unknown) => e);
+
+    expect(server.state.lastPostJobsBody).toMatchObject({ metadata: { customer: "acme" } });
+    expect(err).toBeInstanceOf(ComfyError);
+    expect(err).not.toBeInstanceOf(InvalidWorkflow);
+    expect((err as ComfyError).code).toBe("metadata_not_supported");
+    expect((err as ComfyError).httpStatus).toBe(422);
+  });
+
+  it("listJobs() sends each metadata pair and the limit, and follows next_cursor until it is absent", async () => {
+    server.state.jobListPages = {
+      "": {
+        jobs: [
+          { id: "job_03", status: "running", metadata: { customer: "acme", tier: "pro" } },
+          { id: "job_02", status: "succeeded", metadata: { customer: "acme", tier: "pro" } },
+        ],
+        next_cursor: "c2",
+      },
+      c2: {
+        jobs: [{ id: "job_01", status: "failed", metadata: { customer: "acme", tier: "pro" } }],
+      },
+    };
+
+    const ids: string[] = [];
+    for await (const job of client.listJobs({
+      metadata: { customer: "acme", tier: "pro" },
+      limit: 2,
+    })) {
+      ids.push(job.id);
+    }
+
+    expect(ids).toEqual(["job_03", "job_02", "job_01"]);
+    const [first, second] = server.state.jobListQueries;
+    expect(server.state.jobListQueries).toHaveLength(2);
+    expect(first.get("metadata[customer]")).toBe("acme");
+    expect(first.get("metadata[tier]")).toBe("pro");
+    expect(first.get("limit")).toBe("2");
+    expect(first.has("cursor")).toBe(false);
+    // Every page repeats the filters and limit; only the cursor moves.
+    expect(second.get("metadata[customer]")).toBe("acme");
+    expect(second.get("metadata[tier]")).toBe("pro");
+    expect(second.get("limit")).toBe("2");
+    expect(second.get("cursor")).toBe("c2");
+  });
+
+  it("listJobs() with no options sends no query at all", async () => {
+    for await (const _ of client.listJobs()) {
+      // the default first page is empty
+    }
+    expect(server.state.jobListQueries).toHaveLength(1);
+    expect([...server.state.jobListQueries[0].keys()]).toEqual([]);
+  });
+
+  it("listJobs() yields summaries: metadata is an empty object and missing fields are null when the server omits them", async () => {
+    server.state.jobListPages = {
+      "": {
+        jobs: [
+          {
+            id: "job_02",
+            status: "succeeded",
+            create_time: "2026-10-05T18:00:00Z",
+            update_time: "2026-10-05T18:01:00Z",
+            deployment_id: "dep_01",
+            metadata: { customer: "acme" },
+          },
+          { id: "job_01", status: "queued" },
+        ],
+      },
+    };
+
+    const jobs = [];
+    for await (const job of client.listJobs()) jobs.push(job);
+
+    expect(jobs).toEqual([
+      {
+        id: "job_02",
+        status: "succeeded",
+        createTime: "2026-10-05T18:00:00Z",
+        updateTime: "2026-10-05T18:01:00Z",
+        deploymentId: "dep_01",
+        metadata: { customer: "acme" },
+      },
+      {
+        id: "job_01",
+        status: "queued",
+        createTime: null,
+        updateTime: null,
+        deploymentId: null,
+        metadata: {},
+      },
+    ]);
+  });
+
+  it("listJobs() stops fetching when the caller stops iterating", async () => {
+    server.state.jobListPages = {
+      "": { jobs: [{ id: "job_02", status: "queued" }], next_cursor: "c2" },
+      c2: { jobs: [{ id: "job_01", status: "queued" }] },
+    };
+
+    for await (const job of client.listJobs()) {
+      expect(job.id).toBe("job_02");
+      break;
+    }
+    expect(server.state.jobListQueries).toHaveLength(1);
+  });
+
+  it("listJobs() rejects promptly when its signal aborts a request in flight", async () => {
+    server.state.hangJobList = true; // never responds; only an abort ends this
+    const controller = new AbortController();
+    const iterator = client.listJobs({ signal: controller.signal });
+    setTimeout(() => controller.abort(), 30);
+    const start = Date.now();
+    await expect(iterator.next()).rejects.toBeTruthy();
+    expect(Date.now() - start).toBeLessThan(500);
+  }, 2000);
+
+  it("listJobs() surfaces a 400 invalid_cursor, for a cursor the list did not issue, as a ComfyError carrying that code", async () => {
+    // The stub 400s invalid_cursor for any cursor without a page.
+    server.state.jobListPages = { "": { jobs: [], next_cursor: "not-issued" } };
+    const err = await (async () => {
+      for await (const _ of client.listJobs()) {
+        // the first page is empty; the second request carries the bad cursor
+      }
+    })().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ComfyError);
+    expect(err).not.toBeInstanceOf(InvalidWorkflow);
+    expect((err as ComfyError).httpStatus).toBe(400);
+    expect((err as ComfyError).code).toBe("invalid_cursor");
+    expect(server.state.jobListQueries[1].get("cursor")).toBe("not-issued");
+  });
+
+  it("listJobs() rejects a next_cursor equal to the cursor it just sent, instead of fetching that page forever", async () => {
+    server.state.jobListPages = {
+      "": { jobs: [], next_cursor: "c2" },
+      c2: { jobs: [{ id: "job_01", status: "queued" }], next_cursor: "c2" },
+    };
+    const ids: string[] = [];
+    const err = await (async () => {
+      for await (const job of client.listJobs()) ids.push(job.id);
+    })().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ComfyError);
+    expect((err as ComfyError).code).toBe("unexpected_response");
+    expect(ids).toEqual(["job_01"]);
+    expect(server.state.jobListQueries.map((q) => q.get("cursor"))).toEqual([null, "c2"]);
+  });
+
+  it("listJobs() rejects a next_cursor it followed pages ago, so a cycle of cursors ends too", async () => {
+    server.state.jobListPages = {
+      "": { jobs: [], next_cursor: "c2" },
+      c2: { jobs: [], next_cursor: "c3" },
+      c3: { jobs: [], next_cursor: "c2" },
+    };
+    const err = await (async () => {
+      for await (const _ of client.listJobs({ metadata: { customer: "acme" } })) {
+        // no job matches; without the check this would never yield or end
+      }
+    })().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ComfyError);
+    expect((err as ComfyError).code).toBe("unexpected_response");
+    expect(server.state.jobListQueries.map((q) => q.get("cursor"))).toEqual([null, "c2", "c3"]);
+  });
+
+  it("listJobs() retries a 429 on a later page after its Retry-After, and resumes at that page", async () => {
+    server.state.jobListPages = {
+      "": { jobs: [{ id: "job_02", status: "queued" }], next_cursor: "c2" },
+      c2: { jobs: [{ id: "job_01", status: "queued" }] },
+    };
+    server.state.jobListThrottle = { cursor: "c2", times: 1, retryAfter: "2" };
+    vi.mocked(abortableSleep).mockImplementationOnce(() => Promise.resolve());
+
+    const ids: string[] = [];
+    for await (const job of client.listJobs()) ids.push(job.id);
+
+    expect(ids).toEqual(["job_02", "job_01"]);
+    expect(abortableSleep).toHaveBeenCalledWith(2_000, undefined);
+    // Page 1 once, then page 2 twice: never back to the start.
+    expect(server.state.jobListQueries.map((q) => q.get("cursor"))).toEqual([null, "c2", "c2"]);
+  });
+
+  it("listJobs() waits at least a second on a 429 with Retry-After: 0, instead of re-sending at once", async () => {
+    server.state.jobListThrottle = { cursor: "", times: 1, retryAfter: "0" };
+    vi.mocked(abortableSleep).mockImplementationOnce(() => Promise.resolve());
+
+    for await (const _ of client.listJobs()) {
+      // the default first page is empty
+    }
+
+    expect(abortableSleep).toHaveBeenCalledWith(1_000, undefined);
+    expect(server.state.jobListQueries).toHaveLength(2);
+  });
+
+  it("listJobs() keeps the server's Retry-After on an error it surfaces", async () => {
+    server.state.jobListError = {
+      status: 503,
+      code: "service_unavailable",
+      message: "try later",
+      retryAfter: "2",
+    };
+    const err = await client
+      .listJobs()
+      .next()
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ComfyError);
+    expect((err as ComfyError).httpStatus).toBe(503);
+    expect((err as ComfyError).retryAfter).toBe(2);
+  });
+
+  it("listJobs() matches a filter value that is not a string by the text it sends, for an untyped caller", async () => {
+    server.state.jobListPages = {
+      "": { jobs: [{ id: "job_01", status: "succeeded", metadata: { run: "7" } }] },
+    };
+
+    const ids: string[] = [];
+    // A JavaScript caller can pass a number; it goes out as metadata[run]=7.
+    for await (const job of client.listJobs({ metadata: { run: 7 } as never })) ids.push(job.id);
+
+    expect(server.state.jobListQueries[0].get("metadata[run]")).toBe("7");
+    expect(ids).toEqual(["job_01"]);
+  });
+
+  it("listJobs() matches a filter key or value holding a lone surrogate by the U+FFFD the query sends", async () => {
+    server.state.jobListPages = {
+      "": { jobs: [{ id: "job_01", status: "succeeded", metadata: { "k\uFFFD": "\uFFFD" } }] },
+    };
+
+    const ids: string[] = [];
+    for await (const job of client.listJobs({ metadata: { "k\uD800": "\uD800" } })) {
+      ids.push(job.id);
+    }
+
+    expect(server.state.jobListQueries[0].get("metadata[k\uFFFD]")).toBe("\uFFFD");
+    expect(ids).toEqual(["job_01"]);
+  });
+
+  it("listJobs() keeps a label keyed __proto__ as an own key", async () => {
+    server.state.jobListPages = {
+      "": {
+        jobs: [
+          {
+            id: "job_01",
+            status: "succeeded",
+            // JSON.parse makes "__proto__" an own key, as a server's JSON would.
+            metadata: JSON.parse('{"__proto__":"tenant-7","customer":"acme"}'),
+          },
+        ],
+      },
+    };
+
+    const jobs = [];
+    for await (const job of client.listJobs()) jobs.push(job);
+
+    expect(Object.entries(jobs[0].metadata)).toEqual([
+      ["__proto__", "tenant-7"],
+      ["customer", "acme"],
+    ]);
+  });
+
+  it("listJobs() with a filter skips any item whose labels do not hold every pair, for a server that ignores the filter", async () => {
+    // A self-hosted proxy, or a gateway without label support, answers a
+    // filtered list with every job.
+    server.state.jobListPages = {
+      "": {
+        jobs: [
+          { id: "job_05", status: "succeeded", metadata: { customer: "acme", tier: "pro" } },
+          { id: "job_04", status: "succeeded", metadata: { customer: "other", tier: "pro" } },
+          { id: "job_03", status: "succeeded", metadata: { customer: "acme" } },
+          { id: "job_02", status: "succeeded", metadata: "a proxy string" },
+          { id: "job_01", status: "succeeded" },
+        ],
+      },
+    };
+
+    const ids: string[] = [];
+    for await (const job of client.listJobs({ metadata: { customer: "acme", tier: "pro" } })) {
+      ids.push(job.id);
+    }
+
+    expect(ids).toEqual(["job_05"]);
+  });
+
+  it("listJobs() reads a metadata that is not an object as empty, and drops values that are not strings", async () => {
+    server.state.jobListPages = {
+      "": {
+        jobs: [
+          // A self-hosted proxy sends its own metadata as a plain string.
+          { id: "job_03", status: "succeeded", metadata: "a proxy string" },
+          { id: "job_02", status: "succeeded", metadata: ["customer", "acme"] },
+          { id: "job_01", status: "succeeded", metadata: { customer: "acme", run: 7, x: null } },
+        ],
+      },
+    };
+
+    const metadata = [];
+    for await (const job of client.listJobs()) metadata.push(job.metadata);
+
+    expect(metadata).toEqual([{}, {}, { customer: "acme" }]);
+  });
+
+  it("listJobs() surfaces a 400 invalid_metadata_filter as a ComfyError carrying that code", async () => {
+    server.state.jobListError = {
+      status: 400,
+      code: "invalid_metadata_filter",
+      message: "at most 3 metadata filters",
+    };
+    const err = await client
+      .listJobs({ metadata: { a: "1", b: "2", c: "3", d: "4" } })
+      .next()
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ComfyError);
+    expect(err).not.toBeInstanceOf(InvalidWorkflow);
+    expect((err as ComfyError).httpStatus).toBe(400);
+    expect((err as ComfyError).code).toBe("invalid_metadata_filter");
   });
 
   it("downloads a byte range of an output", async () => {
