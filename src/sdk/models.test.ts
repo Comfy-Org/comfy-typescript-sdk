@@ -1079,18 +1079,20 @@ describe("comfy.models.run on a binary result", () => {
     // the one lossless answer. Simulated, since the real size is ~512 MiB.
     const bytes = new Uint8Array([0x7b, 0x7d, 0x00, 0x01]);
     const realDecode = TextDecoder.prototype.decode;
-    const spy = vi
-      .spyOn(TextDecoder.prototype, "decode")
-      .mockImplementation(function (this: TextDecoder, input, options) {
-        if (
-          input instanceof Uint8Array &&
-          input.byteLength === bytes.byteLength &&
-          input.every((b, i) => b === bytes[i])
-        ) {
-          throw new RangeError("Invalid string length");
-        }
-        return realDecode.call(this, input, options);
-      });
+    const spy = vi.spyOn(TextDecoder.prototype, "decode").mockImplementation(function (
+      this: TextDecoder,
+      input,
+      options,
+    ) {
+      if (
+        input instanceof Uint8Array &&
+        input.byteLength === bytes.byteLength &&
+        input.every((b, i) => b === bytes[i])
+      ) {
+        throw new RangeError("Invalid string length");
+      }
+      return realDecode.call(this, input, options);
+    });
     try {
       await withRouterStub(async (server) => {
         useStub(server);
@@ -1137,18 +1139,20 @@ describe("comfy.models.run on a binary result", () => {
   it("says decoding, not parsing, when a declared-JSON 200 is too long to decode", async () => {
     const bytes = new Uint8Array([0x7b, 0x7d, 0x20, 0x20, 0x20]);
     const realDecode = TextDecoder.prototype.decode;
-    const spy = vi
-      .spyOn(TextDecoder.prototype, "decode")
-      .mockImplementation(function (this: TextDecoder, input, options) {
-        if (
-          input instanceof Uint8Array &&
-          input.byteLength === bytes.byteLength &&
-          input.every((b, i) => b === bytes[i])
-        ) {
-          throw new RangeError("Invalid string length");
-        }
-        return realDecode.call(this, input, options);
-      });
+    const spy = vi.spyOn(TextDecoder.prototype, "decode").mockImplementation(function (
+      this: TextDecoder,
+      input,
+      options,
+    ) {
+      if (
+        input instanceof Uint8Array &&
+        input.byteLength === bytes.byteLength &&
+        input.every((b, i) => b === bytes[i])
+      ) {
+        throw new RangeError("Invalid string length");
+      }
+      return realDecode.call(this, input, options);
+    });
     try {
       await withRouterStub(async (server) => {
         useStub(server);
