@@ -19,6 +19,18 @@ entry. See CONTRIBUTING.md.
 
 ### Added
 
+- **A queued submit's cost quote is on the handle.** When Router quotes a
+  request on admission, `comfy.models.submit` (and so `subscribe`) now reads it
+  into `RequestHandle.estimate`, a new exported `CostEstimate`: `source` as the
+  server's open string, `isExact` / `isEstimated` / `isUnknown` to branch on (an
+  unrecognised source reads as unknown), the dollar figures `amount` /
+  `minAmount` / `maxAmount` as decimal strings, their `*Cents` and `credits`
+  counterparts as numbers, `reason`, `currency`, `provider`, `model`,
+  `pricingAsOf`, and the untouched `raw` object. `estimate` is `null` when no
+  quote is available — none sent, one that could not be read, an idempotent
+  replay, or a handle rebuilt by `comfy.models.handle` — and `null` never means
+  free. A malformed quote never fails the submit.
+
 - **The rest of a job's state is readable off the handle.** `Job` held the
   whole v2 job model privately and re-exported four fields, so a caller who
   wanted a run's duration had to cast past `private` to reach the timestamps.

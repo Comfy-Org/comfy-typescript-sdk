@@ -49,6 +49,7 @@ export {
   MIN_REQUEST_TIMEOUT_MS,
   nextPollDelayMs,
   RequestHandle,
+  type CostEstimate,
   type QueueUpdate,
   type SubmitOptions,
   type SubscribeOptions,

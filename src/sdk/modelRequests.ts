@@ -230,6 +230,83 @@ export interface QueueUpdate {
   raw: Record<string, unknown>;
 }
 
+/**
+ * What Comfy quoted for a queued request when it admitted it — the submit
+ * response's `estimate` object, read into camelCase.
+ *
+ * Priced before dispatch from the same rate card the charge is billed against,
+ * in US dollars. It is a QUOTE, not a price lock: the run is charged at the
+ * rates in force when it is rated, which can differ from those in force at
+ * {@link pricingAsOf}.
+ *
+ * Read {@link source} first; it says which of the figures exist:
+ *
+ * - `exact` carries {@link amount} (and {@link amountCents}, {@link credits});
+ * - `estimated` carries {@link minAmount} and {@link maxAmount} and no amount;
+ * - `unknown` carries no figure, and a {@link reason}.
+ *
+ * An absent amount never means free.
+ */
+export interface CostEstimate {
+  /**
+   * `"exact"`, `"estimated"` or `"unknown"`, verbatim — or whatever a newer
+   * server sends. An OPEN string, like {@link QueueUpdate.status}: a source
+   * added server side reaches the caller as itself. Branch on
+   * {@link isExact} / {@link isEstimated} / {@link isUnknown} rather than on
+   * this, so an unrecognised value lands in `isUnknown` as the contract says
+   * it must.
+   */
+  source: string;
+  /** `source` is `"exact"`: {@link amount} is the figure. */
+  isExact: boolean;
+  /** `source` is `"estimated"`: the figure is the {@link minAmount}–{@link maxAmount} range. */
+  isEstimated: boolean;
+  /**
+   * `source` is `"unknown"` OR a value this release does not recognise — no
+   * figure can be relied on. Not a statement that the run is free.
+   */
+  isUnknown: boolean;
+  /** Always `"USD"` today. */
+  currency: string;
+  /** The provider leg this quote is for — on a queued submit, the leg that will run. */
+  provider: string;
+  /** The `{provider}/{model}` id the quote prices. */
+  model: string;
+  /**
+   * When the rate card this quote was priced from was fetched, as the
+   * server's own ISO-8601 string (not parsed into a `Date`).
+   */
+  pricingAsOf: string;
+  /**
+   * Dollars as a decimal STRING (`"0.04"`), present on an exact quote. A
+   * string on purpose: it is exact to eight decimals on the wire, and a
+   * `number` would round it. `null` when the server sent none.
+   */
+  amount: string | null;
+  /** Lower bound in dollars as a decimal string, on an estimated quote, else `null`. */
+  minAmount: string | null;
+  /** Upper bound in dollars as a decimal string, on an estimated quote, else `null`. */
+  maxAmount: string | null;
+  /** {@link amount} in US cents, unrounded, for arithmetic; `null` when absent. */
+  amountCents: number | null;
+  /** {@link minAmount} in US cents; `null` when absent. */
+  minAmountCents: number | null;
+  /** {@link maxAmount} in US cents; `null` when absent. */
+  maxAmountCents: number | null;
+  /** {@link amount} in Comfy credits, rounded to 2 decimals; `null` when absent. */
+  credits: number | null;
+  /**
+   * Why there is no figure, on an unknown quote — `"not_quotable"`,
+   * `"unpriced_model"`, or a newer value, verbatim. `null` when absent.
+   */
+  reason: string | null;
+  /**
+   * The decoded `estimate` object, unmodified — the escape hatch for a field
+   * this interface does not model yet.
+   */
+  raw: Record<string, unknown>;
+}
+
 /** Options accepted by {@link Models.submit}. */
 export interface SubmitOptions {
   /**
@@ -431,6 +508,99 @@ function requestIdOf(body: unknown, response: QueueResponse): string {
       response.status,
     );
   }
+}
+
+/**
+ * Read a Router cost estimate object into a {@link CostEstimate}, or `null`.
+ *
+ * Lenient by design, and it NEVER throws: it is read off a submit the server
+ * has already accepted, so a quote this SDK cannot read must not turn a
+ * queued (and possibly billed) request into a failed call that lost its
+ * handle. Any malformed shape — not an object, a required field missing or
+ * not a non-empty string, an optional field present with the wrong type —
+ * reads as `null`, "no quote available", rather than as a partial quote whose
+ * missing figure a caller could mistake for zero.
+ */
+export function costEstimateOf(value: unknown): CostEstimate | null {
+  if (!isRecord(value)) return null;
+  const source = text(value.source);
+  const currency = text(value.currency);
+  const provider = text(value.provider);
+  const model = text(value.model);
+  const pricingAsOf = text(value.pricing_as_of);
+  if (
+    source === null ||
+    currency === null ||
+    provider === null ||
+    model === null ||
+    pricingAsOf === null
+  ) {
+    return null;
+  }
+  // `undefined` marks a field present with the wrong type; one of those makes
+  // the whole object malformed.
+  const optionalText = (field: unknown): string | null | undefined =>
+    field === undefined || field === null ? null : typeof field === "string" ? field : undefined;
+  const optionalNumber = (field: unknown): number | null | undefined =>
+    field === undefined || field === null
+      ? null
+      : typeof field === "number" && Number.isFinite(field)
+        ? field
+        : undefined;
+  const amount = optionalText(value.amount);
+  const minAmount = optionalText(value.min_amount);
+  const maxAmount = optionalText(value.max_amount);
+  const reason = optionalText(value.reason);
+  const amountCents = optionalNumber(value.amount_cents);
+  const minAmountCents = optionalNumber(value.min_amount_cents);
+  const maxAmountCents = optionalNumber(value.max_amount_cents);
+  const credits = optionalNumber(value.credits);
+  if (
+    amount === undefined ||
+    minAmount === undefined ||
+    maxAmount === undefined ||
+    reason === undefined ||
+    amountCents === undefined ||
+    minAmountCents === undefined ||
+    maxAmountCents === undefined ||
+    credits === undefined
+  ) {
+    return null;
+  }
+  const isExact = source === "exact";
+  const isEstimated = source === "estimated";
+  return Object.freeze({
+    source,
+    isExact,
+    isEstimated,
+    // The contract: "read any other value as `unknown`".
+    isUnknown: !isExact && !isEstimated,
+    currency,
+    provider,
+    model,
+    pricingAsOf,
+    amount,
+    minAmount,
+    maxAmount,
+    amountCents,
+    minAmountCents,
+    maxAmountCents,
+    credits,
+    reason,
+    raw: value,
+  });
+}
+
+/**
+ * The quote a submit response carries, or `null`.
+ *
+ * `null` on an idempotent replay even if the body somehow carried one: the
+ * server does not store the original quote, so whatever a replayed body held
+ * is not the quote the request was admitted under.
+ */
+function submitEstimateOf(body: unknown, response: QueueResponse): CostEstimate | null {
+  if (parseReplayed(response.headers.get(IDEMPOTENT_REPLAYED_HEADER))) return null;
+  return isRecord(body) ? costEstimateOf(body.estimate) : null;
 }
 
 /**
@@ -721,12 +891,30 @@ export class RequestHandle<TData = unknown> {
    */
   readonly requestId: string;
 
+  /**
+   * What Comfy quoted for this request when it admitted it, or `null`.
+   *
+   * `null` means NO QUOTE IS AVAILABLE — never "no charge". It is `null` on a
+   * handle rebuilt by `comfy.models.handle` (the quote is not stored anywhere
+   * a later process could fetch it), on an idempotent replay of a submit (the
+   * server does not keep the original quote either), when the server did not
+   * send one, and when the one it sent could not be read. See
+   * {@link CostEstimate} for how far to trust a quote that is present.
+   */
+  readonly estimate: CostEstimate | null;
+
   readonly #retry: RetryOptions | false;
 
   /** @internal — built by `comfy.models.submit` / `comfy.models.handle`. */
-  constructor(model: string, requestId: string, retry: RetryOptions | false = {}) {
+  constructor(
+    model: string,
+    requestId: string,
+    retry: RetryOptions | false = {},
+    estimate: CostEstimate | null = null,
+  ) {
     this.model = model;
     this.requestId = requestId;
+    this.estimate = estimate;
     this.#retry = retry;
     Object.freeze(this);
   }
@@ -1038,7 +1226,12 @@ export async function submit<TData = unknown>(
         what: "submit",
       });
       const body = decode(response, [200, 201, 202]);
-      return new RequestHandle<TData>(model, requestIdOf(body, response), options.retry ?? {});
+      return new RequestHandle<TData>(
+        model,
+        requestIdOf(body, response),
+        options.retry ?? {},
+        submitEstimateOf(body, response),
+      );
     },
     {
       // See `models.run`: one `AbortController` shared across concurrent calls

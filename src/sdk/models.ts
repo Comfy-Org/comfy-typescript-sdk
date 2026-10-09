@@ -736,6 +736,10 @@ export interface Models {
    * that is a lost response, where the request may have been accepted and its
    * id lost with the reply.
    *
+   * The handle's {@link RequestHandle.estimate} is the cost quote the server
+   * returned with the acceptance, when it returned one it could be read from;
+   * `null` means no quote is available, never no charge.
+   *
    * The surface is gated SERVER SIDE: a caller the queue is not switched on for
    * is answered `403 not_enabled`, which arrives here as
    * `routerErrors.NotEnabled`. Nothing about the request is wrong in that case,
