@@ -423,13 +423,34 @@ export class ComfyLow {
     return this.parseOrRaise<Asset>(response, [200, 201]);
   }
 
-  /** `HEAD /api/v2/assets/by-hash/{hash}` — existence probe. */
+  /**
+   * `HEAD /api/v2/assets/by-hash/{hash}` — existence probe.
+   *
+   * A refusal to a HEAD has no body, so there is no `error.code` to read: the
+   * gateway's `429 rate_limited` and `403` arrive as a bare status. Both are
+   * synthesized here rather than left to the status fallback, which would read
+   * a 429 as `queue_full` — a throttle on this probe is not a full job queue.
+   */
   async headAssetByHash(hash: string, options: { signal?: AbortSignal } = {}): Promise<boolean> {
     const response = await this.request("HEAD", `/assets/by-hash/${encodeURIComponent(hash)}`, {
       signal: options.signal,
     });
     if (response.status === 200) return true;
     if (response.status === 404) return false;
+    if (response.status === 429) {
+      throw errorFromEnvelope(
+        429,
+        { error: { code: "rate_limited", message: "Rate limited" } },
+        { retryAfter: parseRetryAfter(response) },
+      );
+    }
+    if (response.status === 403) {
+      throw errorFromEnvelope(
+        403,
+        { error: { code: "forbidden", message: "Forbidden" } },
+        { retryAfter: parseRetryAfter(response) },
+      );
+    }
     return this.parseOrRaise<boolean>(response, [200]);
   }
 

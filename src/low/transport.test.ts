@@ -11,6 +11,7 @@ import { StubServer } from "../../test/support/stub-server.js";
 import {
   ApiError,
   BlobNotFound,
+  Forbidden,
   HashMismatch,
   IdempotencyKeyReuse,
   NotFound,
@@ -38,6 +39,31 @@ describe("ComfyLow transport", () => {
     await expect(low.headAssetByHash("blake3:known")).resolves.toBe(true);
     await expect(low.headAssetByHash("blake3:unknown")).resolves.toBe(false);
     expect(server.state.headCount).toBe(2);
+  });
+
+  it("headAssetByHash maps a bodiless 429 to rate_limited, not queue_full", async () => {
+    server.state.headStatus = 429;
+    server.state.retryAfterHeader = "7";
+    const err = await low.headAssetByHash("blake3:any").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err).not.toBeInstanceOf(QueueFull);
+    expect(err).toMatchObject({ code: "rate_limited", httpStatus: 429, retryAfter: 7 });
+  });
+
+  it("headAssetByHash bodiless 429 without Retry-After has retryAfter null", async () => {
+    server.state.headStatus = 429;
+    server.state.omitHeadRetryAfter = true;
+    const err = await low.headAssetByHash("blake3:any").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err).not.toBeInstanceOf(QueueFull);
+    expect(err).toMatchObject({ code: "rate_limited", httpStatus: 429, retryAfter: null });
+  });
+
+  it("headAssetByHash maps a bodiless 403 to Forbidden", async () => {
+    server.state.headStatus = 403;
+    const err = await low.headAssetByHash("blake3:any").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Forbidden);
+    expect(err).toMatchObject({ code: "forbidden", httpStatus: 403, message: "Forbidden" });
   });
 
   it("assetFromHash dedup-mints over an existing blob", async () => {
