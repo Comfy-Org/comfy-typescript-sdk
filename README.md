@@ -38,11 +38,13 @@ JavaScript is async-native).
 import { Comfy } from "@comfyorg/sdk";
 
 const client = new Comfy({ apiKey: "..." }); // Comfy Cloud
+// ...or set COMFY_API_KEY and write `new Comfy()` — the key is optional, the
+// environment variable is the fallback.
 // COMFY_BASE_URL=http://127.0.0.1:8189 targets a local proxy instead (no key needed)
 
 const wf = await client.workflows.fromFile("workflow_api.json");
 const asset = client.assets.fromFile("photo.png"); // lazy; hashed + uploaded on first use
-wf.setInput("10", "image", asset);
+wf.setInput("10", "image", asset); // "10" is a LoadImage node: bind handles to a loader's file widget
 
 const job = await client.run(wf); // submit, then poll to a terminal state
 await job.getOutputs("13")[0].toFile("out.png");
@@ -68,11 +70,42 @@ await job.getOutputs("13")[0].toFile("out.png");
 
 ## Auth, per surface
 
-| Surface                                                            | Auth                                   |
-| ------------------------------------------------------------------ | -------------------------------------- |
-| Self-hosted proxy (`comfy-api-proxy` in front of your own ComfyUI) | none — do **not** pass `apiKey`        |
-| Comfy Cloud                                                        | `new Comfy({ apiKey: "comfyui-..." })` |
-| Serverless                                                         | `new Comfy({ apiKey: "comfyui-..." })` |
+| Surface                                                            | Auth                                                       |
+| ------------------------------------------------------------------ | ---------------------------------------------------------- |
+| Self-hosted proxy (`comfy-api-proxy` in front of your own ComfyUI) | none — do **not** pass `apiKey`                            |
+| Comfy Cloud                                                        | `new Comfy({ apiKey: "comfyui-..." })`, or `COMFY_API_KEY` |
+| Serverless                                                         | `new Comfy({ apiKey: "comfyui-..." })`, or `COMFY_API_KEY` |
+
+`new Comfy()` resolves its credential at construction, in this order — the same
+order and the same variable the [Python SDK](https://github.com/Comfy-Org/comfy-python-sdk)
+uses, and the same variable `comfy.models.*` reads:
+
+1. The explicit `apiKey` option, when it is a non-blank string.
+2. Otherwise `COMFY_API_KEY` from the environment. Surrounding whitespace is
+   stripped and a blank value counts as unset, so `COMFY_API_KEY=` in a shell
+   profile is not an error, and a key read out of a file brings its trailing
+   newline along harmlessly. It is read **per construction**, so a process can
+   build successive clients under different credentials.
+3. Otherwise, targeting Comfy Cloud — which always requires a key — a
+   `MissingCredentials` thrown **at construction**, naming both ways to supply
+   one. No request is made: a missing credential reported as a server `401`
+   sends you looking at your key's validity instead of at its absence.
+
+Point `COMFY_BASE_URL` at another deployment and step 3 changes: an unresolved
+key is not an error there, and means "send no credentials at all" — a
+self-hosted ComfyUI behind `comfy-api-proxy` legitimately has none. Steps 1
+and 2 do **not** change: a `COMFY_API_KEY` in the environment is sent to
+whatever `COMFY_BASE_URL` names, as the Python SDK does. For a keyless
+deployment, leave `COMFY_API_KEY` unset in that process.
+
+A runtime with no `process` (a browser) never sees the variable, so there the
+`apiKey` option is the only source. `comfy.config({ credentials })` configures
+the `comfy.*` namespace only — deliberately, so a process-global credential
+cannot leak into a multi-tenant server's per-request clients — and does **not**
+configure a class client. `COMFY_API_KEY` is process-global too, though: a
+blank or whitespace-only `apiKey` counts as unset (as in the Python SDK) and
+falls through to it, so a per-request client in a process that sets
+`COMFY_API_KEY` should reject an empty tenant key before constructing.
 
 The client only attaches the `Authorization` header to requests aimed at its
 own target deployment's origin. If the server hands back an absolute URL on a
@@ -205,6 +238,16 @@ failure bucket (`model_not_found`, `invalid_input`, `provider_timeout`,
 classes: `Unauthorized`, `Forbidden`, `InsufficientCredits`, and `NotFound`
 for an ID that names no model. A model-level validation failure keeps its
 per-field detail on `error.details.detail`.
+
+A failure that never got a response — a dropped connection (undici's
+`TypeError` "fetch failed") or an aborted `signal` (`AbortError`) — is not a
+`ComfyError`, but it carries the same `idempotencyKey` as an own property,
+since the key is the only handle on a call the server never answered.
+`requestId` reads `null` on it, and so does `retryAfter` unless `run` was
+collecting, when it is the pace Router named. When several calls share one
+`AbortController`, each rejects with its own copy of `signal.reason` carrying
+its own key, so the error is not `=== signal.reason`; a reason the SDK cannot
+copy faithfully (your own `Error` subclass, say) is re-thrown as is, unkeyed.
 
 An `Idempotency-Key` is sent on every call; one is minted per call unless you pass your own. Every attempt within one call — the first and every retry — sends that same key, so a retry after a lost or 5xx-ed response is a replay rather than a second generation, and a second charge. Supplying your own key extends that across calls: a fresh `run` with a key you already used replays the original result instead of running the model again.
 
@@ -379,7 +422,7 @@ const { data } = await comfy.models.subscribe(
 
 The same bound is available on `handle.get()` and `handle.events()`, where it rejects **without** cancelling: the queue is the server's, and a local clock running out says nothing about it. The first poll is always made, so `timeoutMs: 0` reads "look once".
 
-Each `submit` **call** mints one fresh `Idempotency-Key`: two deliberate submits of the same input are two requests, while a transport-level retry inside one call keeps the one key and replays the original acceptance rather than queueing a second generation. Pass `idempotencyKey` to choose it yourself — the case that earns it is a lost response, where the request may have been accepted and its id lost with the reply.
+Each `submit` **call** mints one fresh `Idempotency-Key`: two deliberate submits of the same input are two requests, while a transport-level retry inside one call keeps the one key and replays the original acceptance rather than queueing a second generation. Pass `idempotencyKey` to choose it yourself — the case that earns it is a lost response, where the request may have been accepted and its id lost with the reply. Every failure past the argument checks carries the key the call went out under on `err.idempotencyKey`, a minted one included, the same way `run`'s do.
 
 This surface is **gated server side**. A caller the queue is not switched on for is answered `403 not_enabled`, which arrives as `routerErrors.NotEnabled` — nothing about the request is wrong, and it is terminal, so it is not retried.
 
@@ -396,9 +439,9 @@ asset and handing the model the asset's download URL:
 ```ts
 import { Comfy, comfy } from "@comfyorg/sdk";
 
-// `comfy.models` reads COMFY_API_KEY from the environment; the class client
-// takes its key explicitly, so hand it the same one.
-const client = new Comfy({ apiKey: process.env.COMFY_API_KEY });
+// Both surfaces read COMFY_API_KEY when nothing was passed, so one variable
+// in the environment configures this whole snippet.
+const client = new Comfy();
 
 // 1. Upload the local image (dedup-aware; a re-run re-uploads nothing) and
 //    resolve a short-lived, self-authorizing signed URL for it.
@@ -562,6 +605,12 @@ export COMFY_BASE_URL="http://127.0.0.1:8189"               # self-hosted proxy
 It is read each time a client is constructed, must be an `http(s)` URL, and
 an unset or blank value (including whitespace-only) means Comfy Cloud.
 
+It also decides whether a missing credential is an error: see "Auth, per
+surface" above. Comfy Cloud is matched by normalized origin and path rather
+than by string, so `https://cloud.comfy.org:443` is still Comfy Cloud, while a
+deployment mounted under that host (`https://cloud.comfy.org/self-hosted`) is a
+different target and may go keyless.
+
 Upgrading from an earlier version: `new Comfy(url, opts)` becomes
 `new Comfy(opts)` with `COMFY_BASE_URL` set. A positional string now throws a
 `TypeError` rather than being silently ignored.
@@ -656,7 +705,23 @@ handle is actually used. Embed the handle directly in a workflow input with
 
 ```ts
 const asset = client.assets.fromFile("photo.png");
+wf.setInput("10", "image", asset); // "10" is a LoadImage node: see below
+```
+
+An asset handle resolves to a **filename** on the server, not to decoded
+media. Bind it only to an input that takes a filename: the file widget of a
+loader node (`LoadImage.image`, `LoadVideo.file`, `LoadAudio.audio`,
+`Load3D.model_file`, or a custom node's own filename widget), then link that
+loader's output into the node that needs the tensor. Binding a handle directly
+to an `IMAGE`, `VIDEO`, `AUDIO` or `MASK` socket, including grouped
+partner-node inputs such as `model.reference_images.image_1`, is accepted at
+submit but fails at execution because the node receives a string.
+
+```ts
+// "10" is a LoadImage node: its `image` widget takes a filename, so bind the handle there.
 wf.setInput("10", "image", asset);
+// "11" is the consumer: link LoadImage's decoded IMAGE output ([nodeId, outputIndex]) into it.
+wf.setInput("11", "image", ["10", 0]);
 ```
 
 On submit, the SDK walks the workflow graph, finds every embedded handle,
@@ -793,6 +858,40 @@ storage URL: whoever holds it can read the asset until `expiresAt` with no API
 key of their own. On a self-hosted proxy it's the content endpoint (normal auth
 still applies) and `expiresAt` is `null`. It works on every backend and never
 downloads the bytes first.
+
+## What a job carries
+
+A `Job` handle reads whatever state it currently holds — nothing re-fetches implicitly, so `await job.refresh()` (or `wait()`/`result()`, which poll for you) is what advances it:
+
+| Accessor            | Type                                          | What it is                                                                                                       |
+| ------------------- | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `job.id`            | `string`                                      | Server-assigned ID; enough on its own to rebuild the handle via `client.jobs.get(id)`                            |
+| `job.status`        | `string`                                      | `queued`, `running`, `canceling`, `succeeded`, `canceled`, `failed`, `expired`                                   |
+| `job.outputs`       | `Output[]`                                    | Every output across all nodes; empty until the job succeeds                                                      |
+| `job.error`         | `JobError \| null`                            | Failure detail when the job ended `failed`                                                                       |
+| `job.createdAt`     | `Date`                                        | When the server accepted the job                                                                                 |
+| `job.startedAt`     | `Date \| null`                                | When it started executing; `null` while still queued                                                             |
+| `job.completedAt`   | `Date \| null`                                | When it reached a terminal state; `null` before it did                                                           |
+| `job.expiresAt`     | `Date`                                        | Retention deadline — after this the job and its outputs are gone                                                 |
+| `job.progress`      | `Progress \| null`                            | Latest progress snapshot the handle holds (see the caveat below)                                                 |
+| `job.queuePosition` | `number \| null`                              | Place in the queue as of the state the handle holds                                                              |
+| `job.metrics`       | `Record<string, number \| null> \| undefined` | Per-run measurements (`queue_ms`, `execution_ms`, …); `undefined` on a surface that reports none                 |
+| `job.urls`          | `JobUrls`                                     | The job's own `self` / `events` / `cancel` links, plus `logs` where the surface captures logs                    |
+| `job.metadata`      | `Record<string, string>`                      | Labels attached at submit (see [Labeling jobs](#labeling-jobs-and-finding-them-again)); `{}` when there are none |
+
+How long a run took is `completedAt` minus `startedAt`:
+
+```ts
+const job = await client.run(wf);
+if (job.startedAt && job.completedAt) {
+  const ms = job.completedAt.getTime() - job.startedAt.getTime();
+  console.log(`took ${String(ms)}ms`);
+}
+```
+
+Three things worth knowing. `job.progress` is the same camelCase `Progress` the `progress` events of `job.events()` carry (`value`, `nodesDone`, `nodesTotal`, `currentNode`, `currentNodeClass`, `step`, `steps`, `message`), so one type covers a snapshot read off the handle and one received live; `JobError` and `JobUrls` above are the generated wire models, exported from `@comfyorg/sdk/low`. Second, `job.progress` is whatever the last poll carried. The contract says a poll returns the latest snapshot — the same data the SSE stream pushes — but Comfy Cloud has been reported to send `null` there even for a running job, so read a `null` as "this state carries no snapshot", not as "not running", and take live progress from `job.events()` (see [Live progress](#live-progress)). Third, the object-valued accessors (`progress`, `metrics`, `urls`) hand back a snapshot copy, so editing what you get back does not rewrite the handle's own state — `job.error` is the exception, handing back the handle's own object by reference, so treat it as read-only.
+
+The two `Date` accessors and `job.urls` are non-nullable because the wire contract makes those fields required. Responses are not validated at runtime, so if a surface breaks that contract and omits one, reading it raises `ComfyError` with `code: "unexpected_response"` naming the field — better than an `Invalid Date` whose every comparison is false, or a `job.urls` that promises `self` as a `string` and hands back `undefined`. The nullable accessors take the other route: an absent or unusable value reads as `null` (or `undefined` for `metrics`), never as a half-built object.
 
 ## Labeling jobs and finding them again
 
@@ -1001,8 +1100,9 @@ with backoff, replayed under the call's own `Idempotency-Key`. Everything
 below `500` is left alone, `NotEnabled` included.
 
 Every one of them carries `errorType`, `requestId` (the server-minted id off
-`X-Comfy-Request-Id` — the value to quote in a support request) and
-`httpStatus`.
+`X-Comfy-Request-Id` — the value to quote in a support request),
+`httpStatus` and `idempotencyKey` (the key a failed `comfy.models.submit` went
+out under; `null` from the handle's methods, which address the request by id).
 
 An `error_type` this release has never heard of — a newer server — surfaces as
 a plain `RouterError` carrying the raw value in `errorType`, never as an

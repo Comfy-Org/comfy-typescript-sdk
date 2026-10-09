@@ -99,6 +99,8 @@ import {
   Forbidden,
   InsufficientCredits,
   NotFound,
+  stampIdempotencyKey,
+  stamping,
   Unauthorized,
 } from "./exceptions.js";
 import {
@@ -217,6 +219,28 @@ export const FALLBACK_PROVIDER_HEADER = "X-Comfy-Router-Fallback-Provider";
 export const DROPPED_PARAMS_HEADER = "X-Comfy-Router-Dropped-Params";
 
 /**
+ * `Idempotent-Replayed` — present (and `true`) only when Router served this
+ * response from an `Idempotency-Key`'s record instead of running the model
+ * again. See {@link RunJsonResult.replayed}. Pinned against the vendored
+ * contract's `RouterIdempotentReplayedHeader` in `router-spec-contract.test.ts`.
+ */
+export const IDEMPOTENT_REPLAYED_HEADER = "Idempotent-Replayed";
+
+/**
+ * Whether the `Idempotent-Replayed` header was present.
+ *
+ * Presence, not value: Router omits the header on a fresh run rather than
+ * sending `false`, and its own contract says so in as many words ("branch on
+ * its presence"). So a `false` on the wire — which nothing is documented to
+ * send, but which a proxy or a future server could — still reads as a replay,
+ * because the only thing the header's arrival can mean is that this answer
+ * came off the record.
+ */
+export function parseReplayed(raw: string | null): boolean {
+  return raw !== null;
+}
+
+/**
  * `X-Comfy-Credits-Used` — what Router priced this call at, in credits. See
  * {@link RunJsonResult.creditsUsed}.
  *
@@ -264,19 +288,18 @@ export function parseCreditsUsed(raw: string | null): string | null {
 /**
  * Parse the `X-Comfy-Router-Dropped-Params` header value.
  *
- * The spec describes this header as "a JSON array of strings" in prose while
- * declaring `schema: {type: array, items: {type: string}}`, which in OpenAPI
- * means the SIMPLE comma-delimited form instead. The two disagree, and the
- * spec's own example settles it: its single entry reads `moderation (fal
- * applies its own, non-configurable safety filtering)` — which contains a
- * comma, so a comma split would tear one entry into two meaningless fragments.
- * The prose is right and the declared schema is the part that is wrong.
+ * The spec (`spec/router-openapi.yaml`, `RouterDroppedParamsHeader`) declares
+ * this header as `type: string`: ONE JSON-encoded string holding an array of
+ * strings. It says to decode it with a JSON parser rather than splitting it on
+ * commas, because each entry is a sentence that carries commas of its own —
+ * the spec's own example entry reads `moderation (fal applies its own,
+ * non-configurable safety filtering)`, which a comma split would tear into two
+ * meaningless fragments.
  *
- * So: parse JSON, and on anything else keep the raw value as ONE entry rather
- * than guessing at delimiters — a single entry a human can read beats two
- * confident fragments. (The spec defect is filed against the server's own
- * openapi.yml; this vendored copy is synced from it, so fixing it here would be
- * reverted by the next sync.)
+ * So: `JSON.parse`, and accept the result only when it is an array of strings.
+ * On anything that is not JSON — or is JSON but not an array of strings — keep
+ * the raw value as ONE entry rather than guessing at delimiters: a single entry
+ * a human can read beats two confident fragments.
  */
 export function parseDroppedParams(raw: string | null): readonly string[] | null {
   if (raw === null) return null;
@@ -326,14 +349,64 @@ export interface RunJsonResult<TData = unknown> {
    */
   servingProvider: string | null;
   /**
-   * `X-Comfy-Router-Dropped-Params`: native fields the translation could not carry.
+   * `X-Comfy-Router-Dropped-Params`: native fields the translation that produced
+   * this call's request body could not express exactly on the provider that
+   * served it. Each entry normally names the field and why — but not
+   * guaranteed: {@link parseDroppedParams} keeps a header that is not a JSON
+   * array of strings as ONE entry holding the raw wire value, so an entry can
+   * be that raw value rather than a field-plus-reason disclosure.
    *
-   * Present only when `modelProvider` translated the body (`strictMode: false`,
-   * the default) and one or more native fields could not be expressed exactly
-   * on the alternate provider's schema; each entry names the field and why.
-   * `null` when no translation ran, or it ran and dropped nothing.
+   * TWO things produce such a translation: an explicit
+   * {@link RunOptions.modelProvider} under the default `strictMode: false`, and
+   * an automatic `fallback_provider` retry — which is ON by default and
+   * independent of `modelProvider` (see {@link RunOptions.fallbackProvider}).
+   * So a call that never set `modelProvider` can still come back with a
+   * non-null value here: the primary attempt failed, and the retry translated
+   * the native body into the other provider's schema to re-send it.
+   *
+   * On a fallback retry the list names what THAT retry's translation dropped,
+   * never the primary attempt's — pair it with
+   * {@link RunJsonResult.servingProvider} to see which provider it refers to.
+   *
+   * `null` when no translation ran, and when one ran and dropped nothing — the
+   * server omits the header in both cases. `strictMode: true` is NOT on its own
+   * a guarantee of `null`: the spec scopes `strict_mode` to `modelProvider`
+   * ("only meaningful together with `model_provider`"), so it suppresses that
+   * translation only and does not govern the automatic fallback retry. Turn
+   * {@link RunOptions.fallbackProvider} off too if you need that guarantee.
+   *
+   * Prefer an explicit `!== null` check over a truthiness test: the server
+   * omitting the header gives `null`, but a present-but-empty header (`"[]"`)
+   * parses to an empty array, which is a non-null empty disclosure.
    */
   droppedParams: readonly string[] | null;
+  /**
+   * `Idempotent-Replayed`: `true` when Router answered this call from the
+   * record held against its `Idempotency-Key` rather than by running the model
+   * again.
+   *
+   * A replay is not charged a second time. It happens on this SDK's own
+   * collect loop (a same-key re-send after a `409 concurrency_limit_exceeded`
+   * or `504 deadline_exceeded`) and on a caller's own retry under a supplied
+   * `idempotencyKey`. On a replay every disclosure field RESTATES the original
+   * run rather than describing a second one, so a spend tracker must SKIP a
+   * result with `replayed: true` instead of adding its cost up again.
+   *
+   * Derived from the header's PRESENCE, exactly as the Python SDK's
+   * `RouterRunResult.replayed` is: Router omits the header on a fresh run
+   * rather than sending `false`. Always `false` on a result from
+   * {@link RequestHandle.get}: the queued result route never carries the
+   * header, and re-collecting the same handle is deduplicated by
+   * `RequestHandle.requestId` instead.
+   *
+   * OPTIONAL only for source compatibility, on the same terms as
+   * {@link creditsUsed}: every result this SDK constructs sets it, and the `?`
+   * keeps a consumer's own result literal written against 0.4.0 compiling. A
+   * hand-built literal that omits it reads as `undefined`, which is falsy —
+   * "not a replay" — so `if (result.replayed)` needs no extra care.
+   */
+  replayed?: boolean;
+
   /**
    * `X-Comfy-Credits-Used`: what Router priced this call at, verbatim — a
    * decimal string (`"12.5"`). The contract does not fix its scale, so do not
@@ -415,6 +488,8 @@ export interface RunBinaryResult {
   servingProvider: string | null;
   /** As {@link RunJsonResult.droppedParams}. */
   droppedParams: readonly string[] | null;
+  /** As {@link RunJsonResult.replayed}, optional for the same reason. */
+  replayed?: boolean;
   /** As {@link RunJsonResult.creditsUsed}, optional for the same reason. */
   creditsUsed?: string | null;
 }
@@ -444,7 +519,7 @@ export type RunResult<TData = unknown> = RunJsonResult<TData> | RunBinaryResult;
 /**
  * A {@link RunResult} as this SDK CONSTRUCTS one: every optional field set.
  *
- * `creditsUsed` is optional on the two published interfaces purely so a
+ * `replayed` and `creditsUsed` are optional on the two published interfaces purely so a
  * consumer's own result literal still compiles against them (see
  * {@link RunJsonResult.creditsUsed}). Inside this package the opposite rule
  * has to hold: a return site that omits it answers `undefined`, which a
@@ -456,8 +531,8 @@ export type RunResult<TData = unknown> = RunJsonResult<TData> | RunBinaryResult;
  * that went missing.
  */
 export type BuiltRunResult<TData = unknown> =
-  | (RunJsonResult<TData> & Required<Pick<RunJsonResult<TData>, "creditsUsed">>)
-  | (RunBinaryResult & Required<Pick<RunBinaryResult, "creditsUsed">>);
+  | (RunJsonResult<TData> & Required<Pick<RunJsonResult<TData>, "replayed" | "creditsUsed">>)
+  | (RunBinaryResult & Required<Pick<RunBinaryResult, "replayed" | "creditsUsed">>);
 
 export interface RunOptions {
   /**
@@ -1255,113 +1330,141 @@ async function run<TData = unknown>(
     if (collectingAt === null) retryAttempt += 1;
     else collectAttempt += 1;
   };
-  for (;;) {
-    const remainingMs = clock().remainingMs;
-    const signal = composeSignal(options.signal, remainingMs);
-    let response: Response;
-    let responseBody: Uint8Array = EMPTY_BODY;
-    // Non-null once this response has been classified as one to ask again
-    // about, and is then the backoff before that re-ask.
-    let repeatAfterMs: number | null = null;
-    try {
-      // `withInactivityLimits` derives undici's own headers/body timers from
-      // the same remaining budget as `signal`. Without it this call is capped
-      // at undici's 300s default however long the deadline says, which is
-      // fatal here specifically: the server holds this one request open for
-      // the whole generation, so nothing arrives on it — not even response
-      // headers — until the model has finished.
-      response = await fetch(
-        url,
-        withInactivityLimits({ method: "POST", headers, body, signal }, remainingMs),
-      );
+  // Everything the loop can throw leaves stamped with the key: the raw
+  // `TypeError`/`DOMException` a transport failure or a caller's abort
+  // re-throws below carries no other handle back to the server-side record,
+  // and comfy-api never minted a request id for a call that never landed. The
+  // three `ComfyError`s inside already carry the key, so the stamp is a no-op
+  // on them. The pre-mint input checks above stay OUTSIDE, unstamped, as in
+  // Python — there is no key to stamp before one is minted.
+  return stamping(idempotencyKey, runLoop, {
+    // The caller's own signal: `fetch` rejects with its `reason`, and that one
+    // object is shared by every concurrent call on the same `AbortController`,
+    // so the stamp must hand this call a private stand-in rather than write our
+    // key onto state the caller (and their other calls) still hold.
+    callerSignal: options.signal,
+  });
 
-      const errorType = response.headers.get(ERROR_TYPE_HEADER);
-      const retryAfter = parseRetryAfter(response.headers);
-
-      // Classified from the status line and the headers, BEFORE the body is
-      // touched. What a response means is not something its body decides
-      // here, and deciding it first is what keeps the cap from overruling it:
-      // a retryable 502 behind an oversized CDN error page stays retryable,
-      // and a collectable 409/504 stays collectable, instead of a cap breach
-      // turning either into a fatal error with the budget unspent and a
-      // generation still running.
-      //
-      // Collect first, and EXCLUSIVELY: a `deadline_exceeded` 504 is a 5xx
-      // too, so both branches would take it — but they are different actions
-      // on different budgets, and the server's own verdict about what it is
-      // holding wins over this module's guess. Which also means a collect
-      // that runs out of `collectBudgetMs` raises rather than falling back
-      // into the ordinary backoff: the class is decided per failure, not
-      // retried in both. `retryAfter !== null` is redundant with
-      // `isCollectable`, which refuses a missing pace — it is written out so
-      // the call below needs no cast.
-      if (retryAfter !== null && isCollectable(response.status, errorType, retryAfter)) {
-        collectingAt = retryAfter;
-        // `null` here means out of collect budget (or past the deadline) —
-        // fall through to the 409/504 the server last gave, which carries its
-        // own `Retry-After` for a caller who wants to re-ask by hand.
-        repeatAfterMs = nextDelayMs();
-      } else if (isRetryableStatus(response.status, errorType)) {
-        // Mid-collect this is still a collect: the 5xx is the re-ask failing
-        // to land, not a verdict on the generation, so it is paced and
-        // budgeted as one (`nextDelayMs` reads `collectingAt`). `null` is out
-        // of budget — fall through and raise the last failure the server
-        // actually gave, rather than a synthetic "retries exhausted".
-        repeatAfterMs = nextDelayMs();
-      }
-
-      if (repeatAfterMs === null) {
-        // Inside the same `try` as the fetch on purpose: the deadline covers
-        // body consumption too, so a signal that fires while the result is
-        // still streaming rejects HERE, and translating it in only one of the
-        // two places would leak a bare DOMException out of the other.
-        //
-        // Bytes rather than `response.text()`, because this route's 200 is not
-        // always a text document: a partner whose generation IS the response
-        // body answers with its own media type, and `text()` would UTF-8-decode
-        // those bytes lossily and irreversibly before anything got to look at
-        // the `Content-Type`. Decoding is deferred to the one branch that wants
-        // a string ({@link decodeUtf8}), which is what `text()` would have done
-        // anyway.
-        responseBody = await readBodyWithin(response, maxBytes, model, idempotencyKey);
-      } else {
-        // Never read: the whole content of a response this call is going to
-        // ask again about is "ask again", which the status line already said.
-        // Dropping it spends neither the download nor the cap on it.
-        await response.body?.cancel().catch(() => undefined);
-      }
-    } catch (exc) {
-      // A body this call would not buffer leaves the loop immediately. It is a
-      // verdict about THIS response, not a transport failure, and the retry
-      // loop sitting around the read is exactly what would make it expensive:
-      // every attempt would re-download the same oversized body until the
-      // budget expired, multiplying the cost of the one thing that already
-      // failed.
-      if (isTooLarge(exc)) throw exc;
-      if (isTimeout(exc, options.signal)) {
-        throw new ComfyError(
-          `models.run("${model}") exceeded its ${String(timeoutMs)}ms deadline before the model finished; ` +
-            "raise it with timeoutMs, or pass timeoutMs: null and your own signal",
-          { code: "request_timeout", cause: exc, idempotencyKey, retryAfter: collectingAt },
+  async function runLoop(): Promise<RunResult<TData>> {
+    for (;;) {
+      const remainingMs = clock().remainingMs;
+      const signal = composeSignal(options.signal, remainingMs);
+      let response: Response;
+      let responseBody: Uint8Array = EMPTY_BODY;
+      // Non-null once this response has been classified as one to ask again
+      // about, and is then the backoff before that re-ask.
+      let repeatAfterMs: number | null = null;
+      try {
+        // `withInactivityLimits` derives undici's own headers/body timers from
+        // the same remaining budget as `signal`. Without it this call is capped
+        // at undici's 300s default however long the deadline says, which is
+        // fatal here specifically: the server holds this one request open for
+        // the whole generation, so nothing arrives on it — not even response
+        // headers — until the model has finished.
+        response = await fetch(
+          url,
+          withInactivityLimits({ method: "POST", headers, body, signal }, remainingMs),
         );
-      }
-      // A caller's abort is theirs: never retried, never re-dressed.
-      if (options.signal?.aborted) throw exc;
-      const delay = nextDelayMs();
-      if (delay === null) throw exc;
-      // Abortable, so an abort during the backoff stops the loop here rather
-      // than sleeping out the delay and sending one more attempt.
-      await abortableSleep(delay, options.signal);
-      countAttempt();
-      continue;
-    }
 
-    if (repeatAfterMs !== null) {
-      await abortableSleep(repeatAfterMs, options.signal);
-      countAttempt();
-      continue;
+        const errorType = response.headers.get(ERROR_TYPE_HEADER);
+        const retryAfter = parseRetryAfter(response.headers);
+
+        // Classified from the status line and the headers, BEFORE the body is
+        // touched. What a response means is not something its body decides
+        // here, and deciding it first is what keeps the cap from overruling it:
+        // a retryable 502 behind an oversized CDN error page stays retryable,
+        // and a collectable 409/504 stays collectable, instead of a cap breach
+        // turning either into a fatal error with the budget unspent and a
+        // generation still running.
+        //
+        // Collect first, and EXCLUSIVELY: a `deadline_exceeded` 504 is a 5xx
+        // too, so both branches would take it — but they are different actions
+        // on different budgets, and the server's own verdict about what it is
+        // holding wins over this module's guess. Which also means a collect
+        // that runs out of `collectBudgetMs` raises rather than falling back
+        // into the ordinary backoff: the class is decided per failure, not
+        // retried in both. `retryAfter !== null` is redundant with
+        // `isCollectable`, which refuses a missing pace — it is written out so
+        // the call below needs no cast.
+        if (retryAfter !== null && isCollectable(response.status, errorType, retryAfter)) {
+          collectingAt = retryAfter;
+          // `null` here means out of collect budget (or past the deadline) —
+          // fall through to the 409/504 the server last gave, which carries its
+          // own `Retry-After` for a caller who wants to re-ask by hand.
+          repeatAfterMs = nextDelayMs();
+        } else if (isRetryableStatus(response.status, errorType)) {
+          // Mid-collect this is still a collect: the 5xx is the re-ask failing
+          // to land, not a verdict on the generation, so it is paced and
+          // budgeted as one (`nextDelayMs` reads `collectingAt`). `null` is out
+          // of budget — fall through and raise the last failure the server
+          // actually gave, rather than a synthetic "retries exhausted".
+          repeatAfterMs = nextDelayMs();
+        }
+
+        if (repeatAfterMs === null) {
+          // Inside the same `try` as the fetch on purpose: the deadline covers
+          // body consumption too, so a signal that fires while the result is
+          // still streaming rejects HERE, and translating it in only one of the
+          // two places would leak a bare DOMException out of the other.
+          //
+          // Bytes rather than `response.text()`, because this route's 200 is not
+          // always a text document: a partner whose generation IS the response
+          // body answers with its own media type, and `text()` would UTF-8-decode
+          // those bytes lossily and irreversibly before anything got to look at
+          // the `Content-Type`. Decoding is deferred to the one branch that wants
+          // a string ({@link decodeUtf8}), which is what `text()` would have done
+          // anyway.
+          responseBody = await readBodyWithin(response, maxBytes, model, idempotencyKey);
+        } else {
+          // Never read: the whole content of a response this call is going to
+          // ask again about is "ask again", which the status line already said.
+          // Dropping it spends neither the download nor the cap on it.
+          await response.body?.cancel().catch(() => undefined);
+        }
+      } catch (exc) {
+        // A body this call would not buffer leaves the loop immediately. It is a
+        // verdict about THIS response, not a transport failure, and the retry
+        // loop sitting around the read is exactly what would make it expensive:
+        // every attempt would re-download the same oversized body until the
+        // budget expired, multiplying the cost of the one thing that already
+        // failed.
+        if (isTooLarge(exc)) throw exc;
+        if (isTimeout(exc, options.signal)) {
+          throw new ComfyError(
+            `models.run("${model}") exceeded its ${String(timeoutMs)}ms deadline before the model finished; ` +
+              "raise it with timeoutMs, or pass timeoutMs: null and your own signal",
+            { code: "request_timeout", cause: exc, idempotencyKey, retryAfter: collectingAt },
+          );
+        }
+        // A caller's abort is theirs: never retried, never re-dressed.
+        if (options.signal?.aborted) throw exc;
+        const delay = nextDelayMs();
+        // Out of budget. If this call was COLLECTING, `collectingAt` holds the
+        // pace Router named on the 409/504 that started the collect, and the
+        // generation is still the server's to hand over — so the failure goes
+        // back carrying that pace, exactly as the sibling `request_timeout`
+        // branch above does. Without this the outer stamp would default
+        // `retryAfter` to `null` and tell the caller the server named no pace,
+        // when the SDK knew one.
+        if (delay === null)
+          throw stampIdempotencyKey(exc, idempotencyKey, {
+            callerSignal: options.signal,
+            retryAfter: collectingAt,
+          });
+        // Abortable, so an abort during the backoff stops the loop here rather
+        // than sleeping out the delay and sending one more attempt.
+        await abortableSleep(delay, options.signal);
+        countAttempt();
+        continue;
+      }
+
+      if (repeatAfterMs !== null) {
+        await abortableSleep(repeatAfterMs, options.signal);
+        countAttempt();
+        continue;
+      }
+      return finish<TData>(model, response, responseBody, idempotencyKey);
     }
-    return finish<TData>(model, response, responseBody, idempotencyKey);
   }
 }
 
@@ -1432,6 +1535,10 @@ function finish<TData>(
   // cannot tell an alt-provider run from a native one.
   const servingProvider = response.headers.get(FALLBACK_PROVIDER_HEADER);
   const droppedParams = parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER));
+  // Read here for the same reason: whether this answer came off the
+  // `Idempotency-Key`'s record or from a run that really happened is not
+  // recoverable from the body, which a replay restates verbatim.
+  const replayed = parseReplayed(response.headers.get(IDEMPOTENT_REPLAYED_HEADER));
   // Read here for the same reason, and kept as the raw header string: what the
   // call COST is not recoverable from the body either, and `null` has to stay
   // distinguishable from a reported `"0"`.
@@ -1486,6 +1593,7 @@ function finish<TData>(
       requestId,
       servingProvider,
       droppedParams,
+      replayed,
       creditsUsed,
     };
   }
@@ -1514,6 +1622,7 @@ function finish<TData>(
         requestId,
         servingProvider,
         droppedParams,
+        replayed,
         creditsUsed,
       };
     }
@@ -1534,6 +1643,7 @@ function finish<TData>(
     requestId,
     servingProvider,
     droppedParams,
+    replayed,
     creditsUsed,
   };
 }

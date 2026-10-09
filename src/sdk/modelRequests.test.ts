@@ -237,6 +237,102 @@ describe("comfy.models.submit", () => {
   });
 });
 
+describe("comfy.models.submit stamps the Idempotency-Key onto every failure", () => {
+  it("stamps a raw transport failure, preserving its TypeError identity", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.resetTimes = 1; // socket destroyed mid-request — no status at all
+
+      const err = (await comfy.models
+        .submit(MODEL, {}, { retry: false, idempotencyKey: "k-transport" })
+        .catch((e: unknown) => e)) as TypeError & Record<string, unknown>;
+
+      expect(err).toBeInstanceOf(TypeError);
+      expect(err.message).toBe("fetch failed"); // identity + message untouched
+      expect(err.idempotencyKey).toBe("k-transport");
+      expect(err.requestId).toBeNull();
+      expect(err.retryAfter).toBeNull();
+    });
+  });
+
+  it("stamps an already-aborted signal's AbortError", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      const controller = new AbortController();
+      controller.abort();
+
+      const err = (await comfy.models
+        .submit(MODEL, {}, { signal: controller.signal, idempotencyKey: "k-abort" })
+        .catch((e: unknown) => e)) as Error & Record<string, unknown>;
+
+      expect(err).not.toBeInstanceOf(ComfyError);
+      expect(err.name).toBe("AbortError");
+      expect(err.idempotencyKey).toBe("k-abort");
+    });
+  });
+
+  it("gives concurrent submits sharing one AbortController their OWN key", async () => {
+    // Same hazard as `models.run`: one already-aborted signal is the reason
+    // object BOTH calls reject with, so stamping it in place would let the
+    // first call decide the key the second one reads.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      const controller = new AbortController();
+      controller.abort();
+
+      const [a, b] = (await Promise.all([
+        comfy.models
+          .submit(MODEL, {}, { signal: controller.signal, idempotencyKey: "k-one" })
+          .catch((e: unknown) => e),
+        comfy.models
+          .submit(MODEL, {}, { signal: controller.signal, idempotencyKey: "k-two" })
+          .catch((e: unknown) => e),
+      ])) as (Error & Record<string, unknown>)[];
+
+      expect(a.name).toBe("AbortError");
+      expect(b.name).toBe("AbortError");
+      expect(a.idempotencyKey).toBe("k-one");
+      expect(b.idempotencyKey).toBe("k-two");
+      expect((controller.signal.reason as Record<string, unknown>).idempotencyKey).toBeUndefined();
+    });
+  });
+
+  it("stamps the RouterError a bare 502 decodes to", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = () => ({
+        status: 502,
+        errorType: "provider_error",
+        body: { detail: "bad gateway", error_type: "provider_error" },
+      });
+
+      const err = (await comfy.models
+        .submit(MODEL, {}, { retry: false, idempotencyKey: "k-502" })
+        .catch((e: unknown) => e)) as routerErrors.RouterError;
+
+      expect(err).toBeInstanceOf(routerErrors.ProviderError);
+      expect(err).toBeInstanceOf(routerErrors.RouterError);
+      expect(err.httpStatus).toBe(502);
+      expect(err.idempotencyKey).toBe("k-502");
+    });
+  });
+
+  it("stamps the request_timeout ComfyError a spent deadline raises", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.hang = true; // never answers, so the deadline is what ends the call
+
+      const err = (await comfy.models
+        .submit(MODEL, {}, { timeoutMs: 50, retry: false, idempotencyKey: "k-timeout" })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("request_timeout");
+      expect(err.idempotencyKey).toBe("k-timeout");
+    });
+  });
+});
+
 describe("RequestHandle.status", () => {
   it("GETs the status route once and reports what the queue said", async () => {
     await withRouterStub(async (server) => {
@@ -469,6 +565,32 @@ describe("RequestHandle.get", () => {
         `GET ${STATUS_PATH}`,
         `GET ${REQUEST_PATH}`,
       ]);
+    });
+  });
+
+  it("reports replayed: false, and again on a second collection of the same handle", async () => {
+    // The queued result route carries no `Idempotent-Replayed` — a replay
+    // marker belongs to the synchronous route's same-key re-send — so this
+    // path's `replayed` is `false` on every real response, INCLUDING the
+    // second collection of a request that has already completed. That is the
+    // trap the field could set for a spend tracker: collecting twice is cheap
+    // and explicitly supported, and nothing about the second result says it is
+    // a repeat. `requestId` on the HANDLE is what identifies the one request,
+    // so it is what deduplication has to key on.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = queueScript({ statuses: [DONE], result: PAYLOAD });
+
+      const handle = comfy.models.handle<typeof PAYLOAD>(MODEL, REQUEST_ID);
+      const first = await handle.get();
+      const second = await handle.get();
+
+      expect(first.replayed).toBe(false);
+      expect(second.replayed).toBe(false);
+      // Same request, collected twice — told apart from two runs by the
+      // handle's id and by nothing on the results themselves.
+      expect(handle.requestId).toBe(REQUEST_ID);
+      expect(second.data).toEqual(first.data);
     });
   });
 
