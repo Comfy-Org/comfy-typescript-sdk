@@ -175,7 +175,10 @@ The three other jobs:
   Pure Node, no dependencies, so you can run it in a clean checkout without
   installing anything.
 - **`sdk-parity`** — `node scripts/sync-python-surface.mjs`. The only job that
-  reaches the network. See section 6.
+  reaches the network, so its fetch retries a transport failure or a 5xx four
+  times before failing (a 4xx is a definite answer and is not retried). A red
+  here means the sibling SDK moved, not that the network blinked. See
+  section 6.
 
 A CLA check (`.github/workflows/cla.yml`) also runs; only the PR author needs
 to sign. `.github/CODEOWNERS` makes every file require review from
@@ -227,21 +230,28 @@ Two things to know before you touch it:
   Python SDK's surface moved. Run `pnpm sync:python-surface`, commit the
   refreshed snapshot, then run `pnpm test` to see which symbols diverged.
 - **Deliberate divergences go in the `INTENTIONAL_ASYMMETRIES` allowlist** at
-  the top of the test, each with a stated reason. Four are declared today (the
-  result envelope, credential resolution, the absence of a sync variant, and
-  the router buckets this SDK currently leads on). Anything not declared there
-  fails. Adding an entry is a design decision — the test also fails on an entry
-  that no longer applies, so the list cannot rot into a blanket exemption.
+  the top of the test, each with a stated reason. Eight are declared today.
+  Anything not declared there fails. Adding an entry is a design decision — the
+  test also fails on an entry that no longer applies, so the list cannot rot
+  into a blanket exemption.
 - **A LEAD is not an asymmetry, and has its own field.** The two SDKs ship on
   separate pull requests, so one of them carries a new Router bucket — or a new
   `models` method — first. `routerErrorClassesAheadOfPython` and
-  `modelsMethodsAheadOfPython` tolerate that in ONE direction — TypeScript may
-  lead, never lag — and each has a rot guard that fails the moment the Python
-  snapshot grows the same name, which is the signal to delete the entry rather
-  than to grow it. `modelsMethodsAheadOfPython` carries `submit`, `subscribe`
-  and `handle` today, because the queued surface landed here while the Python
-  twin was still on an open pull request; run `pnpm sync:python-surface` once
-  that change is on the Python default branch and delete the entry the rot
-  guard then names. Do not reach for either field to excuse something this SDK
-  invented: `router-spec-coverage.test.ts` only passes for a bucket the
-  vendored Router contract actually declares.
+  `modelsMethodsAheadOfPython` tolerate that in ONE direction — TypeScript
+  leading — and each has a rot guard that fails the moment the Python snapshot
+  grows the same name, which is the signal to delete the entry rather than to
+  grow it. `modelsMethodsAheadOfPython` carries `schema` and `list` today. Do
+  not reach for either field to excuse something this SDK invented:
+  `router-spec-coverage.test.ts` only passes for a bucket the vendored Router
+  contract actually declares.
+- **Three fields point the other way, and they do not mean the same thing.**
+  `pythonOnlyModelsMethods` and `pythonOnlyExportedErrorClasses` record a
+  DIVERGENCE — a name this SDK deliberately does not have under that spelling,
+  because the same thing is reached another way (`run_detailed`'s disclosure
+  already rides `comfy.models.run`'s envelope; `RouterError` lives in the
+  `routerErrors` namespace). `exportedErrorClassesBehindPython` records a
+  genuine LAG — a class this SDK cannot express at all, `AlreadyCompleted` and
+  `CancelRefused` today — and is deliberately uncomfortable: its guard insists
+  the name is missing from BOTH the root and `routerErrors`, so an entry is a
+  written admission with a follow-up attached. All three fail the day this SDK
+  grows the name, which is how an entry gets deleted rather than kept.
