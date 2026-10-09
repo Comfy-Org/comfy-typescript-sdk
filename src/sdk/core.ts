@@ -7,8 +7,6 @@
  * substitutes asset handles. Mirrors `comfy_sdk._core` in the Python SDK.
  */
 
-import { randomUUID } from "node:crypto";
-
 import type { AssetReference } from "../low/index.js";
 
 // Terminal job states. `canceling` is deliberately NOT terminal —
@@ -17,7 +15,7 @@ export const TERMINAL = new Set(["succeeded", "canceled", "failed", "expired"]);
 export const SUCCESS = "succeeded";
 
 export function newIdempotencyKey(): string {
-  return randomUUID();
+  return crypto.randomUUID();
 }
 
 export function isTerminal(status: string): boolean {
