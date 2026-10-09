@@ -239,6 +239,16 @@ classes: `Unauthorized`, `Forbidden`, `InsufficientCredits`, and `NotFound`
 for an ID that names no model. A model-level validation failure keeps its
 per-field detail on `error.details.detail`.
 
+A failure that never got a response — a dropped connection (undici's
+`TypeError` "fetch failed") or an aborted `signal` (`AbortError`) — is not a
+`ComfyError`, but it carries the same `idempotencyKey` as an own property,
+since the key is the only handle on a call the server never answered.
+`requestId` reads `null` on it, and so does `retryAfter` unless `run` was
+collecting, when it is the pace Router named. When several calls share one
+`AbortController`, each rejects with its own copy of `signal.reason` carrying
+its own key, so the error is not `=== signal.reason`; a reason the SDK cannot
+copy faithfully (your own `Error` subclass, say) is re-thrown as is, unkeyed.
+
 An `Idempotency-Key` is sent on every call; one is minted per call unless you pass your own. Every attempt within one call — the first and every retry — sends that same key, so a retry after a lost or 5xx-ed response is a replay rather than a second generation, and a second charge. Supplying your own key extends that across calls: a fresh `run` with a key you already used replays the original result instead of running the model again.
 
 ```ts
@@ -414,7 +424,7 @@ const { data } = await comfy.models.subscribe(
 
 The same bound is available on `handle.get()` and `handle.events()`, where it rejects **without** cancelling: the queue is the server's, and a local clock running out says nothing about it. The first poll is always made, so `timeoutMs: 0` reads "look once".
 
-Each `submit` **call** mints one fresh `Idempotency-Key`: two deliberate submits of the same input are two requests, while a transport-level retry inside one call keeps the one key and replays the original acceptance rather than queueing a second generation. Pass `idempotencyKey` to choose it yourself — the case that earns it is a lost response, where the request may have been accepted and its id lost with the reply.
+Each `submit` **call** mints one fresh `Idempotency-Key`: two deliberate submits of the same input are two requests, while a transport-level retry inside one call keeps the one key and replays the original acceptance rather than queueing a second generation. Pass `idempotencyKey` to choose it yourself — the case that earns it is a lost response, where the request may have been accepted and its id lost with the reply. Every failure past the argument checks carries the key the call went out under on `err.idempotencyKey`, a minted one included, the same way `run`'s do.
 
 This surface is **gated server side**. A caller the queue is not switched on for is answered `403 not_enabled`, which arrives as `routerErrors.NotEnabled` — nothing about the request is wrong, and it is terminal, so it is not retried.
 
@@ -1092,8 +1102,9 @@ with backoff, replayed under the call's own `Idempotency-Key`. Everything
 below `500` is left alone, `NotEnabled` included.
 
 Every one of them carries `errorType`, `requestId` (the server-minted id off
-`X-Comfy-Request-Id` — the value to quote in a support request) and
-`httpStatus`.
+`X-Comfy-Request-Id` — the value to quote in a support request),
+`httpStatus` and `idempotencyKey` (the key a failed `comfy.models.submit` went
+out under; `null` from the handle's methods, which address the request by id).
 
 An `error_type` this release has never heard of — a newer server — surfaces as
 a plain `RouterError` carrying the raw value in `errorType`, never as an
