@@ -285,6 +285,14 @@ const ROUTE_COVERAGE: Record<string, { method: keyof typeof models | null; why: 
       "`run()` and `schema()` take. Exposing it is additive and unblocked; it is left out here " +
       "only because nothing has asked for it yet.",
   },
+  estimateRouterModelCost: {
+    method: null,
+    why:
+      "the pre-run price quote (`POST .../estimate`), which no `comfy.models` method reaches " +
+      "yet. It runs nothing and charges nothing, so `run()` does not depend on it, and the " +
+      "contract has it answering `403 not_enabled` while it rolls out. Exposing it is additive " +
+      "and belongs in its own change, with its Python twin.",
+  },
   submitRouterModelRequest: {
     method: "submit",
     why: "the queued submission route — `comfy.models.submit` posts a request to it.",

@@ -107,6 +107,11 @@ entry. See CONTRIBUTING.md.
   `request_not_found` buckets the vendored Router contract now declares, so a
   queued failure carrying one of them is a typed `catch` rather than a bare
   `RouterError`.
+- **`routerErrors.QueueBacklogFull`** for the `queue_backlog_full` bucket: a
+  queued submit refused with `429` because you already have too many queued
+  requests waiting. Nothing was submitted or charged; submit again once some
+  of your queued requests finish. It shares `429` with
+  `ConcurrencyLimitExceeded`, and `errorType` tells them apart.
 
 ### Changed
 
