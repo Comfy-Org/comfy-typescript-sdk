@@ -176,18 +176,6 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
     pythonAsyncModelsClasses: ["AsyncModels"],
   },
   {
-    id: "discovery-methods-land-first-in-typescript",
-    why:
-      "`comfy.models.schema` and `comfy.models.list` reach Router's two discovery routes — the " +
-      "per-model OpenAPI document and the paginated model catalog — which the contract has " +
-      "declared all along and neither SDK called. The shape is settled here first, on purpose: " +
-      "the same two methods belong on `comfy_sdk.models.Models`/`AsyncModels` and are a " +
-      "follow-up on the Python SDK, so the naming is negotiated once rather than twice. This " +
-      "is a LAG, not a divergence — the entry fails the moment the Python snapshot grows " +
-      "either name, which is when it should be deleted rather than kept.",
-    modelsMethodsAheadOfPython: ["schema", "list"],
-  },
-  {
     id: "detailed-run-is-the-python-spelling-of-the-envelope",
     why:
       "`Models.run_detailed` returns Python's `RouterRunResult` — the serving provider, the " +

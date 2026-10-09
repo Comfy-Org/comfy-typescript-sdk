@@ -256,7 +256,7 @@ Two things to know before you touch it:
   Python SDK's surface moved. Run `pnpm sync:python-surface`, commit the
   refreshed snapshot, then run `pnpm test` to see which symbols diverged.
 - **Deliberate divergences go in the `INTENTIONAL_ASYMMETRIES` allowlist** at
-  the top of the test, each with a stated reason. Eight are declared today.
+  the top of the test, each with a stated reason. Seven are declared today.
   Anything not declared there fails. Adding an entry is a design decision — the
   test also fails on an entry that no longer applies, so the list cannot rot
   into a blanket exemption.
@@ -266,7 +266,7 @@ Two things to know before you touch it:
   `modelsMethodsAheadOfPython` tolerate that in ONE direction — TypeScript
   leading — and each has a rot guard that fails the moment the Python snapshot
   grows the same name, which is the signal to delete the entry rather than to
-  grow it. `modelsMethodsAheadOfPython` carries `schema` and `list` today. Do
+  grow it. Neither field carries an entry for a `models` method today. Do
   not reach for either field to excuse something this SDK invented:
   `router-spec-coverage.test.ts` only passes for a bucket the vendored Router
   contract actually declares.
