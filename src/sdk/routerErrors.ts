@@ -57,12 +57,6 @@
  * the same three at the top level of `comfy_sdk`, so both SDKs resolve the
  * collision the same way: a dedicated module, and the class names themselves
  * left untouched.
- *
- * One of the nineteen buckets — `queue_backlog_full`, the most recent the
- * vendored contract grew — is newer than the Python SDK's table. Until its
- * twin lands it is declared as leading this SDK in `surface-parity.test.ts`'s
- * allowlist, which fails once the Python side catches up so the entry cannot
- * outlive the lag.
  */
 
 /**
