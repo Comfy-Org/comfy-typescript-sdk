@@ -14,6 +14,8 @@ export interface ApiErrorOptions {
   httpStatus: number;
   details?: Record<string, unknown> | null;
   retryAfter?: number | null;
+  /** See {@link ApiError.organizationId}. */
+  organizationId?: string | null;
 }
 
 export class ApiError extends Error {
@@ -23,6 +25,12 @@ export class ApiError extends Error {
   readonly httpStatus: number;
   readonly details: Record<string, unknown> | null;
   readonly retryAfter: number | null;
+  /**
+   * On `sso_required`: the organization whose single sign-on governs this key
+   * — the `organization` query parameter of Comfy Cloud's SSO start. `null` on
+   * every other code and when the server does not know it.
+   */
+  readonly organizationId: string | null;
 
   constructor(message: string, options: ApiErrorOptions) {
     super(message);
@@ -31,6 +39,7 @@ export class ApiError extends Error {
     this.httpStatus = options.httpStatus;
     this.details = options.details ?? null;
     this.retryAfter = options.retryAfter ?? null;
+    this.organizationId = options.organizationId ?? null;
   }
 }
 
@@ -97,6 +106,10 @@ const BY_CODE: Record<string, ApiErrorClass> = {
   asset_not_found: NotFound,
   unauthorized: Unauthorized,
   forbidden: Forbidden,
+  // The key is valid but the account must sign in through its organization's
+  // SSO; a Forbidden so an auth `catch` sees it, `code` stays `sso_required`,
+  // `organizationId` names the org.
+  sso_required: Forbidden,
 };
 
 const CODE_BY_STATUS: Record<number, string> = {
@@ -114,6 +127,8 @@ interface ErrorEnvelopeBody {
     code?: string;
     message?: string;
     details?: Record<string, unknown> | null;
+    /** Present only on `sso_required`. */
+    organization_id?: string;
   };
 }
 
@@ -131,6 +146,13 @@ export function errorFromEnvelope(
   let code = err && typeof err === "object" ? err.code : undefined;
   let message = err && typeof err === "object" ? err.message : undefined;
   const details = err && typeof err === "object" ? err.details : undefined;
+  const organizationId =
+    err &&
+    typeof err === "object" &&
+    typeof err.organization_id === "string" &&
+    err.organization_id !== ""
+      ? err.organization_id
+      : null;
 
   if (!code) {
     code = CODE_BY_STATUS[httpStatus] ?? "error";
@@ -145,5 +167,6 @@ export function errorFromEnvelope(
     httpStatus,
     details: details && typeof details === "object" ? details : null,
     retryAfter: options.retryAfter ?? null,
+    organizationId,
   });
 }

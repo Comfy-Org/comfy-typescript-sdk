@@ -1002,7 +1002,10 @@ Catch these SDK-level exceptions around `Comfy` methods. Public asset, job,
 event, and output helpers translate protocol errors; raw low-level exceptions
 are only exposed by direct `ComfyLow` calls.
 
-- `Unauthorized`, `Forbidden`, `NotFound`
+- `Unauthorized`, `Forbidden`, `NotFound`. A `Forbidden` whose `code` is
+  `sso_required` means the key is valid but its account must sign in through
+  its organization's single sign-on; `organizationId` names that organization
+  (`null` when the server does not know it).
 - `InvalidWorkflow` (and `WorkflowFormatUi`, for submitting a UI-export
   instead of an API-format graph)
 - `MissingAsset` — a `core/ASSET` reference the server couldn't resolve

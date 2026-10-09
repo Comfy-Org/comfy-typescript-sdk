@@ -30,6 +30,7 @@ describe("errorFromEnvelope", () => {
     ["asset_not_found", 404, NotFound],
     ["unauthorized", 401, Unauthorized],
     ["forbidden", 403, Forbidden],
+    ["sso_required", 403, Forbidden],
   ];
 
   it.each(cases)("maps code %s to %s", (code, status, expectedClass) => {
@@ -53,6 +54,26 @@ describe("errorFromEnvelope", () => {
       { retryAfter: 3 },
     );
     expect(err.retryAfter).toBe(3);
+  });
+
+  it("carries organization_id through on sso_required", () => {
+    const err = errorFromEnvelope(403, {
+      error: { code: "sso_required", message: "sso", organization_id: "org_01HXYZEXAMPLE" },
+    });
+    expect(err).toBeInstanceOf(Forbidden);
+    expect(err.code).toBe("sso_required");
+    expect(err.organizationId).toBe("org_01HXYZEXAMPLE");
+  });
+
+  it("reads organizationId as null when organization_id is absent or empty", () => {
+    const absent = errorFromEnvelope(403, { error: { code: "sso_required", message: "sso" } });
+    expect(absent.organizationId).toBeNull();
+    const empty = errorFromEnvelope(403, {
+      error: { code: "sso_required", message: "sso", organization_id: "" },
+    });
+    expect(empty.organizationId).toBeNull();
+    const forbidden = errorFromEnvelope(403, { error: { code: "forbidden", message: "no" } });
+    expect(forbidden.organizationId).toBeNull();
   });
 
   it("falls back to a bare ApiError for an unmapped code", () => {
