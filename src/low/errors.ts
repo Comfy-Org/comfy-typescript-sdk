@@ -126,7 +126,8 @@ interface ErrorEnvelopeBody {
  * status-derived code when the body is missing or not a well-formed
  * envelope, so a bare 401 with no JSON still maps to `Unauthorized`; a bare
  * `{message}` body (echo's HTTPError shape, e.g. a request-decoder 400 or a
- * BodyLimit 413) still contributes its message.
+ * BodyLimit 413) still contributes its message. A non-empty envelope message
+ * wins over a top-level one; an empty or non-string message counts as absent.
  */
 export function errorFromEnvelope(
   httpStatus: number,
@@ -137,7 +138,8 @@ export function errorFromEnvelope(
   let code = err && typeof err === "object" ? err.code : undefined;
   let message = err && typeof err === "object" ? err.message : undefined;
   const details = err && typeof err === "object" ? err.details : undefined;
-  if ((typeof message !== "string" || !message) && body && typeof body === "object") {
+  if (typeof message !== "string" || !message) message = undefined;
+  if (message === undefined && body && typeof body === "object") {
     if (typeof body.message === "string" && body.message) message = body.message;
   }
 
@@ -148,7 +150,10 @@ export function errorFromEnvelope(
     message = `HTTP ${httpStatus}`;
   }
 
-  const cls = BY_CODE[code] ?? ApiError;
+  // Own-property lookup only: `code` is server-controlled, and a plain
+  // `BY_CODE[code]` would resolve `constructor` or `toString` off
+  // `Object.prototype` — something that is not an ApiError class at all.
+  const cls = Object.hasOwn(BY_CODE, code) ? BY_CODE[code] : ApiError;
   return new cls(message, {
     code,
     httpStatus,
