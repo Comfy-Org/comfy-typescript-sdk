@@ -1617,6 +1617,18 @@ jobs:
           bump_pr=""
           bump_age_days=""
           bump_delivers=""
+          # WHY the verdict is not self-explaining any more: it now has three
+          # named causes with different owners and different fixes -- the PR's
+          # pin is internally inconsistent (`lint`), it is consistent but
+          # behind the oldest owed commit (`ancestry`), or this job could not
+          # run the lint at all (`lint-fault`, which is a fault in this check
+          # and not a finding about the PR). Both message sites below read
+          # these, and both are reached with NO bump PR open, so they are
+          # initialised out here rather than inside the `if` -- `set -u` would
+          # otherwise kill the step on the commonest path of all.
+          bump_no_reason=""
+          lint_first=""
+          carries_note=""
           if [ -n "$bump" ]; then
             bump_pr="$(printf '%s' "$bump" | jq -r '.number')"
             bump_created="$(printf '%s' "$bump" | jq -r '.createdAt')"
@@ -1660,7 +1672,15 @@ jobs:
             # The pin is read through the SAME `--print-pin` parser the top of
             # this job uses, against a scratch root holding the PR's version of
             # the caller, so this can never disagree with `workflow-pins` about
-            # which line is the pin.
+            # which line is the pin. That scratch root is then ALSO run through
+            # the script's default LINT mode, because `--print-pin` answers only
+            # "what does `workflows_ref` say" and by design never compares it
+            # with the `uses:` SHA -- so a bump PR carrying the oldest owed
+            # commit in `workflows_ref` while `uses:` stayed behind would pass
+            # the ancestry test below and mute this watchdog for a week on a pin
+            # that cannot work. The two modes together are what make `yes` mean
+            # "a caller that would also be GREEN on `workflow-pins`", which is
+            # the only kind of delivery a merge actually delivers.
             #
             # `bump_delivers` is TRI-state -- `yes`, `no`, `unknown` -- because
             # "read the PR's pin, it does not deliver" and "could not read the
@@ -1684,21 +1704,157 @@ jobs:
             # fetching a bare SHA needs a server-side allowance this cannot
             # assume, and the re-check catches the branch moving under us
             # between the two calls.
+            #
+            # EVERY workflow file is materialised, not just the cursor-review
+            # caller, because the real `workflow-pins` job scans the whole of
+            # `.github/workflows` -- so a bump PR that breaks or adds a caller
+            # in some OTHER file would read as a clean delivery here and mute
+            # this watchdog for the full bump-PR window while being red on
+            # merge. `yes` is only worth its meaning ("a caller that would also
+            # be GREEN on `workflow-pins`") if the lint sees the same file set
+            # the merged tree would. Non-recursive and filtered to `.y*ml`, to
+            # match the scanner's own `readdirSync` exactly.
+            #
+            # A SCRATCH ROOT rather than a second clone because `ROOT` in the
+            # script comes from `import.meta.url`: the copy in
+            # `$scratch/scripts` scans `$scratch/.github/workflows`, so both
+            # modes below judge the bump PR's workflows, not this branch's.
+            # The SCRIPT stays this checkout's copy on purpose -- the question
+            # is whether that PR's callers pass the scanner, and this branch
+            # owns the scanner.
+            have_head=no
             if git fetch --quiet --depth=1 origin \
                  "+refs/heads/$BUMP_BRANCH:refs/bump-head" 2>/dev/null \
-              && [ "$(git rev-parse refs/bump-head 2>/dev/null)" = "$bump_head" ] \
-              && git show "refs/bump-head:.github/workflows/ci-cursor-review.yml" \
-                   >"$scratch/.github/workflows/ci-cursor-review.yml" 2>/dev/null
+              && [ "$(git rev-parse refs/bump-head 2>/dev/null)" = "$bump_head" ]
             then
+              have_head=yes
+              # NUL-separated (`-z`), because without it `ls-tree` C-quotes any
+              # path carrying a non-ASCII byte, `"` or `\` -- the name then
+              # arrives wrapped in quotes, fails the `.y*ml` filter below and
+              # is silently left out of the scratch root, so the lint would
+              # pass over a smaller file set than the merged tree's
+              # `readdirSync` sees.
+              git ls-tree -z --name-only "refs/bump-head" .github/workflows/ \
+                >"$scratch/wf.list" 2>/dev/null || : >"$scratch/wf.list"
+              # Read from a FILE, not a pipe: a `... | while` loop runs in a
+              # subshell and `have_head=no` set inside it would not survive.
+              while IFS= read -r -d '' wf; do
+                case "$wf" in
+                  *.yml|*.yaml) ;;
+                  *) continue ;;
+                esac
+                git show "refs/bump-head:$wf" >"$scratch/$wf" 2>/dev/null \
+                  || have_head=no
+              done <"$scratch/wf.list"
+              # The cursor-review caller specifically must be there: without it
+              # `--print-pin` has nothing to answer with, and a lint over the
+              # remaining files would be measuring the wrong thing.
+              [ -f "$scratch/.github/workflows/ci-cursor-review.yml" ] || have_head=no
+            fi
+
+            if [ "$have_head" = yes ]; then
+              # The LINT runs FIRST, ahead of `--print-pin` and the `cat-file`
+              # gate, because its findings are PERMANENT and theirs are not.
+              # A missing `workflows_ref`, a caller spelling the scanner cannot
+              # read, a `uses:` that is not 40-hex -- each of those takes
+              # `--print-pin` down too, and if the pin gate ran first they
+              # would all report as `unknown` ("could not verify, go audit the
+              # PR") when the lint has a firm, actionable answer waiting. The
+              # deterministic verdict must win over the transient one.
+              #
+              # `--print-pin` answers only "what does `workflows_ref` say" and
+              # by design never compares it with the `uses:` SHA -- so a bump
+              # PR carrying the oldest owed commit in `workflows_ref` while
+              # `uses:` stayed behind would pass the ancestry test below and
+              # mute this watchdog for a week on a pin that cannot work. The
+              # two modes together are what make `yes` mean "a caller that
+              # would also be GREEN on `workflow-pins`".
+              #
+              # Exit 1 is the script's VERDICT (a caller it read and rejected)
+              # and anything else is a FAULT in running it -- which says
+              # nothing about the fleet and must not be reported as one. Same
+              # split as every other probe in this step.
+              #
+              # The exit code ALONE does not draw that line, which is why the
+              # `check-workflow-pins:` marker is part of the test. node exits
+              # 1 for an uncaught throw and for a missing module too (measured
+              # against node 22: `node /nonexistent.mjs` -> 1, `throw` -> 1;
+              # only a bad CLI flag gives 9), so a keyed-on-1 classifier would
+              # publish a stack-trace line as "the lint says your caller is
+              # broken" and open a sticky issue blaming the fleet for this
+              # job's own crash. Every one of the script's three exit-1 paths
+              # -- `fail()`, `reportUnreadable()` and the lint-error report --
+              # opens its stderr with `check-workflow-pins: `, and nothing
+              # node emits on its own does; requiring it is what keeps a fault
+              # on the `unknown` path where it belongs.
+              lint_rc=0
+              node "$scratch/scripts/check-workflow-pins.mjs" \
+                >/dev/null 2>"$gwtmp/bump-lint.err" || lint_rc=$?
+              if [ "$lint_rc" -eq 0 ]; then
+                lint_verdict=pass
+              elif [ "$lint_rc" -eq 1 ] && grep -q '^check-workflow-pins: ' "$gwtmp/bump-lint.err"; then
+                lint_verdict=fail
+              else
+                lint_verdict=fault
+              fi
+
+              if [ "$lint_verdict" = fail ]; then
+                # QUOTE the lint rather than paraphrase it. Exit 1 covers
+                # several distinct defects -- a `uses:` that is not 40-hex, a
+                # stale trailing version comment, a missing `workflows_ref`, a
+                # `workflows_ref` that disagrees with `uses:`, a caller
+                # spelling the scanner cannot read at all -- and only one of
+                # them is literally a split pair, so asserting "split pin"
+                # here would be wrong most of the time.
+                #
+                # `|| lint_first=""` is not decoration: `grep -m1` exits 1
+                # when it matches nothing, and under `set -e` a bare
+                # `var="$(pipeline)"` assignment takes that status and kills
+                # the step on the no-verdict fault path. The no-match case is
+                # real -- the script's `fail()` paths (no caller found, a
+                # caller spelling it cannot read) print a header and no `  - `
+                # bullet -- so fall back to its first line instead.
+                lint_first="$(grep -m1 '^  - ' "$gwtmp/bump-lint.err" | sed 's/^  - //')" \
+                  || lint_first=""
+                if [ -z "$lint_first" ]; then
+                  lint_first="$(grep -m1 . "$gwtmp/bump-lint.err")" || lint_first=""
+                fi
+                lint_first="${lint_first:-(the lint exited 1 but printed nothing)}"
+                # The COUNT travels with the first line. Quoting one bullet out
+                # of several reads as "fix this one thing", so the maintainer
+                # pushes a fixup and this job reddens again tomorrow on problem
+                # two. `grep -c` exits 1 on zero matches, which `set -e` would
+                # act on, hence the fallback.
+                lint_n="$(grep -c '^  - ' "$gwtmp/bump-lint.err")" || lint_n=0
+                if [ "${lint_n:-0}" -gt 1 ]; then
+                  lint_first="$lint_first (+$((lint_n - 1)) more problem(s) -- see the lint output)"
+                fi
+              fi
+
+              # ANCESTRY is computed regardless of what the lint said, because
+              # the two are INDEPENDENT facts with different fixes and the
+              # reader needs both: "your two pins disagree" (a fixup commit on
+              # the open PR) is a different bill from "this is an older bump"
+              # (a whole fresh bump). Short-circuiting on the lint verdict used
+              # to make this step assert the PR "is not counted as a delivery
+              # of this backlog" -- a claim about the backlog it had never
+              # measured -- and let a transient lint fault suppress an ancestry
+              # answer that was already fully computable.
+              #
+              # Tested by ANCESTRY rather than equality: the fleet pins callers
+              # to upstream's main TIP, which legitimately sits ahead of any
+              # commit on the watched surface whenever an unwatched commit
+              # landed after it, and demanding equality there would call a
+              # perfectly good bump undelivered.
               head_pin="$(node "$scratch/scripts/check-workflow-pins.mjs" \
                 --print-pin cursor-review.yml 2>/dev/null)" || head_pin=""
+              carries=unknown
+              carries_why=""
               # Whole-value, not per-line -- see the `pin_out` assertion above.
               if ! [[ "$head_pin" =~ ^[0-9a-f]{40}$ ]]; then
-                bump_delivers=unknown
-                echo "Bump PR #$bump_pr: its caller pin did not read as a 40-hex SHA (got \"${head_pin:-(empty)}\"), so delivery could not be verified."
+                carries_why="its caller pin did not read as a 40-hex SHA (got \"${head_pin:-(empty)}\")"
               elif ! GIT_NO_LAZY_FETCH=1 git -C "$gwtmp/gw" cat-file -e "$head_pin" 2>/dev/null; then
-                bump_delivers=unknown
-                echo "Bump PR #$bump_pr pins $head_pin, which is not present in the upstream clone (it may have landed after that clone was taken), so delivery could not be verified."
+                carries_why="it pins $head_pin, which is not present in the upstream clone (it may have landed after that clone was taken)"
               else
                 # `--is-ancestor` exits 1 for "not an ancestor" and 128 for a
                 # git-level failure. Only the 1 is a finding about the PR.
@@ -1706,22 +1862,115 @@ jobs:
                 git -C "$gwtmp/gw" merge-base --is-ancestor \
                   "$oldest_sha" "$head_pin" 2>/dev/null || anc_rc=$?
                 case "$anc_rc" in
-                  0) bump_delivers=yes ;;
-                  1) bump_delivers=no ;;
-                  *) bump_delivers=unknown ;;
+                  0) carries=yes ;;
+                  1) carries=no ;;
+                  *) carries_why="the ancestry check against $oldest_sha exited $anc_rc" ;;
                 esac
-                echo "Bump PR #$bump_pr pins the caller to $head_pin; oldest owed is $oldest_sha -- delivers: $bump_delivers (ancestry check exited $anc_rc)"
+              fi
+              case "$carries" in
+                yes) carries_note="Its pin DOES carry the oldest owed commit ($oldest_sha), so a fixup commit on that PR is what is owed, not a fresh bump." ;;
+                no)  carries_note="Its pin also does not carry the oldest owed commit ($oldest_sha), so a fresh bump is owed." ;;
+                *)   carries_note="Whether its pin carries the oldest owed commit could not be determined${carries_why:+ -- $carries_why}." ;;
+              esac
+
+              # PRECEDENCE, in one place. A lint verdict is permanent and
+              # PR-owned, so it outranks everything; a `no` ancestry answer is
+              # likewise a finding about the PR and outranks a fault in running
+              # the lint; only when no permanent finding exists does a fault
+              # get to demote the result to `unknown`. `yes` therefore requires
+              # BOTH a clean lint AND a pin descended from the oldest owed
+              # commit, which is exactly what a merge of that PR delivers.
+              if [ "$lint_verdict" = fail ]; then
+                bump_delivers=no
+                bump_no_reason=lint
+              elif [ "$carries" = no ]; then
+                bump_delivers=no
+                bump_no_reason=ancestry
+              elif [ "$lint_verdict" = fault ] && [ "$carries" = yes ]; then
+                # Its OWN cause string: on this path the pin was read and
+                # checked and only the auxiliary lint failed to run, so the
+                # generic "could not verify which commit its caller pin
+                # carries" text would send the reader to audit a PR whose pin
+                # this job in fact read fine.
+                #
+                # Gated on `carries = yes` because that is the only state in
+                # which "its pin reads fine" is TRUE. The commonest lint fault
+                # (a broken node, a missing script copy) takes `--print-pin`
+                # down the same way, leaving `carries=unknown` -- a double
+                # fault that falls through to the generic `unknown` text below,
+                # which is what it actually is.
+                bump_delivers=unknown
+                bump_no_reason=lint-fault
+                # The `yes` note above bills "a fixup commit", which presumes a
+                # defect this path never established. State the bare fact.
+                carries_note="Its pin does carry the oldest owed commit ($oldest_sha)."
+                # TRUNCATED: a node fault prints a whole stack trace, and this
+                # string is bound for an `::error::` annotation and a public
+                # issue body. The full text stays in the step log.
+                lint_first="node exited $lint_rc: $(tr '\r\n' '  ' <"$gwtmp/bump-lint.err" | cut -c1-300)"
+              else
+                bump_delivers=$carries
+              fi
+
+              echo "Bump PR #$bump_pr: lint=$lint_verdict, carries-oldest=$carries (oldest owed $oldest_sha, pin ${head_pin:-unreadable}) -- delivers: $bump_delivers${bump_no_reason:+ (because: $bump_no_reason)}"
+              # The note reads as advice about a defect, so it is only worth
+              # printing when there is one; on the clean path the summary line
+              # above already carries `carries-oldest=yes`.
+              if [ "$bump_delivers" != yes ]; then
+                echo "  $carries_note"
+              fi
+              # Read from the stderr file rather than from `$lint_first`: a
+              # fault that LOST precedence to an ancestry verdict never got to
+              # set that variable, and printing an empty one here would claim
+              # the lint said nothing when it in fact could not run.
+              if [ "$lint_verdict" = fail ]; then
+                echo "  lint: $lint_first"
+              elif [ "$lint_verdict" = fault ]; then
+                echo "  lint could not be RUN -- node exited $lint_rc: $(tr '\r\n' '  ' <"$gwtmp/bump-lint.err" | cut -c1-500)"
               fi
             else
+              # The fetch or the materialisation failed, so nothing was read at
+              # all -- neither pin nor lint. Transient by nature (a network
+              # blip, or the branch moving between the API call and the fetch),
+              # so it is a fault, not a finding about the PR.
               bump_delivers=unknown
-              echo "Bump PR #$bump_pr: could not read its caller pin, so delivery could not be verified and this job is not treating it as delivered."
+              echo "Bump PR #$bump_pr: its head could not be fetched into a scratch root, so neither its pin nor the workflow-pins lint could be read and delivery could not be verified."
             fi
             rm -rf "$scratch"
+
+            # SANITISED HERE, at the boundary, rather than trusting the
+            # producer. `$GITHUB_OUTPUT` is LINE-oriented, so a value carrying
+            # a newline in the plain `name=value` form writes further
+            # `name=value` lines -- forging outputs such as `oldest_sha` or
+            # `behind_count` set earlier in this same block and never
+            # overwritten. Today these two strings are single-line by
+            # construction, but that is a property of the lint's current
+            # message set (and of `tr`-flattened stderr), not of this file, and
+            # a future lint message interpolating a path with a newline in it
+            # would turn a diagnostic into step-output injection. Carriage
+            # returns go too: they are not newlines to the parser but they do
+            # survive into the issue body and the annotation below.
+            lint_first="$(printf '%s' "$lint_first" | tr '\n\r' '  ')"
+            carries_note="$(printf '%s' "$carries_note" | tr '\n\r' '  ')"
+            field_eof="BUMP_FIELD_EOF_$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 
             {
               echo "bump_pr=$bump_pr"
               echo "bump_age_days=$bump_age_days"
               echo "bump_delivers=$bump_delivers"
+              echo "bump_no_reason=$bump_no_reason"
+              # The DELIMITER form, not `name=value`, for the two free-text
+              # fields: it is the form that stays correct if the flattening
+              # above ever stops being enough, and it costs two extra lines.
+              # The delimiter is RUN-UNIQUE, as GitHub's docs recommend: a
+              # fixed literal is closed early by a value carrying a line equal
+              # to it, and the remainder then parses as `key=value` records.
+              echo "bump_lint_first<<$field_eof"
+              printf '%s\n' "$lint_first"
+              echo "$field_eof"
+              echo "bump_carries_note<<$field_eof"
+              printf '%s\n' "$carries_note"
+              echo "$field_eof"
             } >>"$GITHUB_OUTPUT"
           fi
 
@@ -1751,8 +2000,36 @@ jobs:
           else
             landed="landed $((age / 86400)) days ago"
           fi
-          if [ -n "$bump_pr" ] && [ "$bump_delivers" = no ]; then
+          # ESCAPED for the workflow-command grammar before it reaches any
+          # `::error::`. The runner percent-DECODES `%25`, `%0A` and `%0D` in
+          # command message DATA, so a lint line quoting a `uses:` ref, a
+          # `workflows_ref` value or a path containing one of those sequences
+          # would forge extra annotation lines out of a single message. `%`
+          # must be escaped FIRST or it would re-encode the `%` of the escapes
+          # that follow; newlines and CRs were already flattened at the
+          # `$GITHUB_OUTPUT` boundary above, and are re-encoded here anyway so
+          # this holds on its own. The `printf`-argument note on the issue step
+          # below covers a different hazard (the format string) and does not
+          # cover these `echo`s.
+          lint_first_ann="$(printf '%s' "$lint_first" | sed -e 's/%/%25/g' -e 's/\r/%0D/g')"
+          carries_note_ann="$(printf '%s' "$carries_note" | sed -e 's/%/%25/g' -e 's/\r/%0D/g')"
+          if [ -n "$bump_pr" ] && [ "$bump_delivers" = no ] && [ "$bump_no_reason" = lint ]; then
+            # A DIFFERENT complaint from the one below, with a different fix:
+            # its two pins do not agree with each other, so merging it delivers
+            # a caller that `workflow-pins` reddens. The lint's own line is
+            # quoted rather than summarised -- see the `bump_no_reason=lint`
+            # branch above -- and the ancestry fact is carried alongside it,
+            # because it is what decides whether a fixup commit or a whole
+            # fresh bump is owed. Neither fact is inferable from the other.
+            echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) $landed. PR #$bump_pr is open on $BUMP_BRANCH, but its caller fails the repo's own workflow-pins lint ($lint_first_ann), so merging it cannot deliver a working pin. $carries_note_ann"
+          elif [ -n "$bump_pr" ] && [ "$bump_delivers" = no ]; then
             echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) $landed. PR #$bump_pr is open on $BUMP_BRANCH, but its own caller pin does not carry the oldest owed commit ($oldest_sha) -- the fleet reuses that branch, so this is an older bump, not a delivery of this backlog."
+          elif [ -n "$bump_pr" ] && [ "$bump_no_reason" = lint-fault ]; then
+            # NOT the same as "could not read the pin": here the pin was read,
+            # asserted 40-hex and found upstream, and only the auxiliary lint
+            # failed to RUN. Pointing the reader at the PR would waste their
+            # time on a pin this job verified -- the fault is this job's.
+            echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) $landed. PR #$bump_pr is open on $BUMP_BRANCH and its pin reads fine, but THIS JOB could not run the workflow-pins lint against its caller ($lint_first_ann), so it is held short of a delivery verdict. $carries_note_ann This is a fault in this check, not a finding about that PR."
           elif [ -n "$bump_pr" ] && [ "$bump_delivers" = unknown ]; then
             echo "::error::the github-workflows pin ($pin) is stale -- $behind_count consumer-visible commit(s) behind, the oldest ($oldest_sha) $landed. PR #$bump_pr is open on $BUMP_BRANCH, but this job could NOT VERIFY which commit its caller pin carries, so it is not being counted as a delivery of this backlog. Check that PR before assuming a fresh bump is owed."
           elif [ -n "$bump_pr" ]; then
@@ -1901,6 +2178,15 @@ jobs:
           BUMP_PR: ${{ steps.assess.outputs.bump_pr }}
           BUMP_AGE_DAYS: ${{ steps.assess.outputs.bump_age_days }}
           BUMP_DELIVERS: ${{ steps.assess.outputs.bump_delivers }}
+          # Which of the three named causes was found, and the lint's own
+          # first problem line to quote for the two that have one. Both are
+          # empty on every other path, so the branch order below selects them.
+          BUMP_NO_REASON: ${{ steps.assess.outputs.bump_no_reason }}
+          BUMP_LINT_FIRST: ${{ steps.assess.outputs.bump_lint_first }}
+          # The ancestry fact, phrased as a sentence. Carried separately from
+          # the lint verdict because the two are independent and the reader
+          # needs both to know whether a fixup commit or a fresh bump is owed.
+          BUMP_CARRIES_NOTE: ${{ steps.assess.outputs.bump_carries_note }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -1909,26 +2195,79 @@ jobs:
           gh label create "$MODE_LABEL" --force --color ededed \
             --description "cursor-review pin freshness watchdog: the pin is stale" >/dev/null
 
-          if [ -n "$BUMP_PR" ] && [ "$BUMP_DELIVERS" = no ]; then
+          # `$cause` and `$step1` are chosen TOGETHER, in one branch each,
+          # because they are two halves of one statement: the paragraph says
+          # what this run found, and step 1 of the checklist says what to do
+          # about it. Leaving step 1 fixed at "it has already delivered both
+          # pins and only the merge is owed -- review and land it" made the
+          # checklist contradict the paragraph directly above it on every
+          # non-delivering cause, and following it lands a caller this very job
+          # just said would redden `workflow-pins` on the default branch.
+          #
+          # `$BUMP_LINT_FIRST` and `$BUMP_CARRIES_NOTE` are ARGUMENTS to
+          # `printf`, never part of its format string. They are plain text from
+          # this repo's own script, but the one thing that would turn them into
+          # a bug is a `%` in a path or a SHA-like token reaching the format
+          # position, and keeping them arguments costs nothing.
+          if [ -n "$BUMP_PR" ] && [ "$BUMP_DELIVERS" = no ] && [ "$BUMP_NO_REASON" = lint ]; then
+            cause="$(printf '%s ' \
+              "PR #$BUMP_PR is open on \`$BUMP_BRANCH\`, but its caller fails the repo's own" \
+              "workflow-pins lint ($BUMP_LINT_FIRST), so merging it cannot deliver a working" \
+              "pin." "$BUMP_CARRIES_NOTE")"
+            step1="$(printf '%s ' \
+              "**Fix the bump PR before landing it.** #$BUMP_PR does NOT pass" \
+              "\`node scripts/check-workflow-pins.mjs\` -- merging it as it stands reddens the" \
+              "\`workflow-pins\` job on the default branch. Push a fixup to that branch (or" \
+              "close it), and this job re-checks on the next daily run.")"
+          elif [ -n "$BUMP_PR" ] && [ "$BUMP_DELIVERS" = no ]; then
             cause="$(printf '%s ' \
               "PR #$BUMP_PR is open on \`$BUMP_BRANCH\`, but its own caller pin does not carry" \
               "the oldest owed commit -- the fleet reuses that branch, so this is an older bump" \
               "rather than a delivery of this backlog. A fresh bump is owed.")"
+            step1="$(printf '%s ' \
+              "**Do not land #$BUMP_PR expecting it to fix this.** It is an older bump on the" \
+              "reused \`$BUMP_BRANCH\` branch and its pin predates the commit this issue is" \
+              "about. Repin that branch to \`$NEWEST_SHA\` (step 3 below has the two lines), or" \
+              "close it and re-dispatch the fleet.")"
+          elif [ -n "$BUMP_PR" ] && [ "$BUMP_NO_REASON" = lint-fault ]; then
+            cause="$(printf '%s ' \
+              "PR #$BUMP_PR is open on \`$BUMP_BRANCH\` and its pin reads fine, but this job" \
+              "could not RUN the workflow-pins lint against its caller ($BUMP_LINT_FIRST), so it" \
+              "is held short of a delivery verdict." "$BUMP_CARRIES_NOTE" \
+              "That is a fault in this check, NOT a finding about that PR.")"
+            step1="$(printf '%s ' \
+              "**Re-run this job first.** The lint could not be executed, which is usually" \
+              "transient (a runner fault, not a pin problem). If it clears, #$BUMP_PR may well" \
+              "be a clean delivery and only the merge is owed; if it keeps failing the same way," \
+              "this watchdog itself needs fixing before its verdict is worth acting on.")"
           elif [ -n "$BUMP_PR" ] && [ "$BUMP_DELIVERS" = unknown ]; then
             cause="$(printf '%s ' \
               "PR #$BUMP_PR is open on \`$BUMP_BRANCH\`, but this job could not verify which" \
               "commit its caller pin carries, so it is not counted as a delivery of this" \
               "backlog. That is a limit of this check, NOT a finding about the fleet -- read" \
               "that PR before assuming a fresh bump is owed.")"
+            step1="$(printf '%s ' \
+              "**Read #$BUMP_PR before doing anything else.** This job could not verify its" \
+              "pin, so it has NOT established that a fresh bump is owed. If that PR does carry" \
+              "\`$OLDEST_SHA\`, landing it is the whole fix and the rest of this list does not" \
+              "apply.")"
           elif [ -n "$BUMP_PR" ]; then
             cause="$(printf '%s ' \
               "PR #$BUMP_PR is open on \`$BUMP_BRANCH\` but has been unmerged for" \
               "$BUMP_AGE_DAYS days, so delivery is not what is missing -- the merge is.")"
+            step1="$(printf '%s ' \
+              "**Is there a bump PR waiting on a human?** #$BUMP_PR has already delivered both" \
+              "pins and only the merge is owed -- review and land it, or close it so this job" \
+              "stops counting it as delivery.")"
           else
             cause="$(printf '%s ' \
               "No PR is open on the \`$BUMP_BRANCH\` branch, so nothing is moving the pin.")"
+            step1="$(printf '%s ' \
+              "**No bump PR is open**, so there is nothing to land -- go straight to steps 2" \
+              "and 3.")"
           fi
           cause="${cause% }"
+          step1="${step1% }"
 
           # The grace window is normally judged on elapsed time, but a commit
           # dated implausibly far ahead of the runner's clock is judged out of
@@ -1946,47 +2285,6 @@ jobs:
             overdue="The oldest one has been sitting there past the $GRACE_DAYS-day grace window."
           fi
 
-          # Step 1's remediation has to agree with the `cause` paragraph built
-          # above. A single fixed wording -- "if one is named above, it has
-          # already delivered both pins and only the merge is owed" -- was
-          # emitted for EVERY verdict that names a PR, including the two that
-          # say the opposite: `no`, where the PR's own pin does not carry the
-          # oldest owed commit and a fresh bump is owed, and `unknown`, where
-          # delivery could not be verified at all. It contradicted the
-          # diagnosis in the same issue body and pointed the reader at a merge
-          # that cannot clear the reported backlog.
-          if [ -z "$BUMP_PR" ]; then
-            step1="$(printf '%s\n' \
-              "1. **Is there a bump PR waiting on a human?** None is open on \`$BUMP_BRANCH\`, so" \
-              "   nothing is currently moving the pin -- go on to step 2 and step 3.")"
-          elif [ "$BUMP_DELIVERS" = yes ]; then
-            step1="$(printf '%s\n' \
-              "1. **Is there a bump PR waiting on a human?** PR #$BUMP_PR has already delivered" \
-              "   both pins and only the merge is owed -- review and land it, or close it so this" \
-              "   job stops counting it as delivery.")"
-          elif [ "$BUMP_DELIVERS" = no ]; then
-            step1="$(printf '%s\n' \
-              "1. **Is there a bump PR waiting on a human?** PR #$BUMP_PR is open, but its caller" \
-              "   pin does not carry the oldest owed commit, so merging it will NOT clear this" \
-              "   backlog. A fresh bump is owed -- re-dispatch the fleet (step 2), or hand-bump" \
-              "   (step 3).")"
-          else
-            # The bar named here is `$OLDEST_SHA`, matching the `no` branch
-            # above and this job's OWN delivery test
-            # (`merge-base --is-ancestor "$oldest_sha" "$head_pin"`). Naming
-            # `$NEWEST_SHA` made the advice STRICTER than the criterion it
-            # stands in for -- upstream's tip is recomputed every run, so a
-            # reader who found the PR pinned to anything older would
-            # re-dispatch or close a PR this job would itself have counted as
-            # delivering, which is the same moving-target bar the delivery
-            # test above deliberately rejected.
-            step1="$(printf '%s\n' \
-              "1. **Is there a bump PR waiting on a human?** PR #$BUMP_PR is open, but this job" \
-              "   could not verify which commit its caller pin carries. Read that PR first: if its" \
-              "   pin already carries the oldest owed commit \`$OLDEST_SHA\`, only the merge is" \
-              "   owed; if it does not, a fresh bump is owed and steps 2 and 3 apply.")"
-          fi
-
           body="$(printf '%s\n' \
             "\`.github/workflows/ci-cursor-review.yml\` is pinned to \`$PIN\`, which is" \
             "**$BEHIND_COUNT consumer-visible commit(s) behind \`Comfy-Org/github-workflows@$UPSTREAM_BRANCH\`**." \
@@ -2000,7 +2298,7 @@ jobs:
             "" \
             "Things to check, in this order:" \
             "" \
-            "$step1" \
+            "1. $step1" \
             "2. **Is this repo still on the bump fleet's roster?** The fleet only visits repos" \
             "   listed in the \`CURSOR_REVIEW_CALLERS\` secret on \`Comfy-Org/github-workflows\`," \
             "   whose canonical copy lives in the private ops repo (deliberately not named here --" \
