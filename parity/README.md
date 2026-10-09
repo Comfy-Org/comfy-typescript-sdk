@@ -8,7 +8,7 @@ The two SDKs are maintained in separate repositories by separate pull requests, 
 
 ## How the other repository's surface is obtained
 
-`scripts/sync-python-surface.mjs` reads four files from the public `Comfy-Org/comfy-python-sdk` repository over plain HTTPS (`raw.githubusercontent.com` — no token, no clone, no Python toolchain) and extracts the surface with `scripts/python-surface.mjs`, which parses those four source files rather than importing the package.
+`scripts/sync-python-surface.mjs` reads its source files from the public `Comfy-Org/comfy-python-sdk` repository over plain HTTPS (`raw.githubusercontent.com` — no token, no clone, no Python toolchain) and extracts the surface with `scripts/python-surface.mjs`, which parses those source files rather than importing the package.
 
 The result is committed rather than fetched at test time, for the same reason `spec/openapi.yaml` is vendored: the assertion has to run offline and deterministically on every pull request, and a test that reaches the network fails for reasons that have nothing to do with the code under review. So the work is split in two:
 
@@ -28,16 +28,14 @@ pnpm test                  # see which symbols actually diverged
 
 Then either mirror the change in this SDK, or — if the difference is deliberate — add it to the `INTENTIONAL_ASYMMETRIES` allowlist in `src/sdk/surface-parity.test.ts` with the reason. An allowlist entry is a design decision, not a way to quiet a failure.
 
-## Credential resolution: extracted, not yet asserted
+## Credential resolution
 
-`scripts/python-surface.mjs` reads the Python client's credential resolution — the `COMFY_API_KEY` / `COMFY_BASE_URL` variable names, the Comfy Cloud base URL, the order `_resolve_api_key` tries its sources in, and the error it raises when they are exhausted against Comfy Cloud — and `extractPythonSurface` emits it as a `credentialResolution` section. The class clients now resolve identically, so this is the behaviour a name-only check cannot see, in the same sense the status fallback table is.
+`scripts/python-surface.mjs` also reads the Python client's credential resolution — the `COMFY_API_KEY` / `COMFY_BASE_URL` variable names, the Comfy Cloud base URL, the order `_resolve_api_key` tries its sources in, and the error it raises when they are exhausted against Comfy Cloud — into the snapshot's `credentialResolution` section. This is behaviour a name-only check cannot see, in the same sense the status fallback table is.
 
-The section is **not in the committed snapshot yet**, and so nothing in `surface-parity.test.ts` compares it against this SDK: refreshing the snapshot today is blocked on unrelated Python-side drift that the `sdk-parity` job is already failing on: the Python SDK now ships `models.schema` and `models.list`, so the `modelsMethodsAheadOfPython` lead for those two fires its rot guard once the snapshot is refreshed, and retiring that lead is its own change. Until that is dealt with, the TypeScript half of credential resolution is pinned by `src/sdk/apiKeyEnv.test.ts` and by the `credential-resolution` entry's `sharedCredentialOrder` rot guard in `surface-parity.test.ts`, which derives the order from real constructions.
-
-When the snapshot can be refreshed, add `credentialResolution` to `loadPythonSurface`'s non-empty section list and compare `apiKeyEnvVar` / `cloudBaseUrl` / `order` / `missingKeyError` (through `RENAMES`) against the values that test already derives.
+The "credential resolution" block of `surface-parity.test.ts` compares each field against this SDK: the variable names and the Cloud URL against its constants, the order against the `credential-resolution` entry's `sharedCredentialOrder` (which a second test derives from real constructions), and the error through `RENAMES`.
 
 ## What this deliberately does not check
 
-- **Behaviour.** Surface only: names, and the `error_type` each error class maps to. Two methods with the same name that do different things pass.
+- **Behaviour.** Surface only: names, and the `error_type` each error class maps to, plus the two behaviours read on purpose (the status fallback table and credential resolution). Two methods with the same name that do different things pass.
 - **Within-language parity.** Whether the Python SDK's own sync and async clients agree is that SDK's test to run, not this one's. The one exception is that the async `models` class may not introduce a method name the sync class lacks, because such a name would be a Python-only method with no counterpart here.
 - **Documentation.** Whether the two SDKs' docs cover the same ground is a separate concern.

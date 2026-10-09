@@ -384,9 +384,8 @@ export function extractRetryPolicyFields(source) {
  * formatting — the candidate sequence IS the documented precedence, and the
  * cloud-guarded raise IS the "Comfy Cloud always requires a key" rule.
  *
- * The committed snapshot does not carry this section yet and nothing compares
- * it — see "Credential resolution: extracted, not yet asserted" in
- * `parity/README.md` for why, and for the two lines that turn it on.
+ * `src/sdk/surface-parity.test.ts` compares each field against this SDK's
+ * constants and its live constructions ("credential resolution").
  */
 export function extractCredentialResolution(source) {
   const constant = (name) => {

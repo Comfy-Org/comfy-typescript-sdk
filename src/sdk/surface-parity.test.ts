@@ -284,6 +284,14 @@ interface PythonSurface {
   routerErrorTypeByStatus: Record<string, string>;
   exportedErrorClasses: string[];
   retryPolicyFields: Record<string, string>;
+  credentialResolution: {
+    resolver: string;
+    apiKeyEnvVar: string;
+    baseUrlEnvVar: string;
+    cloudBaseUrl: string;
+    order: string[];
+    missingKeyError: string;
+  };
 }
 
 async function loadPythonSurface(): Promise<PythonSurface> {
@@ -298,6 +306,7 @@ async function loadPythonSurface(): Promise<PythonSurface> {
     ["routerErrorTypeByStatus", Object.keys(surface.routerErrorTypeByStatus).length],
     ["exportedErrorClasses", surface.exportedErrorClasses.length],
     ["retryPolicyFields", Object.keys(surface.retryPolicyFields).length],
+    ["credentialResolution", surface.credentialResolution?.order?.length ?? 0],
   ];
   for (const [name, size] of sections) {
     if (size === 0) {
@@ -774,17 +783,27 @@ describe("credential resolution", () => {
     }
   });
 
-  it("reads the environment variable the Python client names", () => {
+  it("tries its sources in the order the Python client does", async () => {
+    // The test above proves the class client follows SHARED_CREDENTIAL_ORDER;
+    // this pins that declaration to the order read off `_resolve_api_key`.
+    const { credentialResolution } = await loadPythonSurface();
+    expect(SHARED_CREDENTIAL_ORDER).toEqual(credentialResolution.order);
+  });
+
+  it("reads the environment variables the Python client names", async () => {
     // `comfy.models.*` resolves through this same constant, so the two
     // TypeScript surfaces cannot drift from each other either.
-    expect(CREDENTIALS_ENV_VAR).toBe("COMFY_API_KEY");
+    const { credentialResolution } = await loadPythonSurface();
+    expect(CREDENTIALS_ENV_VAR).toBe(credentialResolution.apiKeyEnvVar);
+    expect(BASE_URL_ENV_VAR).toBe(credentialResolution.baseUrlEnvVar);
   });
 
   it("raises the renamed error against Comfy Cloud, and nothing off it", async () => {
     // The Python side raises `MissingApiKey` here; the rename is declared in
     // INTENTIONAL_ASYMMETRIES and its liveness is guarded above. What this
     // adds is WHEN: Comfy Cloud only, and with no network call.
-    expect(RENAMES.MissingApiKey).toBe("MissingCredentials");
+    const { missingKeyError } = (await loadPythonSurface()).credentialResolution;
+    expect(RENAMES[missingKeyError] ?? missingKeyError).toBe(MissingCredentials.name);
 
     vi.stubEnv(BASE_URL_ENV_VAR, undefined);
     vi.stubEnv(CREDENTIALS_ENV_VAR, undefined);
@@ -797,11 +816,12 @@ describe("credential resolution", () => {
     expect(await credentialSent()).toBeNull();
   });
 
-  it("agrees with the Python client on where Comfy Cloud is", () => {
+  it("agrees with the Python client on where Comfy Cloud is", async () => {
     // The constant the cloud carve-out is keyed on. If the two SDKs disagreed
     // about it, one of them would hand back a keyless client for the host the
     // other guards.
-    expect(COMFY_CLOUD_BASE_URL).toBe("https://cloud.comfy.org");
+    const { credentialResolution } = await loadPythonSurface();
+    expect(COMFY_CLOUD_BASE_URL).toBe(credentialResolution.cloudBaseUrl);
   });
 });
 
