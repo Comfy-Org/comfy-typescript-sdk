@@ -25,7 +25,9 @@
  *   } else if (err instanceof routerErrors.InvalidInput) {
  *     for (const d of err.detail) console.log(d.loc.join("."), d.type, d.msg);
  *   } else if (err instanceof routerErrors.RouterError) {
- *     console.log(err.errorType, err.requestId); // any bucket, known or not
+ *     // any bucket, known or not; `idempotencyKey` is set when the SDK stamped
+ *     // this on the `models.submit` queue path, else null
+ *     console.log(err.errorType, err.requestId, err.idempotencyKey);
  *   }
  * }
  * ```
@@ -274,6 +276,8 @@ export interface RouterErrorOptions {
   retryAfter?: number | null;
   /** See {@link RouterError.refusalSubject}. */
   refusalSubject?: string | null;
+  /** See {@link RouterError.idempotencyKey}. */
+  idempotencyKey?: string | null;
 }
 
 /**
@@ -362,6 +366,19 @@ export class RouterError extends Error {
    */
   readonly refusalSubject: string | null;
 
+  /**
+   * The `Idempotency-Key` the failed queue call was sent under, or `null` when
+   * none was in scope.
+   *
+   * It is here for the same reason it is on `ComfyError.idempotencyKey`:
+   * on a transport failure comfy-api never minted an {@link requestId}, so the
+   * key is the only value that correlates the failure to the server-side
+   * record. A queue-path error the SDK stamps in `models.submit` (a bare `502`
+   * `ProviderError`, say) reports it here rather than as a duck-typed own
+   * property, so a caller who caught a `RouterError` can read it by type.
+   */
+  readonly idempotencyKey: string | null;
+
   constructor(message: string, options: RouterErrorOptions = {}) {
     super(message);
     // Restore the prototype explicitly. Extending a built-in is the classic
@@ -378,6 +395,7 @@ export class RouterError extends Error {
     this.httpStatus = options.httpStatus ?? null;
     this.retryAfter = options.retryAfter ?? null;
     this.refusalSubject = options.refusalSubject ?? null;
+    this.idempotencyKey = options.idempotencyKey ?? null;
   }
 }
 
