@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { attachedDispatcher } from "../../test/support/dispatchers.js";
 import { RouterStubServer, withRouterStub } from "../../test/support/router-stub-server.js";
-import { parseDroppedParams } from "./models.js";
+import { parseCreditsUsed, parseDroppedParams } from "./models.js";
 import {
   comfy,
   ComfyError,
@@ -113,6 +113,12 @@ describe("comfy.models.run on success", () => {
         // `null` here is "the provider asked for served it", not "unknown".
         servingProvider: null,
         droppedParams: null,
+        // A fresh run: Router sends no `Idempotent-Replayed` at all, so this
+        // is "ran for real, and was charged for" rather than "unknown".
+        replayed: false,
+        // The stub stamped no `X-Comfy-Credits-Used`: `null` is "not
+        // reported", which is a different answer from a reported `"0"`.
+        creditsUsed: null,
       });
     });
   });
@@ -211,6 +217,202 @@ describe("comfy.models.run on success", () => {
   });
 });
 
+describe("comfy.models.run and Idempotent-Replayed", () => {
+  /** A model whose partner answers with bytes, for the binary arm below. */
+  const AUDIO_MODEL = "elevenlabs/eleven_v3";
+  const MP3 = new Uint8Array([0x49, 0x44, 0x33, 0x04]);
+
+  it("reports replayed: false on a fresh run, which sends no such header", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+
+      const result = await comfy.models.run(MODEL, {});
+
+      // The fixture really is a fresh run: the stub only stamps the header
+      // when asked, so `false` here is read off an absent header rather than
+      // off a `false` nothing sends.
+      expect(server.state.idempotentReplayed).toBe(false);
+      expect(result.replayed).toBe(false);
+    });
+  });
+
+  it("reports replayed: true on a plain 200 that carries the header", async () => {
+    // No collect loop and no retry involved — a caller's OWN re-send under a
+    // supplied `idempotencyKey` reaches Router as one ordinary request and is
+    // answered off the record. That path never touches `retry.ts`, so it is
+    // worth its own fixture rather than being left to the collect tests.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.idempotentReplayed = true;
+
+      const result = await comfy.models.run(MODEL, {});
+
+      expect(result.kind).toBe("json");
+      expect(result.replayed).toBe(true);
+    });
+  });
+
+  it("reports it on the binary arm too — the two arms mirror each other", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "audio/mpeg";
+      server.state.body = MP3;
+      server.state.idempotentReplayed = true;
+
+      const result = await comfy.models.run(AUDIO_MODEL, {});
+
+      // A replayed generation is handed back byte for byte, so the arm a
+      // replay lands on is the arm the original landed on.
+      expect(result.kind).toBe("binary");
+      expect(result.replayed).toBe(true);
+    });
+  });
+
+  it("branches on the header's PRESENCE, not on its value", async () => {
+    // Router's own contract says to: "The header is absent on a fresh run
+    // rather than sent as `false`, so branch on its presence." So a literal
+    // `false` on the wire — which Router does not send, but which a proxy or a
+    // later server could — is still a replay, because its ARRIVAL is the only
+    // thing that carries meaning. Reading the value instead would report a
+    // replayed call as a fresh charge, which is the exact confusion this field
+    // exists to end.
+    for (const value of ["false", "", "0"]) {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.respond = () => ({
+          status: 200,
+          body: { images: [] },
+          headers: { "Idempotent-Replayed": value },
+        });
+
+        const result = await comfy.models.run(MODEL, {});
+
+        expect(result.replayed, JSON.stringify(value)).toBe(true);
+      });
+    }
+  });
+});
+
+describe("comfy.models.run and X-Comfy-Credits-Used", () => {
+  /** A model whose partner answers with bytes, for the binary arm below. */
+  const AUDIO_MODEL = "elevenlabs/eleven_v3";
+
+  it("surfaces the header verbatim on a stamped JSON run", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.creditsUsed = "0.42";
+
+      const result = await comfy.models.run(MODEL, {});
+
+      // Verbatim, and a STRING: the wire value is decimal and a caller
+      // reconciling money parses it deliberately rather than receiving a
+      // float this SDK chose the rounding of.
+      expect(result.creditsUsed).toBe("0.42");
+      expect(typeof result.creditsUsed).toBe("string");
+    });
+  });
+
+  it("surfaces it on a binary run too — the arms mirror each other", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.contentType = "audio/mpeg";
+      server.state.body = new Uint8Array([0x49, 0x44, 0x33, 0x04]);
+      server.state.creditsUsed = "1.50";
+
+      const result = await comfy.models.run(AUDIO_MODEL, {});
+
+      expect(result.kind).toBe("binary");
+      expect(result.creditsUsed).toBe("1.50");
+    });
+  });
+
+  it("is null when the response carried no such header", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.creditsUsed = null;
+
+      const result = await comfy.models.run(MODEL, {});
+
+      // "Not reported", NOT "free" — a sizeable share of real Router runs
+      // carry no header today even where the cost is known, so a caller that
+      // sums this as zero understates spend.
+      expect(result.creditsUsed).toBeNull();
+    });
+  });
+
+  it("reads a blank header as absent rather than as a cost of zero", async () => {
+    // A present-but-empty `X-Comfy-Credits-Used:` is the one value that
+    // defeats the whole `string | null` design if it is passed through: `""`
+    // survives the documented `creditsUsed != null` presence check and then
+    // reads as `0` through `Number("")`, so a caller following the TSDoc to
+    // the letter books a run as free that Router never priced.
+    for (const blank of ["", "   "]) {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.creditsUsed = blank;
+
+        const result = await comfy.models.run(MODEL, {});
+
+        expect(result.creditsUsed).toBeNull();
+      });
+    }
+  });
+
+  it("trims a padded value rather than handing back the padding", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.creditsUsed = " 0.42 ";
+
+      expect((await comfy.models.run(MODEL, {})).creditsUsed).toBe("0.42");
+    });
+  });
+
+  it('keeps a reported "0" distinguishable from an absent header', async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.creditsUsed = "0";
+      const reportedZero = await comfy.models.run(MODEL, {});
+
+      server.state.creditsUsed = null;
+      const notReported = await comfy.models.run(MODEL, {});
+
+      // The whole reason the field is `string | null` rather than a number:
+      // `"0"` is a real reported cost and absence is silence, so the two must
+      // not collapse. Both readings of a numeric field would collapse them —
+      // `Number(null)` is `0`, and `"0"` is falsy once parsed.
+      expect(reportedZero.creditsUsed).toBe("0");
+      expect(notReported.creditsUsed).toBeNull();
+      expect(reportedZero.creditsUsed).not.toBe(notReported.creditsUsed);
+      // Branch on PRESENCE — the first pair below. The second pair is the
+      // bug this test encodes against: a value-based check reads the free
+      // call and the unreported one identically.
+      expect(reportedZero.creditsUsed !== null).toBe(true);
+      expect(notReported.creditsUsed !== null).toBe(false);
+      expect(Number(reportedZero.creditsUsed) !== 0).toBe(Number(notReported.creditsUsed) !== 0);
+    });
+  });
+
+  describe("parseCreditsUsed", () => {
+    it("normalizes only absence and blankness", () => {
+      expect(parseCreditsUsed(null)).toBeNull();
+      expect(parseCreditsUsed("")).toBeNull();
+      expect(parseCreditsUsed("\t \n")).toBeNull();
+      expect(parseCreditsUsed(" 0.42 ")).toBe("0.42");
+      // A reported zero is a COST, and survives every trimming above.
+      expect(parseCreditsUsed("0")).toBe("0");
+    });
+
+    it("hands back a value it cannot read rather than guessing at a price", () => {
+      // What `Headers.get` produces from a header sent twice. Picking one of
+      // the two figures would invent a charge; returning `null` would claim
+      // Router reported nothing, when it reported this. Neither is this
+      // SDK's call to make, so the caller's own parse is where it fails.
+      expect(parseCreditsUsed("0.42, 0.42")).toBe("0.42, 0.42");
+      expect(parseCreditsUsed("free")).toBe("free");
+    });
+  });
+});
+
 describe("comfy.models.run and Idempotency-Key", () => {
   it("sends one on every call", async () => {
     await withRouterStub(async (server) => {
@@ -237,6 +439,75 @@ describe("comfy.models.run and Idempotency-Key", () => {
       useStub(server);
       await comfy.models.run(MODEL, {}, { idempotencyKey: "my-own-key" });
       expect(server.state.lastIdempotencyKey).toBe("my-own-key");
+    });
+  });
+});
+
+describe("comfy.models.run stamps the Idempotency-Key onto every failure", () => {
+  it("stamps a raw transport failure, preserving its TypeError identity", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.resetTimes = 1; // socket destroyed mid-request — no status at all
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { retry: false, idempotencyKey: "k-transport" })
+        .catch((e: unknown) => e)) as TypeError & Record<string, unknown>;
+
+      expect(err).toBeInstanceOf(TypeError);
+      expect(err.message).toBe("fetch failed"); // identity + message untouched
+      expect(err.idempotencyKey).toBe("k-transport");
+      // On a transport failure there is no response to read either off.
+      expect(err.requestId).toBeNull();
+      expect(err.retryAfter).toBeNull();
+    });
+  });
+
+  it("stamps a transport failure with the key the SDK minted when none was passed", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.resetTimes = 1;
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { retry: false })
+        .catch((e: unknown) => e)) as TypeError & Record<string, unknown>;
+
+      expect(err).toBeInstanceOf(TypeError);
+      expect(server.state.idempotencyKeys).toHaveLength(1);
+      expect(err.idempotencyKey).toBe(server.state.idempotencyKeys[0]);
+    });
+  });
+
+  it("stamps an already-aborted signal's AbortError", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      const controller = new AbortController();
+      controller.abort();
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { signal: controller.signal, idempotencyKey: "k-abort" })
+        .catch((e: unknown) => e)) as Error & Record<string, unknown>;
+
+      expect(err).not.toBeInstanceOf(ComfyError);
+      expect(err.name).toBe("AbortError");
+      expect(err.idempotencyKey).toBe("k-abort");
+    });
+  });
+
+  it("stamps a bare 502 without overwriting the retryAfter it read off the header", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 502;
+      server.state.retryAfter = "12";
+      server.state.body = { detail: "bad gateway", error_type: "provider_error" };
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { retry: false, idempotencyKey: "k-502" })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.httpStatus).toBe(502);
+      expect(err.idempotencyKey).toBe("k-502");
+      expect(err.retryAfter).toBe(12); // the header's pace survives the stamp
     });
   });
 });
@@ -639,6 +910,10 @@ describe("comfy.models.run on a binary result", () => {
         requestId: "6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21",
         servingProvider: null,
         droppedParams: null,
+        replayed: false,
+        // The stub stamped no `X-Comfy-Credits-Used`: `null` is "not
+        // reported", which is a different answer from a reported `"0"`.
+        creditsUsed: null,
       });
     });
   });
@@ -812,6 +1087,9 @@ describe("comfy.models.run on a binary result", () => {
       // Both attempts under the one key: the collect is a re-ask for the
       // generation the first attempt already started, not a second run.
       expect(new Set(server.state.idempotencyKeys).size).toBe(1);
+      // And the caller can SEE that: the bytes came off the key's record, so
+      // a spend tracker must not count this result a second time.
+      expect(result.replayed).toBe(true);
       expect(result.kind).toBe("binary");
       if (result.kind !== "binary") throw new Error("unreachable");
       expect(result.contentType).toBe("audio/mpeg");
@@ -1417,6 +1695,8 @@ describe("comfy.models.run collecting a generation under the same key", () => {
       // safe. A fresh key would dispatch, and bill, a second generation.
       expect(server.state.idempotencyKeys).toHaveLength(3);
       expect(new Set(server.state.idempotencyKeys).size).toBe(1);
+      // Router says so on the answer itself, and the SDK passes it on.
+      expect(result.replayed).toBe(true);
     });
   }, 20_000);
 
@@ -1434,6 +1714,46 @@ describe("comfy.models.run collecting a generation under the same key", () => {
       expect(result.data).toEqual({ images: [{ url: "https://example.invalid/out.png" }] });
       expect(server.state.requestCount).toBe(2);
       expect(new Set(server.state.idempotencyKeys).size).toBe(1);
+      expect(result.replayed).toBe(true);
+    });
+  }, 20_000);
+
+  it("hands back the collect pace, not just the key, when the collect budget runs out", async () => {
+    // A collect that dies on a dropped socket rather than on a status: Router
+    // named a pace on the 409 that started the collect and is STILL holding the
+    // generation, so the failure has to carry that pace as well as the key —
+    // otherwise the caller is told the server named none and has nothing to
+    // time a manual re-ask by. The sibling `request_timeout` branch already
+    // does this; the raw transport re-throw used to default `retryAfter` to
+    // `null` and drop it.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.failTimes = 1;
+      server.state.failStatus = 409;
+      server.state.failErrorType = "concurrency_limit_exceeded";
+      server.state.failRetryAfter = "1";
+      server.state.idempotentReplayed = true;
+      // Ordered AFTER the 409, so the socket drops on the COLLECT attempt.
+      server.state.resetTimes = 1;
+      server.state.resetAfterFail = true;
+
+      const err = (await comfy.models
+        .run(
+          MODEL,
+          {},
+          {
+            idempotencyKey: "k-collect",
+            // Exactly the one paced re-ask fits; the transport failure that ends
+            // it lands with the collect budget already spent.
+            retry: { budgetMs: 60_000, baseDelayMs: 5, maxDelayMs: 10, collectBudgetMs: 1_000 },
+          },
+        )
+        .catch((e: unknown) => e)) as Error & Record<string, unknown>;
+
+      expect(err).toBeInstanceOf(TypeError); // the raw transport failure, not a status
+      expect(err.idempotencyKey).toBe("k-collect");
+      expect(err.retryAfter).toBe(1); // the pace Router named on the 409
+      expect(server.state.requestCount).toBe(2);
     });
   }, 20_000);
 
@@ -1456,6 +1776,7 @@ describe("comfy.models.run collecting a generation under the same key", () => {
       expect(result.requestId).toBe("6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21");
       expect(server.state.requestCount).toBe(2);
       expect(new Set(server.state.idempotencyKeys).size).toBe(1);
+      expect(result.replayed).toBe(true);
       // Backoff pacing (milliseconds), not the second the header did not name.
       expect(Date.now() - started).toBeLessThan(500);
     });
@@ -1487,6 +1808,7 @@ describe("comfy.models.run collecting a generation under the same key", () => {
       expect(result.data).toEqual({ images: [{ url: "https://example.invalid/out.png" }] });
       expect(server.state.requestCount).toBe(3);
       expect(new Set(server.state.idempotencyKeys).size).toBe(1);
+      expect(result.replayed).toBe(true);
     });
   }, 20_000);
 
@@ -1669,6 +1991,44 @@ describe("comfy.models.run cancellation", () => {
     });
   }, 10_000);
 
+  it("gives concurrent runs sharing one AbortController their OWN key", async () => {
+    // `fetch` rejects with `signal.reason`, and `AbortSignal.any` propagates the
+    // source signal's reason OBJECT — so both of these calls reject with one and
+    // the same `DOMException`. Stamping it in place would let whichever call got
+    // there first decide the key BOTH callers then read, and a manual collect
+    // under someone else's key re-asks for someone else's generation while your
+    // own stays uncollectable.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.hang = true;
+      const controller = new AbortController();
+      const first = comfy.models.run(
+        MODEL,
+        {},
+        { signal: controller.signal, idempotencyKey: "k-one" },
+      );
+      const second = comfy.models.run(
+        MODEL,
+        {},
+        { signal: controller.signal, idempotencyKey: "k-two" },
+      );
+      await waitFor(() => server.state.requestCount === 2);
+      controller.abort();
+
+      const [a, b] = (await Promise.all([
+        first.catch((e: unknown) => e),
+        second.catch((e: unknown) => e),
+      ])) as (Error & Record<string, unknown>)[];
+
+      expect(a.name).toBe("AbortError");
+      expect(b.name).toBe("AbortError");
+      expect(a.idempotencyKey).toBe("k-one");
+      expect(b.idempotencyKey).toBe("k-two");
+      // And the caller's controller is left exactly as they built it.
+      expect((controller.signal.reason as Record<string, unknown>).idempotencyKey).toBeUndefined();
+    });
+  }, 10_000);
+
   it("stops the retry loop mid-backoff instead of letting the next attempt go out", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
@@ -1737,11 +2097,10 @@ describe("comfy.models.run argument validation", () => {
 
 describe("parseDroppedParams", () => {
   it("reads the header as JSON, because a comma split would shred its own example", () => {
-    // The spec describes this header as "a JSON array of strings" while
-    // declaring `schema: {type: array}` — OpenAPI's comma-delimited form. Its
-    // own example entry settles which is right: it CONTAINS a comma, so the
-    // comma-delimited reading tears one meaningful disclosure into two
-    // meaningless fragments.
+    // The spec declares this header as a single JSON-encoded string precisely
+    // because its entries carry commas of their own — the example entry below
+    // CONTAINS one — so the parser has to JSON-decode it. A comma split would
+    // tear that one meaningful disclosure into two meaningless fragments.
     const entry = "moderation (fal applies its own, non-configurable safety filtering)";
     expect(parseDroppedParams(JSON.stringify([entry]))).toEqual([entry]);
     expect(parseDroppedParams(JSON.stringify([]))).toEqual([]);

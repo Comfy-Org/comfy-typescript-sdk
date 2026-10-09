@@ -29,6 +29,7 @@ export interface Progress {
   nodesDone: number | null;
   nodesTotal: number | null;
   currentNode: string | null;
+  currentNodeClass: string | null;
   step: number | null;
   steps: number | null;
 }
@@ -59,7 +60,12 @@ export interface Log {
 
 export type ComfyEvent = Progress | Preview | OutputReady | StatusChange | Log;
 
-function progressFrom(data: Record<string, unknown>): Progress {
+/**
+ * A wire progress snapshot as the SDK's {@link Progress}. Shared by the
+ * `progress` frames of `job.events()` and `job.progress`, so a snapshot read
+ * off a handle and one received live are the same type.
+ */
+export function progressFrom(data: Record<string, unknown>): Progress {
   return {
     kind: "progress",
     value: typeof data.value === "number" ? data.value : 0,
@@ -67,6 +73,7 @@ function progressFrom(data: Record<string, unknown>): Progress {
     nodesDone: (data.nodes_done as number | null | undefined) ?? null,
     nodesTotal: (data.nodes_total as number | null | undefined) ?? null,
     currentNode: (data.current_node as string | null | undefined) ?? null,
+    currentNodeClass: (data.current_node_class as string | null | undefined) ?? null,
     step: (data.step as number | null | undefined) ?? null,
     steps: (data.steps as number | null | undefined) ?? null,
   };

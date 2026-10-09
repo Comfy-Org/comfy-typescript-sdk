@@ -4,8 +4,8 @@
  *
  * Router answers every failure with a coarse, machine-readable bucket on the
  * `X-Comfy-Error-Type` response header (and, for the request-level body
- * shape, in `error_type` as well). The bucket set is *closed* at eighteen
- * values in this release: six request-level and twelve transport-level. This
+ * shape, in `error_type` as well). The bucket set is *closed* at nineteen
+ * values in this release: six request-level and thirteen transport-level. This
  * module turns that value into a class an integrator can `catch`. The names
  * below are the shared set: the Python SDK spells every one of them
  * identically, so a snippet, a doc page or a forum answer transfers between
@@ -25,7 +25,9 @@
  *   } else if (err instanceof routerErrors.InvalidInput) {
  *     for (const d of err.detail) console.log(d.loc.join("."), d.type, d.msg);
  *   } else if (err instanceof routerErrors.RouterError) {
- *     console.log(err.errorType, err.requestId); // any bucket, known or not
+ *     // any bucket, known or not; `idempotencyKey` is set when the SDK stamped
+ *     // this on the `models.submit` queue path, else null
+ *     console.log(err.errorType, err.requestId, err.idempotencyKey);
  *   }
  * }
  * ```
@@ -49,18 +51,18 @@
  *   done until a class exists for it here.
  *
  * These classes are namespaced (`routerErrors.*`) rather than exported from
- * the package root because three of the eighteen names — `Unauthorized`,
+ * the package root because three of the nineteen names — `Unauthorized`,
  * `Forbidden`, `InsufficientCredits` — already exist at the root as
  * workflow-API exceptions descending from `ComfyError`. The Python SDK has
  * the same three at the top level of `comfy_sdk`, so both SDKs resolve the
  * collision the same way: a dedicated module, and the class names themselves
  * left untouched.
  *
- * Three of the eighteen buckets — `cancelled`, `queue_timeout` and
- * `request_not_found`, the queue tier the vendored contract most recently grew
- * — are newer than the Python SDK's table. Until its twin lands they are
- * declared as leading this SDK in `surface-parity.test.ts`'s allowlist, which
- * fails once the Python side catches up so the entry cannot outlive the lag.
+ * One of the nineteen buckets — `queue_backlog_full`, the most recent the
+ * vendored contract grew — is newer than the Python SDK's table. Until its
+ * twin lands it is declared as leading this SDK in `surface-parity.test.ts`'s
+ * allowlist, which fails once the Python side catches up so the entry cannot
+ * outlive the lag.
  */
 
 /**
@@ -85,14 +87,15 @@ export const REQUEST_ERROR_TYPES = [
 ] as const;
 
 /**
- * The twelve transport-level buckets, in the order the error contract lists
+ * The thirteen transport-level buckets, in the order the error contract lists
  * them. They are part of the same closed set — a caller reads one value off
  * one header — but they are raised before or around the model call rather
  * than derived from a provider response.
  *
- * The last three (`cancelled`, `queue_timeout`, `request_not_found`) are the
- * QUEUE tier: they are reported by the queued `submit`/`handle` surface, three
- * of them by status codes an older bucket already owns. In all, four HTTP
+ * The last four (`cancelled`, `queue_timeout`, `request_not_found`,
+ * `queue_backlog_full`) are the QUEUE tier: they are reported by the queued
+ * `submit`/`handle` surface, all four by status codes an older bucket already
+ * owns. In all, five HTTP
  * statuses here carry more than one bucket, and the status alone cannot tell
  * them apart — so a caller that branches on status gets the wrong answer for
  * all but the oldest member of each:
@@ -106,7 +109,8 @@ export const REQUEST_ERROR_TYPES = [
  *   result of a request the caller withdrew).
  * - `429` is `concurrency_limit_exceeded` (clears when one of the caller's
  *   own in-flight calls finishes) **or** `rate_limited` (clears only when a
- *   time window rolls).
+ *   time window rolls) **or** `queue_backlog_full` (clears as the caller's own
+ *   QUEUED requests finish).
  * - `504` is `provider_timeout` (the partner ran out of time) **or**
  *   `deadline_exceeded` (Comfy stopped holding the connection) **or**
  *   `queue_timeout` (a queued request was never admitted).
@@ -128,12 +132,13 @@ export const TRANSPORT_ERROR_TYPES = [
   "cancelled",
   "queue_timeout",
   "request_not_found",
+  "queue_backlog_full",
 ] as const;
 
 /** The closed error-type set for this release: request-level, then transport-level. */
 export const ROUTER_ERROR_TYPES = [...REQUEST_ERROR_TYPES, ...TRANSPORT_ERROR_TYPES] as const;
 
-/** One of the eighteen buckets this release knows about. */
+/** One of the nineteen buckets this release knows about. */
 export type RouterErrorType = (typeof ROUTER_ERROR_TYPES)[number];
 
 /** `X-Comfy-Error-Type` — the coarse bucket, set on every Router error response. */
@@ -229,6 +234,8 @@ export interface RouterErrorOptions {
   httpStatus?: number | null;
   /** See {@link RouterError.retryAfter}. */
   retryAfter?: number | null;
+  /** See {@link RouterError.idempotencyKey}. */
+  idempotencyKey?: string | null;
 }
 
 /**
@@ -283,6 +290,19 @@ export class RouterError extends Error {
    */
   readonly retryAfter: number | null;
 
+  /**
+   * The `Idempotency-Key` the failed queue call was sent under, or `null` when
+   * none was in scope.
+   *
+   * It is here for the same reason it is on `ComfyError.idempotencyKey`:
+   * on a transport failure comfy-api never minted an {@link requestId}, so the
+   * key is the only value that correlates the failure to the server-side
+   * record. A queue-path error the SDK stamps in `models.submit` (a bare `502`
+   * `ProviderError`, say) reports it here rather than as a duck-typed own
+   * property, so a caller who caught a `RouterError` can read it by type.
+   */
+  readonly idempotencyKey: string | null;
+
   constructor(message: string, options: RouterErrorOptions = {}) {
     super(message);
     // Restore the prototype explicitly. Extending a built-in is the classic
@@ -298,6 +318,7 @@ export class RouterError extends Error {
     this.requestId = options.requestId ?? null;
     this.httpStatus = options.httpStatus ?? null;
     this.retryAfter = options.retryAfter ?? null;
+    this.idempotencyKey = options.idempotencyKey ?? null;
   }
 }
 
@@ -533,6 +554,22 @@ export class RequestNotFound extends RouterError {
   static override readonly errorType = "request_not_found";
 }
 
+/**
+ * A queued submit was refused because the caller already has too many queued
+ * requests waiting to run.
+ *
+ * It shares `429` with {@link ConcurrencyLimitExceeded} and is not the same
+ * thing: that one is the synchronous route's bound on calls in flight at once,
+ * whereas the queue accepts a submit at that limit and parks it — this is the
+ * separate bound on how many a caller may leave waiting, so that parking
+ * cannot mean enqueuing without end. Nothing was submitted and nothing was
+ * charged. It clears as the caller's own queued requests finish, so submit
+ * again once some of them complete.
+ */
+export class QueueBacklogFull extends RouterError {
+  static override readonly errorType = "queue_backlog_full";
+}
+
 type RouterErrorClass = new (message: string, options: RouterErrorOptions) => RouterError;
 
 const BY_ERROR_TYPE: Record<string, RouterErrorClass> = {
@@ -554,6 +591,7 @@ const BY_ERROR_TYPE: Record<string, RouterErrorClass> = {
   cancelled: Cancelled,
   queue_timeout: QueueTimeout,
   request_not_found: RequestNotFound,
+  queue_backlog_full: QueueBacklogFull,
 };
 
 /**
@@ -574,11 +612,11 @@ const BY_ERROR_TYPE: Record<string, RouterErrorClass> = {
  * here, and adding them would be a regression rather than an improvement: a
  * header-less `403` cannot be told from a `forbidden`, a header-less `429`
  * from a `concurrency_limit_exceeded`, or a header-less `504` from a
- * `provider_timeout`. The queue tier adds three more of the same shape —
- * `cancelled` shares `409`, `queue_timeout` shares `504`, and
- * `request_not_found` shares `404` — and stays out for the same reason: the
- * table keeps naming `model_not_found` for `404` and the run-route member for
- * `409`/`504`. Guessing the newer member of a shared status would relabel
+ * `provider_timeout`. The queue tier adds four more of the same shape —
+ * `cancelled` shares `409`, `queue_timeout` shares `504`, `request_not_found`
+ * shares `404` and `queue_backlog_full` shares `429` — and stays out for the
+ * same reason: the table keeps naming `model_not_found` for `404` and the
+ * run-route member for `409`/`429`/`504`. Guessing the newer member of a shared status would relabel
  * failures this table has always classified, on exactly the responses that
  * carry the least evidence.
  *

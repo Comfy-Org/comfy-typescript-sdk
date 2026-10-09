@@ -64,7 +64,7 @@ export {
 } from "./retry.js";
 export { Asset, AssetFactory } from "./assets.js";
 export { Workflow, WorkflowFactory, type WorkflowGraph } from "./workflows.js";
-export { Job, JobFactory } from "./jobs.js";
+export { Job, JobFactory, type JobSummary } from "./jobs.js";
 export { Output } from "./outputs.js";
 export type { ComfyEvent, Log, OutputReady, Preview, Progress, StatusChange } from "./events.js";
 export {
@@ -91,7 +91,7 @@ export {
  * `routerErrors.RouterError`. Also reachable as `@comfyorg/sdk/errors`.
  *
  * They are namespaced rather than flattened into the exports above because
- * three of the eighteen names (`Unauthorized`, `Forbidden`,
+ * three of the nineteen names (`Unauthorized`, `Forbidden`,
  * `InsufficientCredits`) are already taken here by the workflow-API
  * exceptions, which descend from `ComfyError`. See `./routerErrors.ts`.
  */

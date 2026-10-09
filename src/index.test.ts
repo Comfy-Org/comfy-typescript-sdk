@@ -20,9 +20,10 @@ describe("public surface", () => {
   });
 
   it("constructs a client and exposes assets/workflows/jobs namespaces", () => {
-    // An invalid COMFY_BASE_URL in the ambient shell would otherwise throw here.
+    // An invalid COMFY_BASE_URL in the ambient shell would otherwise throw
+    // here; the key is explicit so the ambient COMFY_API_KEY is never read.
     vi.stubEnv(BASE_URL_ENV_VAR, undefined);
-    const client = new Comfy();
+    const client = new Comfy({ apiKey: "comfyui-surface-test" });
     expect(client).toBeInstanceOf(Comfy);
     expect(client.assets).toBeDefined();
     expect(client.workflows).toBeDefined();
@@ -39,14 +40,12 @@ describe("public surface", () => {
 
   it("re-exports the Router error namespace from the package root", () => {
     expect(routerErrors.RouterError).toBeTypeOf("function");
-    expect(routerErrors.ROUTER_ERROR_TYPES).toHaveLength(18);
+    expect(routerErrors.ROUTER_ERROR_TYPES).toHaveLength(19);
     // The length assertion above counts the closed set but cannot say the new
     // members reached the package ROOT — a class added to the set and missed by
-    // the re-export would keep that count at 18 and still be unreachable to a
-    // caller writing `import { routerErrors }`. Name the three this sync added.
-    expect(routerErrors.Cancelled).toBeTypeOf("function");
-    expect(routerErrors.QueueTimeout).toBeTypeOf("function");
-    expect(routerErrors.RequestNotFound).toBeTypeOf("function");
+    // the re-export would keep that count at 19 and still be unreachable to a
+    // caller writing `import { routerErrors }`. Name the newest bucket's class.
+    expect(routerErrors.QueueBacklogFull).toBeTypeOf("function");
     expect(new routerErrors.ContentPolicyViolation("boom")).toBeInstanceOf(
       routerErrors.RouterError,
     );
