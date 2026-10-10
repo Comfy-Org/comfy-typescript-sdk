@@ -50,7 +50,8 @@
     "RateLimited",
     "Cancelled",
     "QueueTimeout",
-    "RequestNotFound"
+    "RequestNotFound",
+    "QueueBacklogFull"
   ],
   "routerErrorTypes": {
     "RouterError": "",
@@ -71,7 +72,8 @@
     "RateLimited": "rate_limited",
     "Cancelled": "cancelled",
     "QueueTimeout": "queue_timeout",
-    "RequestNotFound": "request_not_found"
+    "RequestNotFound": "request_not_found",
+    "QueueBacklogFull": "queue_backlog_full"
   },
   "routerErrorTypeOrder": [
     "invalid_input",
@@ -91,7 +93,8 @@
     "rate_limited",
     "cancelled",
     "queue_timeout",
-    "request_not_found"
+    "request_not_found",
+    "queue_backlog_full"
   ],
   "routerErrorTypeByStatus": {
     "401": "unauthorized",

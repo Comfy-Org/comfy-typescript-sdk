@@ -158,7 +158,7 @@ paths:
   /v2/models/{provider}/{model}/estimate:
     post:
       summary: Price a model call before running it, without running it.
-      description: "Returns what Comfy will charge for running this body on this model, in US dollars, priced from the same rate card the charge is billed against. The body is validated against the model's input schema first, so a body the run would refuse is the same `422` here; nothing is dispatched to a provider and nothing is charged. The answer is not a price lock: it is priced at the rates in force at `pricing_as_of`, and a run is charged at the rates in force when it is rated. While the feature is rolling out the route answers `403` with `error_type: not_enabled`."
+      description: "Returns what Comfy will charge for running this body on this model, in US dollars, priced from the same rate card the charge is billed against. The body is validated against the model's input schema first, as a default run (no `strict_mode`, no `reject_unknown_fields`) validates it, so a body that fails the model's schema is the same `422` here as on the run; nothing is dispatched to a provider and nothing is charged. The answer is not a price lock: it is priced at the rates in force at `pricing_as_of`, and a run is charged at the rates in force when it is rated. While the feature is rolling out the route answers `403` with `error_type: not_enabled`."
       operationId: estimateRouterModelCost
       tags:
         - Comfy Router
@@ -171,7 +171,7 @@ paths:
         - $ref: "#/components/parameters/ModelProvider"
       requestBody:
         required: true
-        description: The partner model's native JSON input, identical to the body the synchronous route accepts for this model. It is validated against the model's own input schema exactly as the run validates it, and its own fields (the output count, the operation an input image selects) decide what is priced.
+        description: The partner model's native JSON input, identical to the body the synchronous route accepts for this model. It is validated against the model's own input schema as a default run validates it (this route takes no `strict_mode` or `reject_unknown_fields`), and its own fields (the output count, the operation an input image selects) decide what is priced.
         content:
           application/json:
             schema:
@@ -503,10 +503,10 @@ components:
         pricing_as_of:
           type: string
           format: date-time
-          description: When the rate card this quote was priced from was fetched. The run is charged at the rates in force when it is rated, not at this instant.
+          description: "When the rate card this quote was priced from was fetched. The run is charged at the rates in force when it is rated, not at this instant. Whenever no rate card was read (`reason: pricing_unavailable`, `byok`, or a `not_quotable` call that cannot be priced from any card), this is when the quote was answered."
         reason:
           type: string
-          description: "Present only when `source` is `unknown`: `not_quotable` (Router cannot price this call before it runs - its price depends on what the provider reports back, or the body does not bound a billed quantity) or `unpriced_model` (the rate card does not price this request). Read any other value as `not_quotable`."
+          description: "Present only when `source` is `unknown`: `not_quotable` (Router cannot price this call before it runs - its price depends on what the provider reports back, or the body does not bound a billed quantity), `unpriced_model` (the rate card does not price this request), `byok` (queued submit only: the run uses your own provider key, so Comfy bills nothing for it), or `pricing_unavailable` (queued submit only: the rate card could not be read when the request was admitted; this is transient, and the run is still charged as usual). Read any other value as `not_quotable`."
     RouterErrorResponse:
       type: object
       description: "Router's request-level error body: what is returned when the request never reached the model, or failed for a reason the model itself did not report - auth, quota, an unknown model ID, or provider transport. A model-level validation failure has its own shape, `RouterValidationErrorResponse`, because flattening a FastAPI `detail[]` array into this `detail` string would destroy the per-field granularity an SDK branches on."
@@ -761,6 +761,10 @@ components:
           $ref: "#/components/schemas/RouterQueueStatus"
         queue_position:
           $ref: "#/components/schemas/RouterQueuePosition"
+        estimate:
+          allOf:
+            - $ref: "#/components/schemas/RouterCostEstimate"
+          description: "The pre-flight cost estimate for this request, present on a fresh admission when the cost estimate is enabled for the caller. It quotes the provider leg this request was pinned to (the queue has no fallback loop, so `fallback_provider` never changes the leg that runs). When no figure can be given it is still present, with `source: unknown`; the submission never fails because of the estimate. Omitted on an idempotent replay (`Idempotent-Replayed: true`), because the original quote is not stored. It is not a price lock: the run is charged at the rates in force when it is rated."
       required:
         - request_id
         - status
