@@ -120,6 +120,48 @@ entry. See CONTRIBUTING.md.
   a JSON config file spells "absent" — now throws a `TypeError` at
   construction. Pass `undefined` (or omit the field) to fall back to the
   environment.
+- **`RequestHandle.get()` / `models.subscribe()` now return the `binary` arm
+  of `RunResult` when the queued result route answers a non-JSON
+  `Content-Type`**, matching `models.run` and the Router spec's `*/*` arm. The
+  result request now sends `Accept: application/json, */*;q=0.9` and is read
+  within the same `DEFAULT_MAX_RESPONSE_BYTES` cap `run` applies. Not reachable
+  on today's Router, which refuses binary models at submit; forward-compatible
+  only.
+- **A queued result route answering `200` with an empty body now raises
+  `invalid_response`** instead of resolving to `{ kind: "json", data: {} }`.
+  An empty `200` is a truncated or malformed response, not a result.
+- **A queued result `200` with no `Content-Type` whose body is not JSON
+  (including invalid UTF-8) now resolves as `kind: "binary"` with
+  `contentType: ""`** instead of raising `invalid_response`, as `run` does. A
+  body that declares a JSON type and does not parse still raises
+  `invalid_response`.
+- **A queued result larger than `DEFAULT_MAX_RESPONSE_BYTES` now raises
+  `response_too_large`** where it used to be read with no limit. `get()` and
+  `subscribe()` take a per-call `maxBytes` with the same meaning as
+  `models.run`'s (`null` disables the cap), and the request stays collectable,
+  so a later `get()` with a larger cap still fetches it. The error carries the
+  queued request's id as `details.queuedRequestId`, which is how a
+  `subscribe()` caller — who gets no handle back — reaches it. `get()` takes
+  the new `GetOptions` (`WaitOptions` plus `maxBytes`), so `events()` no
+  longer accepts a cap it would ignore. The cap applies to the result `200`
+  only: a `202` from the result route is diagnosed without reading its body,
+  and an error answer is truncated rather than refused, so it still reports
+  its own diagnosis.
+- **An error body under a `maxBytes` smaller than 1 MiB is now read to 1 MiB
+  before it is truncated**, on `models.run` and the queued result read alike,
+  so a small result cap no longer cuts the envelope a body-only `error_type`
+  or a validation `detail[]` is parsed from. `models.run` also drops the body
+  of a `2xx` other than `200` unread, so an oversized `202` reports
+  `unexpected_response` rather than `response_too_large`.
+- **A compressed response is measured by its decoded bytes.** The
+  `Content-Length` of a body whose `Content-Encoding` `fetch` decodes (`gzip`,
+  `deflate`, `br`, `zstd`) counts the encoded bytes, while `maxBytes` caps the
+  decoded ones, so it no longer refuses such a response before reading it; the
+  bytes read are counted against the cap as before. Any other coding,
+  `identity` included, reaches the reader undecoded, so its `Content-Length`
+  still refuses before the read. `maxBytes` also now rejects a fraction with a `TypeError` at the
+  call, as it already did `NaN` and negatives, rather than failing inside the
+  read as `response_too_large`.
 
 ### Fixed
 
