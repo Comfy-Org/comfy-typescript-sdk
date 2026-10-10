@@ -543,19 +543,38 @@ describe("queued model-request routes (spec/router-openapi.yaml)", () => {
  * contract cannot drift apart without one of them reddening here.
  */
 describe("refusal subject wire names (spec/router-openapi.yaml)", () => {
-  type Doc = {
-    components?: {
-      headers?: Record<string, { description?: string }>;
-      responses?: Record<string, { headers?: Record<string, { $ref?: string }> }>;
-      schemas?: Record<
-        string,
-        { properties?: Record<string, { type?: string; description?: string }> }
-      >;
-    };
-  };
-  const doc = parse(
+  // Parsed as `unknown` and narrowed on every read rather than asserted to a
+  // shape: `src/**` forbids unsafe type assertions, and a spec that moved a
+  // node should redden the assertion that reads it, not reach it as a lie.
+  const doc: unknown = parse(
     readFileSync(fileURLToPath(new URL("../../spec/router-openapi.yaml", import.meta.url)), "utf8"),
-  ) as Doc;
+  );
+
+  /** The value at `keys` under `value`, or `undefined` where a step is not a mapping. */
+  function at(value: unknown, ...keys: string[]): unknown {
+    let current = value;
+    for (const key of keys) {
+      if (typeof current !== "object" || current === null || Array.isArray(current)) {
+        return undefined;
+      }
+      current = Object.hasOwn(current, key) ? Reflect.get(current, key) : undefined;
+    }
+    return current;
+  }
+
+  /** The entries of `value` when it is a mapping, else none. */
+  function entries(value: unknown): [string, unknown][] {
+    return typeof value === "object" && value !== null && !Array.isArray(value)
+      ? Object.entries(value)
+      : [];
+  }
+
+  function text(value: unknown): string | undefined {
+    return typeof value === "string" ? value : undefined;
+  }
+
+  const refusalSubjectProperty = (): unknown =>
+    at(doc, "components", "schemas", "RouterErrorResponse", "properties", "refusal_subject");
 
   function vocabulary(description: string | undefined): string[] {
     const listed = /closed vocabulary:([^.]*)\./.exec(description ?? "")?.[1] ?? "";
@@ -565,9 +584,11 @@ describe("refusal subject wire names (spec/router-openapi.yaml)", () => {
   /** The name every response gives the shared RouterRefusalSubjectHeader. */
   function refusalHeaderNames(): string[] {
     const found: string[] = [];
-    for (const response of Object.values(doc.components?.responses ?? {})) {
-      for (const [name, header] of Object.entries(response.headers ?? {})) {
-        if (header.$ref === "#/components/headers/RouterRefusalSubjectHeader") found.push(name);
+    for (const [, response] of entries(at(doc, "components", "responses"))) {
+      for (const [name, header] of entries(at(response, "headers"))) {
+        if (at(header, "$ref") === "#/components/headers/RouterRefusalSubjectHeader") {
+          found.push(name);
+        }
       }
     }
     return found;
@@ -586,20 +607,20 @@ describe("refusal subject wire names (spec/router-openapi.yaml)", () => {
   });
 
   it("reads the body's `refusal_subject`, a string field of RouterErrorResponse", () => {
-    const property = doc.components?.schemas?.RouterErrorResponse?.properties?.refusal_subject;
+    const property = refusalSubjectProperty();
     expect(
       property,
       "RouterErrorResponse no longer declares `refusal_subject` — update the body fallback " +
         "in src/sdk/routerErrors.ts and src/sdk/models.ts",
     ).toBeDefined();
-    expect(property?.type).toBe("string");
+    expect(at(property, "type")).toBe("string");
   });
 
   it("lists REFUSAL_SUBJECTS exactly as the contract's closed vocabulary", () => {
-    const fromHeader = vocabulary(doc.components?.headers?.RouterRefusalSubjectHeader?.description);
-    const fromBody = vocabulary(
-      doc.components?.schemas?.RouterErrorResponse?.properties?.refusal_subject?.description,
+    const fromHeader = vocabulary(
+      text(at(doc, "components", "headers", "RouterRefusalSubjectHeader", "description")),
     );
+    const fromBody = vocabulary(text(at(refusalSubjectProperty(), "description")));
     // Guard the prose parse itself: an empty read would make the comparison
     // below vacuous rather than wrong.
     expect(fromHeader.length, "could not read the header's closed vocabulary").toBeGreaterThan(0);
