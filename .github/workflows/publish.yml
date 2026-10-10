@@ -68,31 +68,6 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # A release must be described before it ships: refuse a tag whose version
-      # has no `## [X.Y.Z]` section in CHANGELOG.md. Without this, a tag can be
-      # cut straight off `## [Unreleased]`, and the changelog silently loses that
-      # release (0.4.0 shipped that way). Prereleases (`-rc.1` and the like) are
-      # exempt, so a release candidate does not need its own section; any
-      # `+build` metadata is ignored when matching.
-      - name: Require a CHANGELOG section for the release version
-        if: github.event_name == 'release'
-        shell: bash
-        env:
-          TAG: ${{ github.event.release.tag_name }}
-        run: |
-          set -euo pipefail
-          VERSION="${TAG#v}"
-          VERSION="${VERSION%%+*}"
-          if [[ "$VERSION" == *-* ]]; then
-            echo "Prerelease ${VERSION}: no CHANGELOG section required."
-            exit 0
-          fi
-          if ! grep -qF "## [${VERSION}]" CHANGELOG.md; then
-            echo "::error::CHANGELOG.md has no '## [${VERSION}]' section. Cut the changelog for ${VERSION} (move its entries out of '## [Unreleased]') and merge that before publishing ${TAG}."
-            exit 1
-          fi
-          echo "CHANGELOG.md describes ${VERSION}."
-
       # Tag-driven versioning: the release tag (vX.Y.Z) is the source of truth.
       # Inject it into package.json before build/pack so the published tarball
       # carries the tag's version. (On a workflow_dispatch dry run there is no
@@ -115,6 +90,37 @@ jobs:
           npm pkg set version="$VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Set package.json version = $VERSION"
+
+      # A release must be described before it ships: refuse a tag whose version
+      # has no `## [X.Y.Z]` heading in CHANGELOG.md. Without this, a tag can be
+      # cut straight off `## [Unreleased]`, and the changelog silently loses that
+      # release (0.4.0 shipped that way). Runs after `setver`, so it reads the
+      # version that step already validated rather than deriving its own.
+      # Prereleases (`-rc.1` and the like) are exempt, so a release candidate
+      # does not need its own section; any `+build` metadata is ignored when
+      # matching. The match is anchored to a level-2 heading line, so a
+      # `### [X.Y.Z]` heading or a passing mention of the version does not count.
+      # This runs before anything is uploaded, but the Release is already
+      # published: on failure, merge the changelog, then delete and re-create
+      # the Release and its tag on a commit that has it.
+      - name: Require a CHANGELOG section for the release version
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          VERSION: ${{ steps.setver.outputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="${VERSION%%+*}"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "Prerelease ${VERSION}: no CHANGELOG section required."
+            exit 0
+          fi
+          if ! grep -qE "^## \[${VERSION//./\\.}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [${VERSION}]' section. Cut the changelog for ${VERSION} (move its entries out of '## [Unreleased]') and merge that, then delete and re-create the ${TAG} Release and tag on a commit that has it."
+            exit 1
+          fi
+          echo "CHANGELOG.md describes ${VERSION}."
 
       - name: Build
         run: pnpm build
@@ -212,4 +218,10 @@ jobs:
           # "dist-pack/<file>.tgz" matches npm's "<owner>/<repo>" GitHub
           # shorthand, so npm tries to git-fetch "github:dist-pack/<file>" and
           # fails with EALLOWGIT instead of publishing the packed tarball.
-          npm publish "./${tarball}" --access public --provenance
+          # A prerelease (any `-` in the version) goes out under the `next`
+          # dist-tag, so a release candidate never becomes what a plain
+          # `npm install @comfyorg/sdk` resolves to.
+          VER="${{ needs.build.outputs.version }}"
+          DIST_TAG=latest
+          if [[ "${VER%%+*}" == *-* ]]; then DIST_TAG=next; fi
+          npm publish "./${tarball}" --access public --provenance --tag "$DIST_TAG"
