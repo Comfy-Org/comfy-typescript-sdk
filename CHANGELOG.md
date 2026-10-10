@@ -134,6 +134,16 @@ entry. See CONTRIBUTING.md.
   `fallback_provider` retry as a second producer, so a call that never set
   `modelProvider` can still come back with a non-null `droppedParams`. Comments
   only; the parsing and the header handling are unchanged.
+- **A bodiless `429` on the asset dedup probe now raises code `rate_limited`
+  instead of `QueueFull`.** The gateway answers a throttled
+  `HEAD /api/v2/assets/by-hash/{hash}` with a bare `429` — a HEAD response
+  carries no body — and the status fallback read that as `queue_full`, so an
+  asset `commit()` reported a full job queue when the caller had been rate
+  limited. It now surfaces as a `ComfyError` with `code: "rate_limited"`,
+  carrying `retryAfter` when the server sent `Retry-After`. A bodiless `401` or
+  `403` on the same probe still raises `Unauthorized` or `Forbidden`, now with
+  the message `Unauthorized` or `Forbidden` rather than `HTTP 401` /
+  `HTTP 403`.
 - `retryAfter` on a `ComfyError` from a `Comfy` method (`submit()`,
   `client.jobs.get()`, asset and output calls) now carries the server's
   `Retry-After` on every error. Only `QueueFull` kept it before; every other

@@ -29,6 +29,15 @@ export interface ServerState {
    * there.
    */
   jobUrlsOrigin: string | null;
+  /**
+   * When non-null, `HEAD /assets/by-hash/{hash}` answers this status with an
+   * empty body, as the gateway's auth/throttle middleware does on HEAD (the
+   * JSON envelope is dropped). A 429 carries `retryAfterHeader` as its
+   * `Retry-After` unless `omitHeadRetryAfter` is set.
+   */
+  headStatus: 401 | 403 | 429 | null;
+  /** When true, a `headStatus` 429 omits its `Retry-After` header. */
+  omitHeadRetryAfter: boolean;
   /** POST /jobs returns a 429 (see `queueFullCode`) this many times before succeeding. */
   queueFullTimes: number;
   /** The `error.code` sent with the `queueFullTimes` 429 responses. Defaults
@@ -196,6 +205,8 @@ function defaultState(): ServerState {
     contentBytes: Buffer.from("\x89PNG-stub-output-bytes-0123456789"),
     requireAuth: false,
     jobUrlsOrigin: null,
+    headStatus: null,
+    omitHeadRetryAfter: false,
     queueFullTimes: 0,
     queueFullCode: "queue_full",
     retryAfterHeader: "0",
@@ -385,6 +396,15 @@ export class StubServer {
       const m = /^\/api\/v2\/assets\/by-hash\/(.+)$/.exec(path);
       if (m) {
         state.headCount += 1;
+        if (state.headStatus !== null) {
+          const headers: Record<string, string> =
+            state.headStatus === 429 && !state.omitHeadRetryAfter
+              ? { "Retry-After": state.retryAfterHeader }
+              : {};
+          res.writeHead(state.headStatus, headers);
+          res.end();
+          return;
+        }
         res.writeHead(state.knownHashes.has(decodeURIComponent(m[1])) ? 200 : 404);
         res.end();
         return;
