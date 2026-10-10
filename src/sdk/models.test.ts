@@ -776,6 +776,26 @@ describe("comfy.models.run failures", () => {
     });
   });
 
+  it("summarizes a validation entry with no usable toString instead of throwing", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 422;
+      server.state.errorType = "invalid_input";
+      server.state.body = {
+        detail: [
+          { loc: ["body"], type: { toString: null } },
+          { loc: ["body", { toString: null }, "seed"], msg: "too small" },
+        ],
+      };
+
+      const err = (await comfy.models.run(MODEL, {}).catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("invalid_input");
+      expect(err.message).toBe("2 validation errors: body: invalid; body.seed: too small");
+    });
+  });
+
   it("still produces a typed error when the body is not the router's at all", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
@@ -1648,6 +1668,116 @@ describe("comfy.models.run retries", () => {
       expect(Date.now() - started).toBeLessThan(5_000);
     });
   }, 20_000);
+});
+
+describe("comfy.models.run when an error body is cut off mid-read", () => {
+  it("raises the typed error its status and headers describe, with the read failure as cause", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 422;
+      server.state.errorType = "invalid_input";
+      server.state.cutBodyTimes = 1;
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { retry: false })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.httpStatus).toBe(422);
+      expect(err.code).toBe("invalid_input");
+      expect(err.requestId).toBe("6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21");
+      expect(err.idempotencyKey).toBe(server.state.lastIdempotencyKey);
+      expect(err.idempotencyKey).not.toBeNull();
+      expect(err.cause).toBeInstanceOf(TypeError);
+      expect(server.state.requestCount).toBe(1);
+    });
+  });
+
+  it("keeps the bucket's own class", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 402;
+      server.state.errorType = "insufficient_credits";
+      server.state.cutBodyTimes = 1;
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { retry: false })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(InsufficientCredits);
+      expect(err.httpStatus).toBe(402);
+      expect(err.cause).toBeInstanceOf(TypeError);
+    });
+  });
+
+  it("never resolves a header bucket off Object.prototype", async () => {
+    for (const errorType of ["constructor", "toString", "__proto__"]) {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.status = 400;
+        server.state.errorType = errorType;
+        server.state.cutBodyTimes = 1;
+
+        const err = (await comfy.models
+          .run(MODEL, {}, { retry: false })
+          .catch((e: unknown) => e)) as ComfyError;
+
+        expect(err, errorType).toBeInstanceOf(ComfyError);
+        expect(err.code, errorType).toBe(errorType);
+        expect(err.httpStatus, errorType).toBe(400);
+      });
+    }
+  });
+
+  it("still retries the read failure while budget remains, as before", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 422;
+      server.state.errorType = "invalid_input";
+      server.state.body = {
+        detail: [
+          { loc: ["body", "seed"], msg: "input should be greater than 0", type: "greater_than" },
+        ],
+      };
+      server.state.cutBodyTimes = 1;
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { retry: { budgetMs: 5_000, baseDelayMs: 5, maxDelayMs: 20 } })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      // The second attempt's full body is what the error carries.
+      const failures = err.details?.detail as { type: string }[] | undefined;
+      expect(failures?.[0].type).toBe("greater_than");
+      expect(err.cause).toBeUndefined();
+      expect(server.state.requestCount).toBe(2);
+    });
+  });
+
+  it("does not re-dress a 2xx whose body was cut: that is still the raw read failure", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.cutBodyTimes = 1;
+
+      const err = await comfy.models.run(MODEL, {}, { retry: false }).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(TypeError);
+      expect(err).not.toBeInstanceOf(ComfyError);
+    });
+  });
+
+  it("does not invent a status for a failure that never got a response", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 422;
+      server.state.errorType = "invalid_input";
+      server.state.resetTimes = 1;
+
+      const err = await comfy.models.run(MODEL, {}, { retry: false }).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(TypeError);
+      expect(err).not.toBeInstanceOf(ComfyError);
+    });
+  });
 });
 
 describe("comfy.models.run collecting a generation under the same key", () => {

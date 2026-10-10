@@ -132,14 +132,23 @@ export function errorFromEnvelope(
   let message = err && typeof err === "object" ? err.message : undefined;
   const details = err && typeof err === "object" ? err.details : undefined;
 
-  if (!code) {
+  // A string or nothing: `code` is typed `string` downstream, and a non-string
+  // off the wire (an array, an object) would be coerced into a lookup key and
+  // stamped onto the error as-is.
+  if (typeof code !== "string" || !code) {
     code = CODE_BY_STATUS[httpStatus] ?? "error";
   }
-  if (!message) {
+  // Same for `message`: the `Error` constructor stringifies whatever it is
+  // handed, and an object with no usable `toString` would throw a bare
+  // `TypeError` from here instead of the `ApiError` this exists to build.
+  if (typeof message !== "string" || !message) {
     message = `HTTP ${httpStatus}`;
   }
 
-  const cls = BY_CODE[code] ?? ApiError;
+  // Own-property lookup only: `code` comes straight off the server's envelope,
+  // and a plain index would resolve `constructor` or `toString` off
+  // `Object.prototype` — something that is not an ApiError class at all.
+  const cls = Object.hasOwn(BY_CODE, code) ? BY_CODE[code] : ApiError;
   return new cls(message, {
     code,
     httpStatus,

@@ -190,7 +190,10 @@ export function toSdkError(exc: ApiError): ComfyError {
       details: exc.details,
     });
   }
-  const cls = BY_CODE[exc.code] ?? ComfyError;
+  // Own-property lookup only, as `errorFromEnvelope` does one hop upstream:
+  // `exc.code` comes off the server's envelope, and a plain index would
+  // resolve `constructor` or `toString` off `Object.prototype`.
+  const cls = Object.hasOwn(BY_CODE, exc.code) ? BY_CODE[exc.code] : ComfyError;
   return new cls(exc.message, {
     code: exc.code,
     httpStatus: exc.httpStatus,

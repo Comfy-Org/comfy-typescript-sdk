@@ -41,11 +41,31 @@ describe("toSdkError", () => {
     expect(toSdkError(apiError)).toBeInstanceOf(expectedClass);
   });
 
+  it.each(["constructor", "toString", "__proto__", "hasOwnProperty"])(
+    "never resolves a code of %s off Object.prototype",
+    (code) => {
+      const sdkError = toSdkError(new ApiError("?", { code, httpStatus: 500 }));
+      expect(sdkError.constructor).toBe(ComfyError);
+      expect(sdkError.code).toBe(code);
+      expect(sdkError.message).toBe("?");
+    },
+  );
+
   it("carries retryAfter onto QueueFull", () => {
     const apiError = new ApiError("full", { code: "queue_full", httpStatus: 429, retryAfter: 5 });
     const sdkError = toSdkError(apiError);
     expect(sdkError).toBeInstanceOf(QueueFull);
     expect((sdkError as QueueFull).retryAfter).toBe(5);
+  });
+
+  it.each([
+    ["rate_limited", 429],
+    ["service_unavailable", 503],
+    ["not_found", 404],
+  ])("carries retryAfter onto a %s error too", (code, httpStatus) => {
+    const sdkError = toSdkError(new ApiError("wait", { code, httpStatus, retryAfter: 120 }));
+    expect(sdkError).toBeInstanceOf(ComfyError);
+    expect(sdkError.retryAfter).toBe(120);
   });
 
   it("preserves an absent retryAfter on QueueFull", () => {

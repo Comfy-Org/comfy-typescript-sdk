@@ -123,6 +123,29 @@ entry. See CONTRIBUTING.md.
 
 ### Fixed
 
+- **An error response whose body could not be read now raises the typed
+  error for its status and headers.** When a non-2xx answer from
+  `comfy.models.run`, `comfy.models.schema`, `comfy.models.list` or one of
+  the queued request calls (`submit`, `status`, `get`, `cancel`, …) lost its
+  connection mid-body and no retry remained, the call rejected with the runtime's bare `TypeError: terminated`. It now
+  rejects with the error that status and headers describe — `InsufficientCredits`,
+  `InvalidInput` and so on, with the request id — and the read failure as
+  `cause`. Retry behaviour is unchanged, and a cut-off 2xx body, a deadline,
+  a caller abort, a size-cap breach or a failure with no response at all
+  still raise exactly what they did.
+- **A Comfy API v2 error whose `code` names an `Object.prototype` member
+  (`constructor`, `toString`, …) now raises a plain `ApiError`, and a plain
+  `ComfyError` once translated to the `sdk` layer.** Both code-to-class
+  lookups read inherited properties, so such a code produced something that
+  failed every `instanceof` check, or threw a `TypeError` from inside the
+  SDK's own error path. A `code` that is not a string is now ignored in
+  favour of the status-derived one instead of being stamped onto the error.
+  The same goes for a `message` that is not a string, which falls back to
+  `HTTP <status>` instead of throwing a `TypeError` or being flattened.
+- **A `comfy.models.run` validation failure whose `detail[]` entry carries a
+  non-string `type` or `loc` segment no longer throws a `TypeError`** from
+  inside the SDK's error path; the typed error is raised with the entry
+  summarized as `invalid`.
 - **`idempotencyKey` is now stamped onto _every_ error `comfy.models.run` and `comfy.models.submit` throw, including raw transport failures and aborts.** Previously only the `run` response-path `ComfyError` carried it; undici's transport-failure `TypeError` ("fetch failed"), an already-aborted signal's `AbortError`, and the queue path's `RouterError` (e.g. a bare `502` `ProviderError`) all escaped without it. On a transport failure the server never minted an `X-Comfy-Request-Id`, so the key is the only value that correlates the failure to the server-side record. It is now attached as an own `idempotencyKey` property on the raw throwable (its class, `name`, message and stack are otherwise untouched), and `routerErrors.RouterError` gained a typed `idempotencyKey` field. A failure to collect a generation additionally carries the `Retry-After` pace Router named, rather than reporting none. Where the throwable is one the caller owns and other calls share — an `AbortController`'s `signal.reason`, which `fetch` hands to every concurrent call on that controller — each call receives an equivalent per-call error carrying ITS OWN key instead, so no caller reads a key belonging to another generation and `controller.signal.reason` is left unmodified. Mirrors the Python SDK's `exceptions.translating(idempotency_key=…)`.
 - **The `droppedParams` doc comments now match the vendored Router contract.**
   The TSDoc on `parseDroppedParams` and `RunJsonResult.droppedParams` still
