@@ -411,7 +411,8 @@ export function jobSummary(item: JobListItem): JobSummary {
     status: item.status,
     createTime: item.create_time ?? null,
     updateTime: item.update_time ?? null,
-    deploymentId: item.deployment_id ?? null,
+    // Not a declared `JobListItem` field: an extra the server may send.
+    deploymentId: typeof item.deployment_id === "string" ? item.deployment_id : null,
     metadata: readMetadata(item.metadata),
   };
 }

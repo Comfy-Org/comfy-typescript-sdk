@@ -5,7 +5,7 @@ export type ClientOptions = {
 };
 
 /**
- * A user-owned record identified by a server-assigned UUID, backing an immutable blob whose content carries a server-computed blake3 hash. `hash` may be computed lazily: an asset record (and its retrievable bytes) can exist before its hash is filled in.
+ * A user-owned record identified by a server-assigned UUID, backing an immutable blob whose content carries a server-computed blake3 hash. `hash` may be computed lazily: an asset record (and its retrievable bytes) can exist before its hash is filled in. On an output, `job_metadata` carries the labels its producing job was submitted with, so code holding only the asset knows which run it came from. It is absent for assets no job produced, for outputs of a job sent without labels, where the serving surface keeps no job labels, and when the labels could not be read: so `job_id` without `job_metadata` does not prove the job had no labels. A create whose file path and bytes match an existing output answers with that output, so its `job_id` and `job_metadata` are the output's.
  */
 export type Asset = {
     id: string;
@@ -31,9 +31,13 @@ export type Asset = {
      */
     expires_at?: string | null;
     /**
-     * ID of the job that produced this asset. Absent for uploaded assets, which have no producing job.
+     * ID of the job that produced this asset. Absent for assets no job produced, such as a fresh upload.
      */
     job_id?: string | null;
+    /**
+     * The labels the producing job was submitted with, read through `job_id` on each read. Absent for assets no job produced, for outputs of a job sent without labels, where the serving surface keeps no job labels, when the job is gone, and when the labels could not be read: so `job_id` without `job_metadata` does not prove the job had no labels.
+     */
+    job_metadata?: JobMetadata;
 };
 
 /**
@@ -63,6 +67,53 @@ export type Job = {
         [key: string]: number | null;
     };
     urls: JobUrls;
+    /**
+     * The deployment the job was sent to: the id in the address it was posted at, which stays the same when the deployment moves to another release. Absent on a surface that runs jobs on no deployment.
+     */
+    deployment_id?: string;
+    /**
+     * The release of the deployment's build that ran the job, which can differ from the release the deployment runs now. Absent where the serving surface does not report it.
+     */
+    release_id?: string;
+    /**
+     * The version of the release in `release_id`, the number its build cut it as. Absent where the serving surface does not report it or could not look it up at the time of the answer.
+     */
+    release_version?: number;
+    metadata?: JobMetadata;
+};
+
+/**
+ * The labels the job was submitted with, exactly as sent. Absent when it was sent with none.
+ */
+export type JobMetadata = {
+    [key: string]: string;
+};
+
+/**
+ * One page of `GET /api/v2/jobs`.
+ */
+export type JobList = {
+    jobs: Array<JobListItem>;
+    /**
+     * Pass as `cursor` to read the next page. Absent on the last page.
+     */
+    next_cursor?: string;
+};
+
+/**
+ * A job's stored record. The fields below are stable; an item may carry more, which a client should ignore rather than rely on.
+ */
+export type JobListItem = {
+    id: string;
+    status: JobStatus;
+    create_time: string;
+    update_time: string;
+    /**
+     * The version of the release that ran the job. Absent where the serving surface does not report it or could not look it up at the time of the answer.
+     */
+    release_version?: number;
+    metadata?: JobMetadata;
+    [key: string]: unknown;
 };
 
 /**
@@ -105,7 +156,8 @@ export type JobWorkflowResponse = {
 
 /**
  * Lifecycle: queued → running → succeeded | failed | expired;
- * a cancel request moves running → canceling → canceled.
+ * a cancel request, or the deletion of the deployment the job is running
+ * on, moves running → canceling → canceled.
  * Terminal states: succeeded, canceled, failed, expired.
  *
  */
@@ -180,10 +232,36 @@ export type OutputType = 'image' | 'video' | 'audio' | 'text' | 'file' | 'latent
  */
 export type JobError = {
     code: string;
+    /**
+     * Why the job failed, written for a person to read. On a serverless deployment, where ComfyUI refused the workflow, it names the rejected nodes it has room for and their reasons, which `node_errors` carries in full. Its wording may change; read `code` and `node_errors` rather than matching this text.
+     */
     message: string;
     node_id?: string | null;
     class_type?: string | null;
     traceback?: string | null;
+    /**
+     * Every node ComfyUI rejected when it refused the workflow before running any of it (a value outside its allowed range, a model the deployment does not contain, a graph that loops back on itself), keyed by node id, under the names ComfyUI gave them. Absent when the workflow ran and a node raised: `node_id`, `class_type` and `traceback` describe that failure instead.
+     */
+    node_errors?: {
+        [key: string]: JobNodeError;
+    };
+};
+
+/**
+ * One node that was rejected, and why: by ComfyUI when it refused the workflow after dispatch, or by the gateway when it refused the workflow at submit.
+ */
+export type JobNodeError = {
+    class_type?: string;
+    errors: Array<JobNodeErrorReason>;
+};
+
+/**
+ * One problem found with a node. `type` is the code for it: ComfyUI's (for example `value_not_in_list`, `value_bigger_than_max`, `dependency_cycle`), or one of the gateway's, sent where its submit checks are switched on: `unknown_node_class` (a node class the deployment's build does not contain), `waits_for_browser` (a node the workflow would run whose class waits for a browser tab to answer while the job runs, which a deployment never has), `invalid_node` (the node is not a JSON object), `invalid_inputs` (its `inputs` is present but not an object, refused only where the deployment's ComfyUI would fail such a node anyway, so no workflow that runs today is refused), or `invalid_class_type` (its `class_type` is missing or is not a non-empty string). ComfyUI's `missing_node_type` means the same as `unknown_node_class`, found after dispatch rather than at submit. For either, `message` ends naming the node pack that provides the class where the Comfy node registry knows one. `details` usually starts with the input it is about.
+ */
+export type JobNodeErrorReason = {
+    type: string;
+    message: string;
+    details?: string;
 };
 
 /**
@@ -191,12 +269,26 @@ export type JobError = {
  * `invalid_workflow` (422), `workflow_format_ui` (422),
  * `missing_asset` (422), `hash_mismatch` (409), `blob_not_found`
  * (404), `idempotency_key_reuse` (422),
- * `queue_full` (429 + Retry-After), `insufficient_credits` (402),
- * `not_found` (404), `unauthorized` (401), `forbidden` (403).
+ * `queue_full` (429 + Retry-After), `rate_limited` (429 + Retry-After:
+ * the caller is past a request rate limit; retry), `insufficient_credits`
+ * (402), `not_found` (404), `unauthorized` (401), `forbidden` (403).
  * Deployment-scoped surfaces add: `deployment_not_ready` (429 +
- * Retry-After — the deployment can still reach ready; retry) and
+ * Retry-After — the deployment can still reach ready; retry),
+ * `deployment_unavailable` (429 + Retry-After: the deployment is ready
+ * but its GPU provider is not taking work on it yet; retry),
  * `deployment_stopped` (422 — terminal deployment state; a retry
- * cannot succeed without operator action). A 429 is disambiguated
+ * cannot succeed without operator action), `invalid_request` (422:
+ * a malformed asset upload or asset-from-hash field, or a jobs-list
+ * `limit` that is not a positive integer), `content_blocked` (451:
+ * content moderation flagged the asset's bytes) and `sso_required` (403:
+ * the key is valid, but the account must sign in through its
+ * organization's single sign-on, which does not accept this key). Job
+ * labels add: `metadata_invalid` (422: a submitted `metadata` breaks a
+ * limit; `details.key` names the key, except for too many pairs, which
+ * has no `details`), `metadata_not_supported` (422:
+ * this surface keeps no job labels yet), `invalid_metadata_filter` (400)
+ * and `invalid_cursor` (400). A surface that does not list jobs yet
+ * answers `not_implemented` (501). A 429 is disambiguated
  * by `error.code` alone; clients should treat any 429 + Retry-After
  * as "back off and retry".
  *
@@ -205,6 +297,13 @@ export type ErrorEnvelope = {
     error: {
         code: string;
         message: string;
+        /**
+         * On `sso_required`: the organization whose single sign-on governs this key, the one that holds the account, else the one that holds the key's workspace. It is the `organization` query parameter of Comfy Cloud's single sign-on start; treat it as opaque. Absent when the organization is unknown, and on every other code.
+         */
+        organization_id?: string;
+        /**
+         * Machine-readable detail for the code. When it carries `node_errors`, that is keyed by node id and each value is a `JobNodeError`, the same shape as a job's `error.node_errors`, whether the refusal came at submit (for example `unknown_node_class`, a node class the deployment's build does not contain) or from ComfyUI after dispatch. With `unknown_node_class` errors it carries `unknown_node_classes`, the missing classes; with `waits_for_browser` errors, `browser_wait_node_classes`, the classes that wait for a browser. A submit refusal names at most fifty nodes. For `invalid_node`, `invalid_inputs` and `invalid_class_type`, when it found more than fifty, `node_errors_truncated` is true and `malformed_node_count` carries the full count; for `waits_for_browser`, `browser_wait_node_count` does. For `unknown_node_class` it names only nodes whose class is one of the at most ten listed in `unknown_node_classes`; when those nodes number more than fifty, `node_errors_truncated` is true and `unknown_node_count` is how many nodes have a listed class. Nodes whose class is past those ten are neither named nor counted.
+         */
         details?: {
             [key: string]: unknown;
         } | null;
@@ -266,7 +365,7 @@ export type PostAssetsErrors = {
      */
     401: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
@@ -274,9 +373,13 @@ export type PostAssetsErrors = {
      */
     409: ErrorEnvelope;
     /**
-     * `idempotency_key_reuse` or validation failure.
+     * `idempotency_key_reuse`, `input_blocked` (the bytes are already stored and flagged by content moderation, so `file_path` is not registered for them), or validation failure.
      */
     422: ErrorEnvelope;
+    /**
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
+     */
+    429: ErrorEnvelope;
     /**
      * `upstream_error` — an unexpected failure reaching or processing the request in this implementation's backing services. The message is always a generic, safe-to-display string; implementation detail (the specific upstream, its error text, transport failures) is never included here — see each implementation's own error-mapping notes. Every operation in this contract can fail this way.
      */
@@ -319,13 +422,21 @@ export type AssetFromHashErrors = {
      */
     401: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
      * `blob_not_found` — no blob the caller may mint from.
      */
     404: ErrorEnvelope;
+    /**
+     * `invalid_request` on a deployment: the `file_path`, `tags` or `expires_in` is malformed.
+     */
+    422: ErrorEnvelope;
+    /**
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
+     */
+    429: ErrorEnvelope;
     /**
      * `upstream_error` — an unexpected failure reaching or processing the request in this implementation's backing services. The message is always a generic, safe-to-display string; implementation detail (the specific upstream, its error text, transport failures) is never included here — see each implementation's own error-mapping notes. Every operation in this contract can fail this way.
      */
@@ -365,9 +476,17 @@ export type HeadAssetByHashErrors = {
      */
     401: ErrorEnvelope;
     /**
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
+     */
+    403: ErrorEnvelope;
+    /**
      * No blob the caller may mint from.
      */
     404: unknown;
+    /**
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
+     */
+    429: ErrorEnvelope;
     /**
      * `upstream_error` — an unexpected failure reaching or processing the request in this implementation's backing services. The message is always a generic, safe-to-display string; implementation detail (the specific upstream, its error text, transport failures) is never included here — see each implementation's own error-mapping notes. Every operation in this contract can fail this way.
      */
@@ -398,7 +517,7 @@ export type DeleteAssetErrors = {
      */
     401: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
@@ -409,6 +528,10 @@ export type DeleteAssetErrors = {
      * `asset_in_use` — the record cannot be deleted while the platform still depends on it. Each surface defines its own holds (for example: a job's outputs reference the record, or a content-moderation workflow requires it to be preserved); the response body deliberately never says which hold applies.
      */
     409: ErrorEnvelope;
+    /**
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
+     */
+    429: ErrorEnvelope;
     /**
      * `upstream_error` — an unexpected failure reaching or processing the request in this implementation's backing services. The message is always a generic, safe-to-display string; implementation detail (the specific upstream, its error text, transport failures) is never included here — see each implementation's own error-mapping notes. Every operation in this contract can fail this way.
      */
@@ -441,13 +564,17 @@ export type GetAssetErrors = {
      */
     401: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
      * `not_found`.
      */
     404: ErrorEnvelope;
+    /**
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
+     */
+    429: ErrorEnvelope;
     /**
      * `upstream_error` — an unexpected failure reaching or processing the request in this implementation's backing services. The message is always a generic, safe-to-display string; implementation detail (the specific upstream, its error text, transport failures) is never included here — see each implementation's own error-mapping notes. Every operation in this contract can fail this way.
      */
@@ -486,7 +613,7 @@ export type GetAssetContentErrors = {
      */
     401: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
@@ -497,6 +624,14 @@ export type GetAssetContentErrors = {
      * Range not satisfiable.
      */
     416: unknown;
+    /**
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
+     */
+    429: ErrorEnvelope;
+    /**
+     * `content_blocked` on a deployment: content moderation flagged these bytes, so they are not served.
+     */
+    451: ErrorEnvelope;
     /**
      * `upstream_error` — an unexpected failure reaching or processing the request in this implementation's backing services. The message is always a generic, safe-to-display string; implementation detail (the specific upstream, its error text, transport failures) is never included here — see each implementation's own error-mapping notes. Every operation in this contract can fail this way.
      */
@@ -517,6 +652,74 @@ export type GetAssetContentResponses = {
 };
 
 export type GetAssetContentResponse = GetAssetContentResponses[keyof GetAssetContentResponses];
+
+export type ListJobsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Most jobs per page. Above 500 is read as 500; absent means 500. Not a positive integer: `422` `invalid_request`.
+         */
+        limit?: number;
+        /**
+         * The previous page's `next_cursor`, unchanged. Opaque: do not build or edit one. A cursor that is not well-formed is refused `400` `invalid_cursor`. Cursors are not signed, so a well-formed one is read as a position whether or not this list issued it.
+         */
+        cursor?: string;
+        /**
+         * Exact-match label filters, written `metadata[client]=acme`. Up to 3; all must match.
+         */
+        metadata?: {
+            [key: string]: string;
+        };
+    };
+    url: '/api/v2/jobs';
+};
+
+export type ListJobsErrors = {
+    /**
+     * `invalid_metadata_filter` or `invalid_cursor`.
+     */
+    400: ErrorEnvelope;
+    /**
+     * `unauthorized` — missing or invalid credentials.
+     */
+    401: ErrorEnvelope;
+    /**
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
+     */
+    403: ErrorEnvelope;
+    /**
+     * `not_found`: on a deployment's address, no deployment there that the caller's workspace owns.
+     */
+    404: ErrorEnvelope;
+    /**
+     * `invalid_request`: `limit` is not a positive integer.
+     */
+    422: ErrorEnvelope;
+    /**
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
+     */
+    429: ErrorEnvelope;
+    /**
+     * `upstream_error` — an unexpected failure reaching or processing the request in this implementation's backing services. The message is always a generic, safe-to-display string; implementation detail (the specific upstream, its error text, transport failures) is never included here — see each implementation's own error-mapping notes. Every operation in this contract can fail this way.
+     */
+    500: ErrorEnvelope;
+    /**
+     * `not_implemented`: this surface does not list jobs yet.
+     */
+    501: ErrorEnvelope;
+};
+
+export type ListJobsError = ListJobsErrors[keyof ListJobsErrors];
+
+export type ListJobsResponses = {
+    /**
+     * One page of jobs, newest first.
+     */
+    200: JobList;
+};
+
+export type ListJobsResponse = ListJobsResponses[keyof ListJobsResponses];
 
 export type PostJobsData = {
     body: {
@@ -541,6 +744,12 @@ export type PostJobsData = {
              */
             auth_token_comfy_org?: string;
         };
+        /**
+         * Your own labels for the job, such as which of your customers it ran for. At most 16 pairs. A key is 1 to 40 characters from `A-Z a-z 0-9 _ - .`; a value is a string of at most 256 bytes in UTF-8 (bytes, not characters: 200 `é` is 400 bytes) with no control character (U+0000 to U+001F, tab and newline included, and U+007F to U+009F) and no bidirectional embedding, override or isolate (U+202A to U+202E, U+2066 to U+2069). Anything else is refused `422` `metadata_invalid` and no job is created: a bad key or value is named in the message and in `details.key`, while more than 16 pairs is refused with the count and no `details`. A `metadata` that is not an object is refused `400` `invalid_request`; `null` is the same as none. Stored with the job, returned on it, and filterable on `GET /api/v2/jobs`. Set once, here: nothing changes it later. Only jobs sent to a deployment keep it today: Comfy Cloud refuses a non-empty `metadata` with `422` `metadata_not_supported`, and runs a job with empty or absent `metadata` as before.
+         */
+        metadata?: {
+            [key: string]: string;
+        };
     };
     headers?: {
         /**
@@ -555,6 +764,10 @@ export type PostJobsData = {
 
 export type PostJobsErrors = {
     /**
+     * `invalid_request`: `metadata` is not an object. A body that is not JSON at all, or whose `workflow` or `extra_data` is not an object, is a `400` too, answered by the request decoder before any of these checks, with a bare `message` body rather than this envelope.
+     */
+    400: ErrorEnvelope;
+    /**
      * `unauthorized` — missing or invalid credentials.
      */
     401: ErrorEnvelope;
@@ -563,15 +776,19 @@ export type PostJobsErrors = {
      */
     402: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
-     * `invalid_workflow` (with per-node details), `workflow_format_ui`, `missing_asset`, or `idempotency_key_reuse`.
+     * `not_found`: on a deployment's address, no deployment there that the caller's workspace owns.
+     */
+    404: ErrorEnvelope;
+    /**
+     * `invalid_workflow` (with per-node details), `workflow_format_ui`, `missing_asset`, `idempotency_key_reuse`, `metadata_invalid` (for a bad key or value, the message and `details.key` name the key; for more than 16 pairs, the message gives the count and there are no `details`), or `metadata_not_supported` (a surface that keeps no job labels yet).
      */
     422: ErrorEnvelope;
     /**
-     * `queue_full` (bounded queue depth reached) or, on deployment-scoped surfaces, `deployment_not_ready` (deployment still provisioning/starting). Disambiguate by `error.code`; both mean back off and retry after `Retry-After`.
+     * `queue_full` (bounded queue depth reached) or, on deployment-scoped surfaces, `deployment_not_ready` (deployment still provisioning/starting) or `deployment_unavailable` (the deployment is ready but its GPU provider is not taking work on it yet), or `rate_limited` (the caller is past a request rate limit). Disambiguate by `error.code`; all four mean back off and retry after `Retry-After`.
      */
     429: ErrorEnvelope;
     /**
@@ -606,7 +823,7 @@ export type GetJobErrors = {
      */
     401: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
@@ -614,7 +831,7 @@ export type GetJobErrors = {
      */
     404: ErrorEnvelope;
     /**
-     * `rate_limited` — the caller has exceeded the request rate limit for this account. Account/rate-scoped, not job-specific — this can be returned even for a job id the caller doesn't own or that doesn't exist, without revealing which.
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
      */
     429: ErrorEnvelope;
     /**
@@ -649,7 +866,7 @@ export type GetJobWorkflowErrors = {
      */
     401: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
@@ -657,7 +874,7 @@ export type GetJobWorkflowErrors = {
      */
     404: ErrorEnvelope;
     /**
-     * `rate_limited` — the caller has exceeded the request rate limit for this account. Account/rate-scoped, not job-specific — this can be returned even for a job id the caller doesn't own or that doesn't exist, without revealing which.
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
      */
     429: ErrorEnvelope;
     /**
@@ -692,7 +909,7 @@ export type GetJobLogsErrors = {
      */
     401: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
@@ -700,7 +917,7 @@ export type GetJobLogsErrors = {
      */
     404: ErrorEnvelope;
     /**
-     * `rate_limited` — the caller has exceeded the request rate limit for this account. Account/rate-scoped, not job-specific — this can be returned even for a job id the caller doesn't own or that doesn't exist, without revealing which.
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
      */
     429: ErrorEnvelope;
     /**
@@ -739,7 +956,7 @@ export type GetJobEventsErrors = {
      */
     401: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
@@ -747,7 +964,7 @@ export type GetJobEventsErrors = {
      */
     404: ErrorEnvelope;
     /**
-     * `too_many_streams` — the caller already has the maximum number of concurrent GET .../events streams open. Close an existing stream (or wait for one to reach a terminal status) before opening another; GET /api/v2/jobs/{id} remains available as a plain poll regardless of this limit.
+     * `too_many_streams` — the caller already has the maximum number of concurrent GET .../events streams open. Close an existing stream (or wait for one to reach a terminal status) before opening another; GET /api/v2/jobs/{id} remains available as a plain poll regardless of this limit. Or `rate_limited`, the caller past a request rate limit; retry after `Retry-After`.
      */
     429: ErrorEnvelope;
     /**
@@ -786,7 +1003,7 @@ export type CancelJobErrors = {
      */
     401: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
@@ -794,7 +1011,7 @@ export type CancelJobErrors = {
      */
     404: ErrorEnvelope;
     /**
-     * `rate_limited` — the caller has exceeded the request rate limit for this account. Account/rate-scoped, not job-specific — this can be returned even for a job id the caller doesn't own or that doesn't exist, without revealing which.
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
      */
     429: ErrorEnvelope;
     /**

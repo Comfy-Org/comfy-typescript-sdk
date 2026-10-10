@@ -34,7 +34,9 @@ import type {
   Asset,
   AssetFromHashData,
   Job,
+  JobList,
   JobLogs,
+  JobMetadata,
   JobWorkflowResponse,
   PostJobsData,
 } from "./generated/types.gen.js";
@@ -98,33 +100,8 @@ export type JobWorkflowFormat = JobWorkflowResponse["format"];
 /** Return shape of {@link ComfyLow.getJobWorkflow} — the generated response schema. */
 export type JobWorkflowResult = JobWorkflowResponse;
 
-/**
- * Labels a caller attached to a job at submit: string keys to string values.
- * Hand-written until the vendored spec carries `metadata`; the server owns
- * the limits on it, so none are checked here.
- */
-export type JobMetadata = Record<string, string>;
-
-/**
- * One item of `GET /api/v2/jobs`. Not the `Job` schema: a list item carries
- * no outputs or follow-up links, and the server may send more fields than
- * the stable ones named here.
- */
-export interface JobListItem {
-  id: string;
-  status: string;
-  create_time?: string;
-  update_time?: string;
-  deployment_id?: string | null;
-  metadata?: JobMetadata;
-  [field: string]: unknown;
-}
-
-/** Return shape of {@link ComfyLow.listJobs} — one page; `next_cursor` is absent on the last. */
-export interface JobListPage {
-  jobs: JobListItem[];
-  next_cursor?: string;
-}
+/** Return shape of {@link ComfyLow.listJobs} — the generated `JobList`; `next_cursor` is absent on the last page. */
+export type JobListPage = JobList;
 
 function looksLikePath(value: string): boolean {
   return value.startsWith("http") || value.startsWith("/");
@@ -556,9 +533,6 @@ export class ComfyLow {
    * `GET /api/v2/jobs` — one page of the caller's jobs, newest first. Every
    * `metadata` pair is sent as `metadata[key]=value` and must match exactly.
    * Pass the previous page's `next_cursor` as `cursor` for the next page.
-   *
-   * Ahead of the vendored spec: the operation joins {@link OPERATION_IDS}
-   * when the spec sync that adds it lands.
    */
   async listJobs(
     options: {
@@ -680,6 +654,7 @@ export const OPERATION_IDS = [
   "getJobLogs",
   "getJobEvents",
   "cancelJob",
+  "listJobs",
 ] as const;
 
 // operationId -> transport method name.
@@ -696,4 +671,5 @@ export const OPERATION_METHODS: Record<(typeof OPERATION_IDS)[number], keyof Com
   getJobLogs: "getJobLogs",
   getJobEvents: "getJobEvents",
   cancelJob: "cancelJob",
+  listJobs: "listJobs",
 };

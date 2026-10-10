@@ -3,7 +3,12 @@
 import * as z from 'zod';
 
 /**
- * A user-owned record identified by a server-assigned UUID, backing an immutable blob whose content carries a server-computed blake3 hash. `hash` may be computed lazily: an asset record (and its retrievable bytes) can exist before its hash is filled in.
+ * The labels the job was submitted with, exactly as sent. Absent when it was sent with none.
+ */
+export const zJobMetadata = z.record(z.string(), z.string());
+
+/**
+ * A user-owned record identified by a server-assigned UUID, backing an immutable blob whose content carries a server-computed blake3 hash. `hash` may be computed lazily: an asset record (and its retrievable bytes) can exist before its hash is filled in. On an output, `job_metadata` carries the labels its producing job was submitted with, so code holding only the asset knows which run it came from. It is absent for assets no job produced, for outputs of a job sent without labels, where the serving surface keeps no job labels, and when the labels could not be read: so `job_id` without `job_metadata` does not prove the job had no labels. A create whose file path and bytes match an existing output answers with that output, so its `job_id` and `job_metadata` are the output's.
  */
 export const zAsset = z.object({
     id: z.string(),
@@ -16,7 +21,8 @@ export const zAsset = z.object({
     url: z.url(),
     url_expires_at: z.iso.datetime(),
     expires_at: z.iso.datetime().nullish(),
-    job_id: z.string().nullish()
+    job_id: z.string().nullish(),
+    job_metadata: zJobMetadata.optional()
 });
 
 /**
@@ -39,7 +45,8 @@ export const zJobWorkflowResponse = z.object({
 
 /**
  * Lifecycle: queued → running → succeeded | failed | expired;
- * a cancel request moves running → canceling → canceled.
+ * a cancel request, or the deletion of the deployment the job is running
+ * on, moves running → canceling → canceled.
  * Terminal states: succeeded, canceled, failed, expired.
  *
  */
@@ -52,6 +59,26 @@ export const zJobStatus = z.enum([
     'failed',
     'expired'
 ]);
+
+/**
+ * A job's stored record. The fields below are stable; an item may carry more, which a client should ignore rather than rely on.
+ */
+export const zJobListItem = z.object({
+    id: z.string(),
+    status: zJobStatus,
+    create_time: z.iso.datetime(),
+    update_time: z.iso.datetime(),
+    release_version: z.int().gte(1).optional(),
+    metadata: zJobMetadata.optional()
+});
+
+/**
+ * One page of `GET /api/v2/jobs`.
+ */
+export const zJobList = z.object({
+    jobs: z.array(zJobListItem),
+    next_cursor: z.string().optional()
+});
 
 /**
  * Embedded follow-up links — follow these, don't build URLs. A link is either an absolute URL or a host-relative reference (leading `/`) that already includes any prefix the serving surface is mounted under (e.g. a serverless gateway's `/deployment/{deployment_id}/api/v2`). Clients MUST resolve a host-relative link against the request origin (scheme + authority), never against a configured base URL — joining it to a base URL that carries the same mount prefix duplicates the prefix.
@@ -106,6 +133,23 @@ export const zOutput = z.object({
 });
 
 /**
+ * One problem found with a node. `type` is the code for it: ComfyUI's (for example `value_not_in_list`, `value_bigger_than_max`, `dependency_cycle`), or one of the gateway's, sent where its submit checks are switched on: `unknown_node_class` (a node class the deployment's build does not contain), `waits_for_browser` (a node the workflow would run whose class waits for a browser tab to answer while the job runs, which a deployment never has), `invalid_node` (the node is not a JSON object), `invalid_inputs` (its `inputs` is present but not an object, refused only where the deployment's ComfyUI would fail such a node anyway, so no workflow that runs today is refused), or `invalid_class_type` (its `class_type` is missing or is not a non-empty string). ComfyUI's `missing_node_type` means the same as `unknown_node_class`, found after dispatch rather than at submit. For either, `message` ends naming the node pack that provides the class where the Comfy node registry knows one. `details` usually starts with the input it is about.
+ */
+export const zJobNodeErrorReason = z.object({
+    type: z.string(),
+    message: z.string(),
+    details: z.string().optional()
+});
+
+/**
+ * One node that was rejected, and why: by ComfyUI when it refused the workflow after dispatch, or by the gateway when it refused the workflow at submit.
+ */
+export const zJobNodeError = z.object({
+    class_type: z.string().optional(),
+    errors: z.array(zJobNodeErrorReason)
+});
+
+/**
  * Execution failure detail, carried in `job.error` (not an HTTP error).
  */
 export const zJobError = z.object({
@@ -113,7 +157,8 @@ export const zJobError = z.object({
     message: z.string(),
     node_id: z.string().nullish(),
     class_type: z.string().nullish(),
-    traceback: z.string().nullish()
+    traceback: z.string().nullish(),
+    node_errors: z.record(z.string(), zJobNodeError).optional()
 });
 
 /**
@@ -131,7 +176,11 @@ export const zJob = z.object({
     outputs: z.array(zOutput),
     error: zJobError.nullable(),
     metrics: z.record(z.string(), z.int().nullable()).optional(),
-    urls: zJobUrls
+    urls: zJobUrls,
+    deployment_id: z.string().optional(),
+    release_id: z.string().optional(),
+    release_version: z.int().gte(1).optional(),
+    metadata: zJobMetadata.optional()
 });
 
 /**
@@ -139,12 +188,26 @@ export const zJob = z.object({
  * `invalid_workflow` (422), `workflow_format_ui` (422),
  * `missing_asset` (422), `hash_mismatch` (409), `blob_not_found`
  * (404), `idempotency_key_reuse` (422),
- * `queue_full` (429 + Retry-After), `insufficient_credits` (402),
- * `not_found` (404), `unauthorized` (401), `forbidden` (403).
+ * `queue_full` (429 + Retry-After), `rate_limited` (429 + Retry-After:
+ * the caller is past a request rate limit; retry), `insufficient_credits`
+ * (402), `not_found` (404), `unauthorized` (401), `forbidden` (403).
  * Deployment-scoped surfaces add: `deployment_not_ready` (429 +
- * Retry-After — the deployment can still reach ready; retry) and
+ * Retry-After — the deployment can still reach ready; retry),
+ * `deployment_unavailable` (429 + Retry-After: the deployment is ready
+ * but its GPU provider is not taking work on it yet; retry),
  * `deployment_stopped` (422 — terminal deployment state; a retry
- * cannot succeed without operator action). A 429 is disambiguated
+ * cannot succeed without operator action), `invalid_request` (422:
+ * a malformed asset upload or asset-from-hash field, or a jobs-list
+ * `limit` that is not a positive integer), `content_blocked` (451:
+ * content moderation flagged the asset's bytes) and `sso_required` (403:
+ * the key is valid, but the account must sign in through its
+ * organization's single sign-on, which does not accept this key). Job
+ * labels add: `metadata_invalid` (422: a submitted `metadata` breaks a
+ * limit; `details.key` names the key, except for too many pairs, which
+ * has no `details`), `metadata_not_supported` (422:
+ * this surface keeps no job labels yet), `invalid_metadata_filter` (400)
+ * and `invalid_cursor` (400). A surface that does not list jobs yet
+ * answers `not_implemented` (501). A 429 is disambiguated
  * by `error.code` alone; clients should treat any 429 + Retry-After
  * as "back off and retry".
  *
@@ -153,6 +216,7 @@ export const zErrorEnvelope = z.object({
     error: z.object({
         code: z.string(),
         message: z.string(),
+        organization_id: z.string().optional(),
         details: z.record(z.string(), z.unknown()).nullish()
     })
 });
@@ -236,12 +300,24 @@ export const zGetAssetContentPath = z.object({
  */
 export const zGetAssetContentResponse = z.string();
 
+export const zListJobsQuery = z.object({
+    limit: z.int().gte(1).optional(),
+    cursor: z.string().optional(),
+    metadata: z.record(z.string(), z.string()).optional()
+});
+
+/**
+ * One page of jobs, newest first.
+ */
+export const zListJobsResponse = zJobList;
+
 export const zPostJobsBody = z.object({
     workflow: z.record(z.string(), z.unknown()),
     extra_data: z.object({
         api_key_comfy_org: z.string().optional(),
         auth_token_comfy_org: z.string().optional()
-    }).optional()
+    }).optional(),
+    metadata: z.record(z.string(), z.string().max(256)).optional()
 });
 
 export const zPostJobsHeaders = z.object({
