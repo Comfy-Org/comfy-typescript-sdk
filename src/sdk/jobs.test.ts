@@ -244,6 +244,30 @@ describe("Job", () => {
     expect(server.state.jobPollCount).toBe(2);
   }, 2000);
 
+  it.each(["0", "1"])(
+    "events() waits at least a second on an SSE 429 with Retry-After: %s, instead of reconnecting at once",
+    async (value) => {
+      server.state.eventsStatus = 429;
+      server.state.eventsErrorCode = "too_many_streams";
+      server.state.retryAfterHeader = value; // set explicitly, not left to the stub's default
+      server.state.pollsToSucceed = 1_000_000; // poll backstop never resolves either
+      const job = await jobs.get("job_01");
+      const controller = new AbortController();
+      const iterator = job.events(controller.signal);
+      setTimeout(() => controller.abort(), 300);
+      await expect(iterator.next()).rejects.toBeTruthy(); // aborted mid reconnect-pause
+      // retryAfter * 1000 would be 0 unfloored for "0"; MIN_RETRY_PAUSE_MS is
+      // 1_000 — the regression this guards against. "1" is the boundary.
+      expect(vi.mocked(abortableSleep)).toHaveBeenCalledWith(1_000, controller.signal);
+      // Request-amplification assertion: within 300ms an unfloored loop would
+      // have made many SSE connects and polls; floored, exactly one of each
+      // beyond jobs.get()'s own poll.
+      expect(server.state.eventsConnectCount).toBe(1);
+      expect(server.state.jobPollCount).toBe(2);
+    },
+    2000,
+  );
+
   it("events() uses the default backoff when a 429 omits Retry-After", async () => {
     server.state.eventsStatus = 429;
     server.state.eventsErrorCode = "too_many_streams";

@@ -141,6 +141,10 @@ entry. See CONTRIBUTING.md.
 - `submit()` waits at least one second before re-sending after a 429. A
   `Retry-After: 0` used to re-send at once, over and over, for the whole
   one-minute retry budget.
+- `job.events()` now waits at least one second before reconnecting after a
+  `429` whose `Retry-After` is `0`, matching `submit()`/`listJobs()`;
+  previously a zero `Retry-After` reconnected without pause, for as long as the
+  job stayed non-terminal.
 
 ## [0.4.0] - 2026-09-18
 
