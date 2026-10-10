@@ -188,6 +188,18 @@ describe("Comfy", () => {
     expect(server.state.submitCount).toBe(1); // no retry loop for a non-queue_full error
   });
 
+  it("submit() keeps the server's message from a bare {message} 400 that carries no envelope", async () => {
+    const decoder =
+      "Unmarshal type error: expected=map[string]interface {}, got=string, field=workflow, offset=12";
+    server.state.jobBareError = { status: 400, message: decoder };
+    const wf = client.workflows.fromJson({ "1": {} });
+    const err = await client.submit(wf).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ComfyError);
+    expect((err as ComfyError).httpStatus).toBe(400);
+    expect((err as ComfyError).code).toBe("error");
+    expect((err as ComfyError).message).toBe(decoder);
+  });
+
   it("run() with a timeoutMs that elapses before completion rejects with the raw wait() timeout, not JobFailed", async () => {
     server.state.pollsToSucceed = 1_000_000; // never terminal within the test
     const wf = client.workflows.fromJson({ "1": {} });
