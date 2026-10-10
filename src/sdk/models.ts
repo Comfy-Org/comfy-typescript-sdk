@@ -112,7 +112,7 @@ import {
   type SubscribeOptions,
 } from "./modelRequests.js";
 import { fillRoute, type ModelId, parseModelId, routerRunQuery } from "./modelRoutes.js";
-import { parseRetryAfter } from "./routerErrors.js";
+import { parseRetryAfter, readRefusalSubject, REFUSAL_SUBJECT_HEADER } from "./routerErrors.js";
 import {
   isCollectable,
   isRetryableStatus,
@@ -628,7 +628,9 @@ export interface RunOptions {
    *   module's own jittered backoff. A `4xx` is the server's answer about
    *   this request — `content_policy_violation`, `invalid_input`,
    *   `model_not_found`, a `404`, a `422` — and sending it again would buy
-   *   the same verdict twice.
+   *   the same verdict twice. On a `content_policy_violation` the thrown
+   *   `ComfyError.refusalSubject` names which input or output was refused
+   *   when Router disclosed it, so the request worth sending is a changed one.
    * - **Collect** — the two answers Router pairs with a `Retry-After` to say
    *   "the generation your key already names is still running, ask again":
    *   a `409` naming `concurrency_limit_exceeded` and a `504` naming
@@ -893,6 +895,7 @@ const BY_ERROR_TYPE: Record<
 interface ErrorBody {
   detail?: unknown;
   error_type?: unknown;
+  refusal_subject?: unknown;
 }
 
 function describeValidationFailures(detail: readonly unknown[]): string {
@@ -943,6 +946,12 @@ function errorFromResponse(
   // Header first: it is set on every error response, and on the validation
   // shape it is the only place the bucket appears at all.
   const code = headerType ?? bodyType ?? `http_${String(status)}`;
+  // Header first, body second — the order the bucket is read in, and the order
+  // `routerErrors.toRouterError` reads the same value in for the queued surface.
+  // Not gated on `code`: Router only names a subject on a policy refusal.
+  const refusalSubject =
+    readRefusalSubject(response.headers.get(REFUSAL_SUBJECT_HEADER)) ??
+    readRefusalSubject(body?.refusal_subject);
 
   let message: string;
   if (validationFailures) {
@@ -953,7 +962,11 @@ function errorFromResponse(
     message = `HTTP ${String(status)}`;
   }
 
-  const cls = BY_ERROR_TYPE[code] ?? ComfyError;
+  // Own-property lookup only, as `routerErrors.toRouterError` does: `code` is
+  // server-supplied, and a bare index would resolve `constructor` or
+  // `toString` off `Object.prototype` — `new Object(...)` throws a `String`
+  // wrapper, not a ComfyError, and the rest are not constructors at all.
+  const cls = Object.hasOwn(BY_ERROR_TYPE, code) ? BY_ERROR_TYPE[code] : ComfyError;
   return new cls(message, {
     code,
     httpStatus: status,
@@ -968,6 +981,7 @@ function errorFromResponse(
     // `requestId` is already on the error to avoid.
     retryAfter: parseRetryAfter(response.headers),
     idempotencyKey,
+    refusalSubject,
   });
 }
 

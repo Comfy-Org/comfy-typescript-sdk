@@ -34,7 +34,11 @@
  * one-way vendored copy, and the SDK is the side that follows.
  */
 
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
+import { parse } from "yaml";
 
 import {
   readRouterOperations,
@@ -65,6 +69,7 @@ import {
   MODEL_REQUESTS_ROUTE_TEMPLATE,
 } from "./modelRequests.js";
 import { isCollectable } from "./retry.js";
+import { REFUSAL_SUBJECT_HEADER, REFUSAL_SUBJECTS } from "./routerErrors.js";
 
 describe("router route contract (spec/router-openapi.yaml)", () => {
   it("spells RUN_ROUTE_TEMPLATE the path the contract declares for runRouterModel", async () => {
@@ -523,5 +528,107 @@ describe("queued model-request routes (spec/router-openapi.yaml)", () => {
     ]) {
       expect(templatePlaceholders(template)).toEqual([...parameterNames, "request_id"]);
     }
+  });
+});
+
+/**
+ * `RouterError.refusalSubject`'s two wire names — the `X-Comfy-Refusal-Subject`
+ * header and the body's `refusal_subject` — and the `REFUSAL_SUBJECTS` list,
+ * pinned to `spec/router-openapi.yaml`.
+ *
+ * The contract spells the closed vocabulary out only in prose — both the
+ * header's and the body field's descriptions list it as backticked values after
+ * "closed vocabulary:" — and declares no `enum`, so that list is what this
+ * compares against. Both descriptions are read, so the two halves of the
+ * contract cannot drift apart without one of them reddening here.
+ */
+describe("refusal subject wire names (spec/router-openapi.yaml)", () => {
+  // Parsed as `unknown` and narrowed on every read rather than asserted to a
+  // shape: `src/**` forbids unsafe type assertions, and a spec that moved a
+  // node should redden the assertion that reads it, not reach it as a lie.
+  const doc: unknown = parse(
+    readFileSync(fileURLToPath(new URL("../../spec/router-openapi.yaml", import.meta.url)), "utf8"),
+  );
+
+  /** The value at `keys` under `value`, or `undefined` where a step is not a mapping. */
+  function at(value: unknown, ...keys: string[]): unknown {
+    let current = value;
+    for (const key of keys) {
+      if (typeof current !== "object" || current === null || Array.isArray(current)) {
+        return undefined;
+      }
+      current = Object.hasOwn(current, key) ? Reflect.get(current, key) : undefined;
+    }
+    return current;
+  }
+
+  /** The entries of `value` when it is a mapping, else none. */
+  function entries(value: unknown): [string, unknown][] {
+    return typeof value === "object" && value !== null && !Array.isArray(value)
+      ? Object.entries(value)
+      : [];
+  }
+
+  function text(value: unknown): string | undefined {
+    return typeof value === "string" ? value : undefined;
+  }
+
+  const refusalSubjectProperty = (): unknown =>
+    at(doc, "components", "schemas", "RouterErrorResponse", "properties", "refusal_subject");
+
+  function vocabulary(description: string | undefined): string[] {
+    const listed = /closed vocabulary:([^.]*)\./.exec(description ?? "")?.[1] ?? "";
+    return [...listed.matchAll(/`([^`]+)`/g)].map((match) => match[1] ?? "");
+  }
+
+  /** The name every response gives the shared RouterRefusalSubjectHeader. */
+  function refusalHeaderNames(): string[] {
+    const found: string[] = [];
+    for (const [, response] of entries(at(doc, "components", "responses"))) {
+      for (const [name, header] of entries(at(response, "headers"))) {
+        if (at(header, "$ref") === "#/components/headers/RouterRefusalSubjectHeader") {
+          found.push(name);
+        }
+      }
+    }
+    return found;
+  }
+
+  it("spells REFUSAL_SUBJECT_HEADER the header name the contract declares", () => {
+    const names = refusalHeaderNames();
+    expect(names.length, "no response declares RouterRefusalSubjectHeader").toBeGreaterThan(0);
+    for (const name of names) {
+      expect(
+        name,
+        "the vendored contract renamed the refusal-subject header — update " +
+          "REFUSAL_SUBJECT_HEADER in src/sdk/routerErrors.ts",
+      ).toBe(REFUSAL_SUBJECT_HEADER);
+    }
+  });
+
+  it("reads the body's `refusal_subject`, a string field of RouterErrorResponse", () => {
+    const property = refusalSubjectProperty();
+    expect(
+      property,
+      "RouterErrorResponse no longer declares `refusal_subject` — update the body fallback " +
+        "in src/sdk/routerErrors.ts and src/sdk/models.ts",
+    ).toBeDefined();
+    expect(at(property, "type")).toBe("string");
+  });
+
+  it("lists REFUSAL_SUBJECTS exactly as the contract's closed vocabulary", () => {
+    const fromHeader = vocabulary(
+      text(at(doc, "components", "headers", "RouterRefusalSubjectHeader", "description")),
+    );
+    const fromBody = vocabulary(text(at(refusalSubjectProperty(), "description")));
+    // Guard the prose parse itself: an empty read would make the comparison
+    // below vacuous rather than wrong.
+    expect(fromHeader.length, "could not read the header's closed vocabulary").toBeGreaterThan(0);
+    expect(fromHeader, "update REFUSAL_SUBJECTS in src/sdk/routerErrors.ts").toEqual([
+      ...REFUSAL_SUBJECTS,
+    ]);
+    expect(fromBody, "update REFUSAL_SUBJECTS in src/sdk/routerErrors.ts").toEqual([
+      ...REFUSAL_SUBJECTS,
+    ]);
   });
 });

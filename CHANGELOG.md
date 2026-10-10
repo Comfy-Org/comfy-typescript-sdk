@@ -17,6 +17,25 @@ Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
 entry. See CONTRIBUTING.md.
 -->
 
+### Added
+
+- **`refusalSubject` on `routerErrors.RouterError`, and the
+  `REFUSAL_SUBJECTS` list.** A `ContentPolicyViolation` now says which input
+  or output was refused (`"output_audio"`, `"input_image"`, …) when Router
+  names one, read from the `X-Comfy-Refusal-Subject` header and falling back
+  to the body's `refusal_subject`, so a caller can drop the one refused part
+  and retry. `null` when the response names none. It is not narrowed to the
+  ten documented values: treat an unknown value as unspecified. Only the
+  queued surface raises `RouterError` — `submit`, and a refused completion
+  from `subscribe` or `RequestHandle.get()`; `RequestHandle.status()` and
+  `RequestHandle.events()` report a refused completion as data on
+  `QueueUpdate` rather than throwing. `models.run` carries the same value on
+  `ComfyError.refusalSubject`.
+- **`ComfyError.refusalSubject`** — `comfy.models.run`'s
+  `content_policy_violation` now names the refused input/output, read from
+  `X-Comfy-Refusal-Subject` with a fallback to the body's `refusal_subject`;
+  `null` when unnamed.
+
 ## [0.5.0] - 2026-10-10
 
 ### Added
