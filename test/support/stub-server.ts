@@ -22,6 +22,12 @@ export interface ServerState {
   /** Require an Authorization header (Cloud/serverless). */
   requireAuth: boolean;
   /**
+   * When set, every authenticated request is refused 403 `sso_required` with
+   * this organization id in the envelope (`null` omits the field, as the
+   * gateway does when the org is unknown).
+   */
+  ssoRequired: { organizationId: string | null } | null;
+  /**
    * When set, `urls.self`/`events`/`cancel` in job payloads are absolute
    * URLs prefixed with this origin instead of the default relative path —
    * lets a test simulate a job whose links point at a different host (e.g.
@@ -195,6 +201,7 @@ function defaultState(): ServerState {
     rejectHashMismatch: false,
     contentBytes: Buffer.from("\x89PNG-stub-output-bytes-0123456789"),
     requireAuth: false,
+    ssoRequired: null,
     jobUrlsOrigin: null,
     queueFullTimes: 0,
     queueFullCode: "queue_full",
@@ -378,6 +385,18 @@ export class StubServer {
     if (!this.authOk(req)) {
       await readBody(req);
       sendError(res, 401, "unauthorized", "no key");
+      return;
+    }
+
+    if (state.ssoRequired !== null) {
+      await readBody(req);
+      const error: Record<string, unknown> = {
+        code: "sso_required",
+        message: "This account signs in with your organization's single sign-on",
+      };
+      if (state.ssoRequired.organizationId !== null)
+        error.organization_id = state.ssoRequired.organizationId;
+      sendJson(res, 403, { error });
       return;
     }
 

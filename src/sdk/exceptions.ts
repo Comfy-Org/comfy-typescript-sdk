@@ -21,6 +21,8 @@ export interface ComfyErrorOptions {
   retryAfter?: number | null;
   /** See {@link ComfyError.idempotencyKey}. */
   idempotencyKey?: string | null;
+  /** See {@link ComfyError.organizationId}. */
+  organizationId?: string | null;
   /** The underlying failure, when this error wraps one (a fetch abort, say). */
   cause?: unknown;
 }
@@ -79,6 +81,13 @@ export class ComfyError extends Error {
    */
   readonly idempotencyKey: string | null;
 
+  /**
+   * On `sso_required`: the organization whose single sign-on governs this key
+   * — the `organization` query parameter of Comfy Cloud's SSO start. `null` on
+   * every other code and when the server does not know it.
+   */
+  readonly organizationId: string | null;
+
   constructor(message: string, options: ComfyErrorOptions = {}) {
     super(message, "cause" in options ? { cause: options.cause } : undefined);
     this.name = new.target.name;
@@ -88,6 +97,7 @@ export class ComfyError extends Error {
     this.requestId = options.requestId ?? null;
     this.retryAfter = options.retryAfter ?? null;
     this.idempotencyKey = options.idempotencyKey ?? null;
+    this.organizationId = options.organizationId ?? null;
   }
 }
 
@@ -178,6 +188,10 @@ const BY_CODE: Record<string, ComfyErrorClass> = {
   asset_not_found: NotFound,
   unauthorized: Unauthorized,
   forbidden: Forbidden,
+  // The key is valid but the account must sign in through its organization's
+  // SSO; a Forbidden so an auth `catch` sees it, `code` stays `sso_required`,
+  // `organizationId` names the org.
+  sso_required: Forbidden,
 };
 
 /** Translate a protocol `ApiError` into the idiomatic SDK exception. */
@@ -188,14 +202,16 @@ export function toSdkError(exc: ApiError): ComfyError {
       code: exc.code,
       httpStatus: exc.httpStatus,
       details: exc.details,
+      organizationId: exc.organizationId,
     });
   }
-  const cls = BY_CODE[exc.code] ?? ComfyError;
+  const cls = Object.hasOwn(BY_CODE, exc.code) ? BY_CODE[exc.code] : ComfyError;
   return new cls(exc.message, {
     code: exc.code,
     httpStatus: exc.httpStatus,
     details: exc.details,
     retryAfter: exc.retryAfter,
+    organizationId: exc.organizationId,
   });
 }
 

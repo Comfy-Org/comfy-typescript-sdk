@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  ApiError,
   BlobNotFound,
   Forbidden,
   HashMismatch,
@@ -30,6 +31,7 @@ describe("errorFromEnvelope", () => {
     ["asset_not_found", 404, NotFound],
     ["unauthorized", 401, Unauthorized],
     ["forbidden", 403, Forbidden],
+    ["sso_required", 403, Forbidden],
   ];
 
   it.each(cases)("maps code %s to %s", (code, status, expectedClass) => {
@@ -54,6 +56,49 @@ describe("errorFromEnvelope", () => {
     );
     expect(err.retryAfter).toBe(3);
   });
+
+  it("carries organization_id through on sso_required", () => {
+    const err = errorFromEnvelope(403, {
+      error: { code: "sso_required", message: "sso", organization_id: "org_01HXYZEXAMPLE" },
+    });
+    expect(err).toBeInstanceOf(Forbidden);
+    expect(err.code).toBe("sso_required");
+    expect(err.organizationId).toBe("org_01HXYZEXAMPLE");
+  });
+
+  it("reads organizationId as null when organization_id is absent or empty", () => {
+    const absent = errorFromEnvelope(403, { error: { code: "sso_required", message: "sso" } });
+    expect(absent.organizationId).toBeNull();
+    const empty = errorFromEnvelope(403, {
+      error: { code: "sso_required", message: "sso", organization_id: "" },
+    });
+    expect(empty.organizationId).toBeNull();
+    const blank = errorFromEnvelope(403, {
+      error: { code: "sso_required", message: "sso", organization_id: "  " },
+    });
+    expect(blank.organizationId).toBeNull();
+    const forbidden = errorFromEnvelope(403, { error: { code: "forbidden", message: "no" } });
+    expect(forbidden.organizationId).toBeNull();
+  });
+
+  it("ignores organization_id on every code other than sso_required", () => {
+    const forbidden = errorFromEnvelope(403, {
+      error: { code: "forbidden", message: "no", organization_id: "org_1" },
+    });
+    expect(forbidden.organizationId).toBeNull();
+    const statusDerived = errorFromEnvelope(500, { error: { organization_id: "org_1" } });
+    expect(statusDerived.organizationId).toBeNull();
+  });
+
+  it.each(["constructor", "toString", "__proto__"])(
+    "falls back to a bare ApiError for the inherited name %s",
+    (code) => {
+      const err = errorFromEnvelope(500, { error: { code, message: "?" } });
+      expect(err).toBeInstanceOf(ApiError);
+      expect(err.constructor.name).toBe("ApiError");
+      expect(err.code).toBe(code);
+    },
+  );
 
   it("falls back to a bare ApiError for an unmapped code", () => {
     const err = errorFromEnvelope(500, { error: { code: "weird_new_code", message: "?" } });

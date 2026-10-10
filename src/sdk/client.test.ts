@@ -6,6 +6,7 @@ import { BASE_URL_ENV_VAR, Comfy } from "./client.js";
 import { CREDENTIALS_ENV_VAR } from "./credentials.js";
 import {
   ComfyError,
+  Forbidden,
   IdempotencyKeyReuse,
   InvalidWorkflow,
   QueueFull,
@@ -566,5 +567,29 @@ describe("Comfy", () => {
     const job = await client.run(wf);
     const bytes = await job.getOutputs("13")[0].toBytes({ range: [0, 3] });
     expect(Buffer.from(bytes).toString()).toBe("abcd");
+  });
+
+  it("raises sso_required as a Forbidden carrying the organization id", async () => {
+    server.state.requireAuth = true;
+    server.state.ssoRequired = { organizationId: "org_01HXYZEXAMPLE" };
+    const keyed = new Comfy({ apiKey: "comfyui-personal-key" });
+
+    const err: unknown = await keyed.jobs.get("any").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Forbidden);
+    const forbidden = err as Forbidden;
+    expect(forbidden.code).toBe("sso_required");
+    expect(forbidden.httpStatus).toBe(403);
+    expect(forbidden.organizationId).toBe("org_01HXYZEXAMPLE");
+  });
+
+  it("reads organizationId as null when sso_required names no organization", async () => {
+    server.state.requireAuth = true;
+    server.state.ssoRequired = { organizationId: null };
+    const keyed = new Comfy({ apiKey: "comfyui-personal-key" });
+
+    const err: unknown = await keyed.jobs.get("any").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Forbidden);
+    expect((err as Forbidden).code).toBe("sso_required");
+    expect((err as Forbidden).organizationId).toBeNull();
   });
 });

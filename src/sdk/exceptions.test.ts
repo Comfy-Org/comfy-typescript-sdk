@@ -34,6 +34,7 @@ describe("toSdkError", () => {
     ["asset_not_found", NotFound],
     ["unauthorized", Unauthorized],
     ["forbidden", Forbidden],
+    ["sso_required", Forbidden],
   ];
 
   it.each(cases)("maps protocol code %s to the idiomatic %s", (code, expectedClass) => {
@@ -60,6 +61,42 @@ describe("toSdkError", () => {
     const sdkError = toSdkError(apiError);
     expect(sdkError).toBeInstanceOf(NotFound);
     expect(sdkError.retryAfter).toBe(2);
+  });
+
+  it("carries organizationId onto the sso_required Forbidden, code preserved", () => {
+    const apiError = new ApiError("sso", {
+      code: "sso_required",
+      httpStatus: 403,
+      organizationId: "org_1",
+    });
+    const sdkError = toSdkError(apiError);
+    expect(sdkError).toBeInstanceOf(Forbidden);
+    expect(sdkError.code).toBe("sso_required");
+    expect(sdkError.organizationId).toBe("org_1");
+  });
+
+  it("forwards organizationId on the QueueFull branch too", () => {
+    const apiError = new ApiError("full", {
+      code: "queue_full",
+      httpStatus: 429,
+      organizationId: "org_1",
+    });
+    expect(toSdkError(apiError).organizationId).toBe("org_1");
+  });
+
+  it.each(["constructor", "toString", "__proto__"])(
+    "falls back to a bare ComfyError for the inherited name %s",
+    (code) => {
+      const sdkError = toSdkError(new ApiError("?", { code, httpStatus: 500 }));
+      expect(sdkError).toBeInstanceOf(ComfyError);
+      expect(sdkError.constructor.name).toBe("ComfyError");
+    },
+  );
+
+  it("defaults organizationId to null", () => {
+    expect(
+      toSdkError(new ApiError("no", { code: "forbidden", httpStatus: 403 })).organizationId,
+    ).toBeNull();
   });
 });
 
