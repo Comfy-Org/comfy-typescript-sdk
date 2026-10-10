@@ -68,6 +68,31 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # A release must be described before it ships: refuse a tag whose version
+      # has no `## [X.Y.Z]` section in CHANGELOG.md. Without this, a tag can be
+      # cut straight off `## [Unreleased]`, and the changelog silently loses that
+      # release (0.4.0 shipped that way). Prereleases (`-rc.1` and the like) are
+      # exempt, so a release candidate does not need its own section; any
+      # `+build` metadata is ignored when matching.
+      - name: Require a CHANGELOG section for the release version
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          VERSION="${VERSION%%+*}"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "Prerelease ${VERSION}: no CHANGELOG section required."
+            exit 0
+          fi
+          if ! grep -qF "## [${VERSION}]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [${VERSION}]' section. Cut the changelog for ${VERSION} (move its entries out of '## [Unreleased]') and merge that before publishing ${TAG}."
+            exit 1
+          fi
+          echo "CHANGELOG.md describes ${VERSION}."
+
       # Tag-driven versioning: the release tag (vX.Y.Z) is the source of truth.
       # Inject it into package.json before build/pack so the published tarball
       # carries the tag's version. (On a workflow_dispatch dry run there is no

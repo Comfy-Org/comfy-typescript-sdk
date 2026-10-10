@@ -223,7 +223,10 @@ to sign. `.github/CODEOWNERS` makes every file require review from
   `.github/workflows/publish.yml` injects the release tag's version at build
   time, so the committed value is a placeholder. `pnpm build` regenerates
   `src/low/version.ts` from whatever `package.json` says, so a version edit
-  shows up as an unexpected dirty file.
+  shows up as an unexpected dirty file. What a release DOES need is its
+  changelog: the publish workflow refuses a `vX.Y.Z` tag unless
+  `CHANGELOG.md` has a `## [X.Y.Z]` section, so cut the changelog in a PR
+  before tagging (prereleases are exempt).
 - **`oxfmt` formats Markdown, not just TypeScript.** `pnpm format:check` fails
   on an unformatted `.md` file, so a docs-only PR can fail the `test` job. Run
   `pnpm format` after editing any Markdown.
