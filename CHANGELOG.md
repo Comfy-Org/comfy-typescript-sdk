@@ -123,6 +123,11 @@ entry. See CONTRIBUTING.md.
   `content_policy_violation` now names the refused input/output, read from
   `X-Comfy-Refusal-Subject` with a fallback to the body's `refusal_subject`;
   `null` when unnamed.
+- **`routerErrors.QueueBacklogFull`** for the `queue_backlog_full` bucket: a
+  queued submit refused with `429` because you already have too many queued
+  requests waiting. Nothing was submitted or charged; submit again once some
+  of your queued requests finish. It shares `429` with
+  `ConcurrencyLimitExceeded`, and `errorType` tells them apart.
 
 ### Changed
 

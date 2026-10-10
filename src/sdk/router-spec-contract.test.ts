@@ -38,6 +38,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
+import { parse } from "yaml";
 
 import {
   readRouterOperations,
@@ -68,7 +69,7 @@ import {
   MODEL_REQUESTS_ROUTE_TEMPLATE,
 } from "./modelRequests.js";
 import { isCollectable } from "./retry.js";
-import { REFUSAL_SUBJECT_HEADER } from "./routerErrors.js";
+import { REFUSAL_SUBJECT_HEADER, REFUSAL_SUBJECTS } from "./routerErrors.js";
 
 describe("router route contract (spec/router-openapi.yaml)", () => {
   it("spells RUN_ROUTE_TEMPLATE the path the contract declares for runRouterModel", async () => {
@@ -288,6 +289,14 @@ const ROUTE_COVERAGE: Record<string, { method: keyof typeof models | null; why: 
       "it is not needed to invoke a model, since `list()` already yields the identity fields " +
       "`run()` and `schema()` take. Exposing it is additive and unblocked; it is left out here " +
       "only because nothing has asked for it yet.",
+  },
+  estimateRouterModelCost: {
+    method: null,
+    why:
+      "the pre-run price quote (`POST .../estimate`), which no `comfy.models` method reaches " +
+      "yet. It runs nothing and charges nothing, so `run()` does not depend on it, and the " +
+      "contract has it answering `403 not_enabled` while it rolls out. Exposing it is additive " +
+      "and belongs in its own change, with its Python twin.",
   },
   submitRouterModelRequest: {
     method: "submit",
@@ -524,32 +533,81 @@ describe("queued model-request routes (spec/router-openapi.yaml)", () => {
 
 /**
  * `RouterError.refusalSubject`'s two wire names — the `X-Comfy-Refusal-Subject`
- * header and the body's `refusal_subject` — and the `REFUSAL_SUBJECTS` list.
+ * header and the body's `refusal_subject` — and the `REFUSAL_SUBJECTS` list,
+ * pinned to `spec/router-openapi.yaml`.
  *
- * The upstream contract declares them, but the vendored copy predates that
- * change, so there is nothing here to compare them against yet. This is a rot
- * guard, not a pin: it fails the day a sync brings either name into
- * `spec/router-openapi.yaml`. When it fires, replace it with a comparison of
- * `REFUSAL_SUBJECT_HEADER`, the body field and `REFUSAL_SUBJECTS` in
- * `src/sdk/routerErrors.ts` against what the spec declares.
+ * The contract spells the closed vocabulary out only in prose — both the
+ * header's and the body field's descriptions list it as backticked values after
+ * "closed vocabulary:" — and declares no `enum`, so that list is what this
+ * compares against. Both descriptions are read, so the two halves of the
+ * contract cannot drift apart without one of them reddening here.
  */
 describe("refusal subject wire names (spec/router-openapi.yaml)", () => {
-  it("are not declared by the vendored contract yet", () => {
-    const spec = readFileSync(
-      fileURLToPath(new URL("../../spec/router-openapi.yaml", import.meta.url)),
-      "utf8",
-    ).toLowerCase();
-    // Both needles are spelled out rather than read off REFUSAL_SUBJECT_HEADER,
-    // so a misspelled constant cannot silence the guard meant to catch it; the
-    // first expectation keeps the constant honest in the meantime.
-    expect(REFUSAL_SUBJECT_HEADER).toBe("X-Comfy-Refusal-Subject");
-    for (const name of ["X-Comfy-Refusal-Subject", "refusal_subject"]) {
-      expect(
-        spec.includes(name.toLowerCase()),
-        `spec/router-openapi.yaml now declares ${name} — pin REFUSAL_SUBJECT_HEADER, the ` +
-          "body's `refusal_subject` and REFUSAL_SUBJECTS in src/sdk/routerErrors.ts against " +
-          "it and replace this rot guard",
-      ).toBe(false);
+  type Doc = {
+    components?: {
+      headers?: Record<string, { description?: string }>;
+      responses?: Record<string, { headers?: Record<string, { $ref?: string }> }>;
+      schemas?: Record<
+        string,
+        { properties?: Record<string, { type?: string; description?: string }> }
+      >;
+    };
+  };
+  const doc = parse(
+    readFileSync(fileURLToPath(new URL("../../spec/router-openapi.yaml", import.meta.url)), "utf8"),
+  ) as Doc;
+
+  function vocabulary(description: string | undefined): string[] {
+    const listed = /closed vocabulary:([^.]*)\./.exec(description ?? "")?.[1] ?? "";
+    return [...listed.matchAll(/`([^`]+)`/g)].map((match) => match[1] ?? "");
+  }
+
+  /** The name every response gives the shared RouterRefusalSubjectHeader. */
+  function refusalHeaderNames(): string[] {
+    const found: string[] = [];
+    for (const response of Object.values(doc.components?.responses ?? {})) {
+      for (const [name, header] of Object.entries(response.headers ?? {})) {
+        if (header.$ref === "#/components/headers/RouterRefusalSubjectHeader") found.push(name);
+      }
     }
+    return found;
+  }
+
+  it("spells REFUSAL_SUBJECT_HEADER the header name the contract declares", () => {
+    const names = refusalHeaderNames();
+    expect(names.length, "no response declares RouterRefusalSubjectHeader").toBeGreaterThan(0);
+    for (const name of names) {
+      expect(
+        name,
+        "the vendored contract renamed the refusal-subject header — update " +
+          "REFUSAL_SUBJECT_HEADER in src/sdk/routerErrors.ts",
+      ).toBe(REFUSAL_SUBJECT_HEADER);
+    }
+  });
+
+  it("reads the body's `refusal_subject`, a string field of RouterErrorResponse", () => {
+    const property = doc.components?.schemas?.RouterErrorResponse?.properties?.refusal_subject;
+    expect(
+      property,
+      "RouterErrorResponse no longer declares `refusal_subject` — update the body fallback " +
+        "in src/sdk/routerErrors.ts and src/sdk/models.ts",
+    ).toBeDefined();
+    expect(property?.type).toBe("string");
+  });
+
+  it("lists REFUSAL_SUBJECTS exactly as the contract's closed vocabulary", () => {
+    const fromHeader = vocabulary(doc.components?.headers?.RouterRefusalSubjectHeader?.description);
+    const fromBody = vocabulary(
+      doc.components?.schemas?.RouterErrorResponse?.properties?.refusal_subject?.description,
+    );
+    // Guard the prose parse itself: an empty read would make the comparison
+    // below vacuous rather than wrong.
+    expect(fromHeader.length, "could not read the header's closed vocabulary").toBeGreaterThan(0);
+    expect(fromHeader, "update REFUSAL_SUBJECTS in src/sdk/routerErrors.ts").toEqual([
+      ...REFUSAL_SUBJECTS,
+    ]);
+    expect(fromBody, "update REFUSAL_SUBJECTS in src/sdk/routerErrors.ts").toEqual([
+      ...REFUSAL_SUBJECTS,
+    ]);
   });
 });
