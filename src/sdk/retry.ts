@@ -141,6 +141,13 @@ export const NO_RETRY: RetryPolicy = Object.freeze({
  * caller off the rollout ramp is the one who would otherwise spend a full
  * retry budget on an answer that cannot change within it.
  *
+ * `queue_timeout` is here for the same reason as `not_enabled`, and matters
+ * more: it arrives on a `504`, which the `status >= 500` rule DOES retry, so
+ * without this entry a queued poll or collect that met an admission timeout
+ * burned the whole retry budget re-asking — piling load on the very queue that
+ * had just reported it could not admit the work. The contract calls the bucket
+ * terminal and says to submit a new request rather than re-read this one.
+ *
  * The bucket that is deliberately NOT here is `service_unavailable`: it is
  * the one answer whose condition clears on its own, so it stays retryable and
  * a `503` carrying it climbs out through the ordinary backoff below, replayed
@@ -151,6 +158,7 @@ export const TERMINAL_ERROR_TYPES: ReadonlySet<string> = new Set([
   "invalid_input",
   "model_not_found",
   "not_enabled",
+  "queue_timeout",
 ]);
 
 function nonNegative(value: number | undefined, fallback: number, label: string): number {

@@ -145,7 +145,95 @@ export async function readRouterRouteContract(specPath = ROUTER_SPEC_PATH) {
     serverUrl,
     parameterNames: pathParameterNames(doc, pathItem, pathItem.post),
     retryAfterStatuses: retryAfterStatuses(doc, pathItem),
+    runSuccessHeaders: runSuccessHeaders(doc, pathItem),
+    runSuccessHeaderNames: runSuccessHeaderNames(doc, pathItem),
   };
+}
+
+/**
+ * The headers the run route's `200` declares, as
+ * `{ <header name>: <component name the $ref points at>, required }`.
+ *
+ * The acquisition half of the `IDEMPOTENT_REPLAYED_HEADER` pin in
+ * `src/sdk/router-spec-contract.test.ts`. Three things are wanted there and
+ * the raw name alone gives none of them: the SPELLING the SDK reads a header
+ * by (a name wrong by one segment reports "absent" forever, which is a silent
+ * failure rather than a loud one), the COMPONENT it resolves to (so a sync
+ * that repoints the name at some other header's definition is visible), and
+ * `required` (the presence semantics `parseReplayed` encodes — a header
+ * declared `required: true` could not be read as a marker by its arrival).
+ *
+ * The `$ref` is read UNRESOLVED on purpose: resolving it yields the
+ * description and schema, which is exactly what a repointed `$ref` would
+ * change without changing anything comparable. `required` is read resolved,
+ * because that is where it is written.
+ */
+export function runSuccessHeaders(doc, pathItem) {
+  const responses = deref(doc, pathItem.post.responses ?? {});
+  const ok = deref(doc, responses["200"] ?? {});
+  if (ok === null || typeof ok !== "object") {
+    fail(`spec/router-openapi.yaml: ${RUN_OPERATION_ID} declares no \`200\` response`);
+  }
+  const headers = ok.headers ?? {};
+  if (headers === null || typeof headers !== "object" || Object.keys(headers).length === 0) {
+    fail(
+      `spec/router-openapi.yaml: ${RUN_OPERATION_ID}'s \`200\` declares no response headers. ` +
+        "An empty set would read as agreement with any constant.",
+    );
+  }
+  const byName = {};
+  for (const [name, raw] of Object.entries(headers)) {
+    const ref = raw !== null && typeof raw === "object" ? raw.$ref : undefined;
+    const component =
+      typeof ref === "string" && ref.startsWith("#/components/headers/")
+        ? ref.slice("#/components/headers/".length)
+        : null;
+    const resolved = deref(doc, raw);
+    if (resolved === null || typeof resolved !== "object") {
+      fail(`spec/router-openapi.yaml: malformed response header ${JSON.stringify(name)}`);
+    }
+    byName[name] = { component, required: resolved.required === true };
+  }
+  return byName;
+}
+
+/**
+ * The header names the run route's `200` declares, lowercased and sorted.
+ *
+ * This is the acquisition half of the credits-header pin in
+ * `src/sdk/router-spec-contract.test.ts`, which compares `CREDITS_USED_HEADER`
+ * in `src/sdk/models.ts` against the name the contract declares. That constant
+ * spent one release pinned to NOTHING, because the vendored contract did not
+ * declare `X-Comfy-Credits-Used`; the sync that brought
+ * `RouterCreditsUsedHeader` is what turned the rot guard that stood there into
+ * a real comparison.
+ *
+ * Unlike {@link retryAfterStatuses} this does NOT fail on an empty result: a
+ * `200` legitimately need not declare headers, so reporting the empty set is a
+ * truthful read. It DOES fail when there is no `200` to read at all. The caller is where that becomes an assertion — the pin
+ * demands the credits header be present AND spelled the way the SDK spells it,
+ * so a sync that drops the header reddens there rather than passing vacuously
+ * here.
+ */
+export function runSuccessHeaderNames(doc, pathItem) {
+  return okHeaderNames(doc, pathItem.post, "`runRouterModel`");
+}
+
+/**
+ * The header names a declared `200` carries, lowercased and sorted. An
+ * operation that declares NO `200` — a sync that moved success to `201` or to
+ * the `2XX` range form — is refused rather than read as "declares no
+ * headers", which would let an absent success response pass as agreement.
+ */
+function okHeaderNames(doc, operation, label) {
+  const responses = deref(doc, operation.responses ?? {});
+  const ok = deref(doc, responses["200"]);
+  if (ok === null || typeof ok !== "object") {
+    fail(`spec/router-openapi.yaml: ${label} declares no \`200\` response`);
+  }
+  return Object.keys(deref(doc, ok.headers ?? {}))
+    .map((name) => name.toLowerCase())
+    .sort();
 }
 
 /**
@@ -159,7 +247,18 @@ export async function readRouterRouteContract(specPath = ROUTER_SPEC_PATH) {
  * contract moved the header and nothing compared the two. Read off the run
  * route rather than off the shared `components/responses`, because it is what
  * THIS operation can answer with that the predicate is about.
+ *
+ * Only the COLLECT pace counts. The contract declares two `Retry-After`
+ * header components with opposite meanings: `RouterRetryAfterHeader` (re-send
+ * the same `Idempotency-Key` to collect a generation still running — what
+ * `isCollectable` is about) and `RouterCapacityRetryAfterHeader` (the request
+ * was refused for capacity before anything was submitted; just send it again
+ * later — there is nothing to collect). A `Retry-After` referencing anything
+ * else fails, so a third kind cannot be silently counted as either.
  */
+const COLLECT_RETRY_AFTER_REF = "#/components/headers/RouterRetryAfterHeader";
+const RESEND_RETRY_AFTER_REF = "#/components/headers/RouterCapacityRetryAfterHeader";
+
 export function retryAfterStatuses(doc, pathItem) {
   const responses = deref(doc, pathItem.post.responses ?? {});
   const statuses = [];
@@ -167,26 +266,38 @@ export function retryAfterStatuses(doc, pathItem) {
     const response = deref(doc, rawResponse);
     if (response === null || typeof response !== "object") continue;
     const headers = response.headers ?? {};
-    if (Object.keys(headers).some((name) => name.toLowerCase() === "retry-after")) {
-      // OpenAPI also allows `default` and the `4XX`/`5XX` range forms as
-      // response keys. `Number()` turns those into `NaN`, which compares
-      // unequal to everything (itself included) — the "reads as agreement"
-      // failure this script exists to refuse, arriving through the other
-      // door. Refuse loudly instead: the predicate matches exact statuses.
-      if (!/^\d{3}$/.test(status)) {
-        fail(
-          `spec/router-openapi.yaml: ${RUN_OPERATION_ID} declares a \`Retry-After\` header on ` +
-            `response key ${JSON.stringify(status)}, which is not a single numeric status. ` +
-            "The predicate it is compared against (`isCollectable`) matches exact statuses.",
-        );
-      }
-      statuses.push(Number(status));
+    const retryAfter = Object.entries(headers).find(
+      ([name]) => name.toLowerCase() === "retry-after",
+    )?.[1];
+    if (retryAfter === undefined) continue;
+    const ref = retryAfter?.$ref;
+    if (ref === RESEND_RETRY_AFTER_REF) continue;
+    if (ref !== COLLECT_RETRY_AFTER_REF) {
+      fail(
+        `spec/router-openapi.yaml: ${RUN_OPERATION_ID}'s ${status} declares a \`Retry-After\` ` +
+          `that references ${JSON.stringify(ref ?? null)}, neither ${COLLECT_RETRY_AFTER_REF} ` +
+          `(collect) nor ${RESEND_RETRY_AFTER_REF} (resend). Decide which one it is and ` +
+          "teach retryAfterStatuses in scripts/router-route-contract.mjs.",
+      );
     }
+    // OpenAPI also allows `default` and the `4XX`/`5XX` range forms as
+    // response keys. `Number()` turns those into `NaN`, which compares
+    // unequal to everything (itself included) — the "reads as agreement"
+    // failure this script exists to refuse, arriving through the other
+    // door. Refuse loudly instead: the predicate matches exact statuses.
+    if (!/^\d{3}$/.test(status)) {
+      fail(
+        `spec/router-openapi.yaml: ${RUN_OPERATION_ID} declares a \`Retry-After\` header on ` +
+          `response key ${JSON.stringify(status)}, which is not a single numeric status. ` +
+          "The predicate it is compared against (`isCollectable`) matches exact statuses.",
+      );
+    }
+    statuses.push(Number(status));
   }
   if (statuses.length === 0) {
     fail(
       `spec/router-openapi.yaml: ${RUN_OPERATION_ID} declares no response carrying a ` +
-        "`Retry-After` header. An empty list would read as agreement with any predicate.",
+        "collect `Retry-After` header. An empty list would read as agreement with any predicate.",
     );
   }
   return statuses.sort((a, b) => a - b);
@@ -306,6 +417,36 @@ export function routerOperations(doc) {
 /** {@link routerOperations} for the vendored contract on disk. */
 export async function readRouterOperations(specPath = ROUTER_SPEC_PATH) {
   return routerOperations(parse(await readFile(specPath, "utf-8")));
+}
+
+/**
+ * The header names one operation's `200` declares, lowercased and sorted.
+ *
+ * {@link runSuccessHeaderNames} for any operation, located by `operationId`
+ * rather than by the run route's path item. The queued result read
+ * (`getRouterModelRequestResult`) uses it: `RequestHandle.collect` lifts the
+ * same `X-Comfy-Credits-Used` header off that `200`, and the contract test
+ * watches whether the contract declares it there. An operation that is not
+ * declared at all, or that declares no `200`, is refused rather than read as
+ * "no headers", for the same reason every extractor here refuses an empty
+ * read. (A duplicated `operationId` never reaches here: {@link
+ * routerOperations} already refuses it, naming both declarations.)
+ */
+export function successHeaderNames(doc, operationId) {
+  const matches = routerOperations(doc).filter(
+    (operation) => operation.operationId === operationId,
+  );
+  if (matches.length !== 1) {
+    fail(`spec/router-openapi.yaml declares no operation ${JSON.stringify(operationId)}`);
+  }
+  const { path, method } = matches[0];
+  const operation = deref(doc, doc.paths[path])[method];
+  return okHeaderNames(doc, operation, `\`${operationId}\``);
+}
+
+/** {@link successHeaderNames} for the vendored contract on disk. */
+export async function readSuccessHeaderNames(operationId, specPath = ROUTER_SPEC_PATH) {
+  return successHeaderNames(parse(await readFile(specPath, "utf-8")), operationId);
 }
 
 /**

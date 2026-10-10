@@ -17,6 +17,152 @@ Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
 entry. See CONTRIBUTING.md.
 -->
 
+## [0.5.0] - 2026-10-10
+
+### Added
+
+- **The rest of a job's state is readable off the handle.** `Job` held the
+  whole v2 job model privately and re-exported four fields, so a caller who
+  wanted a run's duration had to cast past `private` to reach the timestamps.
+  Eight read-only accessors now cover the remainder of the wire contract:
+  `createdAt` and `expiresAt` (`Date`), `startedAt` and `completedAt`
+  (`Date | null` — both are nullable on the wire, and a duration is
+  `completedAt` minus `startedAt`), `progress`, `queuePosition`, `metrics` and
+  `urls`. They read whatever state the handle currently holds, exactly like
+  `id`/`status` — nothing re-fetches implicitly — and the object-valued three
+  hand back a snapshot copy so editing the result cannot rewrite the handle's
+  own links. `progress` is the same `Progress` the event stream yields (which
+  now also carries `currentNodeClass`). Comfy Cloud's poll response has been
+  reported to carry `progress: null` even for a running job, so
+  `job.events()` remains the live-progress source there. Where the wire field is nullable, an absent or unusable value
+  reads as "none" rather than as an `Invalid Date` or an empty snapshot; where
+  it is required and non-nullable (`createdAt`, `expiresAt`, `urls`) a
+  response that omits it raises `ComfyError` (`unexpected_response`) instead
+  of handing back a `Date` that silently compares false against everything, or
+  a `{}` typed as a full set of links.
+- **Job labels: `submit()` takes `metadata`, and `client.listJobs()` finds
+  jobs by it.** `metadata` is a map of your own string keys to string values,
+  sent as the body's `metadata`; a submit without it sends the same request
+  as before. `job.metadata` returns the labels (an empty object when there
+  are none). `client.listJobs({ metadata, limit, signal })` lists your jobs
+  newest first, filtered by up to three labels, as an async iterator that
+  fetches page by page; a 429 on a page is retried as `submit()` retries one.
+  The SDK also checks each listed job against the filter, so a server that
+  ignores it yields only matching jobs. A `next_cursor` the walk has already
+  followed raises `ComfyError` with code `unexpected_response` instead of
+  fetching the same pages forever.
+  A rejected map raises `ComfyError` with code `metadata_invalid`. Needs a
+  server that supports job metadata: Comfy Cloud answers a labelled submit
+  with `metadata_not_supported` and the list with `not_implemented` (501),
+  and a self-hosted proxy keeps no labels (a filtered list yields nothing
+  there).
+- **`RunJsonResult.replayed` / `RunBinaryResult.replayed`** — `true` when
+  Router served the call from its `Idempotency-Key` record (`Idempotent-Replayed`)
+  rather than by running the model again, so a replayed result can be told from
+  a fresh charge: a replay restates the original run and is not billed a second
+  time, so a spend tracker must skip it rather than add it up again. Derived
+  from the header's PRESENCE, because Router omits it on a fresh run rather
+  than sending `false`. It happens on this SDK's own collect loop (the same-key
+  re-send after a paced `409`/`504`) and on a caller's own retry under a
+  supplied `idempotencyKey`. Always `false` from `RequestHandle.get()` — the
+  queued result route carries no replay marker — so deduplicate re-collection
+  by `RequestHandle.requestId` instead. OPTIONAL on both interfaces for the
+  same source-compatibility reason as `creditsUsed` below; every result this
+  SDK returns sets it.
+- **`creditsUsed` on a run result — what Router priced the call at.** Both
+  arms of `RunResult` (`RunJsonResult` and `RunBinaryResult`) now carry the
+  `X-Comfy-Credits-Used` response header. The queued result
+  (`RequestHandle.get()`, and so `comfy.models.subscribe`) reads it too, but
+  the contract does not declare it on the queued result route, so there it is
+  unpinned: expect `null`, and reconcile spend against the workspace ledger if
+  it matters (calling `run` for the price is a second, billed generation).
+  Typed `string | null`, verbatim off the wire:
+  the value is decimal and a caller reconciling money should parse it
+  deliberately rather than receive a float this SDK chose the rounding of.
+  Three caveats it is worth reading the TSDoc for — it is a price rather than
+  a settled ledger entry, `null` means "not reported" and never "free", and a
+  reported `"0"` is a real cost, so branch on presence (`creditsUsed != null`)
+  rather than on the value being non-zero. A blank header is normalized to
+  `null` for that last reason: passed through, `""` would clear a presence
+  check and then read as a cost of zero. The field is OPTIONAL on both
+  interfaces so that a consumer's own `RunJsonResult`/`RunBinaryResult`
+  literal — a test double written against `0.4.0`, which shipped these
+  interfaces without it — keeps compiling; every result this SDK returns sets
+  it. Success-only, per the Router contract: the header is written on the path
+  that returns a result, so a Router refusal carries no cost. A priced `200`
+  that the SDK then refuses client-side (`response_too_large`, a body-read
+  timeout, an empty or non-JSON body) throws a `ComfyError` with no cost on
+  it, so reconcile those failures against the workspace ledger.
+- **`routerErrors.QueueBacklogFull`** for the `queue_backlog_full` bucket: a
+  queued submit refused with `429` because you already have too many queued
+  requests waiting. Nothing was submitted or charged; submit again once some
+  of your queued requests finish. It shares `429` with
+  `ConcurrencyLimitExceeded`, and `errorType` tells them apart.
+
+### Changed
+
+- **Breaking:** `new Comfy()` now resolves `COMFY_API_KEY`, matching the Python
+  SDK. The class client takes its credential from the explicit `apiKey` option,
+  then from `COMFY_API_KEY` in the environment (trimmed; blank counts as unset,
+  and it is read per construction), then — targeting Comfy Cloud, which always
+  requires one — throws `MissingCredentials` at construction naming both ways to
+  supply it, before any request. `comfy.models.*` already read that variable;
+  the class client did not, so `new Comfy()` used to send no `Authorization`
+  header and come back with a bare `401` from the server. Pointing
+  `COMFY_BASE_URL` at another deployment keeps the keyless flow: an unresolved
+  key there is not an error and means "send no credentials". A `COMFY_API_KEY`
+  set in the environment, though, is now sent to that deployment too, as the
+  Python SDK does — unset it for a keyless target. The
+  `new Comfy({ apiKey: process.env.COMFY_API_KEY })` workaround in the README
+  is gone. **Note for callers who relied on the old behaviour:** `new Comfy()`
+  against Comfy Cloud with no key anywhere now throws locally instead of failing
+  on the first call, and an `apiKey` that is not a string — including `null`, as
+  a JSON config file spells "absent" — now throws a `TypeError` at
+  construction. Pass `undefined` (or omit the field) to fall back to the
+  environment.
+
+### Fixed
+
+- **`idempotencyKey` is now stamped onto _every_ error `comfy.models.run` and `comfy.models.submit` throw, including raw transport failures and aborts.** Previously only the `run` response-path `ComfyError` carried it; undici's transport-failure `TypeError` ("fetch failed"), an already-aborted signal's `AbortError`, and the queue path's `RouterError` (e.g. a bare `502` `ProviderError`) all escaped without it. On a transport failure the server never minted an `X-Comfy-Request-Id`, so the key is the only value that correlates the failure to the server-side record. It is now attached as an own `idempotencyKey` property on the raw throwable (its class, `name`, message and stack are otherwise untouched), and `routerErrors.RouterError` gained a typed `idempotencyKey` field. A failure to collect a generation additionally carries the `Retry-After` pace Router named, rather than reporting none. Where the throwable is one the caller owns and other calls share — an `AbortController`'s `signal.reason`, which `fetch` hands to every concurrent call on that controller — each call receives an equivalent per-call error carrying ITS OWN key instead, so no caller reads a key belonging to another generation and `controller.signal.reason` is left unmodified. Mirrors the Python SDK's `exceptions.translating(idempotency_key=…)`.
+- **The `droppedParams` doc comments now match the vendored Router contract.**
+  The TSDoc on `parseDroppedParams` and `RunJsonResult.droppedParams` still
+  described the pre-sync spec: it called the declared
+  `X-Comfy-Router-Dropped-Params` schema a defect that would be reverted, and
+  said only an explicit `modelProvider` translation could populate the field.
+  The spec declares that header as one JSON-encoded string deliberately — each
+  entry is a sentence carrying commas of its own — and names an automatic
+  `fallback_provider` retry as a second producer, so a call that never set
+  `modelProvider` can still come back with a non-null `droppedParams`. Comments
+  only; the parsing and the header handling are unchanged.
+- `retryAfter` on a `ComfyError` from a `Comfy` method (`submit()`,
+  `client.jobs.get()`, asset and output calls) now carries the server's
+  `Retry-After` on every error. Only `QueueFull` kept it before; every other
+  error had `null` even when the header was sent.
+- `submit()` waits at least one second before re-sending after a 429. A
+  `Retry-After: 0` used to re-send at once, over and over, for the whole
+  one-minute retry budget.
+
+## [0.4.0] - 2026-09-18
+
+### Added
+
+- **Comfy Router alt-provider controls on `comfy.models.run` —
+  `modelProvider`, `strictMode` and `fallbackProvider`.** Three optional
+  `RunOptions` fields, sent as the `model_provider`, `strict_mode` and
+  `fallback_provider` query params on the synchronous run route.
+  `modelProvider` selects an alternate serving provider (e.g. `"fal"`);
+  `strictMode` (default `false`) toggles native ↔ provider translation, and
+  `true` passes the provider's own raw shape both ways; `fallbackProvider`
+  accepts `"false"` to opt out of provider-fallback. Each is sent ONLY when
+  set, so a run that names none of the three is byte-for-byte the request it
+  always was. These are run-route only — the queued `submit`/`subscribe`
+  surface does not accept them.
+- **Three queue-tier `routerErrors` classes — `Cancelled`, `QueueTimeout`
+  and `RequestNotFound`** — for the `cancelled`, `queue_timeout` and
+  `request_not_found` buckets the vendored Router contract now declares, so a
+  queued failure carrying one of them is a typed `catch` rather than a bare
+  `RouterError`.
+
 ## [0.3.0] - 2026-09-14
 
 ### Added
@@ -466,7 +612,10 @@ First public release of the Comfy API v2 TypeScript SDK (`@comfyorg/sdk`).
   Cloud, and serverless: upload and dedup inputs, submit a workflow, follow it
   (poll or SSE), and download outputs. Requires Node >= 22.
 
-[Unreleased]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.9...v0.2.0
 [0.1.9]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.7...v0.1.8

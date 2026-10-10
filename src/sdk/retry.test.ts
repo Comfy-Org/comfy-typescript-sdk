@@ -93,6 +93,14 @@ describe("isRetryableStatus", () => {
     expect(isRetryableStatus(503, "service_unavailable")).toBe(true);
     expect(TERMINAL_ERROR_TYPES.has("service_unavailable")).toBe(false);
     expect(TERMINAL_ERROR_TYPES.has("not_enabled")).toBe(true);
+    // `queue_timeout` arrives on a 504, which the `status >= 500` rule retries,
+    // so without this entry an admission timeout burns the whole retry budget
+    // re-asking the queue that just said it could not admit the work.
+    expect(TERMINAL_ERROR_TYPES.has("queue_timeout")).toBe(true);
+    expect(isRetryableStatus(504, "queue_timeout")).toBe(false);
+    // Still retryable when the 504 carries no error type at all — a gateway
+    // timeout with nothing claiming it is terminal is the transient case.
+    expect(isRetryableStatus(504, null)).toBe(true);
   });
 
   it("leaves a 403 unretried whichever bucket names it", () => {

@@ -99,6 +99,8 @@ import {
   Forbidden,
   InsufficientCredits,
   NotFound,
+  stampIdempotencyKey,
+  stamping,
   Unauthorized,
 } from "./exceptions.js";
 import {
@@ -109,7 +111,7 @@ import {
   type SubmitOptions,
   type SubscribeOptions,
 } from "./modelRequests.js";
-import { fillRoute, type ModelId, parseModelId } from "./modelRoutes.js";
+import { fillRoute, type ModelId, parseModelId, routerRunQuery } from "./modelRoutes.js";
 import { parseRetryAfter } from "./routerErrors.js";
 import {
   isCollectable,
@@ -205,6 +207,114 @@ export const ERROR_TYPE_HEADER = "X-Comfy-Error-Type";
 export const CONTENT_TYPE_HEADER = "Content-Type";
 
 /**
+ * `X-Comfy-Router-Fallback-Provider` — the provider that actually served a call
+ * that fell back. See {@link RunJsonResult.servingProvider}.
+ */
+export const FALLBACK_PROVIDER_HEADER = "X-Comfy-Router-Fallback-Provider";
+
+/**
+ * `X-Comfy-Router-Dropped-Params` — native fields an alt-provider translation
+ * could not carry. See {@link RunJsonResult.droppedParams}.
+ */
+export const DROPPED_PARAMS_HEADER = "X-Comfy-Router-Dropped-Params";
+
+/**
+ * `Idempotent-Replayed` — present (and `true`) only when Router served this
+ * response from an `Idempotency-Key`'s record instead of running the model
+ * again. See {@link RunJsonResult.replayed}. Pinned against the vendored
+ * contract's `RouterIdempotentReplayedHeader` in `router-spec-contract.test.ts`.
+ */
+export const IDEMPOTENT_REPLAYED_HEADER = "Idempotent-Replayed";
+
+/**
+ * Whether the `Idempotent-Replayed` header was present.
+ *
+ * Presence, not value: Router omits the header on a fresh run rather than
+ * sending `false`, and its own contract says so in as many words ("branch on
+ * its presence"). So a `false` on the wire — which nothing is documented to
+ * send, but which a proxy or a future server could — still reads as a replay,
+ * because the only thing the header's arrival can mean is that this answer
+ * came off the record.
+ */
+export function parseReplayed(raw: string | null): boolean {
+  return raw !== null;
+}
+
+/**
+ * `X-Comfy-Credits-Used` — what Router priced this call at, in credits. See
+ * {@link RunJsonResult.creditsUsed}.
+ *
+ * Pinned against the vendored contract: `runRouterModel`'s `200` declares
+ * `X-Comfy-Credits-Used` (as `RouterCreditsUsedHeader`), and
+ * `router-spec-contract.test.ts` asserts this constant spells that declared
+ * name. Until the sync that brought it, this was the one header constant in
+ * this file pinned to nothing, watched by a rot guard in that same file —
+ * because the drift it would suffer is SILENT: a name wrong by one segment
+ * reports `creditsUsed: null` on every run forever, which is indistinguishable
+ * from the "Router reported no cost" this field is documented to mean.
+ */
+export const CREDITS_USED_HEADER = "X-Comfy-Credits-Used";
+
+/**
+ * Normalize the `X-Comfy-Credits-Used` header value.
+ *
+ * Trimmed, and a BLANK value read as absent rather than passed through. An
+ * empty header is not a price: handed back verbatim it arrives as `""`, which
+ * survives the documented `creditsUsed != null` presence check and then reads
+ * as a reported cost of zero through `Number("")` — precisely the
+ * free-versus-not-reported collapse {@link RunJsonResult.creditsUsed} is typed
+ * `string | null` to prevent. Trimming is the same discipline `declaredLength`
+ * applies to `Content-Length` and `mediaTypeOf` applies to `Content-Type`.
+ *
+ * Any other value is handed back VERBATIM, and that is deliberate — including
+ * the one `Headers.get` joins out of a header sent twice (`"0.42, 0.42"`).
+ * Nothing here guesses at a price: picking one of two figures would invent a
+ * charge, and collapsing a cost that WAS reported into `null` would claim the
+ * one thing that value is documented to mean — that it was not.
+ *
+ * That puts the shape check on the caller, and the obvious parses do not do
+ * it for you: `parseFloat("0.42, 0.42")` silently returns `0.42` (the very
+ * pick refused above), and `Number("0.42, 0.42")` returns `NaN` without
+ * throwing, which then poisons any running total it is added to. Validate the
+ * string before trusting it as one figure (for example against
+ * `/^\d+(\.\d+)?$/`).
+ */
+export function parseCreditsUsed(raw: string | null): string | null {
+  if (raw === null) return null;
+  const value = raw.trim();
+  return value === "" ? null : value;
+}
+
+/**
+ * Parse the `X-Comfy-Router-Dropped-Params` header value.
+ *
+ * The spec (`spec/router-openapi.yaml`, `RouterDroppedParamsHeader`) declares
+ * this header as `type: string`: ONE JSON-encoded string holding an array of
+ * strings. It says to decode it with a JSON parser rather than splitting it on
+ * commas, because each entry is a sentence that carries commas of its own —
+ * the spec's own example entry reads `moderation (fal applies its own,
+ * non-configurable safety filtering)`, which a comma split would tear into two
+ * meaningless fragments.
+ *
+ * So: `JSON.parse`, and accept the result only when it is an array of strings.
+ * On anything that is not JSON — or is JSON but not an array of strings — keep
+ * the raw value as ONE entry rather than guessing at delimiters: a single entry
+ * a human can read beats two confident fragments.
+ */
+export function parseDroppedParams(raw: string | null): readonly string[] | null {
+  if (raw === null) return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (Array.isArray(parsed) && parsed.every((x): x is string => typeof x === "string")) {
+      return parsed;
+    }
+  } catch {
+    // Not JSON — fall through to the single-entry reading below.
+  }
+  return [raw];
+}
+
+/**
  * A completed {@link Models.run} whose result was a JSON document.
  *
  * @typeParam TData - the provider's payload shape. It defaults to `unknown`,
@@ -227,6 +337,127 @@ export interface RunJsonResult<TData = unknown> {
    * Comfy genuinely does not.
    */
   requestId: string | null;
+  /**
+   * `X-Comfy-Router-Fallback-Provider`: the provider that ultimately served this
+   * call, when `fallbackProvider` retried against a second one and that retry
+   * succeeded — never a provider that was attempted and also failed.
+   *
+   * `null` means the provider that was asked for served it, which is the common
+   * case; it does not mean "unknown". This is the ONLY disclosure of the
+   * difference: an alt-provider response is translated back to the model's own
+   * native contract, so `data` alone is identical either way.
+   */
+  servingProvider: string | null;
+  /**
+   * `X-Comfy-Router-Dropped-Params`: native fields the translation that produced
+   * this call's request body could not express exactly on the provider that
+   * served it. Each entry normally names the field and why — but not
+   * guaranteed: {@link parseDroppedParams} keeps a header that is not a JSON
+   * array of strings as ONE entry holding the raw wire value, so an entry can
+   * be that raw value rather than a field-plus-reason disclosure.
+   *
+   * TWO things produce such a translation: an explicit
+   * {@link RunOptions.modelProvider} under the default `strictMode: false`, and
+   * an automatic `fallback_provider` retry — which is ON by default and
+   * independent of `modelProvider` (see {@link RunOptions.fallbackProvider}).
+   * So a call that never set `modelProvider` can still come back with a
+   * non-null value here: the primary attempt failed, and the retry translated
+   * the native body into the other provider's schema to re-send it.
+   *
+   * On a fallback retry the list names what THAT retry's translation dropped,
+   * never the primary attempt's — pair it with
+   * {@link RunJsonResult.servingProvider} to see which provider it refers to.
+   *
+   * `null` when no translation ran, and when one ran and dropped nothing — the
+   * server omits the header in both cases. `strictMode: true` is NOT on its own
+   * a guarantee of `null`: the spec scopes `strict_mode` to `modelProvider`
+   * ("only meaningful together with `model_provider`"), so it suppresses that
+   * translation only and does not govern the automatic fallback retry. Turn
+   * {@link RunOptions.fallbackProvider} off too if you need that guarantee.
+   *
+   * Prefer an explicit `!== null` check over a truthiness test: the server
+   * omitting the header gives `null`, but a present-but-empty header (`"[]"`)
+   * parses to an empty array, which is a non-null empty disclosure.
+   */
+  droppedParams: readonly string[] | null;
+  /**
+   * `Idempotent-Replayed`: `true` when Router answered this call from the
+   * record held against its `Idempotency-Key` rather than by running the model
+   * again.
+   *
+   * A replay is not charged a second time. It happens on this SDK's own
+   * collect loop (a same-key re-send after a `409 concurrency_limit_exceeded`
+   * or `504 deadline_exceeded`) and on a caller's own retry under a supplied
+   * `idempotencyKey`. On a replay every disclosure field RESTATES the original
+   * run rather than describing a second one, so a spend tracker must SKIP a
+   * result with `replayed: true` instead of adding its cost up again.
+   *
+   * Derived from the header's PRESENCE, exactly as the Python SDK's
+   * `RouterRunResult.replayed` is: Router omits the header on a fresh run
+   * rather than sending `false`. Always `false` on a result from
+   * {@link RequestHandle.get}: the queued result route never carries the
+   * header, and re-collecting the same handle is deduplicated by
+   * `RequestHandle.requestId` instead.
+   *
+   * OPTIONAL only for source compatibility, on the same terms as
+   * {@link creditsUsed}: every result this SDK constructs sets it, and the `?`
+   * keeps a consumer's own result literal written against 0.4.0 compiling. A
+   * hand-built literal that omits it reads as `undefined`, which is falsy —
+   * "not a replay" — so `if (result.replayed)` needs no extra care.
+   */
+  replayed?: boolean;
+
+  /**
+   * `X-Comfy-Credits-Used`: what Router priced this call at, verbatim — a
+   * decimal string (`"12.5"`). The contract does not fix its scale, so do not
+   * round or store it at a fixed number of places.
+   *
+   * Three things it is not, and each of them changes what you may do with it:
+   *
+   * - **It is a price, not a settled ledger entry.** It is what Router
+   *   computed as it answered this call, not a posted balance movement. The
+   *   workspace's ledger is reconciled server-side and can disagree — a
+   *   refund, a correction, a replay that is not charged a second time. Show
+   *   it and reconcile against it; do not treat it as the authoritative
+   *   charge.
+   * - **`null` means "not reported", never "free".** A response carrying no
+   *   header says nothing at all about the cost, and a substantial share of
+   *   real Router runs carry none today even where the cost is known. Summing
+   *   `null` as zero understates spend.
+   * - **`"0"` is a real reported cost.** A genuinely free call and an
+   *   unreported one are different answers, so branch on PRESENCE
+   *   (`creditsUsed != null`) and never on the value being non-zero — the
+   *   falsiness of `"0"`'s numeric reading is exactly the bug.
+   *
+   * Success-only, and that is the contract's own word rather than this SDK's
+   * choice: `RouterCreditsUsedHeader` says it "is written only on the path
+   * that returns a result, which a refused call never reaches". That covers
+   * Router's own refusals: an error response carries no cost to lift. It does
+   * NOT cover a `200` that Router priced and this SDK then refuses
+   * client-side — a body over the size cap (`response_too_large`), a
+   * body-read timeout, or an empty or non-JSON body. That call throws a
+   * {@link ComfyError}, which carries no credits field, so its cost is not
+   * reported to the caller even though Router charged it. Reconcile such a
+   * failure against the workspace ledger rather than assuming it was free.
+   *
+   * `string | null` rather than `number | null` on purpose, the same way
+   * {@link droppedParams} keeps the server's own shape: the wire value is
+   * decimal, `Number("")` and `Number(null)` are both `0`, and a caller
+   * reconciling money should not silently receive a float nothing asked it to
+   * parse. Parse it deliberately, and check the result: `Number` answers `NaN`
+   * rather than throwing on a value that is not one decimal, and `parseFloat`
+   * quietly reads only its leading figure (see {@link parseCreditsUsed}).
+   *
+   * OPTIONAL only for source compatibility. Every result this SDK constructs
+   * sets the field, so a value read off a real run is `string | null` and
+   * never `undefined`; the `?` is there so a consumer's own `RunJsonResult`
+   * literal — a test double written against 0.4.0, which shipped these two
+   * interfaces without this field — still compiles. That is also why the
+   * presence check above is the loose `!= null` rather than `!== null`: it is
+   * the one form that reads a hand-built literal's missing field the same way
+   * it reads an unstamped response.
+   */
+  creditsUsed?: string | null;
 }
 
 /**
@@ -253,6 +484,14 @@ export interface RunBinaryResult {
   contentType: string;
   /** As {@link RunJsonResult.requestId}. */
   requestId: string | null;
+  /** As {@link RunJsonResult.servingProvider}. */
+  servingProvider: string | null;
+  /** As {@link RunJsonResult.droppedParams}. */
+  droppedParams: readonly string[] | null;
+  /** As {@link RunJsonResult.replayed}, optional for the same reason. */
+  replayed?: boolean;
+  /** As {@link RunJsonResult.creditsUsed}, optional for the same reason. */
+  creditsUsed?: string | null;
 }
 
 /**
@@ -276,6 +515,24 @@ export interface RunBinaryResult {
  * ```
  */
 export type RunResult<TData = unknown> = RunJsonResult<TData> | RunBinaryResult;
+
+/**
+ * A {@link RunResult} as this SDK CONSTRUCTS one: every optional field set.
+ *
+ * `replayed` and `creditsUsed` are optional on the two published interfaces purely so a
+ * consumer's own result literal still compiles against them (see
+ * {@link RunJsonResult.creditsUsed}). Inside this package the opposite rule
+ * has to hold: a return site that omits it answers `undefined`, which a
+ * caller's documented `creditsUsed != null` check reads as "Router reported
+ * no cost" — the free-versus-not-reported confusion this field was added to
+ * end, arriving through the back door of the compatibility marker that ends
+ * it for everyone else. So the SDK's own producers are typed as this, and the
+ * compiler names the omission rather than a caller meeting it as a charge
+ * that went missing.
+ */
+export type BuiltRunResult<TData = unknown> =
+  | (RunJsonResult<TData> & Required<Pick<RunJsonResult<TData>, "replayed" | "creditsUsed">>)
+  | (RunBinaryResult & Required<Pick<RunBinaryResult, "replayed" | "creditsUsed">>);
 
 export interface RunOptions {
   /**
@@ -315,6 +572,15 @@ export interface RunOptions {
    *
    * Every attempt within one call — the first and each retry — sends the
    * same key, whichever way it was obtained.
+   *
+   * **Resend the alt-provider controls with it.** A key's identity covers the
+   * QUERY as well as the method and body, and {@link modelProvider},
+   * {@link strictMode} and {@link fallbackProvider} are query parameters — so a
+   * recovery call that supplies the key but drops them presents the same key
+   * under a different query, is refused, and leaves the very generation it was
+   * meant to collect uncollectable. This bites at the server default too:
+   * `strictMode: false` is sent as `strict_mode=false`, which is a different
+   * query from omitting it. Replay the call exactly as it was made.
    */
   idempotencyKey?: string;
   /**
@@ -379,6 +645,39 @@ export interface RunOptions {
    * `retry: false` is one attempt, collect included.
    */
   retry?: RetryOptions | false;
+  /**
+   * Select an alternate serving provider for this model — Comfy Router's
+   * `model_provider` query param (e.g. `"fal"`). Omitted, the model runs on its
+   * default provider and the request is byte-for-byte what it always was.
+   *
+   * Under the default `strictMode` (`false`) the `input` you pass stays this
+   * model's own native shape and Router translates it to the alternate
+   * provider's schema on the way in and the response back to native on the way
+   * out. See {@link strictMode} and {@link fallbackProvider} for the two knobs
+   * that ride with it — all three are sent ONLY when set, so a call that names
+   * none of them is unchanged.
+   */
+  modelProvider?: string;
+  /**
+   * `strict_mode` — only meaningful alongside {@link modelProvider}. `false`
+   * (the default) has Router translate between this model's native shape and the
+   * alternate provider's own schema in both directions; `true` sends and returns
+   * that provider's raw shape unchanged, so `input` must already BE that
+   * provider's schema and no translation happens either way. Rendered on the
+   * wire as `true`/`false`.
+   */
+  strictMode?: boolean;
+  /**
+   * `fallback_provider` — pass `false` to opt out of Router retrying a failed
+   * call against the model's other registered provider. Any other value, or
+   * omitting it, leaves provider-fallback on (the default).
+   *
+   * Prefer the boolean. The spec turns fallback on for ANY value that is not
+   * exactly `false`, so `"False"`, `"0"`, `"no"` and `"off"` all type-check and
+   * then do the opposite of what they read as — a `boolean` cannot be spelled
+   * wrong, and is normalised to the wire spelling for you.
+   */
+  fallbackProvider?: boolean | string;
 }
 
 /**
@@ -454,9 +753,15 @@ export interface Models {
    * call.
    *
    * The ergonomic form for a caller who does want to wait but also wants to
-   * show progress while waiting. It resolves to `RunResult<TData>`, identical
-   * to what {@link Models.run} would have returned for the same model and
-   * input.
+   * show progress while waiting. It resolves to `RunResult<TData>`, the same
+   * shape {@link Models.run} returns for the same model and input — with one
+   * difference in what it carries: {@link RunJsonResult.creditsUsed}. The
+   * Router contract declares `X-Comfy-Credits-Used` on the synchronous run
+   * route but not on the queued result route, so the queued value is
+   * unpinned and a caller should expect `null` ("not reported", never
+   * "free") here, and reconcile spend against the workspace ledger if it
+   * matters. Calling {@link Models.run} to learn the price is a second,
+   * separately billed generation, not a lookup of this one.
    *
    * ```ts
    * const { data } = await comfy.models.subscribe(
@@ -544,8 +849,11 @@ export interface Models {
  */
 export const RUN_ROUTE_TEMPLATE = "/v2/models/{provider}/{model}";
 
-function runUrl(baseUrl: string, id: ModelId): string {
-  return `${baseUrl}${fillRoute(RUN_ROUTE_TEMPLATE, id)}`;
+function runUrl(baseUrl: string, id: ModelId, query: string): string {
+  // `query` is already percent-encoded (`routerRunQuery`) and empty for a call
+  // that named no alt-provider control, so nothing is appended and the URL is
+  // byte-for-byte the one this route has always built.
+  return `${baseUrl}${fillRoute(RUN_ROUTE_TEMPLATE, id)}${query === "" ? "" : `?${query}`}`;
 }
 
 /**
@@ -955,7 +1263,16 @@ async function run<TData = unknown>(
     );
   }
 
-  const url = runUrl(resolveBaseUrl(), id);
+  // The alt-provider controls, as a query string that is empty unless the
+  // caller set one — so the URL, and the whole request, is unchanged for a run
+  // that names none of them. Built once, outside the retry loop, since every
+  // attempt of this one logical call goes to the same URL.
+  const query = routerRunQuery({
+    modelProvider: options.modelProvider,
+    strictMode: options.strictMode,
+    fallbackProvider: options.fallbackProvider,
+  });
+  const url = runUrl(resolveBaseUrl(), id, query);
   // Minted once, outside the retry loop: every attempt of this one logical
   // call sends the SAME key. The server records the first response against
   // it and replays that for a repeat, so a retry after a lost or 5xx-ed
@@ -1013,113 +1330,141 @@ async function run<TData = unknown>(
     if (collectingAt === null) retryAttempt += 1;
     else collectAttempt += 1;
   };
-  for (;;) {
-    const remainingMs = clock().remainingMs;
-    const signal = composeSignal(options.signal, remainingMs);
-    let response: Response;
-    let responseBody: Uint8Array = EMPTY_BODY;
-    // Non-null once this response has been classified as one to ask again
-    // about, and is then the backoff before that re-ask.
-    let repeatAfterMs: number | null = null;
-    try {
-      // `withInactivityLimits` derives undici's own headers/body timers from
-      // the same remaining budget as `signal`. Without it this call is capped
-      // at undici's 300s default however long the deadline says, which is
-      // fatal here specifically: the server holds this one request open for
-      // the whole generation, so nothing arrives on it — not even response
-      // headers — until the model has finished.
-      response = await fetch(
-        url,
-        withInactivityLimits({ method: "POST", headers, body, signal }, remainingMs),
-      );
+  // Everything the loop can throw leaves stamped with the key: the raw
+  // `TypeError`/`DOMException` a transport failure or a caller's abort
+  // re-throws below carries no other handle back to the server-side record,
+  // and comfy-api never minted a request id for a call that never landed. The
+  // three `ComfyError`s inside already carry the key, so the stamp is a no-op
+  // on them. The pre-mint input checks above stay OUTSIDE, unstamped, as in
+  // Python — there is no key to stamp before one is minted.
+  return stamping(idempotencyKey, runLoop, {
+    // The caller's own signal: `fetch` rejects with its `reason`, and that one
+    // object is shared by every concurrent call on the same `AbortController`,
+    // so the stamp must hand this call a private stand-in rather than write our
+    // key onto state the caller (and their other calls) still hold.
+    callerSignal: options.signal,
+  });
 
-      const errorType = response.headers.get(ERROR_TYPE_HEADER);
-      const retryAfter = parseRetryAfter(response.headers);
-
-      // Classified from the status line and the headers, BEFORE the body is
-      // touched. What a response means is not something its body decides
-      // here, and deciding it first is what keeps the cap from overruling it:
-      // a retryable 502 behind an oversized CDN error page stays retryable,
-      // and a collectable 409/504 stays collectable, instead of a cap breach
-      // turning either into a fatal error with the budget unspent and a
-      // generation still running.
-      //
-      // Collect first, and EXCLUSIVELY: a `deadline_exceeded` 504 is a 5xx
-      // too, so both branches would take it — but they are different actions
-      // on different budgets, and the server's own verdict about what it is
-      // holding wins over this module's guess. Which also means a collect
-      // that runs out of `collectBudgetMs` raises rather than falling back
-      // into the ordinary backoff: the class is decided per failure, not
-      // retried in both. `retryAfter !== null` is redundant with
-      // `isCollectable`, which refuses a missing pace — it is written out so
-      // the call below needs no cast.
-      if (retryAfter !== null && isCollectable(response.status, errorType, retryAfter)) {
-        collectingAt = retryAfter;
-        // `null` here means out of collect budget (or past the deadline) —
-        // fall through to the 409/504 the server last gave, which carries its
-        // own `Retry-After` for a caller who wants to re-ask by hand.
-        repeatAfterMs = nextDelayMs();
-      } else if (isRetryableStatus(response.status, errorType)) {
-        // Mid-collect this is still a collect: the 5xx is the re-ask failing
-        // to land, not a verdict on the generation, so it is paced and
-        // budgeted as one (`nextDelayMs` reads `collectingAt`). `null` is out
-        // of budget — fall through and raise the last failure the server
-        // actually gave, rather than a synthetic "retries exhausted".
-        repeatAfterMs = nextDelayMs();
-      }
-
-      if (repeatAfterMs === null) {
-        // Inside the same `try` as the fetch on purpose: the deadline covers
-        // body consumption too, so a signal that fires while the result is
-        // still streaming rejects HERE, and translating it in only one of the
-        // two places would leak a bare DOMException out of the other.
-        //
-        // Bytes rather than `response.text()`, because this route's 200 is not
-        // always a text document: a partner whose generation IS the response
-        // body answers with its own media type, and `text()` would UTF-8-decode
-        // those bytes lossily and irreversibly before anything got to look at
-        // the `Content-Type`. Decoding is deferred to the one branch that wants
-        // a string ({@link decodeUtf8}), which is what `text()` would have done
-        // anyway.
-        responseBody = await readBodyWithin(response, maxBytes, model, idempotencyKey);
-      } else {
-        // Never read: the whole content of a response this call is going to
-        // ask again about is "ask again", which the status line already said.
-        // Dropping it spends neither the download nor the cap on it.
-        await response.body?.cancel().catch(() => undefined);
-      }
-    } catch (exc) {
-      // A body this call would not buffer leaves the loop immediately. It is a
-      // verdict about THIS response, not a transport failure, and the retry
-      // loop sitting around the read is exactly what would make it expensive:
-      // every attempt would re-download the same oversized body until the
-      // budget expired, multiplying the cost of the one thing that already
-      // failed.
-      if (isTooLarge(exc)) throw exc;
-      if (isTimeout(exc, options.signal)) {
-        throw new ComfyError(
-          `models.run("${model}") exceeded its ${String(timeoutMs)}ms deadline before the model finished; ` +
-            "raise it with timeoutMs, or pass timeoutMs: null and your own signal",
-          { code: "request_timeout", cause: exc, idempotencyKey, retryAfter: collectingAt },
+  async function runLoop(): Promise<RunResult<TData>> {
+    for (;;) {
+      const remainingMs = clock().remainingMs;
+      const signal = composeSignal(options.signal, remainingMs);
+      let response: Response;
+      let responseBody: Uint8Array = EMPTY_BODY;
+      // Non-null once this response has been classified as one to ask again
+      // about, and is then the backoff before that re-ask.
+      let repeatAfterMs: number | null = null;
+      try {
+        // `withInactivityLimits` derives undici's own headers/body timers from
+        // the same remaining budget as `signal`. Without it this call is capped
+        // at undici's 300s default however long the deadline says, which is
+        // fatal here specifically: the server holds this one request open for
+        // the whole generation, so nothing arrives on it — not even response
+        // headers — until the model has finished.
+        response = await fetch(
+          url,
+          withInactivityLimits({ method: "POST", headers, body, signal }, remainingMs),
         );
-      }
-      // A caller's abort is theirs: never retried, never re-dressed.
-      if (options.signal?.aborted) throw exc;
-      const delay = nextDelayMs();
-      if (delay === null) throw exc;
-      // Abortable, so an abort during the backoff stops the loop here rather
-      // than sleeping out the delay and sending one more attempt.
-      await abortableSleep(delay, options.signal);
-      countAttempt();
-      continue;
-    }
 
-    if (repeatAfterMs !== null) {
-      await abortableSleep(repeatAfterMs, options.signal);
-      countAttempt();
-      continue;
+        const errorType = response.headers.get(ERROR_TYPE_HEADER);
+        const retryAfter = parseRetryAfter(response.headers);
+
+        // Classified from the status line and the headers, BEFORE the body is
+        // touched. What a response means is not something its body decides
+        // here, and deciding it first is what keeps the cap from overruling it:
+        // a retryable 502 behind an oversized CDN error page stays retryable,
+        // and a collectable 409/504 stays collectable, instead of a cap breach
+        // turning either into a fatal error with the budget unspent and a
+        // generation still running.
+        //
+        // Collect first, and EXCLUSIVELY: a `deadline_exceeded` 504 is a 5xx
+        // too, so both branches would take it — but they are different actions
+        // on different budgets, and the server's own verdict about what it is
+        // holding wins over this module's guess. Which also means a collect
+        // that runs out of `collectBudgetMs` raises rather than falling back
+        // into the ordinary backoff: the class is decided per failure, not
+        // retried in both. `retryAfter !== null` is redundant with
+        // `isCollectable`, which refuses a missing pace — it is written out so
+        // the call below needs no cast.
+        if (retryAfter !== null && isCollectable(response.status, errorType, retryAfter)) {
+          collectingAt = retryAfter;
+          // `null` here means out of collect budget (or past the deadline) —
+          // fall through to the 409/504 the server last gave, which carries its
+          // own `Retry-After` for a caller who wants to re-ask by hand.
+          repeatAfterMs = nextDelayMs();
+        } else if (isRetryableStatus(response.status, errorType)) {
+          // Mid-collect this is still a collect: the 5xx is the re-ask failing
+          // to land, not a verdict on the generation, so it is paced and
+          // budgeted as one (`nextDelayMs` reads `collectingAt`). `null` is out
+          // of budget — fall through and raise the last failure the server
+          // actually gave, rather than a synthetic "retries exhausted".
+          repeatAfterMs = nextDelayMs();
+        }
+
+        if (repeatAfterMs === null) {
+          // Inside the same `try` as the fetch on purpose: the deadline covers
+          // body consumption too, so a signal that fires while the result is
+          // still streaming rejects HERE, and translating it in only one of the
+          // two places would leak a bare DOMException out of the other.
+          //
+          // Bytes rather than `response.text()`, because this route's 200 is not
+          // always a text document: a partner whose generation IS the response
+          // body answers with its own media type, and `text()` would UTF-8-decode
+          // those bytes lossily and irreversibly before anything got to look at
+          // the `Content-Type`. Decoding is deferred to the one branch that wants
+          // a string ({@link decodeUtf8}), which is what `text()` would have done
+          // anyway.
+          responseBody = await readBodyWithin(response, maxBytes, model, idempotencyKey);
+        } else {
+          // Never read: the whole content of a response this call is going to
+          // ask again about is "ask again", which the status line already said.
+          // Dropping it spends neither the download nor the cap on it.
+          await response.body?.cancel().catch(() => undefined);
+        }
+      } catch (exc) {
+        // A body this call would not buffer leaves the loop immediately. It is a
+        // verdict about THIS response, not a transport failure, and the retry
+        // loop sitting around the read is exactly what would make it expensive:
+        // every attempt would re-download the same oversized body until the
+        // budget expired, multiplying the cost of the one thing that already
+        // failed.
+        if (isTooLarge(exc)) throw exc;
+        if (isTimeout(exc, options.signal)) {
+          throw new ComfyError(
+            `models.run("${model}") exceeded its ${String(timeoutMs)}ms deadline before the model finished; ` +
+              "raise it with timeoutMs, or pass timeoutMs: null and your own signal",
+            { code: "request_timeout", cause: exc, idempotencyKey, retryAfter: collectingAt },
+          );
+        }
+        // A caller's abort is theirs: never retried, never re-dressed.
+        if (options.signal?.aborted) throw exc;
+        const delay = nextDelayMs();
+        // Out of budget. If this call was COLLECTING, `collectingAt` holds the
+        // pace Router named on the 409/504 that started the collect, and the
+        // generation is still the server's to hand over — so the failure goes
+        // back carrying that pace, exactly as the sibling `request_timeout`
+        // branch above does. Without this the outer stamp would default
+        // `retryAfter` to `null` and tell the caller the server named no pace,
+        // when the SDK knew one.
+        if (delay === null)
+          throw stampIdempotencyKey(exc, idempotencyKey, {
+            callerSignal: options.signal,
+            retryAfter: collectingAt,
+          });
+        // Abortable, so an abort during the backoff stops the loop here rather
+        // than sleeping out the delay and sending one more attempt.
+        await abortableSleep(delay, options.signal);
+        countAttempt();
+        continue;
+      }
+
+      if (repeatAfterMs !== null) {
+        await abortableSleep(repeatAfterMs, options.signal);
+        countAttempt();
+        continue;
+      }
+      return finish<TData>(model, response, responseBody, idempotencyKey);
     }
-    return finish<TData>(model, response, responseBody, idempotencyKey);
   }
 }
 
@@ -1182,8 +1527,22 @@ function finish<TData>(
   response: Response,
   responseBody: Uint8Array,
   idempotencyKey: string,
-): RunResult<TData> {
+): BuiltRunResult<TData> {
   const requestId = response.headers.get(REQUEST_ID_HEADER);
+  // Read before any branch returns: these disclose HOW the call ran (which
+  // provider served it, what a translation dropped), and an alt-provider
+  // response is translated back to the native contract, so the body alone
+  // cannot tell an alt-provider run from a native one.
+  const servingProvider = response.headers.get(FALLBACK_PROVIDER_HEADER);
+  const droppedParams = parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER));
+  // Read here for the same reason: whether this answer came off the
+  // `Idempotency-Key`'s record or from a run that really happened is not
+  // recoverable from the body, which a replay restates verbatim.
+  const replayed = parseReplayed(response.headers.get(IDEMPOTENT_REPLAYED_HEADER));
+  // Read here for the same reason, and kept as the raw header string: what the
+  // call COST is not recoverable from the body either, and `null` has to stay
+  // distinguishable from a reported `"0"`.
+  const creditsUsed = parseCreditsUsed(response.headers.get(CREDITS_USED_HEADER));
   if (!response.ok) throw errorFromResponse(response, decodeUtf8(responseBody), idempotencyKey);
 
   // A 202 is a task handle, not a result. This route is the synchronous one,
@@ -1227,7 +1586,16 @@ function finish<TData>(
   const contentType = response.headers.get(CONTENT_TYPE_HEADER)?.trim() ?? "";
   const mediaType = mediaTypeOf(contentType);
   if (mediaType !== "" && !isJsonMediaType(mediaType)) {
-    return { kind: "binary", data: responseBody, contentType, requestId };
+    return {
+      kind: "binary",
+      data: responseBody,
+      contentType,
+      requestId,
+      servingProvider,
+      droppedParams,
+      replayed,
+      creditsUsed,
+    };
   }
 
   let data: unknown;
@@ -1247,7 +1615,16 @@ function finish<TData>(
     // contradicting its own header, which no caller can do anything useful
     // with a `Uint8Array` of.
     if (mediaType === "") {
-      return { kind: "binary", data: responseBody, contentType: "", requestId };
+      return {
+        kind: "binary",
+        data: responseBody,
+        contentType: "",
+        requestId,
+        servingProvider,
+        droppedParams,
+        replayed,
+        creditsUsed,
+      };
     }
     throw new ComfyError(
       `models.run("${model}") returned a ${String(response.status)} whose body is not JSON`,
@@ -1260,7 +1637,15 @@ function finish<TData>(
       },
     );
   }
-  return { kind: "json", data: data as TData, requestId };
+  return {
+    kind: "json",
+    data: data as TData,
+    requestId,
+    servingProvider,
+    droppedParams,
+    replayed,
+    creditsUsed,
+  };
 }
 
 // -- discovery: the model catalog, and one model's published schemas ---------

@@ -34,16 +34,15 @@
  * one-way vendored copy, and the SDK is the side that follows.
  */
 
-import { readFile } from "node:fs/promises";
-
 import { describe, expect, it } from "vitest";
-import { parse } from "yaml";
 
 import {
   readRouterOperations,
   readRouterRouteContract,
+  readSuccessHeaderNames,
   routerOperations,
-  ROUTER_SPEC_PATH,
+  runSuccessHeaderNames,
+  successHeaderNames,
   templatePlaceholders,
 } from "../../scripts/router-route-contract.mjs";
 import { withRouterStub } from "../../test/support/router-stub-server.js";
@@ -51,6 +50,10 @@ import { comfy } from "./comfy.js";
 import { COMFY_ROUTER_BASE_URL, config } from "./credentials.js";
 import {
   CATALOG_ROUTE_TEMPLATE,
+  CREDITS_USED_HEADER,
+  DROPPED_PARAMS_HEADER,
+  FALLBACK_PROVIDER_HEADER,
+  IDEMPOTENT_REPLAYED_HEADER,
   models,
   RUN_ROUTE_TEMPLATE,
   SCHEMA_ROUTE_TEMPLATE,
@@ -71,6 +74,96 @@ describe("router route contract (spec/router-openapi.yaml)", () => {
       "the vendored Router contract moved the runRouterModel path — update RUN_ROUTE_TEMPLATE " +
         "in src/sdk/models.ts to match it (comfy.models.run 404s until you do)",
     ).toBe(RUN_ROUTE_TEMPLATE);
+  });
+
+  it("spells IDEMPOTENT_REPLAYED_HEADER the replay marker the contract declares", async () => {
+    // The same pinning the route templates get, for the one header whose
+    // drift is SILENT in both directions. `parseReplayed` reads this header by
+    // its PRESENCE, so a constant wrong by one character reports
+    // `replayed: false` on every replay forever — indistinguishable from the
+    // fresh run the field is there to tell a replay apart from — and a
+    // contract that made the header `required: true` would mean its arrival no
+    // longer marks anything, which is the other half of the same assumption.
+    const { runSuccessHeaders } = await readRouterRouteContract();
+    const declared = runSuccessHeaders[IDEMPOTENT_REPLAYED_HEADER];
+    expect(
+      declared,
+      `the vendored Router contract's runRouterModel 200 no longer declares a ` +
+        `\`${IDEMPOTENT_REPLAYED_HEADER}\` header — update IDEMPOTENT_REPLAYED_HEADER in ` +
+        "src/sdk/models.ts to whatever it declares instead (every run reports replayed: false " +
+        "until you do, which reads as a fresh charge on a call that was not charged)",
+    ).toBeDefined();
+    expect(
+      declared?.component,
+      `${IDEMPOTENT_REPLAYED_HEADER} now resolves to a different header component`,
+    ).toBe("RouterIdempotentReplayedHeader");
+    expect(
+      declared?.required,
+      "the contract now declares the replay marker `required` — it would then be sent on a " +
+        "fresh run too, and parseReplayed in src/sdk/models.ts must stop reading it as a " +
+        "presence flag and read its VALUE instead",
+    ).toBe(false);
+  });
+
+  /**
+   * The pin for `CREDITS_USED_HEADER`, which until the sync that landed
+   * `RouterCreditsUsedHeader` was the one header constant in
+   * `src/sdk/models.ts` pinned to NOTHING.
+   *
+   * It matters more than the other two because its drift is SILENT. A route
+   * that moves 404s loudly; a credits header name wrong by one segment reports
+   * `creditsUsed: null` on every run forever, which is exactly the value the
+   * field is documented to carry when Router reported no cost. Nothing else in
+   * the repo could catch it: the stub hard-codes the same literal the SDK
+   * expects, so SDK and fixture agree with each other while both disagree with
+   * Router.
+   *
+   * This replaces the rot guard that stood here while the contract declared no
+   * credits header — it watched for the arrival, and the arrival happened. The
+   * name it brought MATCHES the constant, so the SDK was reading the right
+   * header all along; this is what keeps that true through the next sync.
+   */
+  it("spells CREDITS_USED_HEADER the credits header the contract declares on runRouterModel's 200", async () => {
+    const { runSuccessHeaderNames } = await readRouterRouteContract();
+    // Sanity: the read works at all. A selector that silently returned nothing
+    // would satisfy an "is it declared" check vacuously, which is the "empty
+    // set reads as agreement" failure this file exists to refuse.
+    expect(runSuccessHeaderNames).toContain(FALLBACK_PROVIDER_HEADER.toLowerCase());
+    expect(runSuccessHeaderNames).toContain(DROPPED_PARAMS_HEADER.toLowerCase());
+
+    const credits = runSuccessHeaderNames.filter((name) => name.includes("credits"));
+    expect(
+      credits,
+      "the vendored Router contract changed which credits headers runRouterModel's 200 " +
+        "declares. Exactly one is expected, and CREDITS_USED_HEADER in src/sdk/models.ts is " +
+        "the SDK's copy of its name. If the header was REMOVED, comfy.models.run now reports " +
+        "creditsUsed: null on every call and this pin is how you found out — do not delete it " +
+        "to go green.",
+    ).toEqual([CREDITS_USED_HEADER.toLowerCase()]);
+  });
+
+  /**
+   * The queued twin of the pin above — and a ROT GUARD, because today there
+   * is nothing to pin it to.
+   *
+   * `RequestHandle.collect` lifts `creditsUsed` off `getRouterModelRequestResult`'s
+   * `200` with the same `CREDITS_USED_HEADER`, but that response declares no
+   * credits header, so a queued result's `creditsUsed` is coupled to nothing
+   * the contract states and will read `null` until Router both stamps and
+   * declares it. This asserts that absence, so the sync that declares it
+   * reddens here: when it fires, replace this with the pin above's shape
+   * (exactly `[CREDITS_USED_HEADER.toLowerCase()]`) rather than deleting it.
+   */
+  it("still declares no credits header on the queued result read (rot guard)", async () => {
+    const declared = await readSuccessHeaderNames("getRouterModelRequestResult");
+    // Sanity: the read works at all, so an empty read cannot pass as "absent".
+    expect(declared).toContain("x-comfy-request-id");
+    expect(
+      declared.filter((name) => name.includes("credits")),
+      "getRouterModelRequestResult's 200 now declares a credits header. Replace this rot " +
+        "guard with a pin that its name equals CREDITS_USED_HEADER in src/sdk/models.ts, " +
+        "which RequestHandle.collect in src/sdk/modelRequests.ts already reads.",
+    ).toEqual([]);
   });
 
   it("spells COMFY_ROUTER_BASE_URL the host the contract declares", async () => {
@@ -192,6 +285,38 @@ const ROUTE_COVERAGE: Record<string, { method: keyof typeof models | null; why: 
       "`run()` and `schema()` take. Exposing it is additive and unblocked; it is left out here " +
       "only because nothing has asked for it yet.",
   },
+  estimateRouterModelCost: {
+    method: null,
+    why:
+      "the pre-run price quote (`POST .../estimate`), which no `comfy.models` method reaches " +
+      "yet. It runs nothing and charges nothing, so `run()` does not depend on it, and the " +
+      "contract has it answering `403 not_enabled` while it rolls out. Exposing it is additive " +
+      "and belongs in its own change, with its Python twin.",
+  },
+  submitRouterModelRequest: {
+    method: "submit",
+    why: "the queued submission route — `comfy.models.submit` posts a request to it.",
+  },
+  getRouterModelRequestResult: {
+    method: "handle",
+    why:
+      "the queued request's RESULT route, collected through the RequestHandle that " +
+      "`comfy.models.submit`/`handle` return (`RequestHandle.get`), and by `subscribe`. It maps " +
+      "to `handle` because that is the `comfy.models` method whose returned object addresses it.",
+  },
+  getRouterModelRequestStatus: {
+    method: "handle",
+    why:
+      "the queued request's STATUS route, polled through the RequestHandle from " +
+      "`comfy.models.submit`/`handle` (`RequestHandle.status`/`events`) and driven by `subscribe`.",
+  },
+  cancelRouterModelRequest: {
+    method: "handle",
+    why:
+      "the queued request's CANCEL route (`RequestHandle.cancel`, and the best-effort cancel " +
+      "`subscribe` issues on timeout), reached through the handle `comfy.models.submit`/`handle` " +
+      "return.",
+  },
 };
 
 describe("router route coverage (spec/router-openapi.yaml)", () => {
@@ -301,28 +426,84 @@ describe("the operation extractor the coverage check reads through", () => {
       "declares no operationId",
     );
   });
+
+  it("refuses an operation that declares no `200`, rather than reading it as no headers", () => {
+    // A sync that moved success to `201` or to `2XX` would otherwise read as
+    // "declares no credits header" — an absent response passing as agreement.
+    const moved = { operationId: "runRouterModel", responses: { "201": { headers: {} } } };
+    const doc = { paths: { "/v2/models/{model_id}": { post: moved } } };
+    expect(() => successHeaderNames(doc, "runRouterModel")).toThrow(
+      "`runRouterModel` declares no `200` response",
+    );
+    expect(() => runSuccessHeaderNames(doc, doc.paths["/v2/models/{model_id}"])).toThrow(
+      "declares no `200` response",
+    );
+    // A declared `200` with no headers is still a truthful empty read.
+    const bare = {
+      paths: { "/v2/models/{model_id}": { post: { ...moved, responses: { "200": {} } } } },
+    };
+    expect(successHeaderNames(bare, "runRouterModel")).toEqual([]);
+  });
 });
 
 /**
- * The four QUEUE routes (`comfy.models.submit` and the handle it returns) are
- * not in the vendored contract yet — the operations are authored upstream but
- * held, and the one-way sync strips a held operation. So there is nothing in
- * `spec/router-openapi.yaml` to compare them against, and the pin has to be a
- * RELATION instead: each one is the run route plus a fixed suffix under a
- * `requests` collection, which is how the Python SDK binds the same four.
+ * The four QUEUE routes (`comfy.models.submit` and the handle it returns), now
+ * that the vendored contract DECLARES them.
  *
- * That relation is worth pinning even without a spec, because it is what makes
- * a sync that moves the RUN route move these too — the failure mode it closes
- * is the run route being updated and the queue routes silently left behind,
- * 404ing every `submit` while `run` works.
- *
- * The last test here is the rot guard: it fails the day the vendored contract
- * DOES declare the collection, which is the signal to replace this whole block
- * with a comparison against the spec — the same shape the run route already
- * gets above.
+ * They used to be held out of the one-way sync, so this block pinned them by a
+ * RELATION to the run route (each is that route plus a fixed suffix under a
+ * `requests` collection) and carried a rot guard that fired the day the
+ * collection arrived in `spec/router-openapi.yaml`. It has arrived — the four
+ * `*RouterModelRequest*` operations are in the contract — so the pin is now a
+ * comparison against the spec, the same shape the run route gets above: a sync
+ * that moves any of the four reddens here rather than 404ing `submit` at
+ * runtime. The relation is kept as a second, cheaper assertion because it is
+ * still true and still documents the collection's shape.
  */
-describe("queued model-request routes (not yet in spec/router-openapi.yaml)", () => {
-  it("extends the run route with a `requests` collection", () => {
+describe("queued model-request routes (spec/router-openapi.yaml)", () => {
+  it("spells each queue constant the path the contract declares for its operation", async () => {
+    const byId = new Map(
+      (await readRouterOperations()).map((operation) => [operation.operationId, operation]),
+    );
+    const pins: [string, string, string, string][] = [
+      // [operationId, HTTP method, the constant's value, its name]
+      [
+        "submitRouterModelRequest",
+        "post",
+        MODEL_REQUESTS_ROUTE_TEMPLATE,
+        "MODEL_REQUESTS_ROUTE_TEMPLATE",
+      ],
+      [
+        "getRouterModelRequestResult",
+        "get",
+        MODEL_REQUEST_ROUTE_TEMPLATE,
+        "MODEL_REQUEST_ROUTE_TEMPLATE",
+      ],
+      [
+        "getRouterModelRequestStatus",
+        "get",
+        MODEL_REQUEST_STATUS_ROUTE_TEMPLATE,
+        "MODEL_REQUEST_STATUS_ROUTE_TEMPLATE",
+      ],
+      [
+        "cancelRouterModelRequest",
+        "put",
+        MODEL_REQUEST_CANCEL_ROUTE_TEMPLATE,
+        "MODEL_REQUEST_CANCEL_ROUTE_TEMPLATE",
+      ],
+    ];
+    for (const [operationId, method, constant, name] of pins) {
+      const declared = byId.get(operationId);
+      expect(declared, `spec/router-openapi.yaml no longer declares ${operationId}`).toBeDefined();
+      expect(
+        declared?.path,
+        `the vendored contract moved ${operationId} — update ${name} in src/sdk/modelRequests.ts`,
+      ).toBe(constant);
+      expect(declared?.method, `${operationId} changed HTTP method`).toBe(method);
+    }
+  });
+
+  it("still extends the run route with a `requests` collection", () => {
     expect(MODEL_REQUESTS_ROUTE_TEMPLATE).toBe(`${RUN_ROUTE_TEMPLATE}/requests`);
     expect(MODEL_REQUEST_ROUTE_TEMPLATE).toBe(`${MODEL_REQUESTS_ROUTE_TEMPLATE}/{request_id}`);
     expect(MODEL_REQUEST_STATUS_ROUTE_TEMPLATE).toBe(`${MODEL_REQUEST_ROUTE_TEMPLATE}/status`);
@@ -342,27 +523,5 @@ describe("queued model-request routes (not yet in spec/router-openapi.yaml)", ()
     ]) {
       expect(templatePlaceholders(template)).toEqual([...parameterNames, "request_id"]);
     }
-  });
-
-  it("still has nothing in the vendored contract to be pinned against", async () => {
-    // The rot guard. When this fails, the queue operations have arrived in the
-    // vendored spec: read their paths out of it the way `readRouterRouteContract`
-    // reads `runRouterModel`'s, and compare the four constants against THOSE
-    // instead of against the relation above.
-    // Narrowed at runtime rather than asserted: `src/**` forbids unsafe type
-    // assertions, and a spec that parsed to something other than a mapping
-    // would otherwise reach `Object.keys` as a lie about its own shape.
-    const doc: unknown = parse(await readFile(ROUTER_SPEC_PATH, "utf-8"));
-    const paths = typeof doc === "object" && doc !== null && "paths" in doc ? doc.paths : undefined;
-    const queuePaths =
-      typeof paths === "object" && paths !== null
-        ? Object.keys(paths).filter((path) => path.includes("/requests"))
-        : [];
-    expect(
-      queuePaths,
-      "spec/router-openapi.yaml now declares the queued model-request routes — pin the four " +
-        "MODEL_REQUEST* constants in src/sdk/modelRequests.ts against the spec and delete the " +
-        "relation assertions in this block",
-    ).toEqual([]);
   });
 });
