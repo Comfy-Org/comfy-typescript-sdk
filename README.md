@@ -394,6 +394,16 @@ Polling is **poll-authoritative**: there is no stream to reconcile against on th
 
 **A `200` is not the same thing as a success here.** The server reports a failed _and_ a cancelled request as `COMPLETED` carrying an `error_type`, so `get()` rejects with the matching typed exception from [`routerErrors`](#router-errors-comfymodelsrun) rather than handing the failure back as a result. `events()` deliberately does not reject **for that case** — a completion carrying an `error_type` is yielded as an observation, because `events()` is a view of the queue's progress and `get()` is the one that collects. It can still reject for reasons that are not the request's own outcome: a transport failure, an exhausted `timeoutMs`, or an aborted `signal`. So keep those handlers; it is only the completion error that arrives as data rather than a throw.
 
+When the server quotes the request on admission, the quote is on `handle.estimate` — a `CostEstimate`, priced in US dollars from the same rate card the charge is billed against:
+
+```ts
+const { estimate } = handle;
+if (estimate?.isExact) console.log(`$${estimate.amount}`);
+else if (estimate?.isEstimated) console.log(`$${estimate.minAmount}–$${estimate.maxAmount}`);
+```
+
+Read `isExact` / `isEstimated` / `isUnknown` rather than `source`: `source` is the server's open string, and a value this release does not recognise reads as unknown. Dollar figures (`amount`, `minAmount`, `maxAmount`) are decimal **strings**, so nothing is rounded; the `*Cents` and `credits` figures are numbers for arithmetic, and `raw` is the object as sent. It is a quote, not a price lock — the run is charged at the rates in force when it is rated (`pricingAsOf` says when the quote's rate card was read). `estimate` is `null` when no quote is available: the server sent none, sent one this SDK could not read (the submit still succeeds), the submit was an idempotent replay (the original quote is not stored), or the handle was rebuilt with `comfy.models.handle`. **`null` never means free.**
+
 Rebuild a handle in another process from the two ids that address the request, with no call made:
 
 ```ts

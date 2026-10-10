@@ -8,7 +8,12 @@
  * module-evaluation time, so this import order is the one that would surface a
  * temporal-dead-zone regression if either side grew a `const` the other reads.
  */
-import { RequestHandle, nextPollDelayMs, MAX_RETRY_AFTER_MS } from "./modelRequests.js";
+import {
+  costEstimateOf,
+  RequestHandle,
+  nextPollDelayMs,
+  MAX_RETRY_AFTER_MS,
+} from "./modelRequests.js";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -49,17 +54,26 @@ function useStub(server: RouterStubServer): void {
  * the next entry of `statuses` and repeats the last one once they run out; the
  * result route answers `result`; the cancel answers `202`. `extra` overrides
  * any of that per request.
+ *
+ * `estimate` is the submit acceptance's cost quote, sent verbatim when given
+ * and OMITTED by default — a server with the estimate switched off sends no
+ * key at all, which is the shape every other test here wants.
+ * `submitHeaders` rides on that same acceptance.
  */
 function queueScript(options: {
   statuses: Record<string, unknown>[];
   result?: unknown;
   statusHeaders?: Record<string, string>;
   resultHeaders?: Record<string, string>;
+  estimate?: unknown;
+  submitHeaders?: Record<string, string>;
 }) {
   let polls = 0;
   return (request: RecordedRequest) => {
     if (request.method === "POST" && request.path === SUBMIT_PATH) {
-      return { status: 201, body: { request_id: REQUEST_ID, status: "IN_QUEUE" } };
+      const body: Record<string, unknown> = { request_id: REQUEST_ID, status: "IN_QUEUE" };
+      if ("estimate" in options) body.estimate = options.estimate;
+      return { status: 201, body, headers: options.submitHeaders };
     }
     if (request.method === "GET" && request.path === STATUS_PATH) {
       const index = Math.min(polls, options.statuses.length - 1);
@@ -234,6 +248,196 @@ describe("comfy.models.submit", () => {
       ).rejects.toBeInstanceOf(TypeError);
     }
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("RequestHandle.estimate", () => {
+  const BASE = {
+    currency: "USD",
+    provider: "bfl",
+    model: MODEL,
+    pricing_as_of: "2026-10-01T12:00:00Z",
+  };
+
+  async function submitWith(
+    estimate: unknown,
+    submitHeaders?: Record<string, string>,
+  ): Promise<RequestHandle> {
+    return await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = queueScript({ statuses: [DONE], estimate, submitHeaders });
+      return await comfy.models.submit(MODEL, { prompt: "a cat" });
+    });
+  }
+
+  it("reads an exact quote, keeping the dollar figure as a string", async () => {
+    const wire = {
+      ...BASE,
+      source: "exact",
+      amount: "0.04",
+      amount_cents: 4,
+      credits: 8.44,
+    };
+    const handle = await submitWith(wire);
+    expect(handle.estimate).toEqual({
+      source: "exact",
+      isExact: true,
+      isEstimated: false,
+      isUnknown: false,
+      currency: "USD",
+      provider: "bfl",
+      model: MODEL,
+      pricingAsOf: "2026-10-01T12:00:00Z",
+      amount: "0.04",
+      minAmount: null,
+      maxAmount: null,
+      amountCents: 4,
+      minAmountCents: null,
+      maxAmountCents: null,
+      credits: 8.44,
+      reason: null,
+      raw: wire,
+    });
+    expect(Object.isFrozen(handle.estimate)).toBe(true);
+  });
+
+  it("reads an estimated quote as a range with no amount", async () => {
+    const handle = await submitWith({
+      ...BASE,
+      source: "estimated",
+      min_amount: "0.00000001",
+      max_amount: "0.12",
+      min_amount_cents: 0.000001,
+      max_amount_cents: 12,
+    });
+    expect(handle.estimate).toMatchObject({
+      source: "estimated",
+      isExact: false,
+      isEstimated: true,
+      isUnknown: false,
+      amount: null,
+      minAmount: "0.00000001",
+      maxAmount: "0.12",
+      minAmountCents: 0.000001,
+      maxAmountCents: 12,
+    });
+  });
+
+  it("reads an unknown quote with its reason", async () => {
+    const handle = await submitWith({ ...BASE, source: "unknown", reason: "not_quotable" });
+    expect(handle.estimate).toMatchObject({
+      source: "unknown",
+      isExact: false,
+      isEstimated: false,
+      isUnknown: true,
+      amount: null,
+      reason: "not_quotable",
+    });
+  });
+
+  it("reads an unrecognised source as unknown, keeping the value verbatim", async () => {
+    const handle = await submitWith({ ...BASE, source: "provisional", amount: "0.04" });
+    expect(handle.estimate).toMatchObject({
+      source: "provisional",
+      isExact: false,
+      isEstimated: false,
+      isUnknown: true,
+      // Still reported — the field is data — but `isUnknown` is what says not
+      // to trust it.
+      amount: "0.04",
+    });
+  });
+
+  it("is null when the acceptance carries no estimate", async () => {
+    const handle = await submitWith(undefined);
+    expect(handle.estimate).toBeNull();
+    // And with the key absent altogether, the default shape.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = queueScript({ statuses: [DONE] });
+      const absent = await comfy.models.submit(MODEL, {});
+      expect(absent.estimate).toBeNull();
+    });
+  });
+
+  it("is null for a malformed estimate, and the submit still succeeds", async () => {
+    const malformed: unknown[] = [
+      null,
+      "0.04",
+      [BASE],
+      { ...BASE },
+      { ...BASE, source: "" },
+      { ...BASE, source: 1 },
+      { source: "exact", amount: "0.04" },
+      { ...BASE, source: "exact", currency: 1 },
+      { ...BASE, source: "exact", pricing_as_of: null },
+      { ...BASE, source: "exact", amount: 0.04 },
+      { ...BASE, source: "exact", amount: "0.04", amount_cents: "4" },
+      { ...BASE, source: "exact", amount: "0.04", credits: "8.44" },
+      { ...BASE, source: "estimated", min_amount: 0, max_amount: "1" },
+      { ...BASE, source: "unknown", reason: 7 },
+      // The figure the source promises is missing.
+      { ...BASE, source: "exact" },
+      { ...BASE, source: "exact", amount: null, amount_cents: 4 },
+      { ...BASE, source: "estimated", min_amount: "0.01" },
+      { ...BASE, source: "estimated", max_amount: "0.05" },
+      // A dollar figure that is not a decimal numeral.
+      { ...BASE, source: "exact", amount: "" },
+      { ...BASE, source: "exact", amount: " " },
+      { ...BASE, source: "exact", amount: "abc" },
+      { ...BASE, source: "exact", amount: "1e-2" },
+      { ...BASE, source: "exact", amount: "-0.04" },
+      { ...BASE, source: "estimated", min_amount: "0.01", max_amount: "$0.05" },
+    ];
+    for (const estimate of malformed) {
+      const handle = await submitWith(estimate);
+      expect(handle.requestId, JSON.stringify(estimate)).toBe(REQUEST_ID);
+      expect(handle.estimate, JSON.stringify(estimate)).toBeNull();
+    }
+  });
+
+  it("keeps an unrecognised spelling of source unrecognised rather than trimming it", async () => {
+    const handle = await submitWith({ ...BASE, source: " exact ", amount: "0.04" });
+    expect(handle.estimate).toMatchObject({
+      source: " exact ",
+      isExact: false,
+      isEstimated: false,
+      isUnknown: true,
+    });
+  });
+
+  it("holds raw as a frozen copy, not the decoded body itself", () => {
+    const wire = { ...BASE, source: "exact", amount: "0.04" };
+    const estimate = costEstimateOf(wire);
+    expect(estimate?.raw).toEqual(wire);
+    expect(estimate?.raw).not.toBe(wire);
+    expect(Object.isFrozen(estimate?.raw)).toBe(true);
+    expect(Object.isFrozen(wire)).toBe(false);
+  });
+
+  it("reads a non-finite number as malformed, and never throws on any input", () => {
+    // Not reachable over JSON, so asserted on the reader directly.
+    for (const credits of [Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(costEstimateOf({ ...BASE, source: "exact", amount: "0.04", credits })).toBeNull();
+    }
+    for (const value of [undefined, 0, true, Symbol("x"), () => 1, new Date()]) {
+      expect(() => costEstimateOf(value)).not.toThrow();
+    }
+  });
+
+  it("is null on an idempotent replay, even if the body carries one", async () => {
+    const handle = await submitWith(
+      { ...BASE, source: "exact", amount: "0.04" },
+      { "Idempotent-Replayed": "true" },
+    );
+    expect(handle.requestId).toBe(REQUEST_ID);
+    expect(handle.estimate).toBeNull();
+  });
+
+  it("is null on a handle rebuilt by comfy.models.handle", () => {
+    forbidNetwork();
+    config({ credentials: CREDENTIAL });
+    expect(comfy.models.handle(MODEL, REQUEST_ID).estimate).toBeNull();
   });
 });
 
