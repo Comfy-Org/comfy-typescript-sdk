@@ -17,6 +17,8 @@ Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
 entry. See CONTRIBUTING.md.
 -->
 
+## [0.5.0] - 2026-10-10
+
 ### Added
 
 - **The rest of a job's state is readable off the handle.** `Job` held the
@@ -54,17 +56,6 @@ entry. See CONTRIBUTING.md.
   with `metadata_not_supported` and the list with `not_implemented` (501),
   and a self-hosted proxy keeps no labels (a filtered list yields nothing
   there).
-- **Comfy Router alt-provider controls on `comfy.models.run` —
-  `modelProvider`, `strictMode` and `fallbackProvider`.** Three optional
-  `RunOptions` fields, sent as the `model_provider`, `strict_mode` and
-  `fallback_provider` query params on the synchronous run route.
-  `modelProvider` selects an alternate serving provider (e.g. `"fal"`);
-  `strictMode` (default `false`) toggles native ↔ provider translation, and
-  `true` passes the provider's own raw shape both ways; `fallbackProvider`
-  accepts `"false"` to opt out of provider-fallback. Each is sent ONLY when
-  set, so a run that names none of the three is byte-for-byte the request it
-  always was. These are run-route only — the queued `submit`/`subscribe`
-  surface does not accept them.
 - **`RunJsonResult.replayed` / `RunBinaryResult.replayed`** — `true` when
   Router served the call from its `Idempotency-Key` record (`Idempotent-Replayed`)
   rather than by running the model again, so a replayed result can be told from
@@ -102,11 +93,6 @@ entry. See CONTRIBUTING.md.
   that the SDK then refuses client-side (`response_too_large`, a body-read
   timeout, an empty or non-JSON body) throws a `ComfyError` with no cost on
   it, so reconcile those failures against the workspace ledger.
-- **Three queue-tier `routerErrors` classes — `Cancelled`, `QueueTimeout`
-  and `RequestNotFound`** — for the `cancelled`, `queue_timeout` and
-  `request_not_found` buckets the vendored Router contract now declares, so a
-  queued failure carrying one of them is a typed `catch` rather than a bare
-  `RouterError`.
 - **`routerErrors.QueueBacklogFull`** for the `queue_backlog_full` bucket: a
   queued submit refused with `429` because you already have too many queued
   requests waiting. Nothing was submitted or charged; submit again once some
@@ -155,6 +141,27 @@ entry. See CONTRIBUTING.md.
 - `submit()` waits at least one second before re-sending after a 429. A
   `Retry-After: 0` used to re-send at once, over and over, for the whole
   one-minute retry budget.
+
+## [0.4.0] - 2026-09-18
+
+### Added
+
+- **Comfy Router alt-provider controls on `comfy.models.run` —
+  `modelProvider`, `strictMode` and `fallbackProvider`.** Three optional
+  `RunOptions` fields, sent as the `model_provider`, `strict_mode` and
+  `fallback_provider` query params on the synchronous run route.
+  `modelProvider` selects an alternate serving provider (e.g. `"fal"`);
+  `strictMode` (default `false`) toggles native ↔ provider translation, and
+  `true` passes the provider's own raw shape both ways; `fallbackProvider`
+  accepts `"false"` to opt out of provider-fallback. Each is sent ONLY when
+  set, so a run that names none of the three is byte-for-byte the request it
+  always was. These are run-route only — the queued `submit`/`subscribe`
+  surface does not accept them.
+- **Three queue-tier `routerErrors` classes — `Cancelled`, `QueueTimeout`
+  and `RequestNotFound`** — for the `cancelled`, `queue_timeout` and
+  `request_not_found` buckets the vendored Router contract now declares, so a
+  queued failure carrying one of them is a typed `catch` rather than a bare
+  `RouterError`.
 
 ## [0.3.0] - 2026-09-14
 
@@ -605,7 +612,10 @@ First public release of the Comfy API v2 TypeScript SDK (`@comfyorg/sdk`).
   Cloud, and serverless: upload and dedup inputs, submit a workflow, follow it
   (poll or SSE), and download outputs. Requires Node >= 22.
 
-[Unreleased]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.9...v0.2.0
 [0.1.9]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.1.7...v0.1.8
