@@ -41,6 +41,11 @@ describe("iterateSse", () => {
     expect(await collect(streamOf("event: ping\n\n"))).toEqual([]);
   });
 
+  it("keeps an `error` frame whose data line is empty, but drops any other empty one", async () => {
+    const events = await collect(streamOf("event: ping\ndata:\n\n", "event: error\ndata:\n\n"));
+    expect(events).toEqual([{ event: "error", data: { raw: "" } }]);
+  });
+
   it("reassembles a frame split across chunk boundaries, including mid-UTF-8", async () => {
     const enc = new TextEncoder();
     const frame = enc.encode('event: message\ndata: {"m":"\u{1F600}ok"}\n\n');

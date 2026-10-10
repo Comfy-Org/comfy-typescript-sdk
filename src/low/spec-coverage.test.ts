@@ -71,3 +71,29 @@ describe("hand-maintained model parity (models.ts)", () => {
     }
   });
 });
+
+// `Job.events()` treats an SSE `error` frame as terminal and turns its data
+// (an error envelope) into a typed error via `sseErrorFromFrame`. The server
+// already emits that frame, but the vendored spec does not declare it yet, so
+// there is nothing to compare against. This is a rot guard, not a pin: it
+// fails the day the spec's `x-sse-events` catalog DOES declare `error`. When
+// it fires, check the declared schema is the error envelope and that the frame
+// is terminal (or fix `Job.events()` and `sseErrorFromFrame` to match), then
+// replace this with a real comparison — including the declared codes against
+// `SSE_STATUS_BY_CODE` in `./errors.ts`.
+describe("SSE error frame (not yet in the vendored spec)", () => {
+  it("getJobEvents' x-sse-events catalog does not declare `error` yet", async () => {
+    const text = await readFile(SPEC_PATH, "utf-8");
+    const doc = parse(text) as {
+      paths: Record<string, Record<string, { operationId?: string; "x-sse-events"?: object }>>;
+    };
+    const op = Object.values(doc.paths)
+      .flatMap((methods) => Object.values(methods))
+      .find((candidate) => candidate.operationId === "getJobEvents");
+    expect(op?.["x-sse-events"], "getJobEvents or its x-sse-events catalog moved").toBeDefined();
+    expect(
+      Object.keys(op?.["x-sse-events"] ?? {}),
+      "the spec now declares the SSE `error` frame: replace this rot guard with a real check",
+    ).not.toContain("error");
+  });
+});

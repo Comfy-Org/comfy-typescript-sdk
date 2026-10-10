@@ -10,7 +10,7 @@
  * in the Python SDK — one async class since JS is async-native.
  */
 
-import { ApiError } from "../low/index.js";
+import { ApiError, sseErrorFromFrame } from "../low/index.js";
 import type {
   ComfyLow,
   Job as LowJob,
@@ -322,6 +322,11 @@ export class Job {
    * to polling to detect terminal status if the stream ends early. An
    * aborted `signal` stops both the current SSE connection/poll and the
    * pause between reconnect attempts.
+   *
+   * When the server cuts the stream with its terminal `error` event, the
+   * iterator rejects with `Unauthorized` (`code: "credential_expired"`),
+   * `Forbidden` or `NotFound` (`code: "job_not_found"`) and does
+   * not reconnect.
    */
   async *events(signal?: AbortSignal): AsyncGenerator<ComfyEvent, void, void> {
     const eventsUrl = this.model.urls.events || this.model.id;
@@ -333,8 +338,21 @@ export class Job {
     for (;;) {
       let terminalSeen = false;
       let reconnectPauseMs: number = RECONNECT_PAUSE_MS;
+      let terminalError: ApiError | null = null;
       try {
         for await (const raw of this.low.getJobEvents(eventsUrl, { signal })) {
+          if (raw.event === "error") {
+            // Terminal frame: the server is ending the stream for a reason other
+            // than the job finishing (credential_expired / forbidden / job_not_found).
+            // No status follows it, so surface it and stop — never reconnect.
+            // Thrown after the try, so the reconnect dispatch below (and its
+            // abort check, which would let the untranslated low error escape)
+            // never sees it. The catch re-checks it too: `break` closes the
+            // iterator inside the try, and a rejection from that close (an
+            // already-errored body) would otherwise land there.
+            terminalError = sseErrorFromFrame(raw.data);
+            break;
+          }
           const event = eventFromRaw(raw, (data) => this.bindOutput(data as unknown as LowOutput));
           if (event === null) continue;
           if (event.kind === "progress") {
@@ -349,6 +367,7 @@ export class Job {
           yield event;
         }
       } catch (exc) {
+        if (terminalError !== null) throw toSdkError(terminalError);
         // A caller abort must propagate (and stop the loop), not be
         // swallowed as an ordinary mid-stream drop.
         if (signal?.aborted) throw exc;
@@ -366,6 +385,7 @@ export class Job {
         }
         // Connection dropped mid-stream (or the server returned 429) — reconnect below.
       }
+      if (terminalError !== null) throw toSdkError(terminalError);
       if (terminalSeen) return;
       // Stream ended without a terminal frame. Poll the authoritative
       // state: stop if already terminal, else reconnect for fresh frames.
