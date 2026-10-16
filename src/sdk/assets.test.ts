@@ -1,6 +1,6 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -27,6 +27,16 @@ describe("AssetFactory / Asset", () => {
     const asset = assets.fromBytes(new Uint8Array([1, 2, 3]));
     expect(asset.id).toBeUndefined();
     expect(server.state.uploadCount + server.state.headCount + server.state.fromHashCount).toBe(0);
+  });
+
+  it("derives filePath exactly as node:path does on this platform", () => {
+    // `basename` is inlined rather than imported so the module loads in a
+    // browser. `node:path` dispatches on platform — win32 treats `\` as a
+    // separator, posix treats it as an ordinary filename character — and a
+    // published package has to match on whichever machine installs it.
+    for (const path of ["a/b/photo.png", "photo.png", "a\\b\\photo.png", "noext", "a/b/"]) {
+      expect(assets.fromFile(path).filePath).toBe(basename(path));
+    }
   });
 
   it("dedup fast-path: a known hash mints via from-hash, never uploads", async () => {
