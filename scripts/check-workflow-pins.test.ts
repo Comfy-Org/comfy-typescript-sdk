@@ -485,23 +485,59 @@ describe("shapes that must NOT read as a caller", () => {
     // produce -- so it leaned on the rest of the suite to notice the second
     // one. Counting callers pins the distinction here: a regression that read
     // the step as a caller reports 2, and one that read neither reports 0.
-    const root = fixtureRoot({
-      [WORKFLOW]: yaml([
-        ...pinnedCaller(),
-        "  build:",
-        "    runs-on: ubuntu-latest",
-        "    steps:",
-        `      - uses: Comfy-Org/github-workflows/actions/setup@${SHA}`,
-      ]),
-    });
-    const { status, stdout, stderr } = run(root);
+    //
+    // Two spellings of the same step. The dash-carrying one is rejected by the
+    // caller regex on the `- ` alone; the dash-less one is a plain mapping key
+    // that matches the regex and is excluded only by POSITION
+    // (`isJobLevelUses`): its owner is `- name:`, not a `<job id>:` under
+    // `jobs:`.
+    const spellings: Record<string, string[]> = {
+      "dash-carrying": [`      - uses: Comfy-Org/github-workflows/actions/setup@${SHA}`],
+      "dash-less": [
+        "      - name: Set up the toolchain",
+        `        uses: Comfy-Org/github-workflows/actions/setup@${SHA}`,
+      ],
+    };
+    for (const [label, step] of Object.entries(spellings)) {
+      const root = fixtureRoot({
+        [WORKFLOW]: yaml([
+          ...pinnedCaller(),
+          "  build:",
+          "    runs-on: ubuntu-latest",
+          "    steps:",
+          ...step,
+        ]),
+      });
+      const { status, stdout, stderr } = run(root);
+      expect(stderr, label).toBe("");
+      expect(status, label).toBe(0);
+      expect(stdout, label).toContain("1 Comfy-Org/github-workflows caller(s)");
+      // ... and it is the job, not the step: only the `cursor-review` reusable
+      // is listed back.
+      expect(stdout, label).toContain("-> cursor-review.yml");
+      expect(stdout, label).not.toContain("setup");
+    }
+  });
+
+  it("does not let a dash-less step's `uses:` fail a real caller in the same file", () => {
+    // The shape that once reddened CI: read as a caller, this step fails the
+    // lint even though the real caller above it is correctly pinned, demanding
+    // a `workflows_ref` input an action cannot take.
+    const lines = [
+      ...pinnedCaller(),
+      "  build:",
+      "    runs-on: ubuntu-latest",
+      "    steps:",
+      "      - name: Set up the toolchain",
+      `        uses: Comfy-Org/github-workflows/actions/setup@${SHA}`,
+    ];
+    const { status, stdout, stderr } = run(fixtureRoot({ [WORKFLOW]: yaml(lines) }));
     expect(stderr).toBe("");
     expect(status).toBe(0);
-    expect(stdout).toContain("1 Comfy-Org/github-workflows caller(s)");
-    // ... and it is the job, not the step: only the `cursor-review` reusable
-    // is listed back.
-    expect(stdout).toContain("-> cursor-review.yml");
-    expect(stdout).not.toContain("setup");
+    expect(stdout).toContain("1 Comfy-Org/github-workflows caller(s) checked, all pins agree");
+    expect(stdout).toContain(
+      `${REL}:${lineNo(lines, `    uses: ${REUSABLE}@${SHA}`)} -> cursor-review.yml`,
+    );
   });
 });
 
