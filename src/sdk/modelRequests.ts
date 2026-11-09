@@ -67,14 +67,22 @@ import { ComfyError, stamping } from "./exceptions.js";
 import { fillRoute, parseModelId, parseRequestId } from "./modelRoutes.js";
 import {
   type BuiltRunResult,
+  CONTENT_TYPE_HEADER,
   CREDITS_USED_HEADER,
+  decodeUtf8,
   DROPPED_PARAMS_HEADER,
   FALLBACK_PROVIDER_HEADER,
   IDEMPOTENT_REPLAYED_HEADER,
+  isJsonMediaType,
+  isTooLarge,
+  mediaTypeOf,
   parseCreditsUsed,
   parseDroppedParams,
   parseReplayed,
+  readBodyWithin,
+  resolveMaxBytes,
   type RunResult,
+  UTF8_STRICT,
 } from "./models.js";
 import {
   ERROR_TYPE_HEADER,
@@ -157,13 +165,18 @@ export const MIN_REQUEST_TIMEOUT_MS = 1_000;
  *
  * They are spelled as literals rather than derived from `RUN_ROUTE_TEMPLATE`
  * on purpose. `./models.ts` imports THIS module (to assemble the frozen
- * `models` namespace) and this module imports nothing from it at run time —
- * only `RunResult` as a type, which is erased. Reading `RUN_ROUTE_TEMPLATE`
- * here would turn that one-way dependency into a cycle whose safety would then
- * rest on evaluation order, and `RUN_ROUTE_TEMPLATE` cannot move out of
- * `./models.ts` because `scripts/router-route-contract.mjs` reads it out of
- * that file's source text. So the run path is spelled twice, and the test is
- * what keeps the two spellings honest.
+ * `models` namespace), and this module imports values back from it — the
+ * header names, the body reader and the media-type helpers the result read
+ * shares with `run`. That cycle is safe for one reason only: every one of
+ * those imports is read inside a function that runs after both modules have
+ * finished evaluating, never at this module's top level. A top-level read
+ * (a `const` initialised from `RUN_ROUTE_TEMPLATE`, say) would be a TDZ
+ * `ReferenceError` under one import order and fine under the other. So the
+ * run path is spelled here rather than read, and `RUN_ROUTE_TEMPLATE` cannot
+ * move out of `./models.ts` because `scripts/router-route-contract.mjs` reads
+ * it out of that file's source text; the test is what keeps the two
+ * spellings honest. Keep every import from `./models.js` out of top-level
+ * initialisers.
  */
 export const MODEL_REQUESTS_ROUTE_TEMPLATE = "/v2/models/{provider}/{model}/requests";
 /** One queued request — the route its RESULT is collected from. */
@@ -259,7 +272,7 @@ export interface SubmitOptions {
   retry?: RetryOptions | false;
 }
 
-/** Options accepted by {@link RequestHandle.get} and {@link RequestHandle.events}. */
+/** Options accepted by {@link RequestHandle.events}, and the base of {@link GetOptions}. */
 export interface WaitOptions {
   /**
    * Abort the wait. Bounds the poll requests, their retries, the pauses
@@ -282,6 +295,24 @@ export interface WaitOptions {
   timeoutMs?: number | null;
   /** Retry policy for each individual poll and for the result fetch. */
   retry?: RetryOptions | false;
+}
+
+/**
+ * Options accepted by {@link RequestHandle.get}: the wait, plus the one knob
+ * only the result fetch has. Not on {@link WaitOptions}, because `events`
+ * fetches no result and a cap it silently ignored would read as enforced.
+ */
+export interface GetOptions extends WaitOptions {
+  /**
+   * Largest result body the collecting fetch will buffer, in bytes. Omit for
+   * `DEFAULT_MAX_RESPONSE_BYTES` (64 MiB); pass `null` to disable the
+   * cap. The same knob, and the same semantics, as `RunOptions.maxBytes` on
+   * `comfy.models.run`: a result past it rejects with `response_too_large`
+   * (carrying `maxBytes`, and the queued request's id as `queuedRequestId`,
+   * on `details`) and is not retried. The request stays collectable, so a
+   * later call with a larger cap can still fetch it.
+   */
+  maxBytes?: number | null;
 }
 
 /** Options accepted by {@link Models.subscribe}. */
@@ -312,6 +343,18 @@ export interface SubscribeOptions extends SubmitOptions {
    * caller's patience.
    */
   timeoutMs?: number | null;
+  /**
+   * Largest result body the collecting fetch will buffer, in bytes. Omit for
+   * `DEFAULT_MAX_RESPONSE_BYTES` (64 MiB); pass `null` to disable the
+   * cap. The same knob, and the same semantics, as `RunOptions.maxBytes` on
+   * `comfy.models.run`: a result past it rejects with `response_too_large`
+   * (carrying `maxBytes`, and the queued request's id as `queuedRequestId`,
+   * on `details`) and is not retried. The request stays collectable, but this
+   * call returns no handle, so collect it with
+   * `comfy.models.handle(model, err.details?.queuedRequestId as string)
+   * .get({ maxBytes })` and a larger cap. It is NOT cancelled: the generation is already paid for.
+   */
+  maxBytes?: number | null;
 }
 
 // -- wire reading ------------------------------------------------------------
@@ -343,8 +386,22 @@ function text(value: unknown): string | null {
   return trimmed === "" ? null : trimmed;
 }
 
-function invalidResponse(message: string, requestId: string | null, httpStatus?: number) {
-  return new ComfyError(message, { code: "invalid_response", httpStatus, requestId });
+function invalidResponse(
+  message: string,
+  requestId: string | null,
+  httpStatus?: number,
+  cause?: unknown,
+  details: Record<string, unknown> | null = null,
+) {
+  return new ComfyError(message, {
+    code: "invalid_response",
+    httpStatus,
+    requestId,
+    // Spread only when given: `ComfyError` tests `"cause" in options`, and an
+    // own `cause: undefined` on every other `invalid_response` reads as one.
+    ...(cause === undefined ? {} : { cause }),
+    details,
+  });
 }
 
 /**
@@ -505,7 +562,14 @@ export function nextPollDelayMs(retryAfterMs: number | null, scheduledMs: number
 interface QueueResponse {
   status: number;
   headers: Headers;
+  /**
+   * The body as text. For a call that read {@link QueueCall.bytes} this is a
+   * lossy UTF-8 decode of {@link body} on a non-2xx only — there for the error
+   * envelope — and `""` otherwise, so a binary result is not decoded for nothing.
+   */
   text: string;
+  /** The raw body, set only for a call that asked for {@link QueueCall.bytes}. */
+  body?: Uint8Array;
 }
 
 interface QueueCall {
@@ -519,6 +583,15 @@ interface QueueCall {
   retry: RetryOptions | false;
   /** Names the call in a deadline message: `submit`, `status`, ... */
   what: string;
+  /** The `Accept` header; `application/json` when unset. */
+  accept?: string;
+  /**
+   * Read the body as bytes within `maxBytes`, rather than as text — for the
+   * result call, whose 200 may be the partner's own media type. `subject`
+   * names the call in a cap-breach message, and `details` is merged into that
+   * error's `details`.
+   */
+  bytes?: { maxBytes: number | null; subject: string; details?: Record<string, unknown> };
 }
 
 /**
@@ -562,7 +635,7 @@ async function send(call: QueueCall): Promise<QueueResponse> {
   const credentials = requireCredentials();
   const headers: Record<string, string> = {
     Authorization: `Bearer ${credentials}`,
-    Accept: "application/json",
+    Accept: call.accept ?? "application/json",
     "User-Agent": buildUserAgent(),
   };
   if (call.body !== undefined) headers["Content-Type"] = "application/json";
@@ -585,23 +658,74 @@ async function send(call: QueueCall): Promise<QueueResponse> {
     const signal = composeSignal(call.signal, requestMs);
     let response: Response;
     let bodyText: string;
+    let bodyBytes: Uint8Array | undefined;
+    // Non-null once this response has been classified as one to ask again
+    // about, and is then the backoff before that re-ask.
+    let repeatAfterMs: number | null = null;
     try {
       response = await fetch(
         call.url,
         withInactivityLimits({ method: call.method, headers, body: call.body, signal }, requestMs),
       );
+      // Classified from the status line BEFORE the body is touched, as `run`
+      // does: the content of a response this call is going to ask again about
+      // is "ask again", so it is dropped rather than downloaded (and, on the
+      // capped path, buffered) once per attempt. Out of budget leaves this
+      // `null` and falls through to raise the failure the server actually
+      // gave, rather than a synthetic "retries exhausted".
+      if (isRetryableStatus(response.status, response.headers.get(ERROR_TYPE_HEADER))) {
+        repeatAfterMs = nextAttemptDelayMs(attempt, retry, clock());
+      }
       // Inside the same `try` as the fetch on purpose: the deadline covers
       // body consumption too, so a signal that fires while the body is still
       // streaming rejects HERE, and translating it in only one of the two
       // places would leak a bare DOMException out of the other.
-      bodyText = await response.text();
+      if (repeatAfterMs !== null) {
+        await response.body?.cancel().catch(() => undefined);
+        bodyText = "";
+      } else if (call.bytes === undefined) {
+        bodyText = await response.text();
+      } else if (response.ok && response.status !== 200) {
+        // Only a 200 is a result. Any other 2xx — a 202 control answer — is
+        // diagnosed from its status line alone, so its body is dropped unread
+        // rather than downloaded, or refused with advice to raise a cap its
+        // result never reached.
+        await response.body?.cancel().catch(() => undefined);
+        bodyText = "";
+        bodyBytes = new Uint8Array(0);
+      } else {
+        // An error envelope is truncated rather than refused (see
+        // `readBodyWithin`), so it still raises the typed error it carries.
+        bodyBytes = await readBodyWithin(
+          response,
+          call.bytes.maxBytes,
+          call.bytes.subject,
+          call.idempotencyKey ?? null,
+          { details: call.bytes.details },
+        );
+        // Decoded after this `try`, not in it: a decode failure is a fact
+        // about the body, not a transport failure to retry.
+        bodyText = "";
+      }
     } catch (exc) {
+      // A body this call would not buffer is a verdict about the response,
+      // not a transport failure: retrying would re-download it every attempt.
+      if (isTooLarge(exc)) throw exc;
       // A caller's abort is theirs: never retried, never re-dressed.
       if (call.signal?.aborted) throw exc;
       if (isTimeout(exc, call.signal)) {
+        // With the caller's identifiers when the call has any: a deadline
+        // that expires while a COMPLETED result is streaming leaves a
+        // `subscribe` caller, who holds no handle, only this error to find
+        // the finished generation by.
         throw new ComfyError(
           `the model queue's ${call.what} call exceeded the deadline left for it`,
-          { code: "request_timeout", cause: exc, idempotencyKey: call.idempotencyKey ?? null },
+          {
+            code: "request_timeout",
+            cause: exc,
+            idempotencyKey: call.idempotencyKey ?? null,
+            details: call.bytes?.details ?? null,
+          },
         );
       }
       const delay = nextAttemptDelayMs(attempt, retry, clock());
@@ -611,17 +735,23 @@ async function send(call: QueueCall): Promise<QueueResponse> {
       continue;
     }
 
-    if (isRetryableStatus(response.status, response.headers.get(ERROR_TYPE_HEADER))) {
-      const delay = nextAttemptDelayMs(attempt, retry, clock());
-      if (delay !== null) {
-        await abortableSleep(delay, call.signal);
-        attempt += 1;
-        continue;
-      }
-      // Out of budget — fall through and raise the failure the server actually
-      // gave, rather than a synthetic "retries exhausted".
+    if (repeatAfterMs !== null) {
+      await abortableSleep(repeatAfterMs, call.signal);
+      attempt += 1;
+      continue;
     }
-    return { status: response.status, headers: response.headers, text: bodyText };
+    if (bodyBytes !== undefined && !response.ok) {
+      try {
+        bodyText = decodeUtf8(bodyBytes);
+      } catch {
+        // An error page too long to hold as a string — reachable with
+        // `maxBytes: null`, or a cap past V8's string limit. Its envelope is
+        // out of reach, so the typed error is diagnosed from the status line
+        // and `X-Comfy-Error-Type` alone, as for an empty error body.
+        bodyText = "";
+      }
+    }
+    return { status: response.status, headers: response.headers, text: bodyText, body: bodyBytes };
   }
 }
 
@@ -629,13 +759,15 @@ async function send(call: QueueCall): Promise<QueueResponse> {
 function decode(response: QueueResponse, accepted: readonly number[]): unknown {
   let body: unknown;
   let parsed = true;
+  let parseError: unknown;
   if (response.text === "") {
     // A `204` (and a `202` with no body) is a legitimate answer to a cancel.
     body = {};
   } else {
     try {
       body = JSON.parse(response.text);
-    } catch {
+    } catch (exc) {
+      parseError = exc;
       parsed = false;
       body = null;
     }
@@ -645,10 +777,17 @@ function decode(response: QueueResponse, accepted: readonly number[]): unknown {
     throw toRouterError(response.status, response.headers, body);
   }
   if (!parsed) {
+    // Blamed on the body only for a `SyntaxError`, as the result read does: a
+    // `RangeError` here is this process running out of room on a body that
+    // may well be valid JSON.
     throw invalidResponse(
-      `the queue answered ${String(response.status)} with a body that is not JSON`,
+      parseError instanceof SyntaxError
+        ? `the queue answered ${String(response.status)} with a body that is not JSON`
+        : `the queue answered ${String(response.status)} with a body this process ran out ` +
+            "of resources parsing (see cause); the body itself may be valid JSON",
       response.headers.get(REQUEST_ID_HEADER),
       response.status,
+      parseError,
     );
   }
   if (!accepted.includes(response.status)) {
@@ -819,6 +958,12 @@ export class RequestHandle<TData = unknown> {
    * of the fetch that collected it (not {@link RequestHandle.requestId}, which
    * identifies the queued request itself).
    *
+   * A model whose partner answers with its own media type resolves to the
+   * `binary` arm (`data` is a `Uint8Array`, `contentType` the partner's type),
+   * same as `run`. The result body is read within {@link GetOptions.maxBytes}
+   * (`DEFAULT_MAX_RESPONSE_BYTES` by default); a larger one rejects with
+   * `response_too_large`.
+   *
    * Rejects with the typed exception from `routerErrors` when the completion
    * carries an `error_type`, which is how the server reports a failed OR
    * cancelled request. `timeoutMs` bounds the wait exactly as it does on
@@ -830,7 +975,9 @@ export class RequestHandle<TData = unknown> {
    * false` — this route has no replay marker — so deduplicate spend by
    * {@link RequestHandle.requestId}, not by `replayed`.
    */
-  async get(options: WaitOptions = {}): Promise<RunResult<TData>> {
+  async get(options: GetOptions = {}): Promise<RunResult<TData>> {
+    // Before the first poll, so a bad cap is reported without spending a wait.
+    const maxBytes = resolveMaxBytes(options.maxBytes, "RequestHandle.get");
     const timeoutMs = options.timeoutMs ?? null;
     const deadlineAt = timeoutMs === null ? null : Date.now() + timeoutMs;
     let completion: QueueUpdate | null = null;
@@ -839,6 +986,7 @@ export class RequestHandle<TData = unknown> {
       signal: options.signal,
       budgetMs: remainingMs(deadlineAt),
       retry: options.retry ?? this.#retry,
+      maxBytes,
     });
   }
 
@@ -853,8 +1001,17 @@ export class RequestHandle<TData = unknown> {
    */
   async collect(
     completion: QueueUpdate | null,
-    options: { signal?: AbortSignal; budgetMs: number | null; retry: RetryOptions | false },
+    options: {
+      signal?: AbortSignal;
+      budgetMs: number | null;
+      retry: RetryOptions | false;
+      maxBytes?: number | null;
+    },
   ): Promise<RunResult<TData>> {
+    // Resolved here too, not only by `get` and `subscribe`: this method is
+    // reachable on the exported class, and an unresolved `undefined` or `NaN`
+    // would read as "no cap". Idempotent on a value either of them resolved.
+    const maxBytes = resolveMaxBytes(options.maxBytes, "RequestHandle.collect");
     if (completion === null) {
       // Unreachable while `events` always yields the completion it stops on;
       // checked anyway, because the alternative is a null dereference in the
@@ -869,7 +1026,22 @@ export class RequestHandle<TData = unknown> {
       budgetMs: options.budgetMs,
       retry: options.retry,
       what: "result",
+      // Same string and reason as `run`: the result 200 declares a `*/*`
+      // binary arm alongside the JSON one, and this call now handles both.
+      accept: "application/json, */*;q=0.9",
+      bytes: {
+        maxBytes,
+        subject: `the result of model request ${this.requestId}`,
+        // `subscribe` hands back no handle when the cap rejects, so the
+        // error carries the id `models.handle(model, id).get` needs to retry.
+        details: { queuedRequestId: this.requestId },
+      },
     });
+    // On every `invalid_response` built below too: the request may well still
+    // be collectable later, and a `subscribe` caller has no handle to do it
+    // with. Not on the typed `RouterError` a non-2xx raises through `decode`:
+    // that class has no `details` to carry it on.
+    const queued = { queuedRequestId: this.requestId };
     if (response.status === 202) {
       // The status read said COMPLETED and the result route says otherwise.
       // Reporting it is the point: returning the 202's status body typed as a
@@ -879,9 +1051,108 @@ export class RequestHandle<TData = unknown> {
           "answered 202 (accepted, not finished)",
         response.headers.get(REQUEST_ID_HEADER),
         202,
+        undefined,
+        queued,
       );
     }
-    const body = decode(response, [200]);
+    const requestId = response.headers.get(REQUEST_ID_HEADER);
+    const servingProvider = response.headers.get(FALLBACK_PROVIDER_HEADER);
+    const droppedParams = parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER));
+    const replayed = parseReplayed(response.headers.get(IDEMPOTENT_REPLAYED_HEADER));
+    const creditsUsed = parseCreditsUsed(response.headers.get(CREDITS_USED_HEADER));
+    if (response.status !== 200) {
+      // A non-2xx raises the typed router error from its (UTF-8-decoded)
+      // envelope; any other 2xx is not the result the contract promises.
+      // `decode` always throws for a non-2xx today; falling through to the
+      // throw below makes that an enforced invariant rather than an incidental
+      // one, so a change there cannot reach code that reports `httpStatus: 200`.
+      if (!(response.status >= 200 && response.status < 300)) decode(response, [200]);
+      throw invalidResponse(
+        `the result route for request ${this.requestId} answered ${String(response.status)} ` +
+          "where 200 was expected",
+        requestId,
+        response.status,
+        undefined,
+        queued,
+      );
+    }
+    const bytes = response.body ?? new Uint8Array(0);
+    if (bytes.byteLength === 0) {
+      // Not `Uint8Array(0)` handed back as a result: an empty 200 is a
+      // truncated or malformed response, not a zero-byte generation.
+      throw invalidResponse(
+        `the result route for request ${this.requestId} answered 200 with an empty body`,
+        requestId,
+        200,
+        undefined,
+        queued,
+      );
+    }
+
+    // The spec declares this 200 as `application/json` OR `*/*` bytes and
+    // tells clients to branch on `Content-Type` — the same two arms `finish`
+    // in models.ts handles for `run`, and branched the same way. Router
+    // refuses binary models at submit until its binary result spill lands, so
+    // the bytes arm is forward-compatible rather than reachable today.
+    const contentType = response.headers.get(CONTENT_TYPE_HEADER)?.trim() ?? "";
+    const mediaType = mediaTypeOf(contentType);
+    if (mediaType !== "" && !isJsonMediaType(mediaType)) {
+      const binary: BuiltRunResult<TData> = {
+        kind: "binary",
+        data: bytes,
+        contentType,
+        requestId,
+        servingProvider,
+        droppedParams,
+        replayed,
+        creditsUsed,
+      };
+      return binary;
+    }
+    let body: unknown;
+    // Set once the body is a string: a throw before that is the decode's.
+    let decoded = false;
+    try {
+      // Strict when nothing declared a type, as in `finish`: a lossy decode
+      // could turn bytes into a JSON string of U+FFFDs.
+      const text = mediaType === "" ? UTF8_STRICT.decode(bytes) : decodeUtf8(bytes);
+      decoded = true;
+      body = JSON.parse(text);
+    } catch (exc) {
+      // No `Content-Type` and not JSON: nothing claimed a document, so it is
+      // the bytes arm with no media type to report. A declared JSON body that
+      // does not parse is the server contradicting its own header.
+      //
+      // As in `finish`: with no type declared ANY throw is "not JSON" —
+      // invalid UTF-8, a body too long to hold as a string, a nesting too deep
+      // for the parser — since nothing claimed a document and a re-collect
+      // fails the same way. A declared-JSON body that fails without a
+      // `SyntaxError` is this process out of room, and says so.
+      if (mediaType === "") {
+        const binary: BuiltRunResult<TData> = {
+          kind: "binary",
+          data: bytes,
+          contentType: "",
+          requestId,
+          servingProvider,
+          droppedParams,
+          replayed,
+          creditsUsed,
+        };
+        return binary;
+      }
+      throw invalidResponse(
+        exc instanceof SyntaxError
+          ? "the queue answered 200 with a body that is not JSON"
+          : `the queue answered 200 with a body this process ran out of resources ${
+              decoded ? "parsing" : "decoding"
+            } (see cause); the body itself may be valid JSON`,
+        requestId,
+        200,
+        exc,
+        queued,
+      );
+    }
     // Checked again on the result body: which of the two responses carries the
     // `error_type` is the server's choice, and reading only one of them is how
     // a failure gets returned as a result.
@@ -890,17 +1161,10 @@ export class RequestHandle<TData = unknown> {
     // the partner's, and a model whose native output is an array or a bare
     // value is not a malformed response.
     //
-    // Always `"json"`: the result route is read through `decode`, which parses
-    // the body as a document, so the queued path has no binary branch to reach
-    // — `RunResult`'s other arm is produced only by the SYNCHRONOUS route
-    // (`finish` in models.ts), which reads `Content-Type` off the generation
-    // itself. The discriminant is still written rather than inferred so a
-    // caller can narrow one union across both paths.
-    //
-    // The two alt-provider disclosure headers are read here for the same
-    // reason the discriminant is written rather than inferred: one union, both
-    // paths, narrowed the same way. They are expected to be absent on this
-    // route — `submitRouterModelRequest` takes neither `model_provider` nor
+    // The two alt-provider disclosure headers are read for the same reason the
+    // discriminant is written rather than inferred: one union, both paths,
+    // narrowed the same way. They are expected to be absent on this route —
+    // `submitRouterModelRequest` takes neither `model_provider` nor
     // `fallback_provider`, and `getRouterModelRequestResult`'s `200` declares
     // neither header, so the contract gives a queued run nothing to disclose
     // — but reading them keeps the two result shapes identical and means this
@@ -928,11 +1192,11 @@ export class RequestHandle<TData = unknown> {
     const result: BuiltRunResult<TData> = {
       kind: "json",
       data: body as TData,
-      requestId: response.headers.get(REQUEST_ID_HEADER),
-      servingProvider: response.headers.get(FALLBACK_PROVIDER_HEADER),
-      droppedParams: parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER)),
-      replayed: parseReplayed(response.headers.get(IDEMPOTENT_REPLAYED_HEADER)),
-      creditsUsed: parseCreditsUsed(response.headers.get(CREDITS_USED_HEADER)),
+      requestId,
+      servingProvider,
+      droppedParams,
+      replayed,
+      creditsUsed,
     };
     return result;
   }
@@ -1059,6 +1323,8 @@ export async function subscribe<TData = unknown>(
   input: Record<string, unknown>,
   options: SubscribeOptions = {},
 ): Promise<RunResult<TData>> {
+  // Before the submit: a cap this call cannot have should not cost a generation.
+  const maxBytes = resolveMaxBytes(options.maxBytes, "models.subscribe");
   const timeoutMs = options.timeoutMs ?? null;
   // The clock starts HERE, before the submit, so `timeoutMs` bounds the whole
   // call as documented and not only the polling after it.
@@ -1114,6 +1380,7 @@ export async function subscribe<TData = unknown>(
     signal: options.signal,
     budgetMs: remainingMs(deadlineAt),
     retry: options.retry ?? {},
+    maxBytes,
   });
 }
 
