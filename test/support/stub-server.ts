@@ -22,6 +22,13 @@ export interface ServerState {
   /** Require an Authorization header (Cloud/serverless). */
   requireAuth: boolean;
   /**
+   * GET /jobs/{id} answers this raw response instead of the job — a
+   * `404 job_not_found`, a web page, a bare 404 or a 5xx.
+   */
+  jobGetRaw: { status: number; contentType: string; body: string } | null;
+  /** The id of every GET /jobs/{id}, in arrival order. */
+  jobGetIds: string[];
+  /**
    * When set, `urls.self`/`events`/`cancel` in job payloads are absolute
    * URLs prefixed with this origin instead of the default relative path —
    * lets a test simulate a job whose links point at a different host (e.g.
@@ -195,6 +202,8 @@ function defaultState(): ServerState {
     rejectHashMismatch: false,
     contentBytes: Buffer.from("\x89PNG-stub-output-bytes-0123456789"),
     requireAuth: false,
+    jobGetRaw: null,
+    jobGetIds: [],
     jobUrlsOrigin: null,
     queueFullTimes: 0,
     queueFullCode: "queue_full",
@@ -530,6 +539,13 @@ export class StubServer {
 
   private serveJob(jobId: string, res: ServerResponse): void {
     const state = this.state;
+    state.jobGetIds.push(jobId);
+    if (state.jobGetRaw !== null) {
+      const { status, contentType, body } = state.jobGetRaw;
+      res.writeHead(status, { "Content-Type": contentType });
+      res.end(body);
+      return;
+    }
     if (state.hangJobPoll) return; // never respond; the caller must abort client-side
     state.jobPollCount += 1;
     const terminal = state.jobPollCount >= state.pollsToSucceed;

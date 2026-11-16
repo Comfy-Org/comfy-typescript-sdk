@@ -17,6 +17,19 @@ Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
 entry. See CONTRIBUTING.md.
 -->
 
+### Added
+
+- `client.workflows.fromExample(name, inputs)`: a built-in workflow to run before you have one
+  of your own. Three examples, `text-to-image` (Z-Image Turbo), `image-to-video` and
+  `text-to-video` (Wan 2.2 5B), with named inputs (`prompt`, `seed`, `image`, ...) so no node
+  ids are needed. `client.workflows.examples()` lists them. `seed` defaults to a new random value
+  per call. An unknown example or input throws a `RangeError` naming the valid ones. The graphs
+  match the Python SDK's.
+- `client.check()`: confirms the key and the address with one authenticated read that runs
+  nothing, and resolves to `{ baseUrl, authenticated }`. A rejected key throws `Unauthorized`;
+  an address that is not a Comfy API v2 deployment throws `ComfyError` with code
+  `not_a_comfy_api`.
+
 ## [0.5.0] - 2026-10-10
 
 ### Added
