@@ -617,16 +617,61 @@ Upgrading from an earlier version: `new Comfy(url, opts)` becomes
 
 ## Quickstart
 
+Get an API key from [platform.comfy.org](https://platform.comfy.org) and export
+it as `COMFY_API_KEY`, then:
+
 ```ts
 import { Comfy } from "@comfyorg/sdk";
 
-const client = new Comfy({ apiKey: "comfyui-..." });
+const client = new Comfy(); // reads COMFY_API_KEY, targets Comfy Cloud
+await client.check(); // confirms the key works; runs nothing, costs nothing
 
-const wf = await client.workflows.fromFile("workflow_api.json");
+const wf = client.workflows.fromExample("text-to-image", {
+  prompt: "a lighthouse at dusk, oil painting",
+});
 const job = await client.run(wf); // submit + poll to a terminal state; throws on failure
+await job.outputs[0].toFile("lighthouse.png");
+```
+
+That runs without a workflow file of your own. When you have one, export it
+from ComfyUI with **File → Export (API)** and swap in `fromFile`:
+
+```ts
+const wf = await client.workflows.fromFile("workflow_api.json");
+const job = await client.run(wf);
 const outputs = job.getOutputs("13"); // outputs produced by node "13"
 await outputs[0].toFile("out.png");
 ```
+
+### Built-in examples
+
+`client.workflows.fromExample(name, inputs)` returns an ordinary `Workflow`.
+Inputs you don't pass keep their defaults, and `seed` is random per call unless
+you set it. `client.workflows.examples()` lists them with their inputs.
+
+| Example          | Output  | Inputs                                                                               | Model         | Time on Cloud |
+| ---------------- | ------- | ------------------------------------------------------------------------------------ | ------------- | ------------- |
+| `text-to-image`  | PNG     | `prompt`, `seed`, `width`, `height`                                                  | Z-Image Turbo | ~7s           |
+| `image-to-video` | MP4, 3s | `image` (required), `prompt`, `negative_prompt`, `seed`, `width`, `height`, `frames` | Wan 2.2 5B    | ~55s          |
+| `text-to-video`  | MP4, 3s | `prompt`, `negative_prompt`, `seed`, `width`, `height`, `frames`                     | Wan 2.2 5B    | ~55s          |
+
+```ts
+const image = client.assets.fromFile("lighthouse.png");
+const video = await client.run(client.workflows.fromExample("image-to-video", { image }));
+await video.outputs[0].toFile("lighthouse.mp4");
+```
+
+The examples use models from the Comfy Cloud library; a self-hosted ComfyUI
+runs them only if it has the same model files.
+
+### Checking a key
+
+`client.check()` makes one authenticated read that creates no job and spends no
+credits, and resolves to `{ baseUrl, authenticated }`. A rejected key throws
+`Unauthorized`; an address that is not a Comfy API v2 deployment throws a
+`ComfyError` with code `not_a_comfy_api`. It confirms the key and the address,
+not your balance: a key that passes can still be refused at submit with
+`InsufficientCredits`.
 
 `run()` submits and polls to completion in one call. If you want to act on
 the job in between (read `job.status`, stream progress, cancel it), use

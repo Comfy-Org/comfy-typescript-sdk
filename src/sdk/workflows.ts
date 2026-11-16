@@ -11,6 +11,8 @@
 
 import { readFile } from "node:fs/promises";
 
+import { buildExample, EXAMPLES, getExample, type Example } from "./examples.js";
+
 export type WorkflowGraph = Record<string, unknown>;
 
 /**
@@ -67,5 +69,29 @@ export class WorkflowFactory {
   /** Parse an API-format workflow from a JSON string. */
   fromString(text: string): Workflow {
     return new Workflow(JSON.parse(text) as WorkflowGraph);
+  }
+
+  /**
+   * A built-in example workflow, ready to run. For a first run before you
+   * have a workflow of your own:
+   *
+   * ```ts
+   * const wf = client.workflows.fromExample("text-to-image", { prompt: "a red fox in snow" });
+   * const job = await client.run(wf);
+   * ```
+   *
+   * `inputs` set the example's named inputs (`prompt`, `seed`, ...); anything
+   * not passed keeps its default, and `seed` defaults to a new random value
+   * per call. An unknown example or input throws a `RangeError` naming the
+   * valid ones. {@link WorkflowFactory.examples} lists them all. The examples
+   * use models from the Comfy Cloud library.
+   */
+  fromExample(name: string, inputs: Record<string, unknown> = {}): Workflow {
+    return buildExample(getExample(name), inputs);
+  }
+
+  /** Every built-in example, for {@link WorkflowFactory.fromExample}. */
+  examples(): Example[] {
+    return [...EXAMPLES];
   }
 }

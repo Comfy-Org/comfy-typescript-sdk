@@ -5,7 +5,13 @@
  * sync/async duplication (JS is async-native).
  */
 
-export { Comfy, BASE_URL_ENV_VAR, COMFY_CLOUD_BASE_URL, type ComfyOptions } from "./client.js";
+export {
+  Comfy,
+  BASE_URL_ENV_VAR,
+  COMFY_CLOUD_BASE_URL,
+  type CheckResult,
+  type ComfyOptions,
+} from "./client.js";
 export { comfy } from "./comfy.js";
 export {
   config,
@@ -64,6 +70,7 @@ export {
 } from "./retry.js";
 export { Asset, AssetFactory } from "./assets.js";
 export { Workflow, WorkflowFactory, type WorkflowGraph } from "./workflows.js";
+export { EXAMPLES, type Example, type ExampleInput } from "./examples.js";
 export { Job, JobFactory, type JobSummary } from "./jobs.js";
 export { Output } from "./outputs.js";
 export type { ComfyEvent, Log, OutputReady, Preview, Progress, StatusChange } from "./events.js";

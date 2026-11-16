@@ -243,8 +243,31 @@ function guardUiFormat(workflow: Workflow): void {
  * `apiKey` is optional: omit it to fall back to `COMFY_API_KEY`. Against
  * Comfy Cloud, neither throws {@link MissingCredentials} at construction.
  */
+/** What {@link Comfy.check} confirmed: this address speaks the v2 API and took the key. */
+export interface CheckResult {
+  /** The deployment that answered (userinfo removed). */
+  readonly baseUrl: string;
+  /** Whether a key was sent. `false` only for a keyless self-hosted proxy. */
+  readonly authenticated: boolean;
+}
+
+/**
+ * A job id no deployment ever issues. {@link Comfy.check} looks it up: the
+ * lookup is authenticated like every v2 route, runs nothing and costs nothing,
+ * and its only successful answer is `404 job_not_found`.
+ */
+const CHECK_JOB_ID = "00000000-0000-0000-0000-000000000000";
+
+function redactUserinfo(baseUrl: string): string {
+  const url = new URL(baseUrl);
+  url.username = "";
+  url.password = "";
+  return url.toString().replace(/\/$/, "");
+}
+
 export class Comfy {
   private readonly low: ComfyLow;
+  readonly #checkTarget: CheckResult;
   readonly assets: AssetFactory;
   readonly workflows: WorkflowFactory;
   readonly jobs: JobFactory;
@@ -265,7 +288,9 @@ export class Comfy {
     }
     // The base URL first: it decides whether a missing key is an error at all.
     const baseUrl = resolveBaseUrl();
-    this.low = new ComfyLow(baseUrl, resolveApiKey(options.apiKey, baseUrl), {
+    const apiKey = resolveApiKey(options.apiKey, baseUrl);
+    this.#checkTarget = { baseUrl: redactUserinfo(baseUrl), authenticated: Boolean(apiKey) };
+    this.low = new ComfyLow(baseUrl, apiKey, {
       timeoutMs: options.timeoutMs,
       fetch: options.fetch,
       clientInfo: options.clientInfo,
@@ -273,6 +298,39 @@ export class Comfy {
     this.assets = new AssetFactory(this.low);
     this.workflows = new WorkflowFactory();
     this.jobs = new JobFactory(this.low);
+  }
+
+  /**
+   * Confirm the key and the address work, without running anything.
+   *
+   * Makes one authenticated read that creates no job and spends no credits.
+   * A rejected key throws `Unauthorized`; an address that is not a Comfy
+   * API v2 deployment throws a {@link ComfyError} with code
+   * `not_a_comfy_api`. It does not check your balance: a key that passes can
+   * still be refused at submit with `InsufficientCredits`.
+   */
+  async check(options: { signal?: AbortSignal } = {}): Promise<CheckResult> {
+    const { baseUrl } = this.#checkTarget;
+    const notComfy = (detail: string, httpStatus?: number): ComfyError =>
+      new ComfyError(
+        `${baseUrl} does not look like a Comfy API v2 deployment (GET /api/v2/jobs/{id} answered ${detail}). Check ${BASE_URL_ENV_VAR}.`,
+        { code: "not_a_comfy_api", httpStatus },
+      );
+    try {
+      await this.low.getJob(CHECK_JOB_ID, options);
+    } catch (exc) {
+      if (exc instanceof ApiError) {
+        if (exc.httpStatus === 404 && exc.code === "job_not_found") return { ...this.#checkTarget };
+        if (exc.httpStatus === 404) throw notComfy(`HTTP 404, ${exc.code}`, 404);
+        throw toSdkError(exc);
+      }
+      // A web page where the API should be: the 200 body is HTML, not JSON.
+      if (exc instanceof SyntaxError) throw notComfy("a page that is not JSON");
+      throw exc;
+    }
+    throw new ComfyError(`${baseUrl} returned a job for an id no deployment issues`, {
+      code: "invalid_response",
+    });
   }
 
   private async materialize(workflow: Workflow, signal?: AbortSignal): Promise<WorkflowGraph> {
