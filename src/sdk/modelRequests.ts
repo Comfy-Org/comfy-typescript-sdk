@@ -234,14 +234,23 @@ export interface QueueUpdate {
  * What Comfy quoted for a queued request when it admitted it — the submit
  * response's `estimate` object, read into camelCase.
  *
- * Priced before dispatch from the same rate card the charge is billed against,
- * in US dollars. It is a QUOTE, not a price lock: the run is charged at the
- * rates in force when it is rated, which can differ from those in force at
- * {@link pricingAsOf}.
+ * Priced before dispatch in US dollars, at Comfy's standard list price — or,
+ * for a model billed the cost its vendor reports, from the vendor's published
+ * price list. It is a QUOTE, not the charge, in three ways:
+ *
+ * - it is not a price lock: the run is charged at the rates in force when it
+ *   is rated, which can differ from those in force at {@link pricingAsOf};
+ * - it does not reflect contract rates: a workspace with negotiated pricing is
+ *   quoted the list price and charged its contract rate, so `exact` means
+ *   exact at list price, not that workspace's charge;
+ * - a vendor-reported model is billed the amount the vendor reports after the
+ *   run, never the quoted figure verbatim.
  *
  * Read {@link source} first; it says which of the figures exist:
  *
  * - `exact` carries {@link amount} (and {@link amountCents}, {@link credits});
+ * - `free` carries an {@link amount} of `"0"` — the rate card prices the
+ *   request at zero;
  * - `estimated` carries {@link minAmount} and {@link maxAmount} and no amount;
  * - `unknown` carries no figure, and a {@link reason}.
  *
@@ -249,10 +258,11 @@ export interface QueueUpdate {
  */
 export interface CostEstimate {
   /**
-   * `"exact"`, `"estimated"` or `"unknown"`, verbatim — or whatever a newer
-   * server sends. An OPEN string, like {@link QueueUpdate.status}: a source
-   * added server side reaches the caller as itself. Branch on
-   * {@link isExact} / {@link isEstimated} / {@link isUnknown} rather than on
+   * `"exact"`, `"estimated"`, `"free"` or `"unknown"`, verbatim — or whatever
+   * a newer server sends. An OPEN string, like {@link QueueUpdate.status}: a
+   * source added server side reaches the caller as itself. Branch on
+   * {@link isExact} / {@link isEstimated} / {@link isFree} /
+   * {@link isUnknown} rather than on
    * this, so an unrecognised value lands in `isUnknown` as the contract says
    * it must.
    */
@@ -261,6 +271,11 @@ export interface CostEstimate {
   isExact: boolean;
   /** `source` is `"estimated"`: the figure is the {@link minAmount}–{@link maxAmount} range. */
   isEstimated: boolean;
+  /**
+   * `source` is `"free"`: the rate card prices this request at zero, and
+   * {@link amount} is `"0"`. The only case in which a quote says free.
+   */
+  isFree: boolean;
   /**
    * `source` is `"unknown"` OR a value this release does not recognise — no
    * figure can be relied on. Not a statement that the run is free.
@@ -278,7 +293,8 @@ export interface CostEstimate {
    */
   pricingAsOf: string;
   /**
-   * Dollars as a decimal STRING (`"0.04"`), present on an exact quote. A
+   * Dollars as a decimal STRING (`"0.04"`), present on an exact quote, and
+   * `"0"` on a free one. A
    * string on purpose: it is exact to eight decimals on the wire, and a
    * `number` would round it. `null` when the server sent none.
    */
@@ -296,10 +312,17 @@ export interface CostEstimate {
   /** {@link amount} in Comfy credits, rounded to 2 decimals; `null` when absent. */
   credits: number | null;
   /**
-   * Why there is no figure, on an unknown quote — `"not_quotable"`,
-   * `"unpriced_model"`, or a newer value, verbatim. `null` when absent. The
-   * contract reads any value other than those two as `"not_quotable"`, so
-   * branch on `reason === "unpriced_model"` rather than on `"not_quotable"`.
+   * Why there is no figure, on an unknown quote, verbatim; `null` when absent:
+   *
+   * - `"not_quotable"` — the call cannot be priced before it runs;
+   * - `"unpriced_model"` — the rate card does not price this request;
+   * - `"byok"` — the run uses your own provider key, so Comfy bills nothing
+   *   for it;
+   * - `"pricing_unavailable"` — the rate card could not be read when the
+   *   request was admitted; transient, and the run is still charged as usual.
+   *
+   * The contract reads any other value as `"not_quotable"`, so branch on the
+   * three specific values and treat everything else as `"not_quotable"`.
    */
   reason: string | null;
   /**
@@ -588,16 +611,21 @@ export function costEstimateOf(value: unknown): CostEstimate | null {
   }
   const isExact = source === "exact";
   const isEstimated = source === "estimated";
+  const isFree = source === "free";
   // The figure the source promises must be there: an `exact` quote without its
   // `amount`, or a range missing a bound, is the partial quote rejected above.
   if (isExact && amount === null) return null;
+  // A `free` quote's amount is the contract's "0"; one carrying a charge is a
+  // contradiction, and reading it as free would under-report a real cost.
+  if (isFree && (amount === null || Number(amount) !== 0)) return null;
   if (isEstimated && (minAmount === null || maxAmount === null)) return null;
   return Object.freeze({
     source,
     isExact,
     isEstimated,
+    isFree,
     // The contract: "read any other value as `unknown`".
-    isUnknown: !isExact && !isEstimated,
+    isUnknown: !isExact && !isEstimated && !isFree,
     currency,
     provider,
     model,

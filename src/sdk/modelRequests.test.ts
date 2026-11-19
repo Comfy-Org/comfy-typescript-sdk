@@ -283,6 +283,7 @@ describe("RequestHandle.estimate", () => {
       source: "exact",
       isExact: true,
       isEstimated: false,
+      isFree: false,
       isUnknown: false,
       currency: "USD",
       provider: "bfl",
@@ -314,6 +315,7 @@ describe("RequestHandle.estimate", () => {
       source: "estimated",
       isExact: false,
       isEstimated: true,
+      isFree: false,
       isUnknown: false,
       amount: null,
       minAmount: "0.00000001",
@@ -323,16 +325,32 @@ describe("RequestHandle.estimate", () => {
     });
   });
 
-  it("reads an unknown quote with its reason", async () => {
-    const handle = await submitWith({ ...BASE, source: "unknown", reason: "not_quotable" });
+  it("reads a free quote as free, not unknown", async () => {
+    const handle = await submitWith({ ...BASE, source: "free", amount: "0", amount_cents: 0 });
     expect(handle.estimate).toMatchObject({
-      source: "unknown",
+      source: "free",
       isExact: false,
       isEstimated: false,
-      isUnknown: true,
-      amount: null,
-      reason: "not_quotable",
+      isFree: true,
+      isUnknown: false,
+      amount: "0",
+      amountCents: 0,
     });
+  });
+
+  it("reads an unknown quote with its reason", async () => {
+    for (const reason of ["not_quotable", "unpriced_model", "byok", "pricing_unavailable"]) {
+      const handle = await submitWith({ ...BASE, source: "unknown", reason });
+      expect(handle.estimate, reason).toMatchObject({
+        source: "unknown",
+        isExact: false,
+        isEstimated: false,
+        isFree: false,
+        isUnknown: true,
+        amount: null,
+        reason,
+      });
+    }
   });
 
   it("reads an unrecognised source as unknown, keeping the value verbatim", async () => {
@@ -381,6 +399,9 @@ describe("RequestHandle.estimate", () => {
       { ...BASE, source: "exact", amount: null, amount_cents: 4 },
       { ...BASE, source: "estimated", min_amount: "0.01" },
       { ...BASE, source: "estimated", max_amount: "0.05" },
+      // A `free` quote without its "0", or carrying a charge.
+      { ...BASE, source: "free" },
+      { ...BASE, source: "free", amount: "0.04" },
       // A dollar figure that is not a decimal numeral.
       { ...BASE, source: "exact", amount: "" },
       { ...BASE, source: "exact", amount: " " },
