@@ -339,18 +339,18 @@ export class Job {
    */
   private async withReadError(event: StatusChange, signal?: AbortSignal): Promise<StatusChange> {
     if (event.status === SUCCESS) return event;
-    const before = this.model;
+    let read: LowJob;
     try {
-      await this.refresh(signal);
+      read = await translate(() =>
+        this.low.getJob(this.model.urls.self || this.model.id, { signal }),
+      );
     } catch (exc) {
       if (signal?.aborted) throw exc;
       return event;
     }
-    if (!isTerminal(this.status)) {
-      this.model = before;
-      return event;
-    }
-    return { ...event, error: this.model.error };
+    if (!isTerminal(read.status)) return event;
+    this.model = read;
+    return { ...event, error: read.error };
   }
 
   /**
