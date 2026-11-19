@@ -248,16 +248,23 @@ function okHeaderNames(doc, operation, label) {
  * route rather than off the shared `components/responses`, because it is what
  * THIS operation can answer with that the predicate is about.
  *
- * Only the COLLECT pace counts. The contract declares two `Retry-After`
- * header components with opposite meanings: `RouterRetryAfterHeader` (re-send
- * the same `Idempotency-Key` to collect a generation still running — what
- * `isCollectable` is about) and `RouterCapacityRetryAfterHeader` (the request
- * was refused for capacity before anything was submitted; just send it again
- * later — there is nothing to collect). A `Retry-After` referencing anything
- * else fails, so a third kind cannot be silently counted as either.
+ * Only the COLLECT pace counts. The contract declares three `Retry-After`
+ * header components, and two of them mean the opposite of the first:
+ * `RouterRetryAfterHeader` (re-send the same `Idempotency-Key` to collect a
+ * generation still running — what `isCollectable` is about),
+ * `RouterCapacityRetryAfterHeader` (the request was refused for capacity before
+ * anything was submitted; just send it again later — there is nothing to
+ * collect) and `RouterRateLimitRetryAfterHeader` (a `429` carrying
+ * `error_type: rate_limited`: the seconds until the per-minute allowance admits
+ * one more request, so it paces SENDING AGAIN and holds nothing to collect). A
+ * `Retry-After` referencing anything else fails, so a fourth kind cannot be
+ * silently counted as any of them.
  */
 const COLLECT_RETRY_AFTER_REF = "#/components/headers/RouterRetryAfterHeader";
-const RESEND_RETRY_AFTER_REF = "#/components/headers/RouterCapacityRetryAfterHeader";
+const RESEND_RETRY_AFTER_REFS = [
+  "#/components/headers/RouterCapacityRetryAfterHeader",
+  "#/components/headers/RouterRateLimitRetryAfterHeader",
+];
 
 export function retryAfterStatuses(doc, pathItem) {
   const responses = deref(doc, pathItem.post.responses ?? {});
@@ -271,13 +278,13 @@ export function retryAfterStatuses(doc, pathItem) {
     )?.[1];
     if (retryAfter === undefined) continue;
     const ref = retryAfter?.$ref;
-    if (ref === RESEND_RETRY_AFTER_REF) continue;
+    if (RESEND_RETRY_AFTER_REFS.includes(ref)) continue;
     if (ref !== COLLECT_RETRY_AFTER_REF) {
       fail(
         `spec/router-openapi.yaml: ${RUN_OPERATION_ID}'s ${status} declares a \`Retry-After\` ` +
           `that references ${JSON.stringify(ref ?? null)}, neither ${COLLECT_RETRY_AFTER_REF} ` +
-          `(collect) nor ${RESEND_RETRY_AFTER_REF} (resend). Decide which one it is and ` +
-          "teach retryAfterStatuses in scripts/router-route-contract.mjs.",
+          `(collect) nor ${RESEND_RETRY_AFTER_REFS.join(" / ")} (resend). Decide which one it ` +
+          "is and teach retryAfterStatuses in scripts/router-route-contract.mjs.",
       );
     }
     // OpenAPI also allows `default` and the `4XX`/`5XX` range forms as
