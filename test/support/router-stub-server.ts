@@ -51,8 +51,9 @@ export interface ScriptedResponse {
   requestId?: string | null;
   /** `X-Comfy-Error-Type`; omitted keeps {@link RouterServerState.errorType}. */
   errorType?: string | null;
-  /** Extra response headers — `Retry-After` is the one the queue needs. */
-  headers?: Record<string, string>;
+  /** Extra response headers — `Retry-After` is the one the queue needs. An
+   * array sends the header once per value, as a repeated header line. */
+  headers?: Record<string, string | string[]>;
 }
 
 export interface RouterServerState {
