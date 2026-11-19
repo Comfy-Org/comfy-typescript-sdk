@@ -5,7 +5,7 @@ export type ClientOptions = {
 };
 
 /**
- * A user-owned record identified by a server-assigned UUID, backing an immutable blob whose content carries a server-computed blake3 hash. `hash` may be computed lazily: an asset record (and its retrievable bytes) can exist before its hash is filled in.
+ * A user-owned record identified by a server-assigned UUID, backing an immutable blob whose content carries a server-computed blake3 hash. `hash` may be computed lazily: an asset record (and its retrievable bytes) can exist before its hash is filled in. On an output, `job_metadata` carries the labels its producing job was submitted with, so code holding only the asset knows which run it came from. It is absent for assets no job produced, for outputs of a job sent without labels, where the serving surface keeps no job labels, and when the labels could not be read: so `job_id` without `job_metadata` does not prove the job had no labels. A create whose file path and bytes match an existing output answers with that output, so its `job_id` and `job_metadata` are the output's.
  */
 export type Asset = {
     id: string;
@@ -17,7 +17,7 @@ export type Asset = {
     content_type: string;
     file_path?: string | null;
     /**
-     * On create responses: distinguishes a brand-new blob (true) from a dedup hit against bytes the platform already had (false).
+     * On `POST /api/v2/assets` responses, distinguishes a brand-new blob (true) from a dedup hit against bytes the platform already had (false). On `POST /api/v2/assets/from-hash` responses, true means a new asset reference was created over existing bytes (201); false means an existing asset was reused (200).
      */
     created_new?: boolean;
     created_at: string;
@@ -31,9 +31,13 @@ export type Asset = {
      */
     expires_at?: string | null;
     /**
-     * ID of the job that produced this asset. Absent for uploaded assets, which have no producing job.
+     * ID of the job that produced this asset. Absent for assets no job produced, such as a fresh upload.
      */
     job_id?: string | null;
+    /**
+     * The labels the producing job was submitted with, read through `job_id` on each read. Absent for assets no job produced, for outputs of a job sent without labels, where the serving surface keeps no job labels, when the job is gone, and when the labels could not be read: so `job_id` without `job_metadata` does not prove the job had no labels.
+     */
+    job_metadata?: JobMetadata;
 };
 
 /**
@@ -63,6 +67,53 @@ export type Job = {
         [key: string]: number | null;
     };
     urls: JobUrls;
+    /**
+     * The deployment the job was sent to: the id in the address it was posted at, which stays the same when the deployment moves to another release. Absent on a surface that runs jobs on no deployment.
+     */
+    deployment_id?: string;
+    /**
+     * The release of the deployment's build that ran the job, which can differ from the release the deployment runs now. Absent where the serving surface does not report it.
+     */
+    release_id?: string;
+    /**
+     * The version of the release in `release_id`, the number its build cut it as. Absent where the serving surface does not report it or could not look it up at the time of the answer.
+     */
+    release_version?: number;
+    metadata?: JobMetadata;
+};
+
+/**
+ * The labels the job was submitted with, exactly as sent. Absent when it was sent with none.
+ */
+export type JobMetadata = {
+    [key: string]: string;
+};
+
+/**
+ * One page of `GET /api/v2/jobs`.
+ */
+export type JobList = {
+    jobs: Array<JobListItem>;
+    /**
+     * Pass as `cursor` to read the next page. Absent on the last page.
+     */
+    next_cursor?: string;
+};
+
+/**
+ * A job's stored record. The fields below are stable; an item may carry more, which a client should ignore rather than rely on.
+ */
+export type JobListItem = {
+    id: string;
+    status: JobStatus;
+    create_time: string;
+    update_time: string;
+    /**
+     * The version of the release that ran the job. Absent where the serving surface does not report it or could not look it up at the time of the answer.
+     */
+    release_version?: number;
+    metadata?: JobMetadata;
+    [key: string]: unknown;
 };
 
 /**
@@ -105,7 +156,8 @@ export type JobWorkflowResponse = {
 
 /**
  * Lifecycle: queued → running → succeeded | failed | expired;
- * a cancel request moves running → canceling → canceled.
+ * a cancel request, or the deletion of the deployment the job is running
+ * on, moves running → canceling → canceled.
  * Terminal states: succeeded, canceled, failed, expired.
  *
  */
@@ -120,7 +172,7 @@ export type JobUrls = {
     cancel: string;
     /**
      * Where to read what this run printed. Present on any surface that captures execution logs, which is why it is the one link here that is optional: absent means this surface captures none, for any job, so a client can stop looking without spending a request on an answer it already has.
-     * Follow this link rather than building the path from the job id. The two are not interchangeable: a surface may be mounted under a prefix this link already carries and a hand-built path would not, and a surface that does not implement the operation at all answers a routing `404` — indistinguishable, to the client, from the `404` that means the job itself is gone. Present does NOT mean this job has a log, and it is deliberately not a signal about one: a surface that captures logs offers the link on every job, including those it will answer `204` for and those whose log it withholds. Read the log, not the link.
+     * Follow this link rather than building the path from the job id. The two are not interchangeable: a surface may be mounted under a prefix this link already carries and a hand-built path would not, and a surface that does not implement the operation at all answers a routing `404` — indistinguishable, to the client, from the `404` that means the job itself is gone. Present does NOT mean this job has a log, and it is deliberately not a signal about one: a surface that captures logs offers the link on every job, including those it will answer `204` for. Read the log, not the link.
      */
     logs?: string;
 };
@@ -180,23 +232,89 @@ export type OutputType = 'image' | 'video' | 'audio' | 'text' | 'file' | 'latent
  */
 export type JobError = {
     code: string;
+    /**
+     * Why the job failed, written for a person to read. On a serverless deployment, where ComfyUI refused the workflow, it names the rejected nodes it has room for and their reasons, which `node_errors` carries in full. Its wording may change; read `code` and `node_errors` rather than matching this text.
+     */
     message: string;
+    /**
+     * Stored category of a user-caused failure on a serverless deployment: invalid_input, content_refused, out_of_gpu_memory, missing_model_or_node, workflow_logic or other. Clients tolerate unknown values as other. Absent for platform or unattributed failures, nonfailed jobs, reports recorded before categories were available, and account-scrubbed content. Comfy Cloud does not set this field. Reads never classify the failure again. This describes the stored report, not first-failure attribution or a guarantee of accuracy.
+     */
+    category?: string;
     node_id?: string | null;
     class_type?: string | null;
     traceback?: string | null;
+    /**
+     * Every node ComfyUI rejected when it refused the workflow before running any of it (a value outside its allowed range, a model the deployment does not contain, a graph that loops back on itself), keyed by node id, under the names ComfyUI gave them. Absent when the workflow ran and a node raised: `node_id`, `class_type` and `traceback` describe that failure instead.
+     */
+    node_errors?: {
+        [key: string]: JobNodeError;
+    };
+};
+
+/**
+ * One node that was rejected, and why: by ComfyUI when it refused the workflow after dispatch, or by the gateway when it refused the workflow at submit.
+ */
+export type JobNodeError = {
+    class_type?: string;
+    errors: Array<JobNodeErrorReason>;
+};
+
+/**
+ * One problem found with a node. `type` is the code for it: ComfyUI's (for example `value_not_in_list`, `value_bigger_than_max`, `dependency_cycle`), or one of the gateway's, sent where its submit checks are switched on: `unknown_node_class` (a node class the deployment's build does not contain), `waits_for_browser` (a node the workflow would run whose class waits for a browser tab to answer while the job runs, which a deployment never has), `invalid_node` (the node is not a JSON object), `invalid_inputs` (its `inputs` is present but not an object, refused only where the deployment's ComfyUI would fail such a node anyway, so no workflow that runs today is refused), or `invalid_class_type` (its `class_type` is missing or is not a non-empty string). ComfyUI's `missing_node_type` means the same as `unknown_node_class`, found after dispatch rather than at submit. For either, `message` ends naming the node pack that provides the class where the Comfy node registry knows one. `details` usually starts with the input it is about.
+ */
+export type JobNodeErrorReason = {
+    type: string;
+    message: string;
+    details?: string;
 };
 
 /**
  * Shared error envelope with machine-readable codes. Core codes (v1):
  * `invalid_workflow` (422), `workflow_format_ui` (422),
  * `missing_asset` (422), `hash_mismatch` (409), `blob_not_found`
- * (404), `idempotency_key_reuse` (422),
- * `queue_full` (429 + Retry-After), `insufficient_credits` (402),
- * `not_found` (404), `unauthorized` (401), `forbidden` (403).
+ * (404), `idempotency_key_reuse` (422), `upload_timed_out` (422: an
+ * asset upload stopped sending or was too slow; retry from a faster
+ * connection),
+ * `queue_full` (429 + Retry-After), `rate_limited` (429 + Retry-After:
+ * the caller is past a request rate limit; retry), `insufficient_credits`
+ * (402), `not_found` (404), `unauthorized` (401), `forbidden` (403).
  * Deployment-scoped surfaces add: `deployment_not_ready` (429 +
- * Retry-After — the deployment can still reach ready; retry) and
+ * Retry-After — the deployment can still reach ready; retry),
+ * `deployment_unavailable` (429 + Retry-After: the deployment is ready
+ * but its GPU provider is not taking work on it yet; retry),
+ * `deployment_lookup_unavailable` (503 + Retry-After, on any
+ * operation: the deployment the address names could not be looked up
+ * just now; nothing was done, so retry), `database_unavailable` (503 +
+ * Retry-After, only on a job submit: the job could not be saved just
+ * now and nothing was started, so retry), `auth_unavailable` (503 +
+ * Retry-After, on any operation: the credential could not be checked
+ * just now, which says nothing about the credential, so retry),
+ * `output_unavailable` (503 + Retry-After, only on a job status read: an
+ * output of the job could not be prepared just now; the job is
+ * unchanged, so retry after `Retry-After`, and report the job if it
+ * keeps answering),
  * `deployment_stopped` (422 — terminal deployment state; a retry
- * cannot succeed without operator action). A 429 is disambiguated
+ * cannot succeed without operator action), `invalid_request` (422:
+ * a malformed asset upload or asset-from-hash field, or a jobs-list
+ * `limit` that is not a positive integer), `validation_error` (422,
+ * Cloud: an asset upload or asset-from-hash field was refused, e.g. a
+ * tag over the tag limits), `content_blocked` (451:
+ * content moderation flagged the asset's bytes) and `sso_required` (403:
+ * the key is valid, but the account must sign in through its
+ * organization's single sign-on, which does not accept this key).
+ * Comfy Cloud's asset upload adds `invalid_content_type` (422: the
+ * request is not `multipart/form-data` with a boundary),
+ * `invalid_body` (422: a malformed multipart body or upload field),
+ * `validation_error` (422: the platform refused the upload, for example
+ * an image over the size cap or a disallowed tag) and `upload_busy`
+ * (503 + Retry-After: the server is busy with other uploads and nothing
+ * was stored, so retry).
+ * Job labels add: `metadata_invalid` (422: a submitted `metadata` breaks a
+ * limit; `details.key` names the key, except for too many pairs, which
+ * has no `details`), `metadata_not_supported` (422:
+ * this surface keeps no job labels yet), `invalid_metadata_filter` (400)
+ * and `invalid_cursor` (400). A surface that does not list jobs yet
+ * answers `not_implemented` (501). A 429 is disambiguated
  * by `error.code` alone; clients should treat any 429 + Retry-After
  * as "back off and retry".
  *
@@ -205,6 +323,13 @@ export type ErrorEnvelope = {
     error: {
         code: string;
         message: string;
+        /**
+         * On `sso_required`: the organization whose single sign-on governs this key, the one that holds the account, else the one that holds the key's workspace. It is the `organization` query parameter of Comfy Cloud's single sign-on start; treat it as opaque. Absent when the organization is unknown, and on every other code.
+         */
+        organization_id?: string;
+        /**
+         * Machine-readable detail for the code. When it carries `node_errors`, that is keyed by node id and each value is a `JobNodeError`, the same shape as a job's `error.node_errors`, whether the refusal came at submit (for example `unknown_node_class`, a node class the deployment's build does not contain) or from ComfyUI after dispatch. With `unknown_node_class` errors it carries `unknown_node_classes`, the missing classes; with `waits_for_browser` errors, `browser_wait_node_classes`, the classes that wait for a browser. A submit refusal names at most fifty nodes. For `invalid_node`, `invalid_inputs` and `invalid_class_type`, when it found more than fifty, `node_errors_truncated` is true and `malformed_node_count` carries the full count; for `waits_for_browser`, `browser_wait_node_count` does. For `unknown_node_class` it names only nodes whose class is one of the at most ten listed in `unknown_node_classes`; when those nodes number more than fifty, `node_errors_truncated` is true and `unknown_node_count` is how many nodes have a listed class. Nodes whose class is past those ten are neither named nor counted.
+         */
         details?: {
             [key: string]: unknown;
         } | null;
@@ -228,26 +353,29 @@ export type BlakeHash = string;
 export type PostAssetsData = {
     body: {
         /**
-         * The raw bytes.
+         * The asset's media type. On Comfy Cloud it must be valid UTF-8, not blank, at most 255 bytes, must not start or end with whitespace, and must not contain control characters (C0, DEL, C1, U+2028, U+2029) or any invisible format or default-ignorable character (every Unicode general category Cf character, including the zero-width joiners and direction marks, and the other default-ignorable code points); otherwise the request is refused with 422 `invalid_body` before anything is stored. An accepted value is stored as sent. A deployment refuses a `content_type` that is blank, is not valid UTF-8 or contains a control character (C0 other than tab, DEL, C1) or a bidi embedding, override or isolate (U+202A-U+202E, U+2066-U+2069), has a tab outside the whitespace that opens a parameter after a `;`, or whose part before its first `;` is not `type/subtype` (two RFC 9110 tokens, optionally followed by spaces), with 422 `invalid_request` before anything is stored.
          */
-        file: Blob | File;
         content_type: string;
         /**
-         * Placement path / filename (global-namespace-root form, e.g. `photo.png` or `models/checkpoints/x.safetensors`).
+         * Placement path / filename (global-namespace-root form, e.g. `photo.png` or `models/checkpoints/x.safetensors`). On Comfy Cloud the last segment becomes the asset name, so it must be valid UTF-8, at most 255 bytes, must not start with `.`, and must not contain control characters (C0, DEL, C1, U+2028, U+2029) or invisible format and default-ignorable characters (Unicode general category Cf, which includes the bidi embedding, override and isolate controls, soft hyphen, zero-width space, word joiner, BOM and tag characters, plus the other default-ignorable code points such as U+034F, U+2065 and the Hangul fillers); otherwise the request is refused with 422 `invalid_body` before anything is stored. ZWNJ/ZWJ (U+200C, U+200D) are allowed only between two visible non-ASCII characters (so not first, last, next to ASCII or next to another of these invisible characters, though one may follow an allowed variation selector, one right after an Indic virama on a letter of the same script may end a word, and a ZWJ after an Arabic-script letter that joins on both sides, or after that letter's marks, may precede ASCII such as a '.' or end the name), for Persian, Indic and emoji names. The direction marks U+200E, U+200F and U+061C are allowed, for right-to-left names, and so are the visible Arabic number signs (prepended concatenation marks such as U+0600, but not U+070F); the direction marks can still change how a name is displayed. The emoji presentation selectors U+FE0E and U+FE0F are allowed only after an ASCII digit, `#` or `*` that U+20E3 (the keycap) follows, after U+2139, the punctuation emoji U+203C, U+2049, U+3030 and U+303D or the math symbols U+2194, U+25FB-U+25FE, U+2934 and U+2935, and after any other symbol of category So except a regional indicator, a skin-tone modifier, a hair component or U+2800. Other variation selectors are allowed only after a base that can have variants: the Mongolian ones after a Mongolian letter, the rest after a unified Han ideograph, plus U+FE00 after the Myanmar and Phags-pa characters it is registered for. The Mongolian and Han rules follow scripts, not the registered sequence list. The tag characters are allowed only as the tag run of the England, Scotland and Wales flag emoji. These allowed invisible characters, white space, U+2800 and combining marks must not make up the whole segment or come before a leading `.`. A deployment keeps the whole `file_path` as the asset name, so it must be valid UTF-8 and must not contain a control character (C0 U+0000-U+001F, including tab, CR and LF; DEL U+007F; C1 U+0080-U+009F) or a bidi embedding, override or isolate (U+202A-U+202E, U+2066-U+2069); otherwise the request is refused with 422 `invalid_request` before anything is stored. Directory segments and other characters stay allowed there.
          */
         file_path: string;
         /**
-         * Optional client-computed blake3 (`blake3:<hex>`). Verified against the server-computed hash; mismatch is rejected with 409 `hash_mismatch` and no asset is minted.
+         * Optional client-computed blake3 (`blake3:<hex>`) of the bytes sent. Omit the part to skip verification: on Comfy Cloud and on a deployment a part sent empty is refused with 422 as malformed. Send it before `file`: nothing after the `file` field is read, so a trailing `expected_hash` is neither verified nor refused, and the response does not say the check was skipped. Verified against the server-computed blake3 of the received bytes, not of the stored bytes; mismatch is rejected with 409 `hash_mismatch`. On serverless deployments no asset is minted and no existing asset's retention is changed; elsewhere the upload is stored before the check, so the 409 returns no asset and a retry with the corrected expectation (and the same file extension) dedups onto it. On Comfy Cloud nothing removes that asset, so when the bytes themselves were wrong they stay stored: as an asset named after the last segment of `file_path` (`x.safetensors` for `models/checkpoints/x.safetensors`), or, when the bytes deduped onto an asset you already had, as that asset under its earlier name. The rest of `file_path` is not recorded. On Comfy Cloud and on a deployment, when `expected_hash` is sent more than once before `file` only the last value is checked, but an empty one among them is still refused with 422.
          */
         expected_hash?: string;
         /**
-         * Category tags (e.g. `input`).
+         * Category tags (e.g. `input`). A create carries at most 64 tags, each a non-empty UTF-8 string of at most 256 bytes (surrounding whitespace included) with no NUL byte. A deployment adds `input` to every asset and counts it, so it takes at most 63 of the caller's own; the `model_type:` tags derived for a model asset are not counted. A tag set breaking a limit is refused with 422. The rest of this paragraph describes Cloud's hosted API and a deployment, not the self-hosted proxy. Both cap the bytes of all `tags` parts sent before `file` combined: 8 KiB on Cloud's hosted API (422 `invalid_body`) and 64 KiB on a deployment (422 `invalid_request`). The cap counts duplicates before they are removed and JSON escapes before they are decoded, and is checked before the count and 256-byte limits above, so a tag set within them can still be refused. A `quoted-printable` part is counted and read after it is decoded; a part in any other `Content-Transfer-Encoding` is read as sent, so a `base64` part is stored as one tag holding its encoded text, while a `7bit`, `8bit` or `binary` part is read like a part with no encoding. A part is read as a JSON array when it starts with `[` (after leading whitespace) and is valid JSON or continues, after optional whitespace, with `"`: `["a","b"]` is two tags, `[]` adds no tags (nor does an empty part), and a malformed array such as `[1]` or `["a` is refused with 422. Any other non-empty part is one bare tag, kept as literal text, so `foo�` sent as a bare part is stored as written. Invalid UTF-8 in a `tags` part, or a lone surrogate escape (e.g. `�`) in a JSON-array `tags` part, is refused with 422 (`invalid_body` on Cloud, `invalid_request` on a deployment).
          */
         tags?: Array<string>;
         /**
          * Optional retention override in seconds (60s–7d): the asset's `expires_at` becomes now + `expires_in`, replacing the platform's default retention. Implementations without configurable retention ignore it. The bounds apply to this override only — the platform default is operator-configured and may lie outside them.
          */
         expires_in?: number;
+        /**
+         * The raw bytes. The order of properties in this schema does not set the order of parts on the wire: `file` must be the last part sent (see the field-order rule above).
+         */
+        file: Blob | File;
     };
     headers?: {
         /**
@@ -262,11 +390,11 @@ export type PostAssetsData = {
 
 export type PostAssetsErrors = {
     /**
-     * `unauthorized` — missing or invalid credentials.
+     * `unauthorized`: missing or invalid credentials. A credential that could not be checked answers `auth_unavailable` (503) instead.
      */
     401: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
@@ -274,13 +402,25 @@ export type PostAssetsErrors = {
      */
     409: ErrorEnvelope;
     /**
-     * `idempotency_key_reuse` or validation failure.
+     * The upload is over a body limit, sent by the edge proxy or the server's body limit. On Comfy Cloud (200 MB, 200,000,000 bytes) and on deployment-scoped surfaces (110 MB, 110,000,000 bytes) the server's own body limit (the Echo layer) sends a plain 413 before the upload is handled when the request declared a `Content-Length` over it; a body without a declared length is not guaranteed this 413. An edge proxy in front of the surface can also refuse a large body — including a chunked one, whether or not a `Content-Length` is declared — with its own 413; in production a CDN edge in front of Comfy Cloud refuses a body over its upload cap before it reaches the server. This spec attaches no schema to the 413 response, so none of these bodies can be decoded from it: the server's 413 is not an `ErrorEnvelope`, and while the self-hosted proxy refuses a file over its configured cap (100 MiB by default) with an `ErrorEnvelope` whose code is `payload_too_large`, that body is untyped here too. Because the server can refuse on the declared `Content-Length` (and the edge before the body is read), a client that writes the whole body before reading the response may see the connection reset and lose the 413. Check the body size before sending; `Expect: 100-continue` helps only when every hop in front of the server waits for the server's answer instead of replying `100 Continue` itself.
+     */
+    413: unknown;
+    /**
+     * `idempotency_key_reuse`, `input_blocked` (the bytes are already stored and flagged by content moderation, so `file_path` is not registered for them), `upload_timed_out` (the client stopped sending or sent too slowly; the server cannot recover the upload, so retry it from a faster connection), or validation failure — including a `tags` set over the limits above or a disallowed tag (`invalid_request` on a deployment or the self-hosted proxy; a deployment answers with a plain 500 a body whose Content-Type is missing, is neither `multipart/form-data` nor `multipart/mixed`, is otherwise unparseable as a media type (an unquoted empty `boundary=` among these; a quoted empty `boundary=""` parses and fails here with `invalid_request`), or carries no `boundary` parameter; a `multipart/mixed` body with a boundary is parsed like a form and either succeeds or fails here instead). On a deployment that includes a truncated `file` part: the body ends inside the part, before the delimiter that ends it. A body that stops right at that delimiter, without the final `--`, is not rejected: the part reads as complete and is stored. Comfy Cloud's asset upload answers validation failure instead with `invalid_content_type` (the request is not `multipart/form-data` with a boundary), `invalid_body` (a malformed multipart body or upload field) or `validation_error` (the platform refused the upload, for example an image over the size cap or a disallowed tag). Cloud refuses a malformed multipart body with `invalid_body` when the fault is found before the `file` part. Cloud stops parsing at `file`, so parts after it are never read, and a body that ends inside the streamed file currently gets 500 `upstream_error` instead. The exception is an upload with `expected_hash`: if Cloud accepts the upload before the whole file is read, it reads the rest. A body that ends inside the `file` part, before its delimiter, then gets `invalid_body`, and a complete body gets 500 `upstream_error` instead of 201 or 409; in both cases the asset is already stored, holding only the part of the file read before the upload was accepted. `invalid_body` also covers `tags` parts over the 8 KiB combined cap described under `tags`, and a body sent without a declared length that is cut off at the body limit, as described for this operation. Cloud uses the same code for a missing `file`; a missing `content_type`, or one that breaks the rules under `content_type`; a missing `file_path`, or one that is absolute, starts with `.`, contains `..`, is not already in clean form (no `//`, no `.` segment such as `/./`, and no trailing `/`) or breaks the rules under `file_path`; a `content_type`, `file_path` or `expected_hash` part over 8 KiB; and a non-empty `expected_hash` that is not `blake3:` followed by 64 lowercase hex characters. A `content_type` or `file_path` sent only after `file` counts as missing (see the field-order rule above). Any Content-Type other than `multipart/form-data` with a `boundary` (including a missing or unparseable one) gets `invalid_content_type` on Cloud. On Comfy Cloud and on a deployment, an `expected_hash` part that is present but empty is a malformed field (`invalid_body` on Comfy Cloud, `invalid_request` on a deployment), not an omitted hash.
      */
     422: ErrorEnvelope;
+    /**
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
+     */
+    429: ErrorEnvelope;
     /**
      * `upstream_error` — an unexpected failure reaching or processing the request in this implementation's backing services. The message is always a generic, safe-to-display string; implementation detail (the specific upstream, its error text, transport failures) is never included here — see each implementation's own error-mapping notes. Every operation in this contract can fail this way.
      */
     500: ErrorEnvelope;
+    /**
+     * On deployment-scoped surfaces, `deployment_lookup_unavailable`: the deployment this address names could not be looked up just now. The request was refused before it did anything (nothing was created, read, changed or canceled), so the same request can be sent again after `Retry-After`. Every operation at a deployment's address can answer this way. A job submit can also answer this 503 with `database_unavailable`: the job could not be saved just now and nothing was started, so the same request can be sent again after `Retry-After`. No other operation answers `database_unavailable`. On Comfy Cloud an asset upload can also answer this 503 with `upload_busy`: the server is busy with other uploads and nothing was stored, so the same upload can be sent again after `Retry-After`. Any operation can also answer this 503 with `auth_unavailable`: the credential could not be checked just now, so the same request can be sent again after `Retry-After`. A job status read can also answer it with `output_unavailable`: an output of the job could not be prepared just now, and the job is unchanged. A transient storage failure clears on a later read after `Retry-After`; an output whose stored address is broken answers it on every read until the platform repairs the output.
+     */
+    503: ErrorEnvelope;
 };
 
 export type PostAssetsError = PostAssetsErrors[keyof PostAssetsErrors];
@@ -301,7 +441,13 @@ export type PostAssetsResponse = PostAssetsResponses[keyof PostAssetsResponses];
 export type AssetFromHashData = {
     body: {
         hash: string;
+        /**
+         * Placement path / filename for a new reference. Comfy Cloud uses its last segment as the name; a deployment uses the full path. Both default to the bare hash digest when omitted or empty. Cloud reuse keeps the existing name even if a different valid path is supplied; a deployment also matches the path when deciding reuse. The self-hosted proxy keeps its indexed record's path. On Comfy Cloud a `file_path` that fails path validation, or whose last segment breaks the `file_path` rules of `POST /api/v2/assets`, is answered with 404 `blob_not_found`, the same as an unknown hash. The UTF-8 rule cannot fire here: invalid UTF-8 bytes and lone surrogate escapes (`�`) are replaced with U+FFFD when the JSON body is decoded, so such a name is stored with U+FFFD in their place. A deployment answers a `file_path` that fails path validation or holds a control character (C0, DEL, C1) or a bidi embedding, override or isolate (U+202A-U+202E, U+2066-U+2069) with 422 `invalid_request`; the same U+FFFD replacement applies there.
+         */
         file_path?: string;
+        /**
+         * Tags for a new reference; reuse keeps the existing tags. Comfy Cloud defaults an omitted or empty set to `input`. Cloud and deployment validation still applies on reuse; the self-hosted proxy does not apply submitted tags. A create carries at most 64 tags, each a non-empty UTF-8 string of at most 256 bytes (surrounding whitespace included) with no NUL byte. A deployment adds `input` to every asset and counts it, so it takes at most 63 of the caller's own; the `model_type:` tags derived for a model asset are not counted. A tag set breaking a limit is refused with 422. Invalid UTF-8 or a lone surrogate escape (e.g. `�`) inside a JSON-encoded tag is not refused: JSON decoding replaces it with U+FFFD (3 bytes each), and the 256-byte limit applies to the replaced value.
+         */
         tags?: Array<string>;
         /**
          * Optional retention override in seconds (60s–7d): the asset's `expires_at` becomes now + `expires_in`, replacing the platform's default retention. Implementations without configurable retention ignore it. The bounds apply to this override only — the platform default is operator-configured and may lie outside them.
@@ -315,11 +461,11 @@ export type AssetFromHashData = {
 
 export type AssetFromHashErrors = {
     /**
-     * `unauthorized` — missing or invalid credentials.
+     * `unauthorized`: missing or invalid credentials. A credential that could not be checked answers `auth_unavailable` (503) instead.
      */
     401: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
@@ -327,20 +473,32 @@ export type AssetFromHashErrors = {
      */
     404: ErrorEnvelope;
     /**
+     * The `tags` or `expires_in` is malformed, `tags` breaks the limits above or holds a disallowed tag, or (on a deployment) the `file_path` is malformed: `invalid_request` on a deployment. On Cloud a tag with a malformed shape is `invalid_body`, and a refusal by the platform (for example a disallowed tag) is `validation_error`. Cloud answers a malformed `file_path` with 404 `blob_not_found` instead (see `file_path`). A deployment checks the tags even when an identical reference exists.
+     */
+    422: ErrorEnvelope;
+    /**
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
+     */
+    429: ErrorEnvelope;
+    /**
      * `upstream_error` — an unexpected failure reaching or processing the request in this implementation's backing services. The message is always a generic, safe-to-display string; implementation detail (the specific upstream, its error text, transport failures) is never included here — see each implementation's own error-mapping notes. Every operation in this contract can fail this way.
      */
     500: ErrorEnvelope;
+    /**
+     * On deployment-scoped surfaces, `deployment_lookup_unavailable`: the deployment this address names could not be looked up just now. The request was refused before it did anything (nothing was created, read, changed or canceled), so the same request can be sent again after `Retry-After`. Every operation at a deployment's address can answer this way. A job submit can also answer this 503 with `database_unavailable`: the job could not be saved just now and nothing was started, so the same request can be sent again after `Retry-After`. No other operation answers `database_unavailable`. On Comfy Cloud an asset upload can also answer this 503 with `upload_busy`: the server is busy with other uploads and nothing was stored, so the same upload can be sent again after `Retry-After`. Any operation can also answer this 503 with `auth_unavailable`: the credential could not be checked just now, so the same request can be sent again after `Retry-After`. A job status read can also answer it with `output_unavailable`: an output of the job could not be prepared just now, and the job is unchanged. A transient storage failure clears on a later read after `Retry-After`; an output whose stored address is broken answers it on every read until the platform repairs the output.
+     */
+    503: ErrorEnvelope;
 };
 
 export type AssetFromHashError = AssetFromHashErrors[keyof AssetFromHashErrors];
 
 export type AssetFromHashResponses = {
     /**
-     * An identical reference already existed; returned as-is.
+     * An existing asset was reused under the serving surface's rules above; `created_new` is false. Its UUID, name and tags are kept; retention may refresh and content URLs are generated for this response.
      */
     200: Asset;
     /**
-     * Asset minted over the existing blob.
+     * A new asset reference with a new UUID was created over existing bytes; `created_new` is true. Supplied metadata and defaults apply as described above.
      */
     201: Asset;
 };
@@ -361,17 +519,29 @@ export type HeadAssetByHashData = {
 
 export type HeadAssetByHashErrors = {
     /**
-     * `unauthorized` — missing or invalid credentials.
+     * `unauthorized`: missing or invalid credentials. A credential that could not be checked answers `auth_unavailable` (503) instead.
      */
     401: ErrorEnvelope;
+    /**
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
+     */
+    403: ErrorEnvelope;
     /**
      * No blob the caller may mint from.
      */
     404: unknown;
     /**
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
+     */
+    429: ErrorEnvelope;
+    /**
      * `upstream_error` — an unexpected failure reaching or processing the request in this implementation's backing services. The message is always a generic, safe-to-display string; implementation detail (the specific upstream, its error text, transport failures) is never included here — see each implementation's own error-mapping notes. Every operation in this contract can fail this way.
      */
     500: ErrorEnvelope;
+    /**
+     * On deployment-scoped surfaces, `deployment_lookup_unavailable`: the deployment this address names could not be looked up just now. The request was refused before it did anything (nothing was created, read, changed or canceled), so the same request can be sent again after `Retry-After`. Every operation at a deployment's address can answer this way. A job submit can also answer this 503 with `database_unavailable`: the job could not be saved just now and nothing was started, so the same request can be sent again after `Retry-After`. No other operation answers `database_unavailable`. On Comfy Cloud an asset upload can also answer this 503 with `upload_busy`: the server is busy with other uploads and nothing was stored, so the same upload can be sent again after `Retry-After`. Any operation can also answer this 503 with `auth_unavailable`: the credential could not be checked just now, so the same request can be sent again after `Retry-After`. A job status read can also answer it with `output_unavailable`: an output of the job could not be prepared just now, and the job is unchanged. A transient storage failure clears on a later read after `Retry-After`; an output whose stored address is broken answers it on every read until the platform repairs the output.
+     */
+    503: ErrorEnvelope;
 };
 
 export type HeadAssetByHashError = HeadAssetByHashErrors[keyof HeadAssetByHashErrors];
@@ -394,11 +564,11 @@ export type DeleteAssetData = {
 
 export type DeleteAssetErrors = {
     /**
-     * `unauthorized` — missing or invalid credentials.
+     * `unauthorized`: missing or invalid credentials. A credential that could not be checked answers `auth_unavailable` (503) instead.
      */
     401: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
@@ -410,9 +580,17 @@ export type DeleteAssetErrors = {
      */
     409: ErrorEnvelope;
     /**
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
+     */
+    429: ErrorEnvelope;
+    /**
      * `upstream_error` — an unexpected failure reaching or processing the request in this implementation's backing services. The message is always a generic, safe-to-display string; implementation detail (the specific upstream, its error text, transport failures) is never included here — see each implementation's own error-mapping notes. Every operation in this contract can fail this way.
      */
     500: ErrorEnvelope;
+    /**
+     * On deployment-scoped surfaces, `deployment_lookup_unavailable`: the deployment this address names could not be looked up just now. The request was refused before it did anything (nothing was created, read, changed or canceled), so the same request can be sent again after `Retry-After`. Every operation at a deployment's address can answer this way. A job submit can also answer this 503 with `database_unavailable`: the job could not be saved just now and nothing was started, so the same request can be sent again after `Retry-After`. No other operation answers `database_unavailable`. On Comfy Cloud an asset upload can also answer this 503 with `upload_busy`: the server is busy with other uploads and nothing was stored, so the same upload can be sent again after `Retry-After`. Any operation can also answer this 503 with `auth_unavailable`: the credential could not be checked just now, so the same request can be sent again after `Retry-After`. A job status read can also answer it with `output_unavailable`: an output of the job could not be prepared just now, and the job is unchanged. A transient storage failure clears on a later read after `Retry-After`; an output whose stored address is broken answers it on every read until the platform repairs the output.
+     */
+    503: ErrorEnvelope;
 };
 
 export type DeleteAssetError = DeleteAssetErrors[keyof DeleteAssetErrors];
@@ -437,11 +615,11 @@ export type GetAssetData = {
 
 export type GetAssetErrors = {
     /**
-     * `unauthorized` — missing or invalid credentials.
+     * `unauthorized`: missing or invalid credentials. A credential that could not be checked answers `auth_unavailable` (503) instead.
      */
     401: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
@@ -449,9 +627,17 @@ export type GetAssetErrors = {
      */
     404: ErrorEnvelope;
     /**
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
+     */
+    429: ErrorEnvelope;
+    /**
      * `upstream_error` — an unexpected failure reaching or processing the request in this implementation's backing services. The message is always a generic, safe-to-display string; implementation detail (the specific upstream, its error text, transport failures) is never included here — see each implementation's own error-mapping notes. Every operation in this contract can fail this way.
      */
     500: ErrorEnvelope;
+    /**
+     * On deployment-scoped surfaces, `deployment_lookup_unavailable`: the deployment this address names could not be looked up just now. The request was refused before it did anything (nothing was created, read, changed or canceled), so the same request can be sent again after `Retry-After`. Every operation at a deployment's address can answer this way. A job submit can also answer this 503 with `database_unavailable`: the job could not be saved just now and nothing was started, so the same request can be sent again after `Retry-After`. No other operation answers `database_unavailable`. On Comfy Cloud an asset upload can also answer this 503 with `upload_busy`: the server is busy with other uploads and nothing was stored, so the same upload can be sent again after `Retry-After`. Any operation can also answer this 503 with `auth_unavailable`: the credential could not be checked just now, so the same request can be sent again after `Retry-After`. A job status read can also answer it with `output_unavailable`: an output of the job could not be prepared just now, and the job is unchanged. A transient storage failure clears on a later read after `Retry-After`; an output whose stored address is broken answers it on every read until the platform repairs the output.
+     */
+    503: ErrorEnvelope;
 };
 
 export type GetAssetError = GetAssetErrors[keyof GetAssetErrors];
@@ -482,11 +668,11 @@ export type GetAssetContentData = {
 
 export type GetAssetContentErrors = {
     /**
-     * `unauthorized` — missing or invalid credentials.
+     * `unauthorized`: missing or invalid credentials. A credential that could not be checked answers `auth_unavailable` (503) instead.
      */
     401: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
@@ -498,9 +684,21 @@ export type GetAssetContentErrors = {
      */
     416: unknown;
     /**
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
+     */
+    429: ErrorEnvelope;
+    /**
+     * `content_blocked` on a deployment: content moderation flagged these bytes, so they are not served.
+     */
+    451: ErrorEnvelope;
+    /**
      * `upstream_error` — an unexpected failure reaching or processing the request in this implementation's backing services. The message is always a generic, safe-to-display string; implementation detail (the specific upstream, its error text, transport failures) is never included here — see each implementation's own error-mapping notes. Every operation in this contract can fail this way.
      */
     500: ErrorEnvelope;
+    /**
+     * On deployment-scoped surfaces, `deployment_lookup_unavailable`: the deployment this address names could not be looked up just now. The request was refused before it did anything (nothing was created, read, changed or canceled), so the same request can be sent again after `Retry-After`. Every operation at a deployment's address can answer this way. A job submit can also answer this 503 with `database_unavailable`: the job could not be saved just now and nothing was started, so the same request can be sent again after `Retry-After`. No other operation answers `database_unavailable`. On Comfy Cloud an asset upload can also answer this 503 with `upload_busy`: the server is busy with other uploads and nothing was stored, so the same upload can be sent again after `Retry-After`. Any operation can also answer this 503 with `auth_unavailable`: the credential could not be checked just now, so the same request can be sent again after `Retry-After`. A job status read can also answer it with `output_unavailable`: an output of the job could not be prepared just now, and the job is unchanged. A transient storage failure clears on a later read after `Retry-After`; an output whose stored address is broken answers it on every read until the platform repairs the output.
+     */
+    503: ErrorEnvelope;
 };
 
 export type GetAssetContentError = GetAssetContentErrors[keyof GetAssetContentErrors];
@@ -517,6 +715,78 @@ export type GetAssetContentResponses = {
 };
 
 export type GetAssetContentResponse = GetAssetContentResponses[keyof GetAssetContentResponses];
+
+export type ListJobsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Most jobs per page. Above 500 is read as 500; absent means 500. Not a positive integer: `422` `invalid_request`.
+         */
+        limit?: number;
+        /**
+         * The previous page's `next_cursor`, unchanged. Opaque: do not build or edit one. A cursor that is not well-formed is refused `400` `invalid_cursor`. Cursors are not signed, so a well-formed one is read as a position whether or not this list issued it.
+         */
+        cursor?: string;
+        /**
+         * Exact-match label filters, written `metadata[client]=acme`. Up to 3; all must match.
+         */
+        metadata?: {
+            [key: string]: string;
+        };
+    };
+    url: '/api/v2/jobs';
+};
+
+export type ListJobsErrors = {
+    /**
+     * `invalid_metadata_filter` or `invalid_cursor`.
+     */
+    400: ErrorEnvelope;
+    /**
+     * `unauthorized`: missing or invalid credentials. A credential that could not be checked answers `auth_unavailable` (503) instead.
+     */
+    401: ErrorEnvelope;
+    /**
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
+     */
+    403: ErrorEnvelope;
+    /**
+     * `not_found`: on a deployment's address, no deployment there that the caller's workspace owns.
+     */
+    404: ErrorEnvelope;
+    /**
+     * `invalid_request`: `limit` is not a positive integer.
+     */
+    422: ErrorEnvelope;
+    /**
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
+     */
+    429: ErrorEnvelope;
+    /**
+     * `upstream_error` — an unexpected failure reaching or processing the request in this implementation's backing services. The message is always a generic, safe-to-display string; implementation detail (the specific upstream, its error text, transport failures) is never included here — see each implementation's own error-mapping notes. Every operation in this contract can fail this way.
+     */
+    500: ErrorEnvelope;
+    /**
+     * `not_implemented`: this surface does not list jobs yet.
+     */
+    501: ErrorEnvelope;
+    /**
+     * On deployment-scoped surfaces, `deployment_lookup_unavailable`: the deployment this address names could not be looked up just now. The request was refused before it did anything (nothing was created, read, changed or canceled), so the same request can be sent again after `Retry-After`. Every operation at a deployment's address can answer this way. A job submit can also answer this 503 with `database_unavailable`: the job could not be saved just now and nothing was started, so the same request can be sent again after `Retry-After`. No other operation answers `database_unavailable`. On Comfy Cloud an asset upload can also answer this 503 with `upload_busy`: the server is busy with other uploads and nothing was stored, so the same upload can be sent again after `Retry-After`. Any operation can also answer this 503 with `auth_unavailable`: the credential could not be checked just now, so the same request can be sent again after `Retry-After`. A job status read can also answer it with `output_unavailable`: an output of the job could not be prepared just now, and the job is unchanged. A transient storage failure clears on a later read after `Retry-After`; an output whose stored address is broken answers it on every read until the platform repairs the output.
+     */
+    503: ErrorEnvelope;
+};
+
+export type ListJobsError = ListJobsErrors[keyof ListJobsErrors];
+
+export type ListJobsResponses = {
+    /**
+     * One page of jobs, newest first.
+     */
+    200: JobList;
+};
+
+export type ListJobsResponse = ListJobsResponses[keyof ListJobsResponses];
 
 export type PostJobsData = {
     body: {
@@ -540,6 +810,22 @@ export type PostJobsData = {
              * Session bearer token for partner (API) nodes — the equivalent of `api_key_comfy_org` for a caller authenticated by session rather than by key.
              */
             auth_token_comfy_org?: string;
+            /**
+             * ComfyUI's preview method for this prompt, passed to ComfyUI as sent, which validates it. Used only for jobs sent by Comfy Cloud's editor; ignored for other callers.
+             */
+            preview_method?: string;
+            /**
+             * ComfyUI's `extra_pnginfo` for this prompt, which carries the editor's workflow into saved outputs. Used only for jobs sent by Comfy Cloud's editor; ignored for other callers.
+             */
+            extra_pnginfo?: {
+                [key: string]: unknown;
+            };
+        };
+        /**
+         * Your own labels for the job, such as which of your customers it ran for. At most 16 pairs. A key is 1 to 40 characters from `A-Z a-z 0-9 _ - .`; a value is a string of at most 256 bytes in UTF-8 (bytes, not characters: 200 `é` is 400 bytes) with no control character (U+0000 to U+001F, tab and newline included, and U+007F to U+009F) and no bidirectional embedding, override or isolate (U+202A to U+202E, U+2066 to U+2069). Anything else is refused `422` `metadata_invalid` and no job is created: a bad key or value is named in the message and in `details.key`, while more than 16 pairs is refused with the count and no `details`. A `metadata` that is not an object is refused `400` `invalid_request`; `null` is the same as none. Stored with the job, returned on it, and filterable on `GET /api/v2/jobs`. Set once, here: nothing changes it later. Only jobs sent to a deployment keep it today: Comfy Cloud refuses a non-empty `metadata` with `422` `metadata_not_supported`, and runs a job with empty or absent `metadata` as before.
+         */
+        metadata?: {
+            [key: string]: string;
         };
     };
     headers?: {
@@ -555,7 +841,11 @@ export type PostJobsData = {
 
 export type PostJobsErrors = {
     /**
-     * `unauthorized` — missing or invalid credentials.
+     * `invalid_request`: `metadata` is not an object. A body that is not JSON at all, or whose `workflow` or `extra_data` is not an object, is a `400` too, answered by the request decoder before any of these checks, with a bare `message` body rather than this envelope.
+     */
+    400: ErrorEnvelope;
+    /**
+     * `unauthorized`: missing or invalid credentials. A credential that could not be checked answers `auth_unavailable` (503) instead.
      */
     401: ErrorEnvelope;
     /**
@@ -563,21 +853,29 @@ export type PostJobsErrors = {
      */
     402: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
-     * `invalid_workflow` (with per-node details), `workflow_format_ui`, `missing_asset`, or `idempotency_key_reuse`.
+     * `not_found`: on a deployment's address, no deployment there that the caller's workspace owns.
+     */
+    404: ErrorEnvelope;
+    /**
+     * `invalid_workflow` (with per-node details), `workflow_format_ui`, `missing_asset`, `idempotency_key_reuse`, `metadata_invalid` (for a bad key or value, the message and `details.key` name the key; for more than 16 pairs, the message gives the count and there are no `details`), or `metadata_not_supported` (a surface that keeps no job labels yet).
      */
     422: ErrorEnvelope;
     /**
-     * `queue_full` (bounded queue depth reached) or, on deployment-scoped surfaces, `deployment_not_ready` (deployment still provisioning/starting). Disambiguate by `error.code`; both mean back off and retry after `Retry-After`.
+     * `queue_full` (bounded queue depth reached) or, on deployment-scoped surfaces, `deployment_not_ready` (deployment still provisioning/starting) or `deployment_unavailable` (the deployment is ready but its GPU provider is not taking work on it yet), or `rate_limited` (the caller is past a request rate limit). Disambiguate by `error.code`; all four mean back off and retry after `Retry-After`.
      */
     429: ErrorEnvelope;
     /**
      * `upstream_error` — an unexpected failure reaching or processing the request in this implementation's backing services. The message is always a generic, safe-to-display string; implementation detail (the specific upstream, its error text, transport failures) is never included here — see each implementation's own error-mapping notes. Every operation in this contract can fail this way.
      */
     500: ErrorEnvelope;
+    /**
+     * On deployment-scoped surfaces, `deployment_lookup_unavailable`: the deployment this address names could not be looked up just now. The request was refused before it did anything (nothing was created, read, changed or canceled), so the same request can be sent again after `Retry-After`. Every operation at a deployment's address can answer this way. A job submit can also answer this 503 with `database_unavailable`: the job could not be saved just now and nothing was started, so the same request can be sent again after `Retry-After`. No other operation answers `database_unavailable`. On Comfy Cloud an asset upload can also answer this 503 with `upload_busy`: the server is busy with other uploads and nothing was stored, so the same upload can be sent again after `Retry-After`. Any operation can also answer this 503 with `auth_unavailable`: the credential could not be checked just now, so the same request can be sent again after `Retry-After`. A job status read can also answer it with `output_unavailable`: an output of the job could not be prepared just now, and the job is unchanged. A transient storage failure clears on a later read after `Retry-After`; an output whose stored address is broken answers it on every read until the platform repairs the output.
+     */
+    503: ErrorEnvelope;
 };
 
 export type PostJobsError = PostJobsErrors[keyof PostJobsErrors];
@@ -602,11 +900,11 @@ export type GetJobData = {
 
 export type GetJobErrors = {
     /**
-     * `unauthorized` — missing or invalid credentials.
+     * `unauthorized`: missing or invalid credentials. A credential that could not be checked answers `auth_unavailable` (503) instead.
      */
     401: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
@@ -614,13 +912,17 @@ export type GetJobErrors = {
      */
     404: ErrorEnvelope;
     /**
-     * `rate_limited` — the caller has exceeded the request rate limit for this account. Account/rate-scoped, not job-specific — this can be returned even for a job id the caller doesn't own or that doesn't exist, without revealing which.
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
      */
     429: ErrorEnvelope;
     /**
      * `upstream_error` — an unexpected failure reaching or processing the request in this implementation's backing services. The message is always a generic, safe-to-display string; implementation detail (the specific upstream, its error text, transport failures) is never included here — see each implementation's own error-mapping notes. Every operation in this contract can fail this way.
      */
     500: ErrorEnvelope;
+    /**
+     * On deployment-scoped surfaces, `deployment_lookup_unavailable`: the deployment this address names could not be looked up just now. The request was refused before it did anything (nothing was created, read, changed or canceled), so the same request can be sent again after `Retry-After`. Every operation at a deployment's address can answer this way. A job submit can also answer this 503 with `database_unavailable`: the job could not be saved just now and nothing was started, so the same request can be sent again after `Retry-After`. No other operation answers `database_unavailable`. On Comfy Cloud an asset upload can also answer this 503 with `upload_busy`: the server is busy with other uploads and nothing was stored, so the same upload can be sent again after `Retry-After`. Any operation can also answer this 503 with `auth_unavailable`: the credential could not be checked just now, so the same request can be sent again after `Retry-After`. A job status read can also answer it with `output_unavailable`: an output of the job could not be prepared just now, and the job is unchanged. A transient storage failure clears on a later read after `Retry-After`; an output whose stored address is broken answers it on every read until the platform repairs the output.
+     */
+    503: ErrorEnvelope;
 };
 
 export type GetJobError = GetJobErrors[keyof GetJobErrors];
@@ -645,11 +947,11 @@ export type GetJobWorkflowData = {
 
 export type GetJobWorkflowErrors = {
     /**
-     * `unauthorized` — missing or invalid credentials.
+     * `unauthorized`: missing or invalid credentials. A credential that could not be checked answers `auth_unavailable` (503) instead.
      */
     401: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
@@ -657,13 +959,17 @@ export type GetJobWorkflowErrors = {
      */
     404: ErrorEnvelope;
     /**
-     * `rate_limited` — the caller has exceeded the request rate limit for this account. Account/rate-scoped, not job-specific — this can be returned even for a job id the caller doesn't own or that doesn't exist, without revealing which.
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
      */
     429: ErrorEnvelope;
     /**
      * `upstream_error` — an unexpected failure reaching or processing the request in this implementation's backing services. The message is always a generic, safe-to-display string; implementation detail (the specific upstream, its error text, transport failures) is never included here — see each implementation's own error-mapping notes. Every operation in this contract can fail this way.
      */
     500: ErrorEnvelope;
+    /**
+     * On deployment-scoped surfaces, `deployment_lookup_unavailable`: the deployment this address names could not be looked up just now. The request was refused before it did anything (nothing was created, read, changed or canceled), so the same request can be sent again after `Retry-After`. Every operation at a deployment's address can answer this way. A job submit can also answer this 503 with `database_unavailable`: the job could not be saved just now and nothing was started, so the same request can be sent again after `Retry-After`. No other operation answers `database_unavailable`. On Comfy Cloud an asset upload can also answer this 503 with `upload_busy`: the server is busy with other uploads and nothing was stored, so the same upload can be sent again after `Retry-After`. Any operation can also answer this 503 with `auth_unavailable`: the credential could not be checked just now, so the same request can be sent again after `Retry-After`. A job status read can also answer it with `output_unavailable`: an output of the job could not be prepared just now, and the job is unchanged. A transient storage failure clears on a later read after `Retry-After`; an output whose stored address is broken answers it on every read until the platform repairs the output.
+     */
+    503: ErrorEnvelope;
 };
 
 export type GetJobWorkflowError = GetJobWorkflowErrors[keyof GetJobWorkflowErrors];
@@ -688,11 +994,11 @@ export type GetJobLogsData = {
 
 export type GetJobLogsErrors = {
     /**
-     * `unauthorized` — missing or invalid credentials.
+     * `unauthorized`: missing or invalid credentials. A credential that could not be checked answers `auth_unavailable` (503) instead.
      */
     401: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
@@ -700,13 +1006,17 @@ export type GetJobLogsErrors = {
      */
     404: ErrorEnvelope;
     /**
-     * `rate_limited` — the caller has exceeded the request rate limit for this account. Account/rate-scoped, not job-specific — this can be returned even for a job id the caller doesn't own or that doesn't exist, without revealing which.
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
      */
     429: ErrorEnvelope;
     /**
      * `upstream_error` — an unexpected failure reaching or processing the request in this implementation's backing services. The message is always a generic, safe-to-display string; implementation detail (the specific upstream, its error text, transport failures) is never included here — see each implementation's own error-mapping notes. Every operation in this contract can fail this way.
      */
     500: ErrorEnvelope;
+    /**
+     * On deployment-scoped surfaces, `deployment_lookup_unavailable`: the deployment this address names could not be looked up just now. The request was refused before it did anything (nothing was created, read, changed or canceled), so the same request can be sent again after `Retry-After`. Every operation at a deployment's address can answer this way. A job submit can also answer this 503 with `database_unavailable`: the job could not be saved just now and nothing was started, so the same request can be sent again after `Retry-After`. No other operation answers `database_unavailable`. On Comfy Cloud an asset upload can also answer this 503 with `upload_busy`: the server is busy with other uploads and nothing was stored, so the same upload can be sent again after `Retry-After`. Any operation can also answer this 503 with `auth_unavailable`: the credential could not be checked just now, so the same request can be sent again after `Retry-After`. A job status read can also answer it with `output_unavailable`: an output of the job could not be prepared just now, and the job is unchanged. A transient storage failure clears on a later read after `Retry-After`; an output whose stored address is broken answers it on every read until the platform repairs the output.
+     */
+    503: ErrorEnvelope;
 };
 
 export type GetJobLogsError = GetJobLogsErrors[keyof GetJobLogsErrors];
@@ -735,11 +1045,11 @@ export type GetJobEventsData = {
 
 export type GetJobEventsErrors = {
     /**
-     * `unauthorized` — missing or invalid credentials.
+     * `unauthorized`: missing or invalid credentials. A credential that could not be checked answers `auth_unavailable` (503) instead.
      */
     401: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
@@ -747,7 +1057,7 @@ export type GetJobEventsErrors = {
      */
     404: ErrorEnvelope;
     /**
-     * `too_many_streams` — the caller already has the maximum number of concurrent GET .../events streams open. Close an existing stream (or wait for one to reach a terminal status) before opening another; GET /api/v2/jobs/{id} remains available as a plain poll regardless of this limit.
+     * `too_many_streams` — the caller already has the maximum number of concurrent GET .../events streams open. Close an existing stream (or wait for one to reach a terminal status) before opening another; GET /api/v2/jobs/{id} remains available as a plain poll regardless of this limit. Or `rate_limited`, the caller past a request rate limit; retry after `Retry-After`.
      */
     429: ErrorEnvelope;
     /**
@@ -758,6 +1068,10 @@ export type GetJobEventsErrors = {
      * `not_implemented` — this deployment does not yet serve live event streaming. GET /api/v2/jobs/{id} remains available as a plain poll in the meantime.
      */
     501: ErrorEnvelope;
+    /**
+     * On deployment-scoped surfaces, `deployment_lookup_unavailable`: the deployment this address names could not be looked up just now. The request was refused before it did anything (nothing was created, read, changed or canceled), so the same request can be sent again after `Retry-After`. Every operation at a deployment's address can answer this way. A job submit can also answer this 503 with `database_unavailable`: the job could not be saved just now and nothing was started, so the same request can be sent again after `Retry-After`. No other operation answers `database_unavailable`. On Comfy Cloud an asset upload can also answer this 503 with `upload_busy`: the server is busy with other uploads and nothing was stored, so the same upload can be sent again after `Retry-After`. Any operation can also answer this 503 with `auth_unavailable`: the credential could not be checked just now, so the same request can be sent again after `Retry-After`. A job status read can also answer it with `output_unavailable`: an output of the job could not be prepared just now, and the job is unchanged. A transient storage failure clears on a later read after `Retry-After`; an output whose stored address is broken answers it on every read until the platform repairs the output.
+     */
+    503: ErrorEnvelope;
 };
 
 export type GetJobEventsError = GetJobEventsErrors[keyof GetJobEventsErrors];
@@ -782,11 +1096,11 @@ export type CancelJobData = {
 
 export type CancelJobErrors = {
     /**
-     * `unauthorized` — missing or invalid credentials.
+     * `unauthorized`: missing or invalid credentials. A credential that could not be checked answers `auth_unavailable` (503) instead.
      */
     401: ErrorEnvelope;
     /**
-     * `forbidden` — authenticated but not allowed.
+     * `forbidden` — authenticated but not allowed. On a serverless deployment, also `sso_required` — the key is valid, but the account must sign in through its organization's single sign-on, which does not accept this key; it can come back on any operation.
      */
     403: ErrorEnvelope;
     /**
@@ -794,13 +1108,17 @@ export type CancelJobErrors = {
      */
     404: ErrorEnvelope;
     /**
-     * `rate_limited` — the caller has exceeded the request rate limit for this account. Account/rate-scoped, not job-specific — this can be returned even for a job id the caller doesn't own or that doesn't exist, without revealing which.
+     * `rate_limited` — the caller has exceeded a request rate limit for this account. Account/rate-scoped, not resource-specific — this can be returned even for a job, asset or deployment the caller doesn't own or that doesn't exist.
      */
     429: ErrorEnvelope;
     /**
      * `upstream_error` — an unexpected failure reaching or processing the request in this implementation's backing services. The message is always a generic, safe-to-display string; implementation detail (the specific upstream, its error text, transport failures) is never included here — see each implementation's own error-mapping notes. Every operation in this contract can fail this way.
      */
     500: ErrorEnvelope;
+    /**
+     * On deployment-scoped surfaces, `deployment_lookup_unavailable`: the deployment this address names could not be looked up just now. The request was refused before it did anything (nothing was created, read, changed or canceled), so the same request can be sent again after `Retry-After`. Every operation at a deployment's address can answer this way. A job submit can also answer this 503 with `database_unavailable`: the job could not be saved just now and nothing was started, so the same request can be sent again after `Retry-After`. No other operation answers `database_unavailable`. On Comfy Cloud an asset upload can also answer this 503 with `upload_busy`: the server is busy with other uploads and nothing was stored, so the same upload can be sent again after `Retry-After`. Any operation can also answer this 503 with `auth_unavailable`: the credential could not be checked just now, so the same request can be sent again after `Retry-After`. A job status read can also answer it with `output_unavailable`: an output of the job could not be prepared just now, and the job is unchanged. A transient storage failure clears on a later read after `Retry-After`; an output whose stored address is broken answers it on every read until the platform repairs the output.
+     */
+    503: ErrorEnvelope;
 };
 
 export type CancelJobError = CancelJobErrors[keyof CancelJobErrors];

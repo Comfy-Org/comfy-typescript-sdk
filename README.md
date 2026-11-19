@@ -792,6 +792,11 @@ permanently, or never even connects, `events()` falls back to polling
 waiting on a stream that isn't coming back. If you only care about the
 final result, `run()`/`job.wait()` (poll-only, no SSE) is simpler.
 
+A terminal `statusChange` other than `succeeded` carries an `error`: the status
+frame itself does not, so `events()` reads the job once and yields what
+`job.error` then holds (`event.error`, `null` for a canceled job). If that read
+fails the status arrives without an `error`.
+
 ## Cancellation and timeouts
 
 `submit`, `run`, `wait`, `events`, and `cancel` all accept an `AbortSignal`,
@@ -873,21 +878,22 @@ downloads the bytes first.
 
 A `Job` handle reads whatever state it currently holds — nothing re-fetches implicitly, so `await job.refresh()` (or `wait()`/`result()`, which poll for you) is what advances it:
 
-| Accessor            | Type                                          | What it is                                                                                                       |
-| ------------------- | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `job.id`            | `string`                                      | Server-assigned ID; enough on its own to rebuild the handle via `client.jobs.get(id)`                            |
-| `job.status`        | `string`                                      | `queued`, `running`, `canceling`, `succeeded`, `canceled`, `failed`, `expired`                                   |
-| `job.outputs`       | `Output[]`                                    | Every output across all nodes; empty until the job succeeds                                                      |
-| `job.error`         | `JobError \| null`                            | Failure detail when the job ended `failed`                                                                       |
-| `job.createdAt`     | `Date`                                        | When the server accepted the job                                                                                 |
-| `job.startedAt`     | `Date \| null`                                | When it started executing; `null` while still queued                                                             |
-| `job.completedAt`   | `Date \| null`                                | When it reached a terminal state; `null` before it did                                                           |
-| `job.expiresAt`     | `Date`                                        | Retention deadline — after this the job and its outputs are gone                                                 |
-| `job.progress`      | `Progress \| null`                            | Latest progress snapshot the handle holds (see the caveat below)                                                 |
-| `job.queuePosition` | `number \| null`                              | Place in the queue as of the state the handle holds                                                              |
-| `job.metrics`       | `Record<string, number \| null> \| undefined` | Per-run measurements (`queue_ms`, `execution_ms`, …); `undefined` on a surface that reports none                 |
-| `job.urls`          | `JobUrls`                                     | The job's own `self` / `events` / `cancel` links, plus `logs` where the surface captures logs                    |
-| `job.metadata`      | `Record<string, string>`                      | Labels attached at submit (see [Labeling jobs](#labeling-jobs-and-finding-them-again)); `{}` when there are none |
+| Accessor              | Type                                          | What it is                                                                                                       |
+| --------------------- | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `job.id`              | `string`                                      | Server-assigned ID; enough on its own to rebuild the handle via `client.jobs.get(id)`                            |
+| `job.status`          | `string`                                      | `queued`, `running`, `canceling`, `succeeded`, `canceled`, `failed`, `expired`                                   |
+| `job.outputs`         | `Output[]`                                    | Every output across all nodes; empty until the job succeeds                                                      |
+| `job.error`           | `JobError \| null`                            | Failure detail when the job ended `failed`                                                                       |
+| `job.failureCategory` | `FailureCategory \| null`                     | Why a user-caused failure happened, or `null` when the error names none                                          |
+| `job.createdAt`       | `Date`                                        | When the server accepted the job                                                                                 |
+| `job.startedAt`       | `Date \| null`                                | When it started executing; `null` while still queued                                                             |
+| `job.completedAt`     | `Date \| null`                                | When it reached a terminal state; `null` before it did                                                           |
+| `job.expiresAt`       | `Date`                                        | Retention deadline — after this the job and its outputs are gone                                                 |
+| `job.progress`        | `Progress \| null`                            | Latest progress snapshot the handle holds (see the caveat below)                                                 |
+| `job.queuePosition`   | `number \| null`                              | Place in the queue as of the state the handle holds                                                              |
+| `job.metrics`         | `Record<string, number \| null> \| undefined` | Per-run measurements (`queue_ms`, `execution_ms`, …); `undefined` on a surface that reports none                 |
+| `job.urls`            | `JobUrls`                                     | The job's own `self` / `events` / `cancel` links, plus `logs` where the surface captures logs                    |
+| `job.metadata`        | `Record<string, string>`                      | Labels attached at submit (see [Labeling jobs](#labeling-jobs-and-finding-them-again)); `{}` when there are none |
 
 How long a run took is `completedAt` minus `startedAt`:
 
@@ -1027,7 +1033,8 @@ are only exposed by direct `ComfyLow` calls.
 - `QueueFull` (carries `retryAfter: number | null`; `submit()` retries 429
   responses with `Retry-After` for a bounded budget, including deployment warm-up)
 - `JobFailed` — a job reached a non-`succeeded` terminal state (carries the
-  node-level `error` detail when the platform provided one)
+  node-level `error` detail when the platform provided one, and its
+  `failureCategory`)
 
 All extend a shared `ComfyError` (`code`, `httpStatus`, `details`, `requestId`, `retryAfter`, `idempotencyKey`). `retryAfter` is the pace the server named for re-sending this exact request, and is `null` whenever the response carried no `Retry-After`. `idempotencyKey` is the key the failed call went out under: every `ComfyError` that `comfy.models.run` raises once a request has gone out carries one — including a key it minted for you — and it is `null` only on a failure raised before any request was sent, or from a surface that stamps no key. Together they are the two things a manual re-ask needs, and the pair `comfy.models.run` uses for the collect loop above.
 
@@ -1042,7 +1049,8 @@ try {
   await client.run(wf);
 } catch (err) {
   if (err instanceof JobFailed) {
-    console.error(err.error); // { code, message, node_id, class_type, traceback } | null
+    console.error(err.error); // { code, message, category, node_id, class_type, traceback, node_errors } | null
+    console.error(err.failureCategory); // "out_of_gpu_memory", "workflow_logic", ... | null
   } else if (err instanceof MissingAsset) {
     console.error("asset reference was not usable:", err.details);
   } else {

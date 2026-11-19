@@ -8,6 +8,7 @@ import {
   ComfyError,
   IdempotencyKeyReuse,
   InvalidWorkflow,
+  JobFailed,
   QueueFull,
   WorkflowFormatUi,
 } from "./exceptions.js";
@@ -91,6 +92,31 @@ describe("Comfy", () => {
     expect(job.status).toBe("succeeded");
     const outputs = job.getOutputs("13");
     expect(outputs).toHaveLength(1);
+  });
+
+  it("submit() reads a failed job's category off the snapshot it returns", async () => {
+    server.state.jobFailure = {
+      code: "node_execution_error",
+      message: "bad graph",
+      category: "workflow_logic",
+    };
+    const job = await client.submit(client.workflows.fromJson({ "1": {} }));
+    expect(job.status).toBe("failed");
+    expect(job.failureCategory).toBe("workflow_logic");
+  });
+
+  it("run() throws a JobFailed carrying the failed job's category", async () => {
+    server.state.terminalStatus = "failed";
+    server.state.jobFailure = {
+      code: "node_execution_error",
+      message: "bad prompt",
+      category: "content_refused",
+    };
+    const thrown = await client
+      .run(client.workflows.fromJson({ "1": {} }))
+      .catch((e: unknown) => e);
+    expect(thrown).toBeInstanceOf(JobFailed);
+    expect((thrown as JobFailed).failureCategory).toBe("content_refused");
   });
 
   it("submit() retries a queue_full response using Retry-After, transparently", async () => {
