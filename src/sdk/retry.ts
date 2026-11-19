@@ -237,6 +237,13 @@ export function isRetryableStatus(status: number, errorType: string | null): boo
  * the server saying there is nothing to collect — and a resend then dispatches
  * NEW work rather than gathering old.
  *
+ * The contract also paces a `502` naming `provider_error` with the same
+ * collect `Retry-After` (a poll leg that ended without a verdict, the key
+ * parked with its handle). It is NOT collectable here: that `502` is retried
+ * under the same key on the ordinary backoff, ignoring the pace, as any other
+ * retryable 5xx is. Collecting it would only change the pace and the budget.
+ * The gap is pinned in `router-spec-contract.test.ts`.
+ *
  * A `429` naming `concurrency_limit_exceeded` is deliberately NOT collectable:
  * that one is plain workspace throttling with nothing running under this key,
  * and it stays outside `models.run`'s retry surface altogether via the

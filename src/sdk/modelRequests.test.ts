@@ -701,6 +701,39 @@ describe("RequestHandle.get", () => {
     });
   });
 
+  it("rejects with ResultExpired on a 410 result_expired from the result route, and does not retry it", async () => {
+    // The request finished and its result aged out of retention. Permanent for
+    // that id, so one attempt: re-reading answers the same way, and re-submitting
+    // is the caller's call, not a retry's.
+    await withRouterStub(async (server) => {
+      useStub(server);
+      const script = queueScript({ statuses: [DONE] });
+      server.state.respond = (request) =>
+        request.method === "GET" && request.path === REQUEST_PATH
+          ? {
+              status: 410,
+              errorType: "result_expired",
+              body: { detail: "The result is no longer stored.", error_type: "result_expired" },
+            }
+          : script(request);
+
+      const err = (await comfy.models
+        .handle(MODEL, REQUEST_ID)
+        .get()
+        .catch((e: unknown) => e)) as routerErrors.RouterError;
+
+      expect(err).toBeInstanceOf(routerErrors.ResultExpired);
+      expect(err).toBeInstanceOf(routerErrors.RouterError);
+      expect(err).not.toBeInstanceOf(routerErrors.RequestNotFound);
+      expect(err.httpStatus).toBe(410);
+      expect(err.message).toBe("The result is no longer stored.");
+      expect(server.state.requests.map((r) => `${r.method} ${r.path}`)).toEqual([
+        `GET ${STATUS_PATH}`,
+        `GET ${REQUEST_PATH}`,
+      ]);
+    });
+  });
+
   it("keeps an `error_type` in the provider's own output out of the raising path", async () => {
     // The result route's body is the partner's payload, forwarded verbatim. A
     // model whose native output happens to have an `error_type` field must not
