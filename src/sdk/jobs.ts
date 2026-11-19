@@ -333,15 +333,21 @@ export class Job {
    * A terminal `status` frame other than `succeeded`, carrying the error of a
    * fresh read of the job. The frame declares only the status, so the error
    * comes from one `GET`, which also moves the handle to the state it read. A
-   * read that fails leaves the frame as it came, rather than raising where
-   * the stream delivered a terminal frame.
+   * read that fails, or that still reports a job not yet terminal, leaves the
+   * frame and the handle as they were, rather than raising where the stream
+   * delivered a terminal frame or reporting an error of a job still running.
    */
   private async withReadError(event: StatusChange, signal?: AbortSignal): Promise<StatusChange> {
     if (event.status === SUCCESS) return event;
+    const before = this.model;
     try {
       await this.refresh(signal);
     } catch (exc) {
       if (signal?.aborted) throw exc;
+      return event;
+    }
+    if (!isTerminal(this.status)) {
+      this.model = before;
       return event;
     }
     return { ...event, error: this.model.error };

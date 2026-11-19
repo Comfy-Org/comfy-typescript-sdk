@@ -1039,7 +1039,7 @@ try {
   await client.run(wf);
 } catch (err) {
   if (err instanceof JobFailed) {
-    console.error(err.error); // { code, message, node_id, class_type, traceback } | null
+    console.error(err.error); // { code, message, category, node_id, class_type, traceback, node_errors } | null
     console.error(err.failureCategory); // "out_of_gpu_memory", "workflow_logic", ... | null
   } else if (err instanceof MissingAsset) {
     console.error("asset reference was not usable:", err.details);

@@ -172,6 +172,17 @@ describe("Job", () => {
         expect(server.state.jobPollCount).toBe(polls);
       });
 
+      it("yields the terminal status without an error, leaving the handle, when the read still reports a running job", async () => {
+        server.state.pollsToSucceed = 3;
+        const job = await jobs.get("job_01");
+        const polls = server.state.jobPollCount;
+        const last = await terminalEvent(job);
+        expect(last.status).toBe("failed");
+        expect(last).not.toHaveProperty("error");
+        expect(job.status).toBe("running");
+        expect(server.state.jobPollCount).toBe(polls + 1);
+      });
+
       it("yields the terminal status without an error, and raises nothing, when the read fails", async () => {
         const job = await jobs.get("job_01");
         server.state.jobPollFailsFrom = server.state.jobPollCount + 1;

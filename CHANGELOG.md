@@ -32,8 +32,9 @@ entry. See CONTRIBUTING.md.
   status frame declares only the status, so on a terminal status other than
   `succeeded` the SDK now reads the job once, moves the handle to that state
   and yields the status with `error` set to what `job.error` then holds. If
-  that read fails, the status is yielded without an `error` and the stream
-  raises nothing it did not before. The same event from the poll fallback
+  that read fails, or finds the job not yet terminal, the status is yielded
+  without an `error`, the handle is left as it was and the stream raises
+  nothing it did not before. The same event from the poll fallback
   carries the error too.
 
 ### Changed
