@@ -52,6 +52,28 @@ entry. See CONTRIBUTING.md.
 - The v2 spec is synced to the current contract and `src/low/generated` is
   regenerated. `ComfyLow.listJobs` is now a spec operation, so
   `OPERATION_IDS` lists it.
+- **`comfy.realtime.connect(model, options)` opens a Comfy Router realtime
+  session.** Router serves its realtime models (`google/genie-4`,
+  `xai/grok-voice/realtime`) over a WebSocket upgrade, and integrators had to
+  hand-roll the URL, the auth rule and the refusal mapping. `connect` builds
+  the `/v2/realtime/{serving}/{model}` URL against the `comfy.models` host,
+  sends `X-API-Key` in Node or a `comfy-bearer.<token>` subprotocol entry from
+  a browser (`idToken`), always offers `comfy-realtime.v1`, and resolves with
+  the open socket plus its `wireFormat` (`msgpack` on the `fal` leg, `json` on
+  the `google` leg), selected subprotocol and `X-Comfy-Request-Id`. No codec
+  is bundled. Models served elsewhere (the WebRTC world models, Fish Live,
+  Reactor) are refused before any socket opens, with a message naming where
+  they are served. `REALTIME_CLOSE_CODES` names the codes the broker closes a
+  session with.
+- **`RouterError.refusalCode`** — the finer `code` a realtime refusal body
+  carries (`router.realtime.session_already_live`, say), beside the coarse
+  `errorType`; `null` on every response without one.
+- **`RealtimeUpgradeFailed`** (`code: "realtime_upgrade_failed"`), raised when
+  an upgrade fails on a WebSocket transport that cannot read why — a
+  browser's, or Node's built-in one.
+- **`ws` is an optional peer dependency.** When it is installed, `connect`
+  uses it in Node and a refused upgrade raises the typed `routerErrors` class
+  instead of `RealtimeUpgradeFailed`.
 
 ## [0.5.0] - 2026-10-10
 

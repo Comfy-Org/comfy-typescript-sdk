@@ -156,6 +156,13 @@ interface Asymmetry {
    * you: the day this SDK exports the class, the entry fails.
    */
   readonly exportedErrorClassesBehindPython?: readonly string[];
+  /**
+   * Error classes this SDK's package root exports AHEAD of the Python one —
+   * the root-export twin of `routerErrorClassesAheadOfPython`. Tolerated in
+   * one direction only, and the rot guard below fails the moment the Python
+   * snapshot exports the same name, which is the signal to delete the entry.
+   */
+  readonly exportedErrorClassesAheadOfPython?: readonly string[];
 }
 
 const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
@@ -248,6 +255,16 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
     routerErrorClassesAheadOfPython: [["ByokCredentialRejected", "byok_credential_rejected"]],
   },
   {
+    id: "realtime-sessions-land-first-in-typescript",
+    why:
+      "`comfy.realtime.connect` opens a Router realtime WebSocket session, and the Python SDK " +
+      "has no realtime helper yet. `RealtimeUpgradeFailed` is the root error that helper " +
+      "raises when the WebSocket transport cannot read why an upgrade was refused. This is a " +
+      "LEAD, not a divergence: the rot guard below fails the moment the Python snapshot " +
+      "exports the same name, which is the signal to delete this entry.",
+    exportedErrorClassesAheadOfPython: ["RealtimeUpgradeFailed"],
+  },
+  {
     id: "collect-switched-off-by-budget",
     why:
       "Python switches the collect loop off with a BOOLEAN (`RetryPolicy.retry_collectable=False`) " +
@@ -281,6 +298,9 @@ const PYTHON_ONLY_ERROR_CLASSES = new Set(
 );
 const BEHIND_PYTHON_ERROR_CLASSES = new Set(
   INTENTIONAL_ASYMMETRIES.flatMap((a) => a.exportedErrorClassesBehindPython ?? []),
+);
+const AHEAD_ROOT_ERROR_CLASSES = new Set(
+  INTENTIONAL_ASYMMETRIES.flatMap((a) => a.exportedErrorClassesAheadOfPython ?? []),
 );
 const AHEAD_ERROR_TYPES = new Set(AHEAD_OF_PYTHON.map(([, errorType]) => errorType));
 const SHARED_CREDENTIAL_ORDER: readonly ("explicit" | "environment")[] =
@@ -653,7 +673,25 @@ describe("cross-SDK surface parity", () => {
       .filter((name) => !PYTHON_ONLY_ERROR_CLASSES.has(name))
       .filter((name) => !BEHIND_PYTHON_ERROR_CLASSES.has(name))
       .map((name) => RENAMES[name] ?? name);
-    expect(nameDivergences("package root", expected, errorClassNames(sdk))).toEqual([]);
+    const typescript = errorClassNames(sdk).filter((name) => !AHEAD_ROOT_ERROR_CLASSES.has(name));
+    expect(nameDivergences("package root", expected, typescript)).toEqual([]);
+  });
+
+  it("keeps every declared root-export lead live, and only in the leading direction", async () => {
+    const python = await loadPythonSurface();
+    const pythonNames = new Set(python.exportedErrorClasses);
+    const rootNames = new Set(errorClassNames(sdk));
+    for (const name of AHEAD_ROOT_ERROR_CLASSES) {
+      expect(
+        rootNames.has(name),
+        `the allowlist says \`${name}\` leads the Python SDK, but this SDK's root does not export it`,
+      ).toBe(true);
+      expect(
+        pythonNames.has(name),
+        `the Python SDK now exports \`${name}\` — delete its entry from ` +
+          "INTENTIONAL_ASYMMETRIES so the two roots are compared again",
+      ).toBe(false);
+    }
   });
 
   it("keeps every root error class this SDK namespaces instead reachable", async () => {

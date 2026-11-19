@@ -56,6 +56,18 @@ export {
 } from "./modelRequests.js";
 export { MAX_REQUEST_ID_LENGTH } from "./modelRoutes.js";
 export {
+  realtime,
+  REALTIME_BEARER_SUBPROTOCOL_PREFIX,
+  REALTIME_CLOSE_CODES,
+  REALTIME_ROUTE_TEMPLATE,
+  REALTIME_SERVING_PROVIDERS,
+  REALTIME_SUBPROTOCOL,
+  type RealtimeConnectOptions,
+  type RealtimeProvider,
+  type RealtimeSession,
+  type RealtimeSocket,
+} from "./realtime.js";
+export {
   DEFAULT_COLLECT_BUDGET_MS,
   DEFAULT_RETRY_BASE_DELAY_MS,
   DEFAULT_RETRY_BUDGET_MS,
@@ -82,6 +94,7 @@ export {
   MissingCredentials,
   NotFound,
   QueueFull,
+  RealtimeUpgradeFailed,
   Unauthorized,
   WorkflowFormatUi,
 } from "./exceptions.js";

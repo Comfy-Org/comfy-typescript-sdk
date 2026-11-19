@@ -579,6 +579,53 @@ class client's setting and is untouched by this.
 partner model — use the class client instead: `await new Comfy({ apiKey
 }).run(workflow)`, as in the Quickstart below.
 
+### Realtime sessions — `comfy.realtime.connect()`
+
+Comfy Router serves its realtime models over a WebSocket.
+`comfy.realtime.connect(model)` builds the session URL against the same host
+`comfy.models` uses, authenticates the upgrade, and resolves with the open
+socket. No codec is bundled: sessions on the `fal` leg (for example
+`xai/grok-voice/realtime`) speak MessagePack binary frames, and the `google`
+leg (`google/genie-4`) speaks JSON text frames — `session.wireFormat` says
+which.
+
+In Node, install the optional `ws` peer dependency so a refused upgrade raises
+the typed Router error (`routerErrors.InsufficientCredits`,
+`routerErrors.ConcurrencyLimitExceeded`, ...) with its `refusalCode`; without
+it, Node's built-in `WebSocket` is used and a refusal raises
+`RealtimeUpgradeFailed`, because that transport does not expose the status.
+
+```ts
+import { comfy } from "@comfyorg/sdk";
+import { decode, encode } from "@msgpack/msgpack"; // your choice of codec
+
+comfy.config({ credentials: "comfyui-..." }); // or COMFY_API_KEY
+
+const voice = await comfy.realtime.connect("xai/grok-voice/realtime");
+voice.socket.binaryType = "arraybuffer";
+voice.socket.addEventListener("message", (event) => console.log(decode(event.data)));
+voice.socket.send(encode(message)); // the model's own message shape
+
+const genie = await comfy.realtime.connect("google/genie-4");
+genie.socket.send(JSON.stringify(message)); // JSON text frames on this leg
+genie.close();
+```
+
+A browser cannot put an API key on a WebSocket upgrade, so it authenticates
+with a signed-in user's ID token, which travels as a subprotocol entry:
+
+```ts
+const session = await comfy.realtime.connect("google/genie-4", { idToken });
+```
+
+Sessions are **billed per second from the moment the upgrade succeeds**, and
+Router allows **one live WebSocket session per workspace** — a second one is
+refused with `429` (`refusalCode` `router.realtime.session_already_live`)
+until the first closes, so close a session you are done with (or pass a
+`signal`). The WebRTC world models, Fish Live and Reactor are not served by
+this WebSocket broker; `connect` refuses them with a message naming where they
+are served, unless you name the serving leg yourself with `provider`.
+
 ### Module formats
 
 The package is **ESM-only** — it publishes no CommonJS build, and its
