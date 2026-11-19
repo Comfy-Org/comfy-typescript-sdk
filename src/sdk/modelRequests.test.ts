@@ -338,6 +338,16 @@ describe("RequestHandle.estimate", () => {
     });
   });
 
+  it("reads a free quote with no charge fields as free", async () => {
+    const handle = await submitWith({ ...BASE, source: "free", amount: "0" });
+    expect(handle.estimate).toMatchObject({
+      isFree: true,
+      amount: "0",
+      amountCents: null,
+      credits: null,
+    });
+  });
+
   it("reads an unknown quote with its reason", async () => {
     for (const reason of ["not_quotable", "unpriced_model", "byok", "pricing_unavailable"]) {
       const handle = await submitWith({ ...BASE, source: "unknown", reason });
@@ -402,6 +412,8 @@ describe("RequestHandle.estimate", () => {
       // A `free` quote without its "0", or carrying a charge.
       { ...BASE, source: "free" },
       { ...BASE, source: "free", amount: "0.04" },
+      { ...BASE, source: "free", amount: "0", amount_cents: 4 },
+      { ...BASE, source: "free", amount: "0", credits: 8.44 },
       // A dollar figure that is not a decimal numeral.
       { ...BASE, source: "exact", amount: "" },
       { ...BASE, source: "exact", amount: " " },

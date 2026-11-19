@@ -617,7 +617,17 @@ export function costEstimateOf(value: unknown): CostEstimate | null {
   if (isExact && amount === null) return null;
   // A `free` quote's amount is the contract's "0"; one carrying a charge is a
   // contradiction, and reading it as free would under-report a real cost.
-  if (isFree && (amount === null || Number(amount) !== 0)) return null;
+  // The cents and credits figures are checked too, so a quote whose dollar
+  // string says "0" while its cents say otherwise is not booked as free.
+  if (
+    isFree &&
+    (amount === null ||
+      Number(amount) !== 0 ||
+      (amountCents !== null && amountCents !== 0) ||
+      (credits !== null && credits !== 0))
+  ) {
+    return null;
+  }
   if (isEstimated && (minAmount === null || maxAmount === null)) return null;
   return Object.freeze({
     source,
