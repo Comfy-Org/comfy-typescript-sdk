@@ -341,10 +341,13 @@ export interface RunJsonResult<TData = unknown> {
    * call, when `fallbackProvider` retried against a second one and that retry
    * succeeded — never a provider that was attempted and also failed.
    *
-   * `null` means the provider that was asked for served it, which is the common
-   * case; it does not mean "unknown". This is the ONLY disclosure of the
-   * difference: an alt-provider response is translated back to the model's own
-   * native contract, so `data` alone is identical either way.
+   * `null` means no `fallbackProvider` retry served this call, which is the
+   * common case; it does not mean "unknown", and it does not name the provider
+   * that did serve it. Router's `X-Comfy-Router-Provider` header reports the
+   * serving provider on every success, which this field does not read. With no
+   * {@link RunOptions.modelProvider}, Router chooses the provider. This is the
+   * ONLY disclosure of a retry: an alt-provider response is translated back to
+   * the model's own native contract, so `data` alone is identical either way.
    */
   servingProvider: string | null;
   /**
@@ -428,11 +431,12 @@ export interface RunJsonResult<TData = unknown> {
    *   (`creditsUsed != null`) and never on the value being non-zero — the
    *   falsiness of `"0"`'s numeric reading is exactly the bug.
    *
-   * Success-only, and that is the contract's own word rather than this SDK's
-   * choice: `RouterCreditsUsedHeader` says it "is written only on the path
-   * that returns a result, which a refused call never reaches". That covers
-   * Router's own refusals: an error response carries no cost to lift. It does
-   * NOT cover a `200` that Router priced and this SDK then refuses
+   * Success-only as this SDK reads it. The contract has the header absent on an
+   * error response, with one exception: a synchronous `content_policy_violation`
+   * from a model that charges on a policy rejection carries the amount recorded.
+   * This SDK lifts the header off a result only, so that refusal reports no cost
+   * here, and neither does any other error. The same goes for a `200` that
+   * Router priced and this SDK then refuses
    * client-side — a body over the size cap (`response_too_large`), a
    * body-read timeout, or an empty or non-JSON body. That call throws a
    * {@link ComfyError}, which carries no credits field, so its cost is not
@@ -646,8 +650,9 @@ export interface RunOptions {
   retry?: RetryOptions | false;
   /**
    * Select an alternate serving provider for this model — Comfy Router's
-   * `model_provider` query param (e.g. `"fal"`). Omitted, the model runs on its
-   * default provider and the request is byte-for-byte what it always was.
+   * `model_provider` query param (e.g. `"fal"`). Omitted, Router chooses the
+   * serving provider, which may be another one than the model's own, and the
+   * request is byte-for-byte what it always was.
    *
    * Under the default `strictMode` (`false`) the `input` you pass stays this
    * model's own native shape and Router translates it to the alternate
