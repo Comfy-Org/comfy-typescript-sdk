@@ -50,6 +50,7 @@ export {
   nextPollDelayMs,
   RequestHandle,
   type QueueUpdate,
+  type GetOptions,
   type SubmitOptions,
   type SubscribeOptions,
   type WaitOptions,

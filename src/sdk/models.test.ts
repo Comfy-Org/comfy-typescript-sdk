@@ -1,5 +1,7 @@
 /** `comfy.models.run` against a stubbed router: the call, the result shape,
  * the headers it sends and reads, its deadline, and its failures. */
+import { gzipSync } from "node:zlib";
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { attachedDispatcher } from "../../test/support/dispatchers.js";
@@ -824,6 +826,39 @@ describe("comfy.models.run failures", () => {
       expect(err.requestId).toBe("6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21");
     });
   });
+
+  it("keeps the identifiers when parsing a declared-JSON 200 fails for a reason other than its shape", async () => {
+    // A `RangeError` (a nesting too deep for the stack, a string too long to
+    // allocate) is not the body's fault, but it must still leave as a
+    // ComfyError carrying what a caller needs to re-collect the generation.
+    const marker = '{"rangeErrorMarker":true}';
+    const realParse = JSON.parse;
+    const spy = vi.spyOn(JSON, "parse").mockImplementation((text: string, reviver?) => {
+      if (text === marker) throw new RangeError("Maximum call stack size exceeded");
+      return realParse(text, reviver) as unknown;
+    });
+    try {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.contentType = "application/json";
+        server.state.body = marker;
+
+        const err = await comfy.models.run(MODEL, {}).catch((e: unknown) => e);
+
+        if (!(err instanceof ComfyError)) throw err;
+        expect(err.code).toBe("unexpected_response");
+        expect(err.httpStatus).toBe(200);
+        expect(err.requestId).toBe("6f1a1a6e-6a53-4a5f-9d3a-2b3b0a1f9c21");
+        expect(err.idempotencyKey).toEqual(expect.any(String));
+        expect(err.cause).toBeInstanceOf(RangeError);
+        // Not blamed on the body, which may well be a valid document.
+        expect(err.message).not.toContain("is not JSON");
+        expect(err.message).toContain("ran out of resources");
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
 });
 
 /**
@@ -1037,6 +1072,105 @@ describe("comfy.models.run on a binary result", () => {
     });
   });
 
+  it("returns headerless bytes too long to decode as bytes, not as an error", async () => {
+    // A string past V8's length limit, which `maxBytes: null` makes
+    // reachable, fails the DECODE rather than the parse — nothing was parsed,
+    // so it says nothing about whether the body was JSON, and the bytes are
+    // the one lossless answer. Simulated, since the real size is ~512 MiB.
+    const bytes = new Uint8Array([0x7b, 0x7d, 0x00, 0x01]);
+    const realDecode = TextDecoder.prototype.decode;
+    const spy = vi.spyOn(TextDecoder.prototype, "decode").mockImplementation(function (
+      this: TextDecoder,
+      input,
+      options,
+    ) {
+      if (
+        input instanceof Uint8Array &&
+        input.byteLength === bytes.byteLength &&
+        input.every((b, i) => b === bytes[i])
+      ) {
+        throw new RangeError("Invalid string length");
+      }
+      return realDecode.call(this, input, options);
+    });
+    try {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.contentType = null;
+        server.state.body = bytes;
+
+        const result = await comfy.models.run(AUDIO_MODEL, {});
+
+        expect(result.kind).toBe("binary");
+        if (result.kind !== "binary") throw new Error("unreachable");
+        expect(Array.from(result.data)).toEqual(Array.from(bytes));
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("returns a headerless 200 the parser ran out of room on as bytes, not as an error", async () => {
+    // Nothing declared a document, and a re-collect fails the same way, so
+    // the bytes are the one lossless answer — as for a decode failure.
+    const marker = '{"rangeErrorMarker":true}';
+    const realParse = JSON.parse;
+    const spy = vi.spyOn(JSON, "parse").mockImplementation((text: string, reviver?) => {
+      if (text === marker) throw new RangeError("Maximum call stack size exceeded");
+      return realParse(text, reviver) as unknown;
+    });
+    try {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.contentType = null;
+        server.state.body = marker;
+
+        const result = await comfy.models.run(AUDIO_MODEL, {});
+
+        expect(result.kind).toBe("binary");
+        if (result.kind !== "binary") throw new Error("unreachable");
+        expect(new TextDecoder().decode(result.data)).toBe(marker);
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("says decoding, not parsing, when a declared-JSON 200 is too long to decode", async () => {
+    const bytes = new Uint8Array([0x7b, 0x7d, 0x20, 0x20, 0x20]);
+    const realDecode = TextDecoder.prototype.decode;
+    const spy = vi.spyOn(TextDecoder.prototype, "decode").mockImplementation(function (
+      this: TextDecoder,
+      input,
+      options,
+    ) {
+      if (
+        input instanceof Uint8Array &&
+        input.byteLength === bytes.byteLength &&
+        input.every((b, i) => b === bytes[i])
+      ) {
+        throw new RangeError("Invalid string length");
+      }
+      return realDecode.call(this, input, options);
+    });
+    try {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.contentType = "application/json";
+        server.state.body = bytes;
+
+        const err = await comfy.models.run(AUDIO_MODEL, {}).catch((e: unknown) => e);
+
+        if (!(err instanceof ComfyError)) throw err;
+        expect(err.code).toBe("unexpected_response");
+        expect(err.cause).toBeInstanceOf(RangeError);
+        expect(err.message).toContain("ran out of resources decoding");
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("still refuses a 202, whatever the body's media type says", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
@@ -1225,6 +1359,68 @@ describe("comfy.models.run response size cap", () => {
     });
   });
 
+  it("measures a compressed body by its decoded bytes, not its Content-Length", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      // Eleven decoded bytes whose gzip framing alone puts the declared
+      // (encoded) length past a 20-byte cap. `fetch` hands over the decoded
+      // body, which is what the cap governs, so this is not a breach.
+      const small = gzipSync(Buffer.from('{"ok":true}'));
+      expect(small.byteLength).toBeGreaterThan(20);
+      server.state.respond = () => ({
+        status: 200,
+        body: small,
+        contentType: "application/json",
+        headers: { "Content-Encoding": "gzip" },
+      });
+      const result = await comfy.models.run(MODEL, {}, { maxBytes: 20 });
+      expect(result.kind).toBe("json");
+      expect(result.data).toEqual({ ok: true });
+
+      // And the converse: a body declared well inside the cap that decodes
+      // past it is still refused, by the count rather than the header.
+      const large = gzipSync(Buffer.from(JSON.stringify({ caption: "a".repeat(10_000) })));
+      expect(large.byteLength).toBeLessThan(512);
+      server.state.respond = () => ({
+        status: 200,
+        body: large,
+        contentType: "application/json",
+        headers: { "Content-Encoding": "gzip" },
+      });
+      const err = (await comfy.models
+        .run(MODEL, {}, { maxBytes: 512 })
+        .catch((e: unknown) => e)) as ComfyError;
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("response_too_large");
+      expect(err.details?.maxBytes).toBe(512);
+      expect(err.details?.bytesRead).toBeGreaterThan(512);
+    });
+  });
+
+  it("still refuses on Content-Length when fetch does not decode the coding", async () => {
+    // `fetch` decodes a coding list only when every token is one it knows;
+    // any other token hands over the encoded bytes, which `Content-Length`
+    // then measures honestly. A bogus coding must not switch off the cheap
+    // pre-read refusal.
+    for (const encoding of ["x-unknown", "gzip, x-unknown", "identity", "identity, identity"]) {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.respond = () => ({
+          status: 200,
+          body: "a".repeat(100),
+          contentType: "audio/mpeg",
+          headers: { "Content-Encoding": encoding },
+        });
+        const err = (await comfy.models
+          .run(MODEL, {}, { maxBytes: 20 })
+          .catch((e: unknown) => e)) as ComfyError;
+        expect(err, encoding).toBeInstanceOf(ComfyError);
+        expect(err.code, encoding).toBe("response_too_large");
+        expect(err.details?.contentLength, encoding).toBe(100);
+      });
+    }
+  });
+
   it("holds a body delivered as many small chunks without breaching on overhead", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
@@ -1346,6 +1542,11 @@ describe("comfy.models.run response size cap", () => {
       TypeError,
     );
     await expect(comfy.models.run(MODEL, {}, { maxBytes: -1 })).rejects.toBeInstanceOf(TypeError);
+    // A fraction is no allocation size: unchecked, it fails inside the read as
+    // a cap breach advising a lower cap, which cannot fix it.
+    await expect(comfy.models.run(MODEL, {}, { maxBytes: 100.5 })).rejects.toBeInstanceOf(
+      TypeError,
+    );
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
@@ -1432,6 +1633,46 @@ describe("comfy.models.run response size cap", () => {
       expect(err).toBeInstanceOf(InsufficientCredits);
       expect(err.code).toBe("insufficient_credits");
       expect(err.httpStatus).toBe(402);
+    });
+  });
+
+  it("reads an error envelope past a small cap far enough to keep its body-only bucket", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      // No `X-Comfy-Error-Type`: the bucket and the per-field failures are in
+      // the body alone, so cutting it at a 64-byte result cap would leave an
+      // unparseable fragment and a bare `http_422`.
+      server.state.status = 422;
+      server.state.body = {
+        error_type: "invalid_input",
+        detail: [{ loc: ["body", "prompt"], msg: "m".repeat(2_000), type: "value_error" }],
+      };
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { maxBytes: 64 })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("invalid_input");
+      expect(err.httpStatus).toBe(422);
+      expect(err.details?.detail).toHaveLength(1);
+    });
+  });
+
+  it("reports a 202 as not finished rather than as a cap breach", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 202;
+      server.state.body = { request_id: "r", status: "IN_PROGRESS", padding: "p".repeat(2_000) };
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { maxBytes: 16 })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("unexpected_response");
+      expect(err.httpStatus).toBe(202);
+      expect(err.message).toContain("202 (accepted, not finished)");
     });
   });
 
