@@ -108,8 +108,10 @@ rest the failure message will not tell you this:
   generation already running. That set is not this SDK's to choose: Router
   sends `Retry-After` only where it holds a handle to collect from, so
   `src/sdk/router-spec-contract.test.ts` reads which `runRouterModel` responses
-  declare that header and asserts the predicate accepts exactly those. A sync
-  that moved the header — onto a `429`, or off the `409` — would otherwise
+  declare that header and asserts the predicate accepts exactly those, bar one
+  recorded exception: the `502` `provider_error` that declares the collect pace
+  is retried on the ordinary backoff and is listed in the test as declared but
+  not collected. A sync that moved the header — onto a `429`, or off the `409` — would otherwise
   leave the SDK re-sending an answer nothing blesses, or refusing to collect a
   generation Comfy is still holding.
 - **`src/low/models.ts`.** Holds four schemas codegen cannot reach, because

@@ -4,11 +4,11 @@
  *
  * Router answers every failure with a coarse, machine-readable bucket on the
  * `X-Comfy-Error-Type` response header (and, for the request-level body
- * shape, in `error_type` as well). The bucket set is *closed* at nineteen
- * values in this release: six request-level and thirteen transport-level. This
+ * shape, in `error_type` as well). The bucket set is *closed* at twenty-one
+ * values in this release: seven request-level and fourteen transport-level. This
  * module turns that value into a class an integrator can `catch`. The names
  * below are the shared set: the Python SDK spells every one of them
- * identically, so a snippet, a doc page or a forum answer transfers between
+ * identically (bar the newest, see the end of this comment), so a snippet, a doc page or a forum answer transfers between
  * the two languages unchanged. They are the PascalCase of the wire value,
  * which is idiomatic in both languages — no per-language casing deviation was
  * needed, and none should be introduced.
@@ -51,22 +51,22 @@
  *   done until a class exists for it here.
  *
  * These classes are namespaced (`routerErrors.*`) rather than exported from
- * the package root because three of the nineteen names — `Unauthorized`,
+ * the package root because three of the twenty-one names — `Unauthorized`,
  * `Forbidden`, `InsufficientCredits` — already exist at the root as
  * workflow-API exceptions descending from `ComfyError`. The Python SDK has
  * the same three at the top level of `comfy_sdk`, so both SDKs resolve the
  * collision the same way: a dedicated module, and the class names themselves
  * left untouched.
  *
- * One of the nineteen buckets — `queue_backlog_full`, the most recent the
- * vendored contract grew — is newer than the Python SDK's table. Until its
- * twin lands it is declared as leading this SDK in `surface-parity.test.ts`'s
- * allowlist, which fails once the Python side catches up so the entry cannot
- * outlive the lag.
+ * One of the twenty-one buckets — `byok_credential_rejected`, the most recent
+ * the vendored contract grew — is newer than the Python SDK's table. Until its
+ * twin lands it is declared as leading the Python SDK in
+ * `surface-parity.test.ts`'s allowlist, which fails once the Python side
+ * catches up so the entry cannot outlive the lead.
  */
 
 /**
- * The six request-level buckets, in the order the error contract lists them.
+ * The seven request-level buckets, in the order the error contract lists them.
  *
  * Two distinctions here are load-bearing rather than cosmetic, because a
  * caller branches on them:
@@ -76,6 +76,11 @@
  * - `provider_timeout` is an *upstream* stall, not a Comfy-side deadline. A
  *   deadline that expires on our side shares the same `504` but arrives as
  *   `deadline_exceeded`.
+ *
+ * The last one, `byok_credential_rejected`, was added after the transport-level
+ * buckets: the contract lists it at the very end of its set, and it keeps its
+ * tier here, so each tier reads in the order the contract lists it. It names
+ * the caller's own PROVIDER key (see {@link ByokCredentialRejected}).
  */
 export const REQUEST_ERROR_TYPES = [
   "invalid_input",
@@ -84,22 +89,27 @@ export const REQUEST_ERROR_TYPES = [
   "provider_timeout",
   "insufficient_credits",
   "model_not_found",
+  "byok_credential_rejected",
 ] as const;
 
 /**
- * The thirteen transport-level buckets, in the order the error contract lists
+ * The fourteen transport-level buckets, in the order the error contract lists
  * them. They are part of the same closed set — a caller reads one value off
  * one header — but they are raised before or around the model call rather
  * than derived from a provider response.
  *
- * The last four (`cancelled`, `queue_timeout`, `request_not_found`,
- * `queue_backlog_full`) are the QUEUE tier: they are reported by the queued
- * `submit`/`handle` surface, all four by status codes an older bucket already
- * owns. In all, five HTTP
- * statuses here carry more than one bucket, and the status alone cannot tell
- * them apart — so a caller that branches on status gets the wrong answer for
- * all but the oldest member of each:
+ * The last five (`cancelled`, `queue_timeout`, `request_not_found`,
+ * `queue_backlog_full`, `result_expired`) are the QUEUE tier: they are reported
+ * by the queued `submit`/`handle` surface, the first four by status codes an
+ * older bucket already owns and the last by `410`, which no other bucket uses.
+ * Counting the request-level `byok_credential_rejected` too, six HTTP statuses
+ * here carry more than one bucket, and the status alone cannot tell them apart
+ * — so a caller that branches on status gets the wrong answer for all but the
+ * oldest member of each:
  *
+ * - `401` is `unauthorized` (the caller's Comfy credential was missing or
+ *   invalid) **or** `byok_credential_rejected` (the provider refused the key
+ *   the caller supplied for it, so the Comfy credential was fine).
  * - `403` is `forbidden` (an entitlement decision about this caller) **or**
  *   `not_enabled` (a state of the Router rollout, nothing to do with the
  *   caller's entitlements).
@@ -133,12 +143,46 @@ export const TRANSPORT_ERROR_TYPES = [
   "queue_timeout",
   "request_not_found",
   "queue_backlog_full",
+  "result_expired",
 ] as const;
 
-/** The closed error-type set for this release: request-level, then transport-level. */
-export const ROUTER_ERROR_TYPES = [...REQUEST_ERROR_TYPES, ...TRANSPORT_ERROR_TYPES] as const;
+/**
+ * The closed error-type set for this release, in the order the contract lists
+ * it: the six oldest request-level buckets, the transport-level ones, then
+ * `byok_credential_rejected`, a request-level bucket the contract added after
+ * them. That is why this is not
+ * `[...REQUEST_ERROR_TYPES, ...TRANSPORT_ERROR_TYPES]`: each tier keeps its own
+ * order, and `router-spec-coverage.test.ts` checks the whole list and each tier
+ * against the contract.
+ */
+export const ROUTER_ERROR_TYPES = [
+  "invalid_input",
+  "content_policy_violation",
+  "provider_error",
+  "provider_timeout",
+  "insufficient_credits",
+  "model_not_found",
+  "unauthorized",
+  "forbidden",
+  "concurrency_limit_exceeded",
+  "client_disconnected",
+  "internal_error",
+  "deadline_exceeded",
+  "not_enabled",
+  "service_unavailable",
+  "rate_limited",
+  "cancelled",
+  "queue_timeout",
+  "request_not_found",
+  "queue_backlog_full",
+  "result_expired",
+  "byok_credential_rejected",
+] as const satisfies readonly (
+  | (typeof REQUEST_ERROR_TYPES)[number]
+  | (typeof TRANSPORT_ERROR_TYPES)[number]
+)[];
 
-/** One of the nineteen buckets this release knows about. */
+/** One of the twenty-one buckets this release knows about. */
 export type RouterErrorType = (typeof ROUTER_ERROR_TYPES)[number];
 
 /** `X-Comfy-Error-Type` — the coarse bucket, set on every Router error response. */
@@ -382,6 +426,22 @@ export class ModelNotFound extends RouterError {
   static override readonly errorType = "model_not_found";
 }
 
+/**
+ * The model provider rejected the key the caller supplied for this call, and
+ * the answer is `401`. Sending the same key again is refused the same way, so
+ * check the key stored for this provider rather than retrying.
+ *
+ * It shares `401` with {@link Unauthorized} and is not the same thing: that one
+ * says the caller's COMFY credential was missing or invalid, whereas this names
+ * the caller's own PROVIDER key. It is not {@link ProviderError} either, which
+ * reports a failure on the provider's side. An upstream `403` is the same
+ * refusal and also arrives as this `401`, with the provider's own status on
+ * `X-Comfy-Upstream-Status`.
+ */
+export class ByokCredentialRejected extends RouterError {
+  static override readonly errorType = "byok_credential_rejected";
+}
+
 // -- transport-level buckets -------------------------------------------------
 
 /** Authentication is required, or the credential presented was not valid. */
@@ -570,6 +630,22 @@ export class QueueBacklogFull extends RouterError {
   static override readonly errorType = "queue_backlog_full";
 }
 
+/**
+ * The queued request existed and finished, but its result is no longer stored,
+ * so the collect has nothing to return. It answers `410` and is PERMANENT for
+ * that `request_id`: re-reading answers the same way, so do not retry it.
+ *
+ * It is deliberately not {@link RequestNotFound}, which would say the id was
+ * never valid and invite re-submitting a generation that has already run.
+ * Running the model again means submitting a new request. Under a
+ * zero-data-retention agreement a result is removed shortly after the first
+ * collect, so a second collect can raise this: store the result on your side
+ * the first time.
+ */
+export class ResultExpired extends RouterError {
+  static override readonly errorType = "result_expired";
+}
+
 type RouterErrorClass = new (message: string, options: RouterErrorOptions) => RouterError;
 
 const BY_ERROR_TYPE: Record<string, RouterErrorClass> = {
@@ -592,6 +668,8 @@ const BY_ERROR_TYPE: Record<string, RouterErrorClass> = {
   queue_timeout: QueueTimeout,
   request_not_found: RequestNotFound,
   queue_backlog_full: QueueBacklogFull,
+  result_expired: ResultExpired,
+  byok_credential_rejected: ByokCredentialRejected,
 };
 
 /**
@@ -616,9 +694,13 @@ const BY_ERROR_TYPE: Record<string, RouterErrorClass> = {
  * `cancelled` shares `409`, `queue_timeout` shares `504`, `request_not_found`
  * shares `404` and `queue_backlog_full` shares `429` — and stays out for the
  * same reason: the table keeps naming `model_not_found` for `404` and the
- * run-route member for `409`/`429`/`504`. Guessing the newer member of a shared status would relabel
- * failures this table has always classified, on exactly the responses that
- * carry the least evidence.
+ * run-route member for `409`/`429`/`504`. So does `byok_credential_rejected`,
+ * which shares `401` with `unauthorized`: a header-less `401` keeps reading as
+ * a rejected Comfy credential. Guessing the newer member of a shared status
+ * would relabel failures this table has always classified, on exactly the
+ * responses that carry the least evidence. `result_expired` shares `410` with
+ * no other bucket, but the Python SDK's table maps no `410` either, so a
+ * header-less `410` raises the base {@link RouterError} here too.
  *
  * A status stays OUT of the table entirely when the plain HTTP reading does
  * not pick ONE bucket, and such a response raises the base {@link RouterError}
