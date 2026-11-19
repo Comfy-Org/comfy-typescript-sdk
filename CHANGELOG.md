@@ -52,6 +52,17 @@ entry. See CONTRIBUTING.md.
 - The v2 spec is synced to the current contract and `src/low/generated` is
   regenerated. `ComfyLow.listJobs` is now a spec operation, so
   `OPERATION_IDS` lists it.
+- **Breaking (`@comfyorg/sdk/low` types):** the low layer's `JobMetadata`,
+  `JobListItem` and `JobListPage` types now come
+  from the vendored v2 spec, which declares the `GET /api/v2/jobs` list. The
+  hand-written copies they replace had drifted from it: `JobListItem.status`
+  is now the `JobStatus` union rather than `string`, `create_time` and
+  `update_time` are required, `release_version` is declared, and
+  `deployment_id` is no longer a declared field (it is still read, if sent,
+  into `JobSummary.deploymentId`). `JobListPage` is an alias of the generated
+  `JobList`. A `JobListItem` literal without `create_time`/`update_time` no
+  longer compiles, and `item.deployment_id` is now `unknown` — narrow it before
+  use.
 
 ## [0.5.0] - 2026-10-10
 
