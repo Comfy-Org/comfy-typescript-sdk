@@ -78,6 +78,17 @@ export interface ServerState {
    * `rate_limited`, with `retryAfter` as its `Retry-After`, `times` times
    * before serving the page. */
   jobListThrottle: { cursor: string; times: number; retryAfter: string } | null;
+  /**
+   * The `error` of a failed job. When set, `POST /jobs` and the cancel
+   * response answer with a job already `failed` carrying it, and `GET
+   * /jobs/{id}` carries it once the job reports `failed`. A running job and a
+   * succeeded one carry none, as on the real server.
+   */
+  jobFailure: Record<string, unknown> | null;
+  /** `GET /jobs/{id}` answers 500 `internal_error` from this poll number on
+   * (counted from 1), so a test can fail the read a stream makes after its
+   * terminal frame. */
+  jobPollFailsFrom: number | null;
   /** Number of GET /jobs/{id} polls before the job reports terminal. */
   pollsToSucceed: number;
   /** Terminal status the job reaches. */
@@ -209,6 +220,8 @@ function defaultState(): ServerState {
     hangJobList: false,
     jobListError: null,
     jobListThrottle: null,
+    jobFailure: null,
+    jobPollFailsFrom: null,
     pollsToSucceed: 1,
     terminalStatus: "succeeded",
     sseMode: "normal",
@@ -460,7 +473,13 @@ export class StubServer {
       }
       const m = /^\/api\/v2\/jobs\/([^/]+)\/cancel$/.exec(path);
       if (m) {
-        sendJson(res, 200, jobJson(m[1], "canceling", [], state.jobUrlsOrigin));
+        sendJson(
+          res,
+          200,
+          state.jobFailure === null
+            ? jobJson(m[1], "canceling", [], state.jobUrlsOrigin)
+            : { ...jobJson(m[1], "failed", [], state.jobUrlsOrigin), error: state.jobFailure },
+        );
         return;
       }
       await readBody(req);
@@ -532,6 +551,10 @@ export class StubServer {
     const state = this.state;
     if (state.hangJobPoll) return; // never respond; the caller must abort client-side
     state.jobPollCount += 1;
+    if (state.jobPollFailsFrom !== null && state.jobPollCount >= state.jobPollFailsFrom) {
+      sendError(res, 500, "internal_error", "poll failed");
+      return;
+    }
     const terminal = state.jobPollCount >= state.pollsToSucceed;
     const status = terminal ? state.terminalStatus : "running";
     // Stamp the polled job's own id as job_id, matching a real server: an
@@ -546,6 +569,7 @@ export class StubServer {
         state.jobUrlsIncludeLogs,
         state.jobMetadata,
       ),
+      ...(status === "failed" && state.jobFailure !== null ? { error: state.jobFailure } : {}),
       ...state.jobFieldOverrides,
     });
   }
@@ -717,7 +741,15 @@ export class StubServer {
 
     const jobId = `job_${String(state.submitCount).padStart(2, "0")}`;
     if (typeof key === "string") state.idempotency.set(key, jobId);
-    sendJson(res, 201, jobJson(jobId, "queued", [], state.jobUrlsOrigin, true, body.metadata));
+    const job = jobJson(
+      jobId,
+      state.jobFailure === null ? "queued" : "failed",
+      [],
+      state.jobUrlsOrigin,
+      true,
+      body.metadata,
+    );
+    sendJson(res, 201, state.jobFailure === null ? job : { ...job, error: state.jobFailure });
   }
 }
 

@@ -79,12 +79,12 @@ interface Asymmetry {
    * fails the moment the Python snapshot grows the same name, so the entry
    * cannot outlive the lag it describes.
    *
-   * No asymmetry declares one today. `deadline_exceeded`, `not_enabled`,
-   * `service_unavailable` and `rate_limited` did until the Python SDK shipped
-   * all four, and `queue_backlog_full` did after them; each time the rot guard
-   * fired and the entry was deleted — which is the mechanism working, not a
-   * gap. The field stays because the
-   * next bucket will land on one side first too.
+   * One asymmetry declares one today: `byok_credential_rejected`.
+   * `deadline_exceeded`, `not_enabled`, `service_unavailable` and
+   * `rate_limited` did until the Python SDK shipped all four, and
+   * `queue_backlog_full` did after them; each time the rot guard fired and the
+   * entry was deleted — which is the mechanism working, not a gap. The field
+   * stays because the next bucket will land on one side first too.
    */
   readonly routerErrorClassesAheadOfPython?: readonly (readonly [string, string])[];
   /**
@@ -236,6 +236,17 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
       "stays visible: the follow-up is to add both classes and delete this entry, which the rot " +
       "guard below forces the moment either one lands.",
     exportedErrorClassesBehindPython: ["AlreadyCompleted", "CancelRefused"],
+  },
+  {
+    id: "byok-credential-bucket-lands-first-in-typescript",
+    why:
+      "The vendored Router contract grew a request-level bucket, `byok_credential_rejected` (the " +
+      "provider refused the key the caller supplied for it, answered `401`), and this SDK's " +
+      "spec-coverage gate requires a class per bucket the moment the spec declares one. The " +
+      "Python SDK has not reconciled the same spec sync yet, so its surface snapshot does not " +
+      "carry it. This is a LEAD, not a divergence: the rot guard below fails the moment the " +
+      "Python snapshot grows it, which is the signal to delete this entry.",
+    routerErrorClassesAheadOfPython: [["ByokCredentialRejected", "byok_credential_rejected"]],
   },
   {
     id: "collect-switched-off-by-budget",
