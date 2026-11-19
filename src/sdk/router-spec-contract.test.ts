@@ -143,13 +143,9 @@ describe("router route contract (spec/router-openapi.yaml)", () => {
   });
 
   /**
-   * The queued twin of the pin above. It was a ROT GUARD while
-   * `getRouterModelRequestResult`'s `200` declared no credits header, because
-   * `RequestHandle.collect` lifts `creditsUsed` off that response with the same
-   * `CREDITS_USED_HEADER` and there was nothing to pin it to. The sync that
-   * declares `X-Comfy-Credits-Used` there is what fired it, and the name it
-   * brought MATCHES the constant, so the SDK was reading the right header
-   * all along; this is what keeps that true through the next sync.
+   * The queued twin of the pin above: `RequestHandle.collect` lifts
+   * `creditsUsed` off `getRouterModelRequestResult`'s `200` with the same
+   * `CREDITS_USED_HEADER`, so the contract's declared name has to stay it.
    */
   it("spells CREDITS_USED_HEADER the credits header the contract declares on the queued result read", async () => {
     const declared = await readSuccessHeaderNames("getRouterModelRequestResult");
@@ -200,14 +196,11 @@ describe("router route contract (spec/router-openapi.yaml)", () => {
     //
     // The contract ALSO declares that header on a `502` naming `provider_error`
     // (a poll leg that ended without a verdict, the key parked with its
-    // handle). This SDK does not collect on it, and that is a decision rather
-    // than an omission: the contract itself names the exception, a `502` whose
-    // park failed, where a same-key resend dispatches and bills a FRESH
-    // generation, and the wire does not say which `502` is which. Collecting
-    // on it would change what `models.run` retries and can charge again, so it
-    // is its own change, and this test is what keeps the gap written down. The
-    // day `isCollectable` takes the `502`, move it from `DECLARED_NOT_COLLECTED`
-    // to `COLLECTED` and give it its bucket below.
+    // handle). This SDK does not collect on it: that `502` is retried under the
+    // same key on the ordinary backoff, ignoring the pace, and collecting would
+    // only change the pace and the budget. Taking it is its own change. The day
+    // `isCollectable` takes the `502`, move it from `DECLARED_NOT_COLLECTED` to
+    // `COLLECTED` and give it its bucket below.
     const COLLECTED = [409, 504];
     const DECLARED_NOT_COLLECTED = [502];
     const { retryAfterStatuses } = await readRouterRouteContract();

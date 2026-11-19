@@ -247,8 +247,7 @@ export function parseReplayed(raw: string | null): boolean {
  * Pinned against the vendored contract: `runRouterModel`'s `200` and
  * `getRouterModelRequestResult`'s `200` both declare `X-Comfy-Credits-Used`
  * (as `RouterCreditsUsedHeader`), and `router-spec-contract.test.ts` asserts
- * this constant spells that declared name on each. Each pin replaced a rot
- * guard that watched for the declaration to arrive, because the drift it would
+ * this constant spells that declared name on each, because the drift it would
  * suffer is SILENT: a name wrong by one segment reports `creditsUsed: null` on
  * every run forever, which is indistinguishable from the "Router reported no
  * cost" this field is documented to mean.

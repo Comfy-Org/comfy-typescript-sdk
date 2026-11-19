@@ -66,7 +66,7 @@
  */
 
 /**
- * The six request-level buckets, in the order the error contract lists them.
+ * The seven request-level buckets, in the order the error contract lists them.
  *
  * Two distinctions here are load-bearing rather than cosmetic, because a
  * caller branches on them:
@@ -433,11 +433,10 @@ export class ModelNotFound extends RouterError {
  *
  * It shares `401` with {@link Unauthorized} and is not the same thing: that one
  * says the caller's COMFY credential was missing or invalid, whereas this names
- * the caller's own PROVIDER key, so the Comfy credential was accepted. It is
- * not {@link ProviderError} either, which reports a failure or an outage on the
- * provider's side. An upstream `403` is the same refusal and is returned as
- * this `401`, with the provider's own status on `X-Comfy-Upstream-Status`. The
- * provider's response body is not included.
+ * the caller's own PROVIDER key. It is not {@link ProviderError} either, which
+ * reports a failure on the provider's side. An upstream `403` is the same
+ * refusal and also arrives as this `401`, with the provider's own status on
+ * `X-Comfy-Upstream-Status`.
  */
 export class ByokCredentialRejected extends RouterError {
   static override readonly errorType = "byok_credential_rejected";
@@ -638,12 +637,10 @@ export class QueueBacklogFull extends RouterError {
  *
  * It is deliberately not {@link RequestNotFound}, which would say the id was
  * never valid and invite re-submitting a generation that has already run.
- * Running the model again means submitting a new request. For a workspace under
- * a zero-data-retention agreement a queued request's result is not kept once
- * delivered: it is removed shortly after the first collect, and an uncollected
- * one is removed after a grace period once the request finishes. There a second
- * collect can raise this, so store the result on your side the first time you
- * collect it.
+ * Running the model again means submitting a new request. Under a
+ * zero-data-retention agreement a result is removed shortly after the first
+ * collect, so a second collect can raise this: store the result on your side
+ * the first time.
  */
 export class ResultExpired extends RouterError {
   static override readonly errorType = "result_expired";
