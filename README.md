@@ -603,11 +603,24 @@ comfy.config({ credentials: "comfyui-..." }); // or COMFY_API_KEY
 
 const voice = await comfy.realtime.connect("xai/grok-voice/realtime");
 voice.socket.binaryType = "arraybuffer";
-voice.socket.addEventListener("message", (event) => console.log(decode(event.data)));
+voice.socket.addEventListener("message", (event) => {
+  if (event.data instanceof ArrayBuffer) console.log(decode(event.data));
+});
 voice.socket.send(encode(message)); // the model's own message shape
+// ...
+voice.close();
+```
 
+A `google` session is the same call, with JSON text frames instead — open it
+once the previous session has closed, since only one may be live at a time:
+
+```ts
 const genie = await comfy.realtime.connect("google/genie-4");
-genie.socket.send(JSON.stringify(message)); // JSON text frames on this leg
+genie.socket.addEventListener("message", (event) => {
+  if (typeof event.data === "string") console.log(JSON.parse(event.data));
+});
+genie.socket.send(JSON.stringify(message)); // the model's own message shape
+// ...
 genie.close();
 ```
 

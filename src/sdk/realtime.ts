@@ -8,7 +8,9 @@
  * comfy.config({ credentials: "comfyui-..." });
  * const session = await comfy.realtime.connect("xai/grok-voice/realtime");
  * session.socket.binaryType = "arraybuffer";
- * session.socket.addEventListener("message", (event) => console.log(decode(event.data)));
+ * session.socket.addEventListener("message", (event) => {
+ *   if (event.data instanceof ArrayBuffer) console.log(decode(event.data));
+ * });
  * session.socket.send(encode(message)); // the model's own message shape
  * ```
  *
@@ -141,6 +143,28 @@ const MAX_REFUSAL_BODY_BYTES = 64 * 1024;
 
 const MODEL_SEGMENT = /^[a-z0-9._-]+$/;
 
+/** What every event a {@link RealtimeSocket} dispatches carries, on both transports. */
+export interface RealtimeEvent {
+  readonly type: string;
+}
+
+/**
+ * A received frame. A text frame is a `string`. A binary frame depends on
+ * `binaryType` and the transport: set `binaryType = "arraybuffer"` and it is
+ * an `ArrayBuffer` on both; otherwise the WHATWG `WebSocket` hands back a
+ * `Blob` and `ws` a `Buffer` (or `Buffer[]` for `"fragments"`).
+ */
+export interface RealtimeMessageEvent extends RealtimeEvent {
+  readonly data: string | ArrayBuffer | Blob | Uint8Array | Uint8Array[];
+}
+
+/** The session ended; {@link REALTIME_CLOSE_CODES} lists the codes the broker sends. */
+export interface RealtimeCloseEvent extends RealtimeEvent {
+  readonly code: number;
+  readonly reason: string;
+  readonly wasClean: boolean;
+}
+
 /**
  * The part of a WebSocket both the `ws` package and the WHATWG `WebSocket`
  * implement — enough to send, receive and close without importing either
@@ -153,8 +177,12 @@ export interface RealtimeSocket {
   binaryType: string;
   send(data: string | ArrayBufferLike | ArrayBufferView | Blob): void;
   close(code?: number, reason?: string): void;
-  addEventListener(type: string, listener: (event: never) => void): void;
-  removeEventListener(type: string, listener: (event: never) => void): void;
+  addEventListener(type: "message", listener: (event: RealtimeMessageEvent) => void): void;
+  addEventListener(type: "close", listener: (event: RealtimeCloseEvent) => void): void;
+  addEventListener(type: string, listener: (event: RealtimeEvent) => void): void;
+  removeEventListener(type: "message", listener: (event: RealtimeMessageEvent) => void): void;
+  removeEventListener(type: "close", listener: (event: RealtimeCloseEvent) => void): void;
+  removeEventListener(type: string, listener: (event: RealtimeEvent) => void): void;
 }
 
 export interface RealtimeConnectOptions {
@@ -211,7 +239,6 @@ export interface RealtimeSession {
 interface WsSocket extends RealtimeSocket {
   on(event: string, listener: (...args: never[]) => void): unknown;
   once(event: string, listener: (...args: never[]) => void): unknown;
-  removeAllListeners(event?: string): unknown;
   terminate(): void;
 }
 
@@ -425,15 +452,11 @@ function openWithWs(
         }),
       );
     });
-    socket.once("open", () =>
-      settle(() => {
-        // Ours were only for the handshake; after open the caller owns the socket.
-        socket.removeAllListeners("error");
-        resolve({ socket, requestId });
-      }),
-    );
-    // Kept attached through a failed handshake: `terminate()` above emits
-    // `error` on the next tick, and an EventEmitter with no `error` listener throws.
+    socket.once("open", () => settle(() => resolve({ socket, requestId })));
+    // Kept attached for the socket's whole life, and a no-op once settled: an
+    // EventEmitter with no `error` listener throws, which would crash the
+    // process on `terminate()` above, or on a malformed frame after open from
+    // a caller that listens only for `close` (which `ws` emits after `error`).
     socket.on("error", (err: Error) =>
       settle(() => reject(upgradeFailed(url, `failed: ${err.message}`, err))),
     );
@@ -561,6 +584,12 @@ export async function connect(
   if (signal !== undefined) {
     signal.addEventListener("abort", onAbort, { once: true });
     socket.addEventListener("close", () => signal.removeEventListener("abort", onAbort));
+    // The handshake's own abort listener is gone by now, so an abort that
+    // landed while the open promise was settling would otherwise be missed.
+    if (signal.aborted) {
+      onAbort();
+      throw abortReason(signal);
+    }
   }
 
   return {

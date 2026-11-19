@@ -403,4 +403,65 @@ describe("abort", () => {
     controller.abort();
     await expect.poll(() => server.closes).toEqual([1000]);
   });
+
+  it("rejects and closes when the abort lands while the open is settling", async () => {
+    const server = await accepting();
+    const controller = new AbortController();
+    // Registered after connect's own `open` listener, so the abort lands
+    // once the handshake has settled but before connect has returned.
+    class AbortOnOpen extends WsWebSocket {
+      constructor(...args: ConstructorParameters<typeof WsWebSocket>) {
+        super(...args);
+        queueMicrotask(() => this.once("open", () => controller.abort(new Error("late"))));
+      }
+    }
+    await expect(
+      connect("google/genie-4", { signal: controller.signal, WebSocket: AbortOnOpen }),
+    ).rejects.toThrow("late");
+    await expect.poll(() => server.closes).toEqual([1000]);
+  });
+});
+
+describe("after open", () => {
+  it("survives a malformed frame on ws when the caller listens only for close", async () => {
+    const wss = new WebSocketServer({
+      port: 0,
+      host: "127.0.0.1",
+      handleProtocols: () => REALTIME_SUBPROTOCOL,
+    });
+    cleanups.push(() => new Promise((resolve) => wss.close(() => resolve())));
+    // A frame with every reserved bit set, which `ws` rejects with `error` then `close`.
+    wss.on("connection", (_socket, req) => req.socket.write(Buffer.from([0xf1, 0x00])));
+    await new Promise<void>((resolve) => wss.once("listening", () => resolve()));
+    config({ baseUrl: `http://127.0.0.1:${String((wss.address() as AddressInfo).port)}` });
+
+    const session = await open("google/genie-4");
+    const closed = new Promise<number>((resolve) =>
+      session.socket.addEventListener("close", (event) => resolve(event.code)),
+    );
+    // No close frame arrives, so the close is a bare 1006 — but it arrives
+    // instead of an unhandled `error` taking the process down.
+    expect(await closed).toBe(1006);
+  });
+
+  it("types a message event's data for the caller", async () => {
+    const wss = new WebSocketServer({
+      port: 0,
+      host: "127.0.0.1",
+      handleProtocols: () => REALTIME_SUBPROTOCOL,
+    });
+    cleanups.push(() => new Promise((resolve) => wss.close(() => resolve())));
+    wss.on("connection", (socket) => socket.on("message", (data) => socket.send(String(data))));
+    await new Promise<void>((resolve) => wss.once("listening", () => resolve()));
+    config({ baseUrl: `http://127.0.0.1:${String((wss.address() as AddressInfo).port)}` });
+
+    const session = await open("google/genie-4");
+    const received = new Promise<unknown>((resolve) =>
+      session.socket.addEventListener("message", (event) => {
+        if (typeof event.data === "string") resolve(JSON.parse(event.data));
+      }),
+    );
+    session.socket.send(JSON.stringify({ hello: "world" }));
+    expect(await received).toEqual({ hello: "world" });
+  });
 });
