@@ -5,6 +5,7 @@ import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 import {
+  ByokCredentialRejected,
   Cancelled,
   ClientDisconnected,
   ConcurrencyLimitExceeded,
@@ -29,6 +30,7 @@ import {
   REQUEST_ID_HEADER,
   parseRetryAfter,
   RequestNotFound,
+  ResultExpired,
   RETRY_AFTER_HEADER,
   ROUTER_ERROR_TYPES,
   RouterError,
@@ -61,6 +63,8 @@ const CLASSES: Array<[RouterErrorType, typeof RouterError]> = [
   ["queue_timeout", QueueTimeout],
   ["request_not_found", RequestNotFound],
   ["queue_backlog_full", QueueBacklogFull],
+  ["result_expired", ResultExpired],
+  ["byok_credential_rejected", ByokCredentialRejected],
 ];
 
 /**
@@ -84,11 +88,20 @@ async function raise(response: Response): Promise<never> {
 }
 
 describe("the closed error-type set", () => {
-  it("is the six request-level buckets plus the thirteen transport-level ones", () => {
-    expect(REQUEST_ERROR_TYPES).toHaveLength(6);
-    expect(TRANSPORT_ERROR_TYPES).toHaveLength(13);
-    expect(ROUTER_ERROR_TYPES).toEqual([...REQUEST_ERROR_TYPES, ...TRANSPORT_ERROR_TYPES]);
-    expect(new Set(ROUTER_ERROR_TYPES).size).toBe(19);
+  it("is the seven request-level buckets plus the fourteen transport-level ones", () => {
+    expect(REQUEST_ERROR_TYPES).toHaveLength(7);
+    expect(TRANSPORT_ERROR_TYPES).toHaveLength(14);
+    expect(new Set(ROUTER_ERROR_TYPES).size).toBe(21);
+    // The whole set is the two tiers and nothing else, and each tier keeps its
+    // own order inside it. It is not `[...REQUEST, ...TRANSPORT]`: the contract
+    // lists `byok_credential_rejected`, a request-level bucket, after the
+    // transport-level ones, and `router-spec-coverage.test.ts` pins that order.
+    expect([...ROUTER_ERROR_TYPES].sort()).toEqual(
+      [...REQUEST_ERROR_TYPES, ...TRANSPORT_ERROR_TYPES].sort(),
+    );
+    const inTier = (tier: readonly string[]) => ROUTER_ERROR_TYPES.filter((t) => tier.includes(t));
+    expect(inTier(REQUEST_ERROR_TYPES)).toEqual([...REQUEST_ERROR_TYPES]);
+    expect(inTier(TRANSPORT_ERROR_TYPES)).toEqual([...TRANSPORT_ERROR_TYPES]);
   });
 
   it("has exactly one class per bucket, and no class outside it", () => {
@@ -282,6 +295,39 @@ describe("toRouterError", () => {
     expect(toRouterError(504, headerless, null)).toBeInstanceOf(ProviderTimeout);
   });
 
+  it("tells byok_credential_rejected from unauthorized on a 401 by the header alone", () => {
+    // Both answer `401`. The first says the provider refused the key the caller
+    // supplied for it, the second that the Comfy credential was missing or bad,
+    // so a caller who rotates the wrong key gets nowhere. A header-less `401`
+    // keeps reading as `unauthorized`, as the status table above has always
+    // said, because it carries no evidence of which one it is.
+    const byok = toRouterError(
+      401,
+      new Headers({ [ERROR_TYPE_HEADER]: "byok_credential_rejected" }),
+      {
+        detail: "The provider rejected the key supplied for this call.",
+      },
+    );
+    expect(byok).toBeInstanceOf(ByokCredentialRejected);
+    expect(byok).toBeInstanceOf(RouterError);
+    expect(byok).not.toBeInstanceOf(Unauthorized);
+    expect(byok.errorType).toBe("byok_credential_rejected");
+    expect(byok.httpStatus).toBe(401);
+    expect(toRouterError(401, new Headers(), null)).toBeInstanceOf(Unauthorized);
+  });
+
+  it("raises ResultExpired for a 410 that names result_expired, and is not request_not_found", () => {
+    const expired = toRouterError(410, new Headers({ [ERROR_TYPE_HEADER]: "result_expired" }), {
+      detail: "The result is no longer stored.",
+    });
+    expect(expired).toBeInstanceOf(ResultExpired);
+    expect(expired).toBeInstanceOf(RouterError);
+    expect(expired).not.toBeInstanceOf(RequestNotFound);
+    expect(expired.errorType).toBe("result_expired");
+    expect(expired.httpStatus).toBe(410);
+    expect(expired.message).toBe("The result is no longer stored.");
+  });
+
   it("raises the base RouterError, with no bucket, for a status with no mapping", () => {
     // A status the table deliberately does not name carries no evidence of
     // which bucket it is, so the SDK says so rather than guessing. There is
@@ -297,7 +343,9 @@ describe("toRouterError", () => {
     //   array and has no `error_type`), so a header-less one is ambiguous.
     // - 503 from an intermediary is not Router's own `service_unavailable`.
     // - 500 is not automatically Router's `internal_error` either.
-    for (const status of [400, 422, 503, 500, 418]) {
+    // - 410 names `result_expired` only on the header, and the Python SDK's
+    //   table maps no `410` either.
+    for (const status of [400, 422, 503, 500, 418, 410]) {
       const err = toRouterError(status, new Headers(), null);
       expect(err.constructor, `HTTP ${String(status)} should raise the base class`).toBe(
         RouterError,

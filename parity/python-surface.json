@@ -51,7 +51,8 @@
     "Cancelled",
     "QueueTimeout",
     "RequestNotFound",
-    "QueueBacklogFull"
+    "QueueBacklogFull",
+    "ResultExpired"
   ],
   "routerErrorTypes": {
     "RouterError": "",
@@ -73,7 +74,8 @@
     "Cancelled": "cancelled",
     "QueueTimeout": "queue_timeout",
     "RequestNotFound": "request_not_found",
-    "QueueBacklogFull": "queue_backlog_full"
+    "QueueBacklogFull": "queue_backlog_full",
+    "ResultExpired": "result_expired"
   },
   "routerErrorTypeOrder": [
     "invalid_input",
@@ -94,7 +96,8 @@
     "cancelled",
     "queue_timeout",
     "request_not_found",
-    "queue_backlog_full"
+    "queue_backlog_full",
+    "result_expired"
   ],
   "routerErrorTypeByStatus": {
     "401": "unauthorized",

@@ -184,8 +184,9 @@ export function fillRoute(template: string, values: Readonly<Record<string, stri
 export interface RouterRunParams {
   /**
    * `model_provider` — an alternate serving provider for this model (e.g.
-   * `"fal"`), instead of its current default. Omitted, the model runs on its
-   * default provider and the request is byte-for-byte what it always was.
+   * `"fal"`), instead of its current default. Omitted, Router chooses the serving
+   * provider, which may be another one than the model's own, and the request is
+   * byte-for-byte what it always was.
    */
   modelProvider?: string;
   /**

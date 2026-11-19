@@ -52,6 +52,16 @@ entry. See CONTRIBUTING.md.
   without an `error`, the handle is left as it was and the stream raises
   nothing it did not before. The same event from the poll fallback
   carries the error too.
+- **Two more Router error classes, `routerErrors.ResultExpired` and
+  `routerErrors.ByokCredentialRejected`**, for the buckets the vendored Router
+  contract now declares. `ResultExpired` (`result_expired`, `410`) is a queued
+  request that finished but whose result is no longer stored: collecting it
+  again answers the same way, so do not retry it, and submit a new request to
+  run the model again. `ByokCredentialRejected` (`byok_credential_rejected`,
+  `401`) is the model provider refusing the key you supplied for it, which is
+  not `Unauthorized` (your Comfy credential) and not `ProviderError` (a
+  provider failure): check the key stored for that provider. Both are
+  `RouterError`s, and `ROUTER_ERROR_TYPES` now lists twenty-one buckets.
 
 ### Changed
 
