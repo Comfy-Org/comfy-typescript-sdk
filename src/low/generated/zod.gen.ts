@@ -155,6 +155,7 @@ export const zJobNodeError = z.object({
 export const zJobError = z.object({
     code: z.string(),
     message: z.string(),
+    category: z.string().optional(),
     node_id: z.string().nullish(),
     class_type: z.string().nullish(),
     traceback: z.string().nullish(),
@@ -187,7 +188,9 @@ export const zJob = z.object({
  * Shared error envelope with machine-readable codes. Core codes (v1):
  * `invalid_workflow` (422), `workflow_format_ui` (422),
  * `missing_asset` (422), `hash_mismatch` (409), `blob_not_found`
- * (404), `idempotency_key_reuse` (422),
+ * (404), `idempotency_key_reuse` (422), `upload_timed_out` (422: an
+ * asset upload stopped sending or was too slow; retry from a faster
+ * connection),
  * `queue_full` (429 + Retry-After), `rate_limited` (429 + Retry-After:
  * the caller is past a request rate limit; retry), `insufficient_credits`
  * (402), `not_found` (404), `unauthorized` (401), `forbidden` (403).
@@ -195,14 +198,34 @@ export const zJob = z.object({
  * Retry-After — the deployment can still reach ready; retry),
  * `deployment_unavailable` (429 + Retry-After: the deployment is ready
  * but its GPU provider is not taking work on it yet; retry),
+ * `deployment_lookup_unavailable` (503 + Retry-After, on any
+ * operation: the deployment the address names could not be looked up
+ * just now; nothing was done, so retry), `database_unavailable` (503 +
+ * Retry-After, only on a job submit: the job could not be saved just
+ * now and nothing was started, so retry), `auth_unavailable` (503 +
+ * Retry-After, on any operation: the credential could not be checked
+ * just now, which says nothing about the credential, so retry),
+ * `output_unavailable` (503 + Retry-After, only on a job status read: an
+ * output of the job could not be prepared just now; the job is
+ * unchanged, so retry after `Retry-After`, and report the job if it
+ * keeps answering),
  * `deployment_stopped` (422 — terminal deployment state; a retry
  * cannot succeed without operator action), `invalid_request` (422:
  * a malformed asset upload or asset-from-hash field, or a jobs-list
- * `limit` that is not a positive integer), `content_blocked` (451:
+ * `limit` that is not a positive integer), `validation_error` (422,
+ * Cloud: an asset upload or asset-from-hash field was refused, e.g. a
+ * tag over the tag limits), `content_blocked` (451:
  * content moderation flagged the asset's bytes) and `sso_required` (403:
  * the key is valid, but the account must sign in through its
- * organization's single sign-on, which does not accept this key). Job
- * labels add: `metadata_invalid` (422: a submitted `metadata` breaks a
+ * organization's single sign-on, which does not accept this key).
+ * Comfy Cloud's asset upload adds `invalid_content_type` (422: the
+ * request is not `multipart/form-data` with a boundary),
+ * `invalid_body` (422: a malformed multipart body or upload field),
+ * `validation_error` (422: the platform refused the upload, for example
+ * an image over the size cap or a disallowed tag) and `upload_busy`
+ * (503 + Retry-After: the server is busy with other uploads and nothing
+ * was stored, so retry).
+ * Job labels add: `metadata_invalid` (422: a submitted `metadata` breaks a
  * limit; `details.key` names the key, except for too many pairs, which
  * has no `details`), `metadata_not_supported` (422:
  * this surface keeps no job labels yet), `invalid_metadata_filter` (400)
@@ -236,12 +259,12 @@ export const zAssetId = z.string();
 export const zBlakeHash = z.string();
 
 export const zPostAssetsBody = z.object({
-    file: z.string(),
     content_type: z.string(),
     file_path: z.string(),
     expected_hash: z.string().optional(),
     tags: z.array(z.string()).optional(),
-    expires_in: z.int().gte(60).lte(604800).optional()
+    expires_in: z.int().gte(60).lte(604800).optional(),
+    file: z.string()
 });
 
 export const zPostAssetsHeaders = z.object({
@@ -261,7 +284,7 @@ export const zAssetFromHashBody = z.object({
 });
 
 /**
- * An identical reference already existed; returned as-is.
+ * An existing asset was reused under the serving surface's rules above; `created_new` is false. Its UUID, name and tags are kept; retention may refresh and content URLs are generated for this response.
  */
 export const zAssetFromHashResponse = zAsset;
 
@@ -315,7 +338,9 @@ export const zPostJobsBody = z.object({
     workflow: z.record(z.string(), z.unknown()),
     extra_data: z.object({
         api_key_comfy_org: z.string().optional(),
-        auth_token_comfy_org: z.string().optional()
+        auth_token_comfy_org: z.string().optional(),
+        preview_method: z.string().optional(),
+        extra_pnginfo: z.record(z.string(), z.unknown()).optional()
     }).optional(),
     metadata: z.record(z.string(), z.string().max(256)).optional()
 });

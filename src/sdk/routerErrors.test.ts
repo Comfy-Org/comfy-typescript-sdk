@@ -20,6 +20,7 @@ import {
   NotEnabled,
   ProviderError,
   ProviderTimeout,
+  QueueBacklogFull,
   QueueTimeout,
   RateLimited,
   REQUEST_ERROR_TYPES,
@@ -57,6 +58,7 @@ const CLASSES: Array<[RouterErrorType, typeof RouterError]> = [
   ["cancelled", Cancelled],
   ["queue_timeout", QueueTimeout],
   ["request_not_found", RequestNotFound],
+  ["queue_backlog_full", QueueBacklogFull],
 ];
 
 /**
@@ -80,11 +82,11 @@ async function raise(response: Response): Promise<never> {
 }
 
 describe("the closed error-type set", () => {
-  it("is the six request-level buckets plus the twelve transport-level ones", () => {
+  it("is the six request-level buckets plus the thirteen transport-level ones", () => {
     expect(REQUEST_ERROR_TYPES).toHaveLength(6);
-    expect(TRANSPORT_ERROR_TYPES).toHaveLength(12);
+    expect(TRANSPORT_ERROR_TYPES).toHaveLength(13);
     expect(ROUTER_ERROR_TYPES).toEqual([...REQUEST_ERROR_TYPES, ...TRANSPORT_ERROR_TYPES]);
-    expect(new Set(ROUTER_ERROR_TYPES).size).toBe(18);
+    expect(new Set(ROUTER_ERROR_TYPES).size).toBe(19);
   });
 
   it("has exactly one class per bucket, and no class outside it", () => {

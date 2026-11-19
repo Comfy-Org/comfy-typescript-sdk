@@ -649,12 +649,12 @@ export const OPERATION_IDS = [
   "deleteAsset",
   "getAssetContent",
   "postJobs",
+  "listJobs",
   "getJob",
   "getJobWorkflow",
   "getJobLogs",
   "getJobEvents",
   "cancelJob",
-  "listJobs",
 ] as const;
 
 // operationId -> transport method name.
@@ -666,10 +666,10 @@ export const OPERATION_METHODS: Record<(typeof OPERATION_IDS)[number], keyof Com
   deleteAsset: "deleteAsset",
   getAssetContent: "getAssetContent",
   postJobs: "postJobs",
+  listJobs: "listJobs",
   getJob: "getJob",
   getJobWorkflow: "getJobWorkflow",
   getJobLogs: "getJobLogs",
   getJobEvents: "getJobEvents",
   cancelJob: "cancelJob",
-  listJobs: "listJobs",
 };
