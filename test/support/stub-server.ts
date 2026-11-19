@@ -54,6 +54,9 @@ export interface ServerState {
   /** POST /jobs returns this error envelope instead of 201; `message`
    * defaults to `job error <code>`. */
   jobError: { status: number; code: string; message?: string } | null;
+  /** POST /jobs returns this bare `{message}` body — echo's HTTPError
+   * shape, no envelope — instead of 201. */
+  jobBareError: { status: number; message: string } | null;
   /** POST /jobs returns this error envelope only when the body carries
    * `metadata`, as the server's own metadata check does. */
   metadataError: { status: number; code: string; message: string } | null;
@@ -213,6 +216,7 @@ function defaultState(): ServerState {
     omitQueueFullRetryAfter: false,
     omitEventsRetryAfter: false,
     jobError: null,
+    jobBareError: null,
     metadataError: null,
     jobMetadata: null,
     jobListPages: { "": { jobs: [] } },
@@ -726,6 +730,11 @@ export class StubServer {
     if (state.metadataError !== null && body.metadata !== undefined) {
       const { status, code, message } = state.metadataError;
       sendError(res, status, code, message);
+      return;
+    }
+
+    if (state.jobBareError !== null) {
+      sendJson(res, state.jobBareError.status, { message: state.jobBareError.message });
       return;
     }
 
