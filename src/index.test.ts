@@ -40,12 +40,13 @@ describe("public surface", () => {
 
   it("re-exports the Router error namespace from the package root", () => {
     expect(routerErrors.RouterError).toBeTypeOf("function");
-    expect(routerErrors.ROUTER_ERROR_TYPES).toHaveLength(19);
+    expect(routerErrors.ROUTER_ERROR_TYPES).toHaveLength(21);
     // The length assertion above counts the closed set but cannot say the new
     // members reached the package ROOT — a class added to the set and missed by
-    // the re-export would keep that count at 19 and still be unreachable to a
-    // caller writing `import { routerErrors }`. Name the newest bucket's class.
-    expect(routerErrors.QueueBacklogFull).toBeTypeOf("function");
+    // the re-export would keep that count at 21 and still be unreachable to a
+    // caller writing `import { routerErrors }`. Name the newest buckets' classes.
+    expect(routerErrors.ResultExpired).toBeTypeOf("function");
+    expect(routerErrors.ByokCredentialRejected).toBeTypeOf("function");
     expect(new routerErrors.ContentPolicyViolation("boom")).toBeInstanceOf(
       routerErrors.RouterError,
     );
