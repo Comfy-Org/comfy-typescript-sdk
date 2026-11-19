@@ -143,27 +143,26 @@ describe("router route contract (spec/router-openapi.yaml)", () => {
   });
 
   /**
-   * The queued twin of the pin above — and a ROT GUARD, because today there
-   * is nothing to pin it to.
-   *
-   * `RequestHandle.collect` lifts `creditsUsed` off `getRouterModelRequestResult`'s
-   * `200` with the same `CREDITS_USED_HEADER`, but that response declares no
-   * credits header, so a queued result's `creditsUsed` is coupled to nothing
-   * the contract states and will read `null` until Router both stamps and
-   * declares it. This asserts that absence, so the sync that declares it
-   * reddens here: when it fires, replace this with the pin above's shape
-   * (exactly `[CREDITS_USED_HEADER.toLowerCase()]`) rather than deleting it.
+   * The queued twin of the pin above. It was a ROT GUARD while
+   * `getRouterModelRequestResult`'s `200` declared no credits header, because
+   * `RequestHandle.collect` lifts `creditsUsed` off that response with the same
+   * `CREDITS_USED_HEADER` and there was nothing to pin it to. The sync that
+   * declares `X-Comfy-Credits-Used` there is what fired it, and the name it
+   * brought MATCHES the constant, so the SDK was reading the right header
+   * all along; this is what keeps that true through the next sync.
    */
-  it("still declares no credits header on the queued result read (rot guard)", async () => {
+  it("spells CREDITS_USED_HEADER the credits header the contract declares on the queued result read", async () => {
     const declared = await readSuccessHeaderNames("getRouterModelRequestResult");
-    // Sanity: the read works at all, so an empty read cannot pass as "absent".
+    // Sanity: the read works at all, so an empty read cannot pass as "agreement".
     expect(declared).toContain("x-comfy-request-id");
     expect(
       declared.filter((name) => name.includes("credits")),
-      "getRouterModelRequestResult's 200 now declares a credits header. Replace this rot " +
-        "guard with a pin that its name equals CREDITS_USED_HEADER in src/sdk/models.ts, " +
-        "which RequestHandle.collect in src/sdk/modelRequests.ts already reads.",
-    ).toEqual([]);
+      "the vendored Router contract changed which credits headers getRouterModelRequestResult's " +
+        "200 declares. Exactly one is expected, and CREDITS_USED_HEADER in src/sdk/models.ts is " +
+        "the SDK's copy of its name, which RequestHandle.collect in src/sdk/modelRequests.ts " +
+        "reads. If the header was REMOVED, a queued result reports creditsUsed: null on every " +
+        "call and this pin is how you found out — do not delete it to go green.",
+    ).toEqual([CREDITS_USED_HEADER.toLowerCase()]);
   });
 
   it("spells COMFY_ROUTER_BASE_URL the host the contract declares", async () => {
@@ -191,27 +190,43 @@ describe("router route contract (spec/router-openapi.yaml)", () => {
     expect(templatePlaceholders(RUN_ROUTE_TEMPLATE)).toEqual(parameterNames);
   });
 
-  it("collects on exactly the statuses the contract paces with a Retry-After", async () => {
+  it("collects on exactly the statuses the contract paces with a Retry-After, bar one it declares", async () => {
     // `isCollectable` accepts a same-key resend on a 409 and a 504 and on
-    // nothing else. That is not a choice this SDK gets to make: Router sends
-    // `Retry-After` only where it still holds a generation the key can
-    // collect, so the predicate's status set has to BE the contract's. A sync
-    // that moved the header — onto a 429, or off the 409 — would otherwise
-    // leave the SDK resending an answer nothing blesses.
+    // nothing else. For those two that is not a choice this SDK gets to make:
+    // Router sends the collect `Retry-After` only where it still holds a
+    // generation the key can collect, so the predicate's status set has to BE
+    // the contract's. A sync that moved the header — onto a 429, or off the
+    // 409 — would otherwise leave the SDK resending an answer nothing blesses.
+    //
+    // The contract ALSO declares that header on a `502` naming `provider_error`
+    // (a poll leg that ended without a verdict, the key parked with its
+    // handle). This SDK does not collect on it, and that is a decision rather
+    // than an omission: the contract itself names the exception, a `502` whose
+    // park failed, where a same-key resend dispatches and bills a FRESH
+    // generation, and the wire does not say which `502` is which. Collecting
+    // on it would change what `models.run` retries and can charge again, so it
+    // is its own change, and this test is what keeps the gap written down. The
+    // day `isCollectable` takes the `502`, move it from `DECLARED_NOT_COLLECTED`
+    // to `COLLECTED` and give it its bucket below.
+    const COLLECTED = [409, 504];
+    const DECLARED_NOT_COLLECTED = [502];
     const { retryAfterStatuses } = await readRouterRouteContract();
     expect(
       retryAfterStatuses,
       "the vendored Router contract moved `Retry-After` on runRouterModel — update " +
         "isCollectable in src/sdk/retry.ts to match it",
-    ).toEqual([409, 504]);
+    ).toEqual([...COLLECTED, ...DECLARED_NOT_COLLECTED].sort((a, b) => a - b));
 
     // And the bucket gates, which are what separate the collectable member of
     // each shared status from the refusal beside it.
-    for (const status of retryAfterStatuses) {
+    for (const status of COLLECTED) {
       const bucket = status === 409 ? "concurrency_limit_exceeded" : "deadline_exceeded";
       expect(isCollectable(status, bucket, 2), String(status)).toBe(true);
       expect(isCollectable(status, null, 2), String(status)).toBe(false);
       expect(isCollectable(status, bucket, null), String(status)).toBe(false);
+    }
+    for (const status of DECLARED_NOT_COLLECTED) {
+      expect(isCollectable(status, "provider_error", 2), String(status)).toBe(false);
     }
   });
 

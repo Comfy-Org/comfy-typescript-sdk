@@ -244,14 +244,14 @@ export function parseReplayed(raw: string | null): boolean {
  * `X-Comfy-Credits-Used` — what Router priced this call at, in credits. See
  * {@link RunJsonResult.creditsUsed}.
  *
- * Pinned against the vendored contract: `runRouterModel`'s `200` declares
- * `X-Comfy-Credits-Used` (as `RouterCreditsUsedHeader`), and
- * `router-spec-contract.test.ts` asserts this constant spells that declared
- * name. Until the sync that brought it, this was the one header constant in
- * this file pinned to nothing, watched by a rot guard in that same file —
- * because the drift it would suffer is SILENT: a name wrong by one segment
- * reports `creditsUsed: null` on every run forever, which is indistinguishable
- * from the "Router reported no cost" this field is documented to mean.
+ * Pinned against the vendored contract: `runRouterModel`'s `200` and
+ * `getRouterModelRequestResult`'s `200` both declare `X-Comfy-Credits-Used`
+ * (as `RouterCreditsUsedHeader`), and `router-spec-contract.test.ts` asserts
+ * this constant spells that declared name on each. Each pin replaced a rot
+ * guard that watched for the declaration to arrive, because the drift it would
+ * suffer is SILENT: a name wrong by one segment reports `creditsUsed: null` on
+ * every run forever, which is indistinguishable from the "Router reported no
+ * cost" this field is documented to mean.
  */
 export const CREDITS_USED_HEADER = "X-Comfy-Credits-Used";
 
@@ -754,14 +754,14 @@ export interface Models {
    *
    * The ergonomic form for a caller who does want to wait but also wants to
    * show progress while waiting. It resolves to `RunResult<TData>`, the same
-   * shape {@link Models.run} returns for the same model and input — with one
-   * difference in what it carries: {@link RunJsonResult.creditsUsed}. The
-   * Router contract declares `X-Comfy-Credits-Used` on the synchronous run
-   * route but not on the queued result route, so the queued value is
-   * unpinned and a caller should expect `null` ("not reported", never
-   * "free") here, and reconcile spend against the workspace ledger if it
-   * matters. Calling {@link Models.run} to learn the price is a second,
-   * separately billed generation, not a lookup of this one.
+   * shape {@link Models.run} returns for the same model and input, including
+   * {@link RunJsonResult.creditsUsed}: the Router contract declares
+   * `X-Comfy-Credits-Used` on the queued result route as on the synchronous run
+   * route, and it is absent whenever Router reported no cost, so a caller
+   * should read `null` as "not reported", never "free", and reconcile spend
+   * against the workspace ledger if it matters. Calling {@link Models.run} to
+   * learn the price is a second, separately billed generation, not a lookup of
+   * this one.
    *
    * ```ts
    * const { data } = await comfy.models.subscribe(
