@@ -9,16 +9,68 @@ import {
   IdempotencyKeyReuse,
   InsufficientCredits,
   InvalidWorkflow,
+  JobFailed,
   MissingAsset,
   NotFound,
   QueueFull,
   Unauthorized,
   WorkflowFormatUi,
+  failureCategoryOf,
   stampIdempotencyKey,
   stamping,
   toSdkError,
   translate,
 } from "./exceptions.js";
+
+describe("failureCategoryOf", () => {
+  const error = (category?: unknown) => ({
+    code: "node_execution_error",
+    message: "boom",
+    ...(category === undefined ? {} : { category }),
+  });
+
+  it.each([
+    "invalid_input",
+    "content_refused",
+    "out_of_gpu_memory",
+    "missing_model_or_node",
+    "workflow_logic",
+    "other",
+  ])("reads the known category %s as itself", (category) => {
+    expect(failureCategoryOf(error(category) as never)).toBe(category);
+  });
+
+  it.each([
+    ["a string the SDK does not know", "quota_exceeded"],
+    ["an empty string", ""],
+    ["a value of another type", 3],
+  ])("reads %s as other", (_label, category) => {
+    expect(failureCategoryOf(error(category) as never)).toBe("other");
+  });
+
+  it.each([
+    ["no error", null],
+    ["no error field", undefined],
+    ["an error with no category", error()],
+    ["an error with a null category", error(null)],
+  ])("reads %s as none", (_label, input) => {
+    expect(failureCategoryOf(input as never)).toBeNull();
+  });
+});
+
+describe("JobFailed", () => {
+  it("carries the category of the error it was built with", () => {
+    const failure = new JobFailed("job ended failed", {
+      error: { code: "node_execution_error", message: "oom", category: "out_of_gpu_memory" },
+    });
+    expect(failure.failureCategory).toBe("out_of_gpu_memory");
+    expect(failure.error?.category).toBe("out_of_gpu_memory");
+  });
+
+  it("has no category when it carries no error", () => {
+    expect(new JobFailed("job ended failed").failureCategory).toBeNull();
+  });
+});
 
 describe("toSdkError", () => {
   const cases: Array<[string, new (...args: never[]) => Error]> = [
