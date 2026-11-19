@@ -191,8 +191,11 @@ export function sseErrorFromFrame(data: Record<string, unknown>): ApiError {
     (typeof err?.message === "string" && err.message) ||
     (typeof raw === "string" && raw) ||
     (err === undefined ? framePayloadText(data) : "");
+  // The fallback interpolates `code`, which is server-controlled too, so it is
+  // sanitized as a whole; `error.code` itself stays verbatim.
   const message =
-    sanitizeFrameMessage(stated) || `event stream ended with an \`error\` frame (${code})`;
+    sanitizeFrameMessage(stated) ||
+    sanitizeFrameMessage(`event stream ended with an \`error\` frame (${code})`);
   return errorFromEnvelope(httpStatus, { error: { code, message, details: err?.details ?? null } });
 }
 

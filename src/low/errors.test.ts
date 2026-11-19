@@ -124,6 +124,17 @@ describe("sseErrorFromFrame", () => {
     expect(err.message.length).toBe(501);
   });
 
+  it("flattens and bounds the fallback when it names a server-stated code", () => {
+    const code = `forged\nline${"x".repeat(1_000)}`;
+    const err = sseErrorFromFrame({ error: { code } });
+    expect(err.code).toBe(code);
+    expect(err.message).not.toMatch(/[\r\n]/);
+    expect(err.message.startsWith("event stream ended with an `error` frame (forged line")).toBe(
+      true,
+    );
+    expect(err.message.length).toBe(501);
+  });
+
   it.each(["constructor", "toString", "valueOf", "__proto__"])(
     "does not resolve the code %s through Object.prototype",
     (code) => {
