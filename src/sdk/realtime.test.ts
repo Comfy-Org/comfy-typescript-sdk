@@ -267,6 +267,9 @@ describe("auth", () => {
       ["x", "x"],
       [REALTIME_SUBPROTOCOL],
       [`${REALTIME_BEARER_SUBPROTOCOL_PREFIX}tok`],
+      // A comma would split into a second entry on the wire, shadowing ours.
+      [`x, ${REALTIME_BEARER_SUBPROTOCOL_PREFIX}tok`],
+      ["my app v1"],
     ]) {
       await expect(
         connect("google/genie-4", {
@@ -304,6 +307,25 @@ describe("auth", () => {
     expect(server.upgrades[0].headers["sec-websocket-protocol"]).toBe(
       "comfy-realtime.v1, comfy-bearer.tok",
     );
+  });
+
+  it("refuses an idToken that is not valid in a subprotocol entry", async () => {
+    for (const idToken of ["", "tok\n", "a b", "a,b"]) {
+      await expect(
+        connect("google/genie-4", { idToken, WebSocket: FailingWhatwgSocket }),
+      ).rejects.toBeInstanceOf(TypeError);
+    }
+  });
+
+  it("rethrows a constructor failure that is not about the init shape", async () => {
+    function CspWebSocket(): never {
+      throw new DOMException("blocked by CSP", "SecurityError");
+    }
+    const err = await connect("google/genie-4", { WebSocket: CspWebSocket }).catch(
+      (e: unknown) => e,
+    );
+    expect(err).not.toBeInstanceOf(MissingCredentials);
+    expect((err as DOMException).name).toBe("SecurityError");
   });
 
   it("raises MissingCredentials on a standards-only constructor in key mode", async () => {
@@ -521,7 +543,7 @@ describe("timeout", () => {
     expect((err as ComfyError).code).toBe("request_timeout");
   });
 
-  it("rejects with request_timeout when a refusal's body stalls", async () => {
+  it("rejects with the typed class when a refusal's body stalls past the deadline", async () => {
     const server = createServer();
     const held: Duplex[] = [];
     server.on("upgrade", (_req: IncomingMessage, socket: Duplex) => {
@@ -537,10 +559,40 @@ describe("timeout", () => {
         }),
     );
     config({ baseUrl: `http://127.0.0.1:${String((server.address() as AddressInfo).port)}` });
+    const started = Date.now();
     const err = await connect("google/genie-4", { timeoutMs: 50, WebSocket: WsWebSocket }).catch(
       (e: unknown) => e,
     );
-    expect((err as ComfyError).code).toBe("request_timeout");
+    // Still bounded by the deadline, but the status line already named the bucket.
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(err).toBeInstanceOf(routerErrors.InsufficientCredits);
+    expect((err as routerErrors.RouterError).httpStatus).toBe(402);
+  });
+
+  it("rejects with the abort reason when the caller aborts during a stalled refusal", async () => {
+    const server = createServer();
+    const held: Duplex[] = [];
+    server.on("upgrade", (_req: IncomingMessage, socket: Duplex) => {
+      held.push(socket);
+      socket.write("HTTP/1.1 402 Refused\r\nContent-Length: 100\r\n\r\n{");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    cleanups.push(
+      () =>
+        new Promise((resolve) => {
+          for (const socket of held) socket.destroy();
+          server.close(() => resolve());
+        }),
+    );
+    config({ baseUrl: `http://127.0.0.1:${String((server.address() as AddressInfo).port)}` });
+    const controller = new AbortController();
+    const pending = connect("google/genie-4", {
+      signal: controller.signal,
+      timeoutMs: null,
+      WebSocket: WsWebSocket,
+    });
+    setTimeout(() => controller.abort(new Error("gave up")), 50);
+    await expect(pending).rejects.toThrow("gave up");
   });
 
   it("refuses a non-positive timeoutMs", async () => {

@@ -66,7 +66,9 @@ entry. See CONTRIBUTING.md.
   they are served. `REALTIME_CLOSE_CODES` names the codes the broker closes a
   session with. The upgrade is bounded by `timeoutMs` (default
   `DEFAULT_REALTIME_CONNECT_TIMEOUT_MS`, 30 s), and a `101` that selected any
-  subprotocol other than `comfy-realtime.v1` is closed and rejected.
+  subprotocol other than `comfy-realtime.v1` is closed and rejected. Extra
+  `protocols` and the `idToken` are checked against the subprotocol token
+  grammar up front, so a comma cannot split one entry into two on the wire.
 - **`RouterError.refusalCode`** — the finer `code` a realtime refusal body
   carries (`router.realtime.session_already_live`, say), beside the coarse
   `errorType`; `null` on every response without one.

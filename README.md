@@ -637,7 +637,8 @@ refused with `429` (`refusalCode` `router.realtime.session_already_live`)
 until the first closes, so close a session you are done with (or pass a
 `signal`). The upgrade itself is bounded by `timeoutMs` (default 30 seconds,
 `null` to disable), which rejects with `code: "request_timeout"` and never
-bounds an open session. The WebRTC world models, Fish Live and Reactor are not served by
+bounds an open session; on `ws`, a refusal whose status arrived in time but
+whose body did not still raises its typed Router error. The WebRTC world models, Fish Live and Reactor are not served by
 this WebSocket broker; `connect` refuses them with a message naming where they
 are served, unless you name the serving leg yourself with `provider`.
 

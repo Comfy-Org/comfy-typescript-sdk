@@ -79,7 +79,7 @@ import { buildUserAgent } from "../low/index.js";
 import { CREDENTIALS_ENV_VAR, requireCredentials, resolveBaseUrl } from "./credentials.js";
 import { ComfyError, MissingCredentials, RealtimeUpgradeFailed } from "./exceptions.js";
 import { fillRoute } from "./modelRoutes.js";
-import { type HeadersLike, REQUEST_ID_HEADER, toRouterError } from "./routerErrors.js";
+import { type HeadersLike, REQUEST_ID_HEADER, RouterError, toRouterError } from "./routerErrors.js";
 
 /** The subprotocol every realtime upgrade must offer; Router selects it on the `101`. */
 export const REALTIME_SUBPROTOCOL = "comfy-realtime.v1";
@@ -151,6 +151,19 @@ export const DEFAULT_REALTIME_CONNECT_TIMEOUT_MS = 30_000;
 const MAX_REFUSAL_BODY_BYTES = 64 * 1024;
 
 const MODEL_SEGMENT = /^[a-z0-9._-]+$/;
+
+/**
+ * A subprotocol entry is an RFC 6455 token (RFC 7230 `tchar`s). Anything else
+ * either throws an opaque `SyntaxError` in the transport or — a comma — splits
+ * into two entries on the wire.
+ */
+const SUBPROTOCOL_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+/**
+ * The `ws` module specifier, held in a variable so a bundler does not try to
+ * resolve this optional peer dependency for a browser build that never runs it.
+ */
+const WS_MODULE = "ws";
 
 /** What every event a {@link RealtimeSocket} dispatches carries, on both transports. */
 export interface RealtimeEvent {
@@ -291,9 +304,13 @@ function isNode(): boolean {
 
 function isWsConstructor(ctor: unknown): ctor is WsConstructor {
   // `ws` is an EventEmitter; neither a browser's nor undici's WebSocket has `on`.
+  // `once` and `terminate` are checked too because the ws path drives both.
+  if (typeof ctor !== "function") return false;
+  const proto = (ctor as { prototype?: Record<string, unknown> }).prototype;
   return (
-    typeof ctor === "function" &&
-    typeof (ctor as { prototype?: { on?: unknown } }).prototype?.on === "function"
+    typeof proto?.on === "function" &&
+    typeof proto.once === "function" &&
+    typeof proto.terminate === "function"
   );
 }
 
@@ -320,12 +337,16 @@ function parseRealtimeModelId(model: string): string[] {
   return segments;
 }
 
-/** Check `options.protocols`: distinct non-empty strings that do not shadow ours. */
+/** Check `options.protocols`: distinct subprotocol tokens that do not shadow ours. */
 function extraProtocols(protocols: unknown): string[] {
   if (protocols === undefined) return [];
-  if (!Array.isArray(protocols) || !protocols.every((p) => typeof p === "string" && p !== "")) {
+  if (
+    !Array.isArray(protocols) ||
+    !protocols.every((p) => typeof p === "string" && SUBPROTOCOL_TOKEN.test(p))
+  ) {
     throw new TypeError(
-      "realtime.connect: options.protocols must be an array of non-empty strings",
+      "realtime.connect: options.protocols must be an array of subprotocol tokens " +
+        "(non-empty, no spaces, commas, quotes or other separators)",
     );
   }
   const extra = protocols as string[];
@@ -393,13 +414,20 @@ async function selectTransport(injected: unknown): Promise<Transport> {
   }
   if (isNode()) {
     try {
-      // Imported here, never at the top level, so a browser bundle does not
-      // pull `ws` in; it is an optional peer dependency.
-      const mod = (await import("ws")) as unknown as { WebSocket?: unknown; default?: unknown };
+      // Imported here, never at the top level, and through a variable, so a
+      // browser bundle does not pull `ws` in; it is an optional peer dependency.
+      const mod = (await import(/* webpackIgnore: true */ /* @vite-ignore */ WS_MODULE)) as {
+        WebSocket?: unknown;
+        default?: unknown;
+      };
       const ctor = mod.WebSocket ?? mod.default;
       if (isWsConstructor(ctor)) return { kind: "ws", ctor };
-    } catch {
-      // Not installed: fall through to the global WebSocket.
+    } catch (err) {
+      // Not installed: fall through to the global WebSocket. An installed `ws`
+      // that fails to load is a real fault, not a reason to quietly lose the
+      // typed refusals only `ws` can read.
+      const code = (err as { code?: unknown } | null)?.code;
+      if (code !== "ERR_MODULE_NOT_FOUND" && code !== "MODULE_NOT_FOUND") throw err;
     }
   }
   const global = (globalThis as { WebSocket?: unknown }).WebSocket;
@@ -485,12 +513,16 @@ function openWithWs(
       signal?.removeEventListener("abort", onAbort);
       fn();
     };
+    // Once a refusal's status line is in, its status and headers already name
+    // the typed class; a body that never finishes only loses the `detail`.
+    const refused = (res: UpgradeResponse, body: unknown) =>
+      toRouterError(res.statusCode ?? 0, headersOf(res), body);
     const onAbort = () =>
       settle(() => {
         // A refusal whose body stalls is not torn down by `terminate()`.
         refusal?.destroy();
         socket.terminate();
-        reject(abortReason(signal as AbortSignal));
+        reject(refusal ? refused(refusal, null) : abortReason(signal as AbortSignal));
       });
 
     socket.once("upgrade", (res: UpgradeResponse) => {
@@ -500,7 +532,7 @@ function openWithWs(
       refusal = res;
       void readRefusalBody(res).then((body) =>
         settle(() => {
-          reject(toRouterError(res.statusCode ?? 0, headersOf(res), body));
+          reject(refused(res, body));
           socket.terminate();
         }),
       );
@@ -511,10 +543,20 @@ function openWithWs(
     // process on `terminate()` above, or on a malformed frame after open from
     // a caller that listens only for `close` (which `ws` emits after `error`).
     socket.on("error", (err: Error) =>
-      settle(() => reject(upgradeFailed(url, `failed: ${err.message}`, err))),
+      settle(() =>
+        reject(
+          refusal ? refused(refusal, null) : upgradeFailed(url, `failed: ${err.message}`, err),
+        ),
+      ),
     );
     socket.once("close", (code: number) =>
-      settle(() => reject(upgradeFailed(url, `closed (${String(code)}) before it opened`))),
+      settle(() =>
+        reject(
+          refusal
+            ? refused(refusal, null)
+            : upgradeFailed(url, `closed (${String(code)}) before it opened`),
+        ),
+      ),
     );
     signal?.addEventListener("abort", onAbort, { once: true });
   });
@@ -539,6 +581,10 @@ function constructWhatwg(
   try {
     return new ctor(url, { protocols, headers });
   } catch (err) {
+    // `connect` has already checked every protocol entry is a valid token, so
+    // a `SyntaxError` here is the init object itself being refused. Anything
+    // else (a `SecurityError` under a CSP, say) is not about headers at all.
+    if ((err as { name?: unknown } | null)?.name !== "SyntaxError") throw err;
     if (!Object.hasOwn(headers, "X-API-Key")) return new ctor(url, protocols);
     throw new MissingCredentials(
       "realtime.connect: this runtime's WebSocket cannot carry the X-API-Key header — " +
@@ -607,7 +653,8 @@ function openWithWhatwg(
  * - {@link RealtimeUpgradeFailed} too when the socket opened but the server
  *   selected a subprotocol other than `comfy-realtime.v1`;
  * - a `ComfyError` with `code: "request_timeout"` when the upgrade outlasts
- *   `options.timeoutMs`;
+ *   `options.timeoutMs` (on `ws`, a refusal whose status arrived in time but
+ *   whose body did not still rejects with its typed class);
  * - {@link MissingCredentials} when no credential is available for the
  *   transport in use;
  * - the abort reason when `options.signal` fires first.
@@ -628,8 +675,16 @@ export async function connect(
   if (timeoutMs !== null && !(typeof timeoutMs === "number" && timeoutMs > 0)) {
     throw new TypeError("realtime.connect: options.timeoutMs must be a positive number or null");
   }
-  if (idToken !== undefined && (typeof idToken !== "string" || idToken === "")) {
-    throw new TypeError("realtime.connect: options.idToken must be a non-empty string");
+  if (
+    idToken !== undefined &&
+    (typeof idToken !== "string" ||
+      idToken === "" ||
+      !SUBPROTOCOL_TOKEN.test(REALTIME_BEARER_SUBPROTOCOL_PREFIX + idToken))
+  ) {
+    throw new TypeError(
+      "realtime.connect: options.idToken must be a non-empty string that is valid in a " +
+        "subprotocol entry (no whitespace — trim a token read from a file)",
+    );
   }
   if (signal?.aborted) throw abortReason(signal);
 
@@ -693,7 +748,9 @@ export async function connect(
       socket = await openWithWhatwg(transport.ctor, url, protocols, headers, handshakeSignal);
     }
   } catch (err) {
-    if (deadline?.aborted && !signal?.aborted) {
+    // The caller's abort wins; then a refusal already read as a typed class.
+    if (signal?.aborted) throw abortReason(signal);
+    if (deadline?.aborted && !(err instanceof RouterError)) {
       throw new ComfyError(
         `realtime.connect: the WebSocket upgrade to ${url} exceeded its ${String(timeoutMs)}ms ` +
           "deadline; raise it with timeoutMs, or pass timeoutMs: null and your own signal",
