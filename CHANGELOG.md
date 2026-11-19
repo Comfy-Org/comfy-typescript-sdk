@@ -64,7 +64,9 @@ entry. See CONTRIBUTING.md.
   is bundled. Models served elsewhere (the WebRTC world models, Fish Live,
   Reactor) are refused before any socket opens, with a message naming where
   they are served. `REALTIME_CLOSE_CODES` names the codes the broker closes a
-  session with.
+  session with. The upgrade is bounded by `timeoutMs` (default
+  `DEFAULT_REALTIME_CONNECT_TIMEOUT_MS`, 30 s), and a `101` that selected any
+  subprotocol other than `comfy-realtime.v1` is closed and rejected.
 - **`RouterError.refusalCode`** — the finer `code` a realtime refusal body
   carries (`router.realtime.session_already_live`, say), beside the coarse
   `errorType`; `null` on every response without one.

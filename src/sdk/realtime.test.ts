@@ -11,6 +11,7 @@ import { config } from "./credentials.js";
 import { ComfyError, MissingCredentials, RealtimeUpgradeFailed } from "./exceptions.js";
 import {
   connect,
+  DEFAULT_REALTIME_CONNECT_TIMEOUT_MS,
   realtime,
   REALTIME_BEARER_SUBPROTOCOL_PREFIX,
   REALTIME_CLOSE_CODES,
@@ -258,6 +259,65 @@ describe("auth", () => {
     expect(server.upgrades[0].headers["sec-websocket-protocol"]).toBe("comfy-realtime.v1,x-extra");
   });
 
+  it("refuses protocols that are not distinct strings, or that shadow ours", async () => {
+    for (const protocols of [
+      "x-extra",
+      [""],
+      [1],
+      ["x", "x"],
+      [REALTIME_SUBPROTOCOL],
+      [`${REALTIME_BEARER_SUBPROTOCOL_PREFIX}tok`],
+    ]) {
+      await expect(
+        connect("google/genie-4", {
+          protocols: protocols as unknown as string[],
+          WebSocket: FailingWhatwgSocket,
+        }),
+      ).rejects.toBeInstanceOf(TypeError);
+    }
+  });
+
+  it("sends the credential configured when connect was called, to that call's host", async () => {
+    const server = await accepting();
+    // The dynamic `import("ws")` yields; reconfiguring in that window must not
+    // pair the new credential with the old host.
+    const pending = connect("google/genie-4");
+    config({ credentials: "comfyui-reconfigured", baseUrl: "http://127.0.0.1:1" });
+    sessions.push(await pending);
+    expect(server.upgrades[0].headers["x-api-key"]).toBe(CREDENTIAL);
+  });
+
+  it("falls back to the protocol list on a standards-only constructor with an idToken", async () => {
+    const server = await accepting();
+    let attempts = 0;
+    // A standards-only WebSocket in a runtime that still defines process.versions.node.
+    class StrictWebSocket extends globalThis.WebSocket {
+      constructor(url: string, init: unknown) {
+        attempts += 1;
+        if (!Array.isArray(init)) throw new SyntaxError("invalid subprotocol");
+        super(url, init);
+      }
+    }
+    const session = await connect("google/genie-4", { idToken: "tok", WebSocket: StrictWebSocket });
+    sessions.push(session);
+    expect(attempts).toBe(2);
+    expect(server.upgrades[0].headers["sec-websocket-protocol"]).toBe(
+      "comfy-realtime.v1, comfy-bearer.tok",
+    );
+  });
+
+  it("raises MissingCredentials on a standards-only constructor in key mode", async () => {
+    class StrictWebSocket extends FailingWhatwgSocket {
+      constructor(url: string, init: unknown) {
+        if (!Array.isArray(init)) throw new SyntaxError("invalid subprotocol");
+        super(url, init);
+      }
+    }
+    await expect(connect("google/genie-4", { WebSocket: StrictWebSocket })).rejects.toBeInstanceOf(
+      MissingCredentials,
+    );
+  });
+
   it("sends an idToken as the comfy-bearer subprotocol and no credential header", async () => {
     const server = await accepting();
     const session = await open("google/genie-4", { idToken: "tok123" });
@@ -364,6 +424,84 @@ describe("refusals", () => {
   });
 });
 
+describe("subprotocol", () => {
+  it("closes and rejects a 101 that selected the bearer entry, without echoing the token", async () => {
+    const wss = new WebSocketServer({
+      port: 0,
+      host: "127.0.0.1",
+      handleProtocols: (offered) =>
+        [...offered].find((p) => p.startsWith("comfy-bearer.")) ?? false,
+    });
+    const closes: number[] = [];
+    wss.on("connection", (socket) => socket.on("close", (code) => closes.push(code)));
+    cleanups.push(() => new Promise((resolve) => wss.close(() => resolve())));
+    await new Promise<void>((resolve) => wss.once("listening", () => resolve()));
+    config({ baseUrl: `http://127.0.0.1:${String((wss.address() as AddressInfo).port)}` });
+
+    const err = await connect("google/genie-4", {
+      idToken: "secret-token",
+      WebSocket: WsWebSocket,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RealtimeUpgradeFailed);
+    expect((err as Error).message).not.toContain("secret-token");
+    await expect.poll(() => closes).toEqual([1000]);
+  });
+});
+
+describe("timeout", () => {
+  it("defaults to a bounded upgrade", () => {
+    expect(DEFAULT_REALTIME_CONNECT_TIMEOUT_MS).toBe(30_000);
+  });
+
+  it("rejects with request_timeout when the server never answers the upgrade", async () => {
+    const server = createServer();
+    const held: Duplex[] = [];
+    server.on("upgrade", (_req: IncomingMessage, socket: Duplex) => held.push(socket));
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    cleanups.push(
+      () =>
+        new Promise((resolve) => {
+          for (const socket of held) socket.destroy();
+          server.close(() => resolve());
+        }),
+    );
+    config({ baseUrl: `http://127.0.0.1:${String((server.address() as AddressInfo).port)}` });
+    const err = await connect("google/genie-4", { timeoutMs: 50, WebSocket: WsWebSocket }).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ComfyError);
+    expect((err as ComfyError).code).toBe("request_timeout");
+  });
+
+  it("rejects with request_timeout when a refusal's body stalls", async () => {
+    const server = createServer();
+    const held: Duplex[] = [];
+    server.on("upgrade", (_req: IncomingMessage, socket: Duplex) => {
+      held.push(socket);
+      socket.write("HTTP/1.1 402 Refused\r\nContent-Length: 100\r\n\r\n{");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    cleanups.push(
+      () =>
+        new Promise((resolve) => {
+          for (const socket of held) socket.destroy();
+          server.close(() => resolve());
+        }),
+    );
+    config({ baseUrl: `http://127.0.0.1:${String((server.address() as AddressInfo).port)}` });
+    const err = await connect("google/genie-4", { timeoutMs: 50, WebSocket: WsWebSocket }).catch(
+      (e: unknown) => e,
+    );
+    expect((err as ComfyError).code).toBe("request_timeout");
+  });
+
+  it("refuses a non-positive timeoutMs", async () => {
+    await expect(
+      connect("google/genie-4", { timeoutMs: 0, WebSocket: FailingWhatwgSocket }),
+    ).rejects.toBeInstanceOf(TypeError);
+  });
+});
+
 describe("abort", () => {
   it("rejects with the abort reason when already aborted", async () => {
     const controller = new AbortController();
@@ -418,6 +556,15 @@ describe("abort", () => {
     await expect(
       connect("google/genie-4", { signal: controller.signal, WebSocket: AbortOnOpen }),
     ).rejects.toThrow("late");
+    await expect.poll(() => server.closes).toEqual([1000]);
+  });
+
+  it("leaves the signal able to close the session when close() throws", async () => {
+    const server = await accepting();
+    const controller = new AbortController();
+    const session = await open("google/genie-4", { signal: controller.signal });
+    expect(() => session.close(1005)).toThrow();
+    controller.abort();
     await expect.poll(() => server.closes).toEqual([1000]);
   });
 });

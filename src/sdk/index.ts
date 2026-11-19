@@ -56,6 +56,7 @@ export {
 } from "./modelRequests.js";
 export { MAX_REQUEST_ID_LENGTH } from "./modelRoutes.js";
 export {
+  DEFAULT_REALTIME_CONNECT_TIMEOUT_MS,
   realtime,
   REALTIME_BEARER_SUBPROTOCOL_PREFIX,
   REALTIME_CLOSE_CODES,

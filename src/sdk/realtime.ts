@@ -74,6 +74,7 @@
  * `Comfy` class, for the reason `comfy.models` does — see `./models.ts`.
  */
 
+import { clampTimerMs } from "../low/dispatcher.js";
 import { buildUserAgent } from "../low/index.js";
 import { CREDENTIALS_ENV_VAR, requireCredentials, resolveBaseUrl } from "./credentials.js";
 import { ComfyError, MissingCredentials, RealtimeUpgradeFailed } from "./exceptions.js";
@@ -138,6 +139,14 @@ const NOT_ON_THE_BROKER: Readonly<Record<string, string>> = Object.freeze({
     "served as a LiveKit session minted by POST /v2/realtime/fish/sessions, not the WebSocket broker",
 });
 
+/**
+ * Default deadline for the upgrade, in milliseconds: from opening the socket
+ * to the `101` (or to reading a refusal's body). It bounds the handshake only,
+ * never the session. Override it per call with `timeoutMs`, or disable it with
+ * `null`.
+ */
+export const DEFAULT_REALTIME_CONNECT_TIMEOUT_MS = 30_000;
+
 /** Largest refusal body read off a failed upgrade; the rest is discarded. */
 const MAX_REFUSAL_BODY_BYTES = 64 * 1024;
 
@@ -194,13 +203,25 @@ export interface RealtimeConnectOptions {
   idToken?: string;
   /** Override the serving leg; by default it is looked up in {@link REALTIME_SERVING_PROVIDERS}. */
   provider?: RealtimeProvider;
-  /** Extra subprotocols to offer after `comfy-realtime.v1`. */
+  /**
+   * Extra subprotocols to offer after `comfy-realtime.v1`. Each must be a
+   * distinct non-empty string, and none may be `comfy-realtime.v1` itself or
+   * a `comfy-bearer.` entry — pass the token as `idToken` instead. They are
+   * offered only: the server must still select `comfy-realtime.v1`.
+   */
   protocols?: string[];
   /**
    * Aborts a pending connect (the socket is closed and the promise rejects
    * with the abort reason) and, once open, closes the session with `1000`.
    */
   signal?: AbortSignal;
+  /**
+   * Deadline for the upgrade, in milliseconds; default
+   * {@link DEFAULT_REALTIME_CONNECT_TIMEOUT_MS}. Past it the socket is closed
+   * and `connect` rejects with a `ComfyError` whose `code` is
+   * `"request_timeout"`. `null` disables it. It never bounds an open session.
+   */
+  timeoutMs?: number | null;
   /**
    * The WebSocket implementation to use: the `ws` package's class, or any
    * WHATWG `WebSocket` constructor. Default: `ws` when it resolves in Node,
@@ -223,8 +244,12 @@ export interface RealtimeSession {
   model: string;
   /** `"json"` on the `google` leg, `"msgpack"` on the `fal` leg. */
   wireFormat: "msgpack" | "json";
-  /** The subprotocol the `101` selected (normally `comfy-realtime.v1`), or `null`. */
-  subprotocol: string | null;
+  /**
+   * The subprotocol the `101` selected: always `comfy-realtime.v1`, which is
+   * what Router selects — `connect` closes and rejects a session on which
+   * the server selected anything else.
+   */
+  subprotocol: string;
   /**
    * `X-Comfy-Request-Id` off the `101` — the value to quote in a support
    * request — when the transport exposes upgrade response headers (`ws`
@@ -295,6 +320,30 @@ function parseRealtimeModelId(model: string): string[] {
   return segments;
 }
 
+/** Check `options.protocols`: distinct non-empty strings that do not shadow ours. */
+function extraProtocols(protocols: unknown): string[] {
+  if (protocols === undefined) return [];
+  if (!Array.isArray(protocols) || !protocols.every((p) => typeof p === "string" && p !== "")) {
+    throw new TypeError(
+      "realtime.connect: options.protocols must be an array of non-empty strings",
+    );
+  }
+  const extra = protocols as string[];
+  for (const p of extra) {
+    if (p === REALTIME_SUBPROTOCOL || p.startsWith(REALTIME_BEARER_SUBPROTOCOL_PREFIX)) {
+      throw new TypeError(
+        `realtime.connect: options.protocols must not include "${REALTIME_SUBPROTOCOL}" or a ` +
+          `"${REALTIME_BEARER_SUBPROTOCOL_PREFIX}" entry — connect offers the first itself, and ` +
+          "the second is options.idToken",
+      );
+    }
+  }
+  if (new Set(extra).size !== extra.length) {
+    throw new TypeError("realtime.connect: options.protocols must not repeat an entry");
+  }
+  return extra;
+}
+
 function refuseUnservedModel(model: string): void {
   const where = Object.hasOwn(NOT_ON_THE_BROKER, model)
     ? NOT_ON_THE_BROKER[model]
@@ -330,7 +379,7 @@ function realtimeUrl(provider: RealtimeProvider, segments: readonly string[]): s
   const path = fillRoute(REALTIME_ROUTE_TEMPLATE.replace("{model}", segments.join("/")), {
     provider,
   });
-  return resolveBaseUrl().replace(/^http(s?):/, "ws$1:") + path;
+  return resolveBaseUrl().replace(/^http(s?):/i, "ws$1:") + path;
 }
 
 async function selectTransport(injected: unknown): Promise<Transport> {
@@ -428,6 +477,7 @@ function openWithWs(
   return new Promise((resolve, reject) => {
     const socket = new ctor(url, protocols, { headers });
     let requestId: string | null = null;
+    let refusal: UpgradeResponse | undefined;
     let settled = false;
     const settle = (fn: () => void) => {
       if (settled) return;
@@ -437,6 +487,8 @@ function openWithWs(
     };
     const onAbort = () =>
       settle(() => {
+        // A refusal whose body stalls is not torn down by `terminate()`.
+        refusal?.destroy();
         socket.terminate();
         reject(abortReason(signal as AbortSignal));
       });
@@ -445,6 +497,7 @@ function openWithWs(
       requestId = headersOf(res).get(REQUEST_ID_HEADER);
     });
     socket.once("unexpected-response", (_req: unknown, res: UpgradeResponse) => {
+      refusal = res;
       void readRefusalBody(res).then((body) =>
         settle(() => {
           reject(toRouterError(res.statusCode ?? 0, headersOf(res), body));
@@ -468,6 +521,34 @@ function openWithWs(
 }
 
 /**
+ * Construct a WHATWG `WebSocket`. Node's (undici's) takes a
+ * `{ protocols, headers }` init; a standards-only one (a browser's, and the
+ * global in Deno, jsdom or an Electron renderer, all of which still define
+ * `process.versions.node`) stringifies that object into an invalid protocol
+ * token and throws. Such a constructor gets the protocol list instead — which
+ * is enough on the `idToken` path, whose only header is the `User-Agent`, but
+ * not on the key path, where dropping `X-API-Key` would only buy a `401`.
+ */
+function constructWhatwg(
+  ctor: WhatwgConstructor,
+  url: string,
+  protocols: string[],
+  headers: Record<string, string> | null,
+): RealtimeSocket {
+  if (headers === null) return new ctor(url, protocols);
+  try {
+    return new ctor(url, { protocols, headers });
+  } catch (err) {
+    if (!Object.hasOwn(headers, "X-API-Key")) return new ctor(url, protocols);
+    throw new MissingCredentials(
+      "realtime.connect: this runtime's WebSocket cannot carry the X-API-Key header — " +
+        "pass options.idToken, or install the `ws` package (or pass it as options.WebSocket)",
+      { code: "missing_credentials", cause: err },
+    );
+  }
+}
+
+/**
  * Open on a WHATWG `WebSocket`. A refused upgrade is indistinguishable from
  * any other failure here — the status is not exposed to script.
  */
@@ -479,10 +560,7 @@ function openWithWhatwg(
   signal: AbortSignal | undefined,
 ): Promise<RealtimeSocket> {
   return new Promise((resolve, reject) => {
-    // Node's (undici's) WebSocket takes a `{ protocols, headers }` init; a
-    // browser's takes the protocol list itself and would stringify an object
-    // into an invalid protocol token, so it gets the list.
-    const socket = new ctor(url, headers === null ? protocols : { protocols, headers });
+    const socket = constructWhatwg(ctor, url, protocols, headers);
     let settled = false;
     const cleanup = () => {
       signal?.removeEventListener("abort", onAbort);
@@ -526,6 +604,10 @@ function openWithWhatwg(
  *   socket opens, for a realtime model served somewhere other than the
  *   WebSocket broker — the message names where (skipped when
  *   `options.provider` names the leg explicitly);
+ * - {@link RealtimeUpgradeFailed} too when the socket opened but the server
+ *   selected a subprotocol other than `comfy-realtime.v1`;
+ * - a `ComfyError` with `code: "request_timeout"` when the upgrade outlasts
+ *   `options.timeoutMs`;
  * - {@link MissingCredentials} when no credential is available for the
  *   transport in use;
  * - the abort reason when `options.signal` fires first.
@@ -539,11 +621,31 @@ export async function connect(
   // day the broker starts serving one of those models.
   if (options.provider === undefined) refuseUnservedModel(model);
   const provider = servingProvider(model, options.provider);
-  const extra = options.protocols ?? [];
+  const extra = extraProtocols(options.protocols);
   const { signal, idToken } = options;
+  const timeoutMs =
+    options.timeoutMs === undefined ? DEFAULT_REALTIME_CONNECT_TIMEOUT_MS : options.timeoutMs;
+  if (timeoutMs !== null && !(typeof timeoutMs === "number" && timeoutMs > 0)) {
+    throw new TypeError("realtime.connect: options.timeoutMs must be a positive number or null");
+  }
+  if (idToken !== undefined && (typeof idToken !== "string" || idToken === "")) {
+    throw new TypeError("realtime.connect: options.idToken must be a non-empty string");
+  }
   if (signal?.aborted) throw abortReason(signal);
 
+  // The host and the credential are read together, before the `await` below
+  // yields: a `comfy.config` landing in between must not send the newly
+  // configured credential to the previously configured host.
   const url = realtimeUrl(provider, segments);
+  let apiKey: string | undefined;
+  let noApiKey: unknown;
+  if (idToken === undefined) {
+    try {
+      apiKey = requireCredentials();
+    } catch (err) {
+      noApiKey = err;
+    }
+  }
   const transport = await selectTransport(options.WebSocket);
   // Headers reach the server on `ws`, and on Node's own WebSocket; a browser's
   // drops them, which is why it has to authenticate with `idToken`.
@@ -552,9 +654,6 @@ export async function connect(
   let protocols: string[];
   let headers: Record<string, string> | null;
   if (idToken !== undefined) {
-    if (typeof idToken !== "string" || idToken === "") {
-      throw new TypeError("realtime.connect: options.idToken must be a non-empty string");
-    }
     protocols = [REALTIME_SUBPROTOCOL, REALTIME_BEARER_SUBPROTOCOL_PREFIX + idToken, ...extra];
     headers = canSendHeaders ? { "User-Agent": buildUserAgent() } : null;
   } else {
@@ -565,19 +664,57 @@ export async function connect(
         { code: "missing_credentials" },
       );
     }
+    if (apiKey === undefined) throw noApiKey;
     protocols = [REALTIME_SUBPROTOCOL, ...extra];
-    headers = { "X-API-Key": requireCredentials(), "User-Agent": buildUserAgent() };
+    headers = { "X-API-Key": apiKey, "User-Agent": buildUserAgent() };
   }
   if (signal?.aborted) throw abortReason(signal);
 
+  // Clamped, as in `models.ts`: past ~25 days `AbortSignal.timeout` would fire at once.
+  const deadline = timeoutMs === null ? undefined : AbortSignal.timeout(clampTimerMs(timeoutMs));
+  const handshakeSignal =
+    deadline === undefined ? signal : signal ? AbortSignal.any([signal, deadline]) : deadline;
   let socket: RealtimeSocket;
   let requestId: string | null = null;
-  if (transport.kind === "ws") {
-    const opened = await openWithWs(transport.ctor, url, protocols, headers ?? {}, signal);
-    socket = opened.socket;
-    requestId = opened.requestId;
-  } else {
-    socket = await openWithWhatwg(transport.ctor, url, protocols, headers, signal);
+  try {
+    if (transport.kind === "ws") {
+      const opened = await openWithWs(
+        transport.ctor,
+        url,
+        protocols,
+        headers ?? {},
+        handshakeSignal,
+      );
+      socket = opened.socket;
+      requestId = opened.requestId;
+    } else {
+      socket = await openWithWhatwg(transport.ctor, url, protocols, headers, handshakeSignal);
+    }
+  } catch (err) {
+    if (deadline?.aborted && !signal?.aborted) {
+      throw new ComfyError(
+        `realtime.connect: the WebSocket upgrade to ${url} exceeded its ${String(timeoutMs)}ms ` +
+          "deadline; raise it with timeoutMs, or pass timeoutMs: null and your own signal",
+        { code: "request_timeout", cause: err },
+      );
+    }
+    throw err;
+  }
+
+  // The server must select ours. Anything else is not the framing `wireFormat`
+  // promises — and if it echoed the `comfy-bearer.` entry, `subprotocol` would
+  // carry the caller's ID token to whatever logs the session.
+  if (socket.protocol !== REALTIME_SUBPROTOCOL) {
+    socket.close(REALTIME_CLOSE_CODES.normal);
+    const selected = socket.protocol.startsWith(REALTIME_BEARER_SUBPROTOCOL_PREFIX)
+      ? "the comfy-bearer entry"
+      : socket.protocol === ""
+        ? "no subprotocol"
+        : JSON.stringify(socket.protocol);
+    throw upgradeFailed(
+      url,
+      `opened, but the server selected ${selected}, not ${REALTIME_SUBPROTOCOL}`,
+    );
   }
 
   const onAbort = () => socket.close(REALTIME_CLOSE_CODES.normal);
@@ -598,11 +735,13 @@ export async function connect(
     provider,
     model,
     wireFormat: provider === "google" ? "json" : "msgpack",
-    subprotocol: socket.protocol === "" ? null : socket.protocol,
+    subprotocol: socket.protocol,
     requestId,
     close(code = REALTIME_CLOSE_CODES.normal, reason?: string) {
-      signal?.removeEventListener("abort", onAbort);
+      // Closed first: `close` throws on a reserved code or an over-long
+      // reason, and the caller's signal must still be able to end the session then.
       socket.close(code, reason);
+      signal?.removeEventListener("abort", onAbort);
     },
   };
 }
