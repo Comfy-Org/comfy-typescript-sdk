@@ -280,6 +280,49 @@ describe("auth", () => {
     }
   });
 
+  it("sends the protocols as they were when connect was called", async () => {
+    const server = await accepting();
+    const protocols = ["x-extra"];
+    const pending = connect("google/genie-4", { protocols, WebSocket: WsWebSocket });
+    // Pushed across the `await` in connect, after the entries were checked.
+    protocols.push(`${REALTIME_BEARER_SUBPROTOCOL_PREFIX}tok`);
+    sessions.push(await pending);
+    expect(server.upgrades[0].headers["sec-websocket-protocol"]).toBe("comfy-realtime.v1,x-extra");
+  });
+
+  it("refuses a signal that is not an AbortSignal, before any socket is constructed", async () => {
+    FailingWhatwgSocket.constructed = 0;
+    await expect(
+      connect("google/genie-4", {
+        signal: { aborted: false } as unknown as AbortSignal,
+        timeoutMs: null,
+        WebSocket: FailingWhatwgSocket,
+      }),
+    ).rejects.toThrow("options.signal must be an AbortSignal");
+    expect(FailingWhatwgSocket.constructed).toBe(0);
+  });
+
+  it("keeps a base URL's user:password out of the session URL", async () => {
+    const server = await accepting();
+    config({ baseUrl: server.baseUrl.replace("http://", "http://user:secret@") });
+    const session = await open("google/genie-4");
+    expect(session.url).not.toContain("secret");
+    expect(session.url).toBe(
+      `${server.baseUrl.replace("http", "ws")}/v2/realtime/google/google/genie-4`,
+    );
+  });
+
+  it("names a base URL's credentials on a WHATWG constructor, not MissingCredentials", async () => {
+    await accepting();
+    config({ baseUrl: "http://user:secret@127.0.0.1:1" });
+    const err = await connect("google/genie-4", { WebSocket: FailingWhatwgSocket }).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(TypeError);
+    expect((err as Error).message).toContain("carrying credentials");
+    expect((err as Error).message).not.toContain("secret");
+  });
+
   it("sends the credential configured when connect was called, to that call's host", async () => {
     const server = await accepting();
     // The dynamic `import("ws")` yields; reconfiguring in that window must not
@@ -567,6 +610,40 @@ describe("timeout", () => {
     expect(Date.now() - started).toBeLessThan(5_000);
     expect(err).toBeInstanceOf(routerErrors.InsufficientCredits);
     expect((err as routerErrors.RouterError).httpStatus).toBe(402);
+  });
+
+  it("keeps the refusalCode a stalled refusal had already sent", async () => {
+    const server = createServer();
+    const held: Duplex[] = [];
+    const body = JSON.stringify({
+      detail: "A session is already live.",
+      error_type: "concurrency_limit_exceeded",
+      code: "router.realtime.session_already_live",
+    });
+    server.on("upgrade", (_req: IncomingMessage, socket: Duplex) => {
+      held.push(socket);
+      // The whole envelope, under a Content-Length that promises more.
+      socket.write(
+        `HTTP/1.1 429 Refused\r\nContent-Length: ${String(body.length + 100)}\r\n\r\n${body}`,
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    cleanups.push(
+      () =>
+        new Promise((resolve) => {
+          for (const socket of held) socket.destroy();
+          server.close(() => resolve());
+        }),
+    );
+    config({ baseUrl: `http://127.0.0.1:${String((server.address() as AddressInfo).port)}` });
+    const err = await connect("google/genie-4", { timeoutMs: 200, WebSocket: WsWebSocket }).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(routerErrors.ConcurrencyLimitExceeded);
+    expect((err as routerErrors.RouterError).refusalCode).toBe(
+      "router.realtime.session_already_live",
+    );
+    expect((err as routerErrors.RouterError).message).toBe("A session is already live.");
   });
 
   it("rejects with the abort reason when the caller aborts during a stalled refusal", async () => {

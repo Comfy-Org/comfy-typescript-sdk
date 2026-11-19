@@ -611,10 +611,15 @@ voice.socket.send(encode(message)); // the model's own message shape
 voice.close();
 ```
 
-A `google` session is the same call, with JSON text frames instead — open it
-once the previous session has closed, since only one may be live at a time:
+A `google` session is the same call, with JSON text frames instead. Only one
+session may be live at a time, and `close()` returns as soon as the close has
+started, so wait for the socket's `close` event before opening the next one:
 
 ```ts
+// after voice.close(): wait for it to finish closing (3 is CLOSED)
+if (voice.socket.readyState !== 3) {
+  await new Promise((resolve) => voice.socket.addEventListener("close", resolve));
+}
 const genie = await comfy.realtime.connect("google/genie-4");
 genie.socket.addEventListener("message", (event) => {
   if (typeof event.data === "string") console.log(JSON.parse(event.data));

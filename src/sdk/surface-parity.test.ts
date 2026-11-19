@@ -672,7 +672,10 @@ describe("cross-SDK surface parity", () => {
     const expected = python.exportedErrorClasses
       .filter((name) => !PYTHON_ONLY_ERROR_CLASSES.has(name))
       .filter((name) => !BEHIND_PYTHON_ERROR_CLASSES.has(name))
-      .map((name) => RENAMES[name] ?? name);
+      .map((name) => RENAMES[name] ?? name)
+      // Both sides, like the other LEAD fields: the day Python catches up, the
+      // rot guard below is the one failure, naming the entry to delete.
+      .filter((name) => !AHEAD_ROOT_ERROR_CLASSES.has(name));
     const typescript = errorClassNames(sdk).filter((name) => !AHEAD_ROOT_ERROR_CLASSES.has(name));
     expect(nameDivergences("package root", expected, typescript)).toEqual([]);
   });

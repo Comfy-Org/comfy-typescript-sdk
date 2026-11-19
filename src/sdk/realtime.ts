@@ -97,6 +97,8 @@ export const REALTIME_ROUTE_TEMPLATE = "/v2/realtime/{provider}/{model}";
 /**
  * Close codes the broker sends after the `101`. Any other code a client sees —
  * notably `1006` — is a bare close with no close frame (a dropped connection).
+ * They are for reading a close, not for sending one: a WHATWG `WebSocket`
+ * throws if the application closes with anything but `1000` or `3000`–`4999`.
  */
 export const REALTIME_CLOSE_CODES = Object.freeze({
   /** The model finished, or the Google session reached its cap. */
@@ -269,7 +271,13 @@ export interface RealtimeSession {
    * does); `null` on the WHATWG `WebSocket`, which does not.
    */
   requestId: string | null;
-  /** Close the session. Defaults to `1000`. */
+  /**
+   * Close the session. Defaults to `1000`. A WHATWG `WebSocket` (a browser's,
+   * or Node's built-in one) accepts only `1000` or `3000`–`4999` from the
+   * application and throws on anything else, so pass one of those to stay
+   * portable: `REALTIME_CLOSE_CODES` other than `normal` are codes the broker
+   * sends, not codes to close with.
+   */
   close(code?: number, reason?: string): void;
 }
 
@@ -340,17 +348,19 @@ function parseRealtimeModelId(model: string): string[] {
 /** Check `options.protocols`: distinct subprotocol tokens that do not shadow ours. */
 function extraProtocols(protocols: unknown): string[] {
   if (protocols === undefined) return [];
+  // Copied before it is checked, and the copy is what goes on the wire: the
+  // caller's array can still change across the `await` in `connect`.
+  const extra: unknown[] = Array.isArray(protocols) ? [...protocols] : [];
   if (
     !Array.isArray(protocols) ||
-    !protocols.every((p) => typeof p === "string" && SUBPROTOCOL_TOKEN.test(p))
+    !extra.every((p) => typeof p === "string" && SUBPROTOCOL_TOKEN.test(p))
   ) {
     throw new TypeError(
       "realtime.connect: options.protocols must be an array of subprotocol tokens " +
         "(non-empty, no spaces, commas, quotes or other separators)",
     );
   }
-  const extra = protocols as string[];
-  for (const p of extra) {
+  for (const p of extra as string[]) {
     if (p === REALTIME_SUBPROTOCOL || p.startsWith(REALTIME_BEARER_SUBPROTOCOL_PREFIX)) {
       throw new TypeError(
         `realtime.connect: options.protocols must not include "${REALTIME_SUBPROTOCOL}" or a ` +
@@ -362,7 +372,7 @@ function extraProtocols(protocols: unknown): string[] {
   if (new Set(extra).size !== extra.length) {
     throw new TypeError("realtime.connect: options.protocols must not repeat an entry");
   }
-  return extra;
+  return extra as string[];
 }
 
 function refuseUnservedModel(model: string): void {
@@ -401,6 +411,15 @@ function realtimeUrl(provider: RealtimeProvider, segments: readonly string[]): s
     provider,
   });
   return resolveBaseUrl().replace(/^http(s?):/i, "ws$1:") + path;
+}
+
+/** `url` without any `user:password@` part. */
+function withoutUserinfo(url: string): string {
+  const parsed = new URL(url);
+  if (parsed.username === "" && parsed.password === "") return url;
+  parsed.username = "";
+  parsed.password = "";
+  return parsed.href;
 }
 
 async function selectTransport(injected: unknown): Promise<Transport> {
@@ -455,21 +474,29 @@ function headersOf(res: UpgradeResponse): HeadersLike {
   };
 }
 
-/** Buffer a refused upgrade's body (up to the cap) and parse it as JSON, or `null`. */
-function readRefusalBody(res: UpgradeResponse): Promise<unknown> {
-  return new Promise((resolve) => {
-    const chunks: Uint8Array[] = [];
-    let size = 0;
+/**
+ * Buffer a refused upgrade's body (up to the cap) and parse it as JSON, or
+ * `null`. `buffered()` parses what has arrived so far, for a body that stalls:
+ * a server that wrote the whole envelope but never ended the stream still
+ * names its `detail` and `refusalCode`.
+ */
+function readRefusalBody(res: UpgradeResponse): { body: Promise<unknown>; buffered(): unknown } {
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  const parse = (): unknown => {
+    const text = new TextDecoder().decode(Buffer.concat(chunks));
+    try {
+      return text.trim() === "" ? null : JSON.parse(text);
+    } catch {
+      return null;
+    }
+  };
+  const body = new Promise<unknown>((resolve) => {
     let done = false;
     const finish = () => {
       if (done) return;
       done = true;
-      const text = new TextDecoder().decode(Buffer.concat(chunks));
-      try {
-        resolve(text.trim() === "" ? null : JSON.parse(text));
-      } catch {
-        resolve(null);
-      }
+      resolve(parse());
     };
     res.on("data", (chunk: Uint8Array) => {
       if (done) return;
@@ -485,6 +512,7 @@ function readRefusalBody(res: UpgradeResponse): Promise<unknown> {
     res.on("close", finish);
     res.on("error", finish);
   });
+  return { body, buffered: parse };
 }
 
 function upgradeFailed(url: string, detail: string, cause?: unknown): RealtimeUpgradeFailed {
@@ -498,6 +526,7 @@ function upgradeFailed(url: string, detail: string, cause?: unknown): RealtimeUp
 function openWithWs(
   ctor: WsConstructor,
   url: string,
+  label: string,
   protocols: string[],
   headers: Record<string, string>,
   signal: AbortSignal | undefined,
@@ -506,6 +535,7 @@ function openWithWs(
     const socket = new ctor(url, protocols, { headers });
     let requestId: string | null = null;
     let refusal: UpgradeResponse | undefined;
+    let refusalBody: ReturnType<typeof readRefusalBody> | undefined;
     let settled = false;
     const settle = (fn: () => void) => {
       if (settled) return;
@@ -517,12 +547,14 @@ function openWithWs(
     // the typed class; a body that never finishes only loses the `detail`.
     const refused = (res: UpgradeResponse, body: unknown) =>
       toRouterError(res.statusCode ?? 0, headersOf(res), body);
+    // A refusal settled before its body finished keeps whatever had arrived.
+    const refusedSoFar = (res: UpgradeResponse) => refused(res, refusalBody?.buffered() ?? null);
     const onAbort = () =>
       settle(() => {
         // A refusal whose body stalls is not torn down by `terminate()`.
         refusal?.destroy();
         socket.terminate();
-        reject(refusal ? refused(refusal, null) : abortReason(signal as AbortSignal));
+        reject(refusal ? refusedSoFar(refusal) : abortReason(signal as AbortSignal));
       });
 
     socket.once("upgrade", (res: UpgradeResponse) => {
@@ -530,7 +562,8 @@ function openWithWs(
     });
     socket.once("unexpected-response", (_req: unknown, res: UpgradeResponse) => {
       refusal = res;
-      void readRefusalBody(res).then((body) =>
+      refusalBody = readRefusalBody(res);
+      void refusalBody.body.then((body) =>
         settle(() => {
           reject(refused(res, body));
           socket.terminate();
@@ -545,7 +578,7 @@ function openWithWs(
     socket.on("error", (err: Error) =>
       settle(() =>
         reject(
-          refusal ? refused(refusal, null) : upgradeFailed(url, `failed: ${err.message}`, err),
+          refusal ? refusedSoFar(refusal) : upgradeFailed(label, `failed: ${err.message}`, err),
         ),
       ),
     );
@@ -553,8 +586,8 @@ function openWithWs(
       settle(() =>
         reject(
           refusal
-            ? refused(refusal, null)
-            : upgradeFailed(url, `closed (${String(code)}) before it opened`),
+            ? refusedSoFar(refusal)
+            : upgradeFailed(label, `closed (${String(code)}) before it opened`),
         ),
       ),
     );
@@ -577,6 +610,15 @@ function constructWhatwg(
   protocols: string[],
   headers: Record<string, string> | null,
 ): RealtimeSocket {
+  // The standard constructor throws a `SyntaxError` on a URL carrying
+  // credentials, which the fallback below would misread as a refused init.
+  const parsed = new URL(url);
+  if (parsed.username !== "" || parsed.password !== "") {
+    throw new TypeError(
+      "realtime.connect: this runtime's WebSocket refuses a URL carrying credentials — " +
+        "remove the user:password part from the configured Comfy Router base URL",
+    );
+  }
   if (headers === null) return new ctor(url, protocols);
   try {
     return new ctor(url, { protocols, headers });
@@ -601,6 +643,7 @@ function constructWhatwg(
 function openWithWhatwg(
   ctor: WhatwgConstructor,
   url: string,
+  label: string,
   protocols: string[],
   headers: Record<string, string> | null,
   signal: AbortSignal | undefined,
@@ -624,8 +667,8 @@ function openWithWhatwg(
     const unreadable =
       "failed, and this WebSocket transport does not expose the refusal's status" +
       (isNode() ? " — install the `ws` package to get the typed Router error" : "");
-    const onError = () => settle(() => reject(upgradeFailed(url, unreadable)));
-    const onClose = () => settle(() => reject(upgradeFailed(url, unreadable)));
+    const onError = () => settle(() => reject(upgradeFailed(label, unreadable)));
+    const onClose = () => settle(() => reject(upgradeFailed(label, unreadable)));
     const onAbort = () =>
       settle(() => {
         socket.close();
@@ -686,12 +729,25 @@ export async function connect(
         "subprotocol entry (no whitespace — trim a token read from a file)",
     );
   }
+  if (
+    signal !== undefined &&
+    (typeof signal !== "object" ||
+      signal === null ||
+      typeof signal.aborted !== "boolean" ||
+      typeof signal.addEventListener !== "function" ||
+      typeof signal.removeEventListener !== "function")
+  ) {
+    throw new TypeError("realtime.connect: options.signal must be an AbortSignal");
+  }
   if (signal?.aborted) throw abortReason(signal);
 
   // The host and the credential are read together, before the `await` below
   // yields: a `comfy.config` landing in between must not send the newly
   // configured credential to the previously configured host.
   const url = realtimeUrl(provider, segments);
+  // What the session and every error message show: a base URL's
+  // `user:password@` part is a credential, and stays off both.
+  const shownUrl = withoutUserinfo(url);
   let apiKey: string | undefined;
   let noApiKey: unknown;
   if (idToken === undefined) {
@@ -738,6 +794,7 @@ export async function connect(
       const opened = await openWithWs(
         transport.ctor,
         url,
+        shownUrl,
         protocols,
         headers ?? {},
         handshakeSignal,
@@ -745,14 +802,21 @@ export async function connect(
       socket = opened.socket;
       requestId = opened.requestId;
     } else {
-      socket = await openWithWhatwg(transport.ctor, url, protocols, headers, handshakeSignal);
+      socket = await openWithWhatwg(
+        transport.ctor,
+        url,
+        shownUrl,
+        protocols,
+        headers,
+        handshakeSignal,
+      );
     }
   } catch (err) {
     // The caller's abort wins; then a refusal already read as a typed class.
     if (signal?.aborted) throw abortReason(signal);
     if (deadline?.aborted && !(err instanceof RouterError)) {
       throw new ComfyError(
-        `realtime.connect: the WebSocket upgrade to ${url} exceeded its ${String(timeoutMs)}ms ` +
+        `realtime.connect: the WebSocket upgrade to ${shownUrl} exceeded its ${String(timeoutMs)}ms ` +
           "deadline; raise it with timeoutMs, or pass timeoutMs: null and your own signal",
         { code: "request_timeout", cause: err },
       );
@@ -771,7 +835,7 @@ export async function connect(
         ? "no subprotocol"
         : JSON.stringify(socket.protocol);
     throw upgradeFailed(
-      url,
+      shownUrl,
       `opened, but the server selected ${selected}, not ${REALTIME_SUBPROTOCOL}`,
     );
   }
@@ -790,7 +854,7 @@ export async function connect(
 
   return {
     socket,
-    url,
+    url: shownUrl,
     provider,
     model,
     wireFormat: provider === "google" ? "json" : "msgpack",
