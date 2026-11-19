@@ -71,6 +71,7 @@ export {
   BlobNotFound,
   ComfyError,
   type ComfyErrorOptions,
+  type FailureCategory,
   Forbidden,
   HashMismatch,
   IdempotencyKeyReuse,
