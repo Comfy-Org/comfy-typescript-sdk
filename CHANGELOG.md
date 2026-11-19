@@ -19,6 +19,37 @@ entry. See CONTRIBUTING.md.
 
 ### Added
 
+- **`comfy.realtime.connect(model, options)` opens a Comfy Router realtime
+  session.** Router serves its realtime models (`google/genie-4`,
+  `xai/grok-voice/realtime`) over a WebSocket upgrade, and integrators had to
+  hand-roll the URL, the auth rule and the refusal mapping. `connect` reads the
+  model's catalog entry and its `realtime` block (`connect_url`, `method`,
+  `transport`, `wire_format`, `auth`), opens `connect_url` against the
+  `comfy.models` host, sends `X-API-Key` in Node or a `comfy-bearer.<token>`
+  subprotocol entry from a browser (`idToken`), offers `comfy-realtime.v1`
+  when the block lists it, and resolves with the open socket plus its
+  `wireFormat`, `transport`, the block itself, the selected subprotocol and
+  `X-Comfy-Request-Id`. Comfy picks the serving leg; there is no client-side
+  serving table and no `provider` option. No codec is bundled. A model with no
+  `realtime` block (`realtime_unsupported_model`), or one served as a `POST`
+  session mint or over WebRTC (`realtime_unsupported_transport`), is refused
+  from the catalog data before any socket opens. `readRealtimeBlock` reads the
+  block off any catalog entry. `REALTIME_CLOSE_CODES` names the codes the
+  broker closes a session with. The catalog read and the upgrade are bounded
+  by `timeoutMs` (default `DEFAULT_REALTIME_CONNECT_TIMEOUT_MS`, 30 s), and a
+  `101` that selected any subprotocol other than `comfy-realtime.v1` is closed
+  and rejected. Extra `protocols` and the `idToken` are checked against the
+  subprotocol token grammar up front, so a comma cannot split one entry into
+  two on the wire.
+- **`RouterError.refusalCode`** — the finer `code` a realtime refusal body
+  carries (`router.realtime.session_already_live`, say), beside the coarse
+  `errorType`; `null` on every response without one.
+- **`RealtimeUpgradeFailed`** (`code: "realtime_upgrade_failed"`), raised when
+  an upgrade fails on a WebSocket transport that cannot read why — a
+  browser's, or Node's built-in one.
+- **`ws` is an optional peer dependency.** When it is installed, `connect`
+  uses it in Node and a refused upgrade raises the typed `routerErrors` class
+  instead of `RealtimeUpgradeFailed`.
 - **A failed job's category reads as a typed value.** The v2 contract's
   `JobError.category` says why a user-caused failure on a serverless
   deployment happened. `job.failureCategory` and `JobFailed.failureCategory`
