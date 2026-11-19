@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StubServer } from "../../test/support/stub-server.js";
 import { ComfyLow } from "../low/index.js";
 import { AssetFactory } from "./assets.js";
-import { HashMismatch, NotFound } from "./exceptions.js";
+import { ComfyError, HashMismatch, NotFound, QueueFull } from "./exceptions.js";
 
 describe("AssetFactory / Asset", () => {
   let server: StubServer;
@@ -41,6 +41,19 @@ describe("AssetFactory / Asset", () => {
     expect(id).toBe("asset_dedup_01");
     expect(server.state.headCount).toBe(1);
     expect(server.state.fromHashCount).toBe(1);
+    expect(server.state.uploadCount).toBe(0);
+  });
+
+  it("a bodiless 429 on the dedup probe surfaces as rate_limited, not QueueFull", async () => {
+    server.state.headStatus = 429;
+    server.state.retryAfterHeader = "7";
+    const asset = assets.fromBytes(new Uint8Array([1, 2, 3]), { filename: "x.bin" });
+
+    const err = await asset.commit().catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ComfyError);
+    expect(err).not.toBeInstanceOf(QueueFull);
+    expect(err).toMatchObject({ code: "rate_limited", httpStatus: 429, retryAfter: 7 });
     expect(server.state.uploadCount).toBe(0);
   });
 

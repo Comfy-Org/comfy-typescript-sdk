@@ -208,6 +208,16 @@ function parseRetryAfter(response: Response): number | null {
   return Number.isNaN(seconds) || seconds < 0 ? null : seconds;
 }
 
+/**
+ * The envelope a bodiless refusal to `HEAD /assets/by-hash/{hash}` stands for,
+ * by status. See `ComfyLow.headAssetByHash`.
+ */
+const HEAD_REFUSALS: Record<number, { code: string; message: string }> = {
+  401: { code: "unauthorized", message: "Unauthorized" },
+  403: { code: "forbidden", message: "Forbidden" },
+  429: { code: "rate_limited", message: "Rate limited" },
+};
+
 /** Synchronous protocol bindings — async throughout (JS is async-native). */
 export class ComfyLow {
   private readonly baseUrl: string;
@@ -423,13 +433,29 @@ export class ComfyLow {
     return this.parseOrRaise<Asset>(response, [200, 201]);
   }
 
-  /** `HEAD /api/v2/assets/by-hash/{hash}` — existence probe. */
+  /**
+   * `HEAD /api/v2/assets/by-hash/{hash}` — existence probe.
+   *
+   * A refusal to a HEAD has no body, so there is no `error.code` to read: the
+   * gateway's `401`, `403` and `429 rate_limited` arrive as a bare status. All
+   * three are synthesized here rather than left to the status fallback, which
+   * would read a 429 as `queue_full` — a throttle on this probe is not a full
+   * job queue — and give the other two the placeholder message `HTTP <status>`.
+   */
   async headAssetByHash(hash: string, options: { signal?: AbortSignal } = {}): Promise<boolean> {
     const response = await this.request("HEAD", `/assets/by-hash/${encodeURIComponent(hash)}`, {
       signal: options.signal,
     });
     if (response.status === 200) return true;
     if (response.status === 404) return false;
+    const refusal = HEAD_REFUSALS[response.status];
+    if (refusal) {
+      throw errorFromEnvelope(
+        response.status,
+        { error: refusal },
+        { retryAfter: parseRetryAfter(response) },
+      );
+    }
     return this.parseOrRaise<boolean>(response, [200]);
   }
 
