@@ -344,7 +344,9 @@ export interface RunJsonResult<TData = unknown> {
    * `null` means no `fallbackProvider` retry served this call, which is the
    * common case; it does not mean "unknown", and it does not name the provider
    * that did serve it. Router's `X-Comfy-Router-Provider` header reports the
-   * serving provider on every success, which this field does not read. With no
+   * serving leg on a success, which this field does not read: it may read
+   * `comfy` when no `modelProvider` was named, and a replay of an older call
+   * may omit it. With no
    * {@link RunOptions.modelProvider}, Router chooses the provider. This is the
    * ONLY disclosure of a retry: an alt-provider response is translated back to
    * the model's own native contract, so `data` alone is identical either way.
