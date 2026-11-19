@@ -179,9 +179,10 @@ const SSE_STATUS_BY_CODE: Record<string, number> = {
  * payload (or names the frame) rather than reporting a nonexistent `HTTP 0`.
  */
 export function sseErrorFromFrame(data: Record<string, unknown>): ApiError {
-  const raw: unknown = (data as ErrorEnvelopeBody).error;
-  const err =
-    raw && typeof raw === "object" ? (raw as NonNullable<ErrorEnvelopeBody["error"]>) : undefined;
+  // Every field is narrowed by a runtime check rather than an assertion: the
+  // frame is server-controlled and has not been validated against the schema.
+  const raw = data.error;
+  const err = isRecord(raw) ? raw : undefined;
   const code = typeof err?.code === "string" && err.code ? err.code : "error";
   const httpStatus = Object.hasOwn(SSE_STATUS_BY_CODE, code) ? SSE_STATUS_BY_CODE[code] : 0;
   // With no envelope message, keep whatever the server did say: a string
@@ -196,7 +197,12 @@ export function sseErrorFromFrame(data: Record<string, unknown>): ApiError {
   const message =
     sanitizeFrameMessage(stated) ||
     sanitizeFrameMessage(`event stream ended with an \`error\` frame (${code})`);
-  return errorFromEnvelope(httpStatus, { error: { code, message, details: err?.details ?? null } });
+  const details = isRecord(err?.details) ? err.details : null;
+  return errorFromEnvelope(httpStatus, { error: { code, message, details } });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function framePayloadText(data: Record<string, unknown>): string {

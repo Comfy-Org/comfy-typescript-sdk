@@ -112,6 +112,24 @@ describe("sseErrorFromFrame", () => {
     expect(err.message).toBe(message);
   });
 
+  it("keeps object details and drops ill-typed ones instead of trusting the envelope", () => {
+    const kept = sseErrorFromFrame({
+      error: { code: "forbidden", message: "x", details: { a: 1 } },
+    });
+    expect(kept.details).toEqual({ a: 1 });
+    for (const details of [["a"], "nope", 7]) {
+      const err = sseErrorFromFrame({ error: { code: "forbidden", message: "x", details } });
+      expect(err.details).toBeNull();
+    }
+  });
+
+  it("does not read an array `error` as an envelope", () => {
+    const err = sseErrorFromFrame({ error: ["gone"] });
+    expect(err.constructor).toBe(ApiError);
+    expect(err.code).toBe("error");
+    expect(err.message).toBe('{"error":["gone"]}');
+  });
+
   it("names the frame when its payload is empty", () => {
     const err = sseErrorFromFrame({ raw: "" });
     expect(err.message).toBe("event stream ended with an `error` frame (error)");
