@@ -53,6 +53,12 @@ entry. See CONTRIBUTING.md.
   regenerated. `ComfyLow.listJobs` is now a spec operation, so
   `OPERATION_IDS` lists it.
 
+### Fixed
+
+- `job.events()` now ends with a typed error (`Unauthorized` with code
+  `credential_expired`, `Forbidden`, or `NotFound`) when the server sends the
+  terminal `error` event, instead of silently reconnecting.
+
 ## [0.5.0] - 2026-10-10
 
 ### Added
