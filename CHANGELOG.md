@@ -22,20 +22,25 @@ entry. See CONTRIBUTING.md.
 - **`comfy.realtime.connect(model, options)` opens a Comfy Router realtime
   session.** Router serves its realtime models (`google/genie-4`,
   `xai/grok-voice/realtime`) over a WebSocket upgrade, and integrators had to
-  hand-roll the URL, the auth rule and the refusal mapping. `connect` builds
-  the `/v2/realtime/{serving}/{model}` URL against the `comfy.models` host,
-  sends `X-API-Key` in Node or a `comfy-bearer.<token>` subprotocol entry from
-  a browser (`idToken`), always offers `comfy-realtime.v1`, and resolves with
-  the open socket plus its `wireFormat` (`msgpack` on the `fal` leg, `json` on
-  the `google` leg), selected subprotocol and `X-Comfy-Request-Id`. No codec
-  is bundled. Models served elsewhere (the WebRTC world models, Fish Live,
-  Reactor) are refused before any socket opens, with a message naming where
-  they are served. `REALTIME_CLOSE_CODES` names the codes the broker closes a
-  session with. The upgrade is bounded by `timeoutMs` (default
-  `DEFAULT_REALTIME_CONNECT_TIMEOUT_MS`, 30 s), and a `101` that selected any
-  subprotocol other than `comfy-realtime.v1` is closed and rejected. Extra
-  `protocols` and the `idToken` are checked against the subprotocol token
-  grammar up front, so a comma cannot split one entry into two on the wire.
+  hand-roll the URL, the auth rule and the refusal mapping. `connect` reads the
+  model's catalog entry and its `realtime` block (`connect_url`, `method`,
+  `transport`, `wire_format`, `auth`), opens `connect_url` against the
+  `comfy.models` host, sends `X-API-Key` in Node or a `comfy-bearer.<token>`
+  subprotocol entry from a browser (`idToken`), offers `comfy-realtime.v1`
+  when the block lists it, and resolves with the open socket plus its
+  `wireFormat`, `transport`, the block itself, the selected subprotocol and
+  `X-Comfy-Request-Id`. Comfy picks the serving leg; there is no client-side
+  serving table and no `provider` option. No codec is bundled. A model with no
+  `realtime` block (`realtime_unsupported_model`), or one served as a `POST`
+  session mint or over WebRTC (`realtime_unsupported_transport`), is refused
+  from the catalog data before any socket opens. `readRealtimeBlock` reads the
+  block off any catalog entry. `REALTIME_CLOSE_CODES` names the codes the
+  broker closes a session with. The catalog read and the upgrade are bounded
+  by `timeoutMs` (default `DEFAULT_REALTIME_CONNECT_TIMEOUT_MS`, 30 s), and a
+  `101` that selected any subprotocol other than `comfy-realtime.v1` is closed
+  and rejected. Extra `protocols` and the `idToken` are checked against the
+  subprotocol token grammar up front, so a comma cannot split one entry into
+  two on the wire.
 - **`RouterError.refusalCode`** — the finer `code` a realtime refusal body
   carries (`router.realtime.session_already_live`, say), beside the coarse
   `errorType`; `null` on every response without one.

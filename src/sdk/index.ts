@@ -57,19 +57,20 @@ export {
 export { MAX_REQUEST_ID_LENGTH } from "./modelRoutes.js";
 export {
   DEFAULT_REALTIME_CONNECT_TIMEOUT_MS,
+  readRealtimeBlock,
   realtime,
   REALTIME_BEARER_SUBPROTOCOL_PREFIX,
   REALTIME_CLOSE_CODES,
-  REALTIME_ROUTE_TEMPLATE,
-  REALTIME_SERVING_PROVIDERS,
   REALTIME_SUBPROTOCOL,
+  type RealtimeAuthMethod,
   type RealtimeCloseEvent,
+  type RealtimeConnection,
   type RealtimeConnectOptions,
   type RealtimeEvent,
   type RealtimeMessageEvent,
-  type RealtimeProvider,
   type RealtimeSession,
   type RealtimeSocket,
+  type RealtimeTransport,
 } from "./realtime.js";
 export {
   DEFAULT_COLLECT_BUDGET_MS,

@@ -14,16 +14,32 @@
  * session.socket.send(encode(message)); // the model's own message shape
  * ```
  *
- * Router serves its realtime models as a WebSocket upgrade at
- * `GET /v2/realtime/{serving}/{model}`. This module does the three things an
- * integrator otherwise hand-rolls — build that URL, authenticate the upgrade
- * the way Router expects, and turn a refused upgrade into the typed
- * `routerErrors` class — and then hands back the raw socket. It is deliberately
- * thin: no codec is bundled and there is no unified event model. A session on
- * the `fal` serving leg speaks MessagePack binary frames (bring an encoder such
- * as `@msgpack/msgpack`); a session on the `google` leg speaks JSON text frames
- * (`JSON.stringify` / `JSON.parse`). {@link RealtimeSession.wireFormat} says
- * which.
+ * # Where a session goes
+ *
+ * Nothing about the route is hardcoded here. Router publishes each realtime
+ * model's connection details on its catalog entry, as an optional `realtime`
+ * block (absent on HTTP-only models), the same way an HTTP model publishes
+ * its contract at `GET /v2/models/{provider}/{model}/openapi.json`:
+ *
+ * ```json
+ * { "connect_url": "/v2/realtime/google/google/genie-4", "method": "GET",
+ *   "transport": "websocket", "wire_format": "json",
+ *   "auth": ["x-api-key", "comfy-realtime.v1", "comfy-bearer"],
+ *   "billing_unit": "per_second", "max_session_seconds": 120 }
+ * ```
+ *
+ * `connect` reads the model's entry, takes `connect_url` as a path on the same
+ * host `comfy.models` uses (`http(s)` becomes `ws(s)`), and opens it with the
+ * block's `wire_format` and `auth`. Comfy picks the serving leg; a caller never
+ * names one, and this module keeps no table of them. A model with no block, or
+ * one whose `method`/`transport` is not a WebSocket upgrade this helper can
+ * open (a `POST` `session_post` mint, a `webrtc` session), is refused with a
+ * typed `ComfyError` built from the catalog data before any socket opens.
+ *
+ * It is deliberately thin after that: no codec is bundled and there is no
+ * unified event model. {@link RealtimeSession.wireFormat} says whether frames
+ * are MessagePack binary (bring an encoder such as `@msgpack/msgpack`) or JSON
+ * text (`JSON.stringify` / `JSON.parse`).
  *
  * # Auth
  *
@@ -33,8 +49,10 @@
  * `comfy-bearer.<token>` subprotocol entry instead ({@link
  * RealtimeConnectOptions.idToken}). Router lifts that entry only when the
  * upgrade carries no `Authorization`/`X-API-Key`, and refuses it unless
- * `comfy-realtime.v1` is offered beside it — which this module always does. A
- * credential is never put in the URL.
+ * `comfy-realtime.v1` is offered beside it. Only methods the block's `auth`
+ * list names are used, and `comfy-realtime.v1` is offered only when it is
+ * listed. A credential is never put in the URL. The catalog read itself sends
+ * the same credential as `Authorization: Bearer`, as `comfy.models.list` does.
  *
  * # Refusals
  *
@@ -65,9 +83,10 @@
  *
  * # Billing and closes
  *
- * A session is billed per second from the `101`, and Router allows one live
- * WebSocket session per workspace, so close a session you are done with. After
- * the `101` the broker ends a session only with the codes in
+ * A session is billed from the `101` in the block's `billing_unit` (per second
+ * in v1) up to its `max_session_seconds`, and Router allows one live WebSocket
+ * session per workspace, so close a session you are done with. After the
+ * `101` the broker ends a session only with the codes in
  * {@link REALTIME_CLOSE_CODES}.
  *
  * `realtime` lives on the module-level `comfy` namespace only, not on the
@@ -77,8 +96,9 @@
 import { clampTimerMs } from "../low/dispatcher.js";
 import { buildUserAgent } from "../low/index.js";
 import { CREDENTIALS_ENV_VAR, requireCredentials, resolveBaseUrl } from "./credentials.js";
-import { ComfyError, MissingCredentials, RealtimeUpgradeFailed } from "./exceptions.js";
+import { ComfyError, MissingCredentials, NotFound, RealtimeUpgradeFailed } from "./exceptions.js";
 import { fillRoute } from "./modelRoutes.js";
+import { CATALOG_ROUTE_TEMPLATE, errorFromResponse, RUN_ROUTE_TEMPLATE } from "./models.js";
 import { type HeadersLike, REQUEST_ID_HEADER, RouterError, toRouterError } from "./routerErrors.js";
 
 /** The subprotocol every realtime upgrade must offer; Router selects it on the `101`. */
@@ -86,13 +106,6 @@ export const REALTIME_SUBPROTOCOL = "comfy-realtime.v1";
 
 /** Prefix of the subprotocol entry that carries a browser's ID token. */
 export const REALTIME_BEARER_SUBPROTOCOL_PREFIX = "comfy-bearer.";
-
-/**
- * The realtime route. `{model}` is the WHOLE catalog id, slashes included, so
- * `xai/grok-voice/realtime` on the `fal` leg is
- * `/v2/realtime/fal/xai/grok-voice/realtime`.
- */
-export const REALTIME_ROUTE_TEMPLATE = "/v2/realtime/{provider}/{model}";
 
 /**
  * Close codes the broker sends after the `101`. Any other code a client sees —
@@ -111,40 +124,10 @@ export const REALTIME_CLOSE_CODES = Object.freeze({
   serviceRestart: 1012,
 });
 
-/** The serving legs the WebSocket broker relays to. */
-export type RealtimeProvider = "fal" | "google";
-
 /**
- * Catalog ids served on a leg other than the default `fal` one. A model not
- * listed here is addressed on `fal`; {@link RealtimeConnectOptions.provider}
- * overrides the lookup for a model this release does not know about yet.
- */
-export const REALTIME_SERVING_PROVIDERS: Readonly<Record<string, RealtimeProvider>> = Object.freeze(
-  {
-    "google/genie-4": "google",
-  },
-);
-
-const DEFAULT_SERVING_PROVIDER: RealtimeProvider = "fal";
-
-/**
- * Realtime catalog ids that are NOT served by the WebSocket broker, and where
- * each one is served instead. Refused before any socket opens, because the
- * broker's answer for them would be a refusal that does not say where to go.
- */
-const NOT_ON_THE_BROKER: Readonly<Record<string, string>> = Object.freeze({
-  "fal-ai/lingbot-world-2":
-    "served over WebRTC signalling, POST /v2/realtime/wma/fal, not the WebSocket broker",
-  "fal-ai/abot-world-0":
-    "served over WebRTC signalling, POST /v2/realtime/wma/fal, not the WebSocket broker",
-  "fish/live-3":
-    "served as a LiveKit session minted by POST /v2/realtime/fish/sessions, not the WebSocket broker",
-});
-
-/**
- * Default deadline for the upgrade, in milliseconds: from opening the socket
- * to the `101` (or to reading a refusal's body). It bounds the handshake only,
- * never the session. Override it per call with `timeoutMs`, or disable it with
+ * Default deadline for a connect, in milliseconds: from the catalog read
+ * through the `101` (or to reading a refusal's body). It bounds the handshake
+ * only, never the session. Override it per call with `timeoutMs`, or disable it with
  * `null`.
  */
 export const DEFAULT_REALTIME_CONNECT_TIMEOUT_MS = 30_000;
@@ -209,6 +192,35 @@ export interface RealtimeSocket {
   removeEventListener(type: string, listener: (event: RealtimeEvent) => void): void;
 }
 
+/** How a realtime session is carried, as the catalog block's `transport` names it. */
+export type RealtimeTransport = "websocket" | "websocket_media_frames" | "webrtc" | "session_post";
+
+/** An auth method the catalog block's `auth` list can name. */
+export type RealtimeAuthMethod = "x-api-key" | "comfy-realtime.v1" | "comfy-bearer";
+
+/**
+ * A model's realtime connection details: the `realtime` block of its Router
+ * catalog entry, read by {@link readRealtimeBlock}. Field values are passed
+ * through as the server published them — a value this release does not know
+ * (a new `transport`, say) is kept, and `connect` refuses it rather than the
+ * reader, so the error can name it.
+ */
+export interface RealtimeConnection {
+  /** A path on the Router host (`/v2/realtime/...`), never a full URL. */
+  connectUrl: string;
+  /** `"GET"` for a WebSocket upgrade, `"POST"` for a session mint. */
+  method: "GET" | "POST" | (string & {});
+  transport: RealtimeTransport | (string & {});
+  /** Frame encoding: MessagePack binary or JSON text. */
+  wireFormat: "json" | "msgpack" | (string & {});
+  /** The auth methods the route accepts. */
+  auth: readonly (RealtimeAuthMethod | (string & {}))[];
+  /** Informational: how the session is billed (`"per_second"` in v1). `null` if unnamed. */
+  billingUnit: string | null;
+  /** Informational: the effective session cap, in seconds. `null` if unnamed. */
+  maxSessionSeconds: number | null;
+}
+
 export interface RealtimeConnectOptions {
   /**
    * Browser mode: a signed-in user's Firebase ID token, offered as the
@@ -216,22 +228,20 @@ export interface RealtimeConnectOptions {
    * sent — Router ignores the token if a credential header is present.
    */
   idToken?: string;
-  /** Override the serving leg; by default it is looked up in {@link REALTIME_SERVING_PROVIDERS}. */
-  provider?: RealtimeProvider;
   /**
-   * Extra subprotocols to offer after `comfy-realtime.v1`. Each must be a
+   * Extra subprotocols to offer after the ones `connect` offers itself. Each must be a
    * distinct non-empty string, and none may be `comfy-realtime.v1` itself or
    * a `comfy-bearer.` entry — pass the token as `idToken` instead. They are
    * offered only: the server must still select `comfy-realtime.v1`.
    */
   protocols?: string[];
   /**
-   * Aborts a pending connect (the socket is closed and the promise rejects
+   * Aborts a pending connect (the catalog read or the socket is abandoned and the promise rejects
    * with the abort reason) and, once open, closes the session with `1000`.
    */
   signal?: AbortSignal;
   /**
-   * Deadline for the upgrade, in milliseconds; default
+   * Deadline for the catalog read plus the upgrade, in milliseconds; default
    * {@link DEFAULT_REALTIME_CONNECT_TIMEOUT_MS}. Past it the socket is closed
    * and `connect` rejects with a `ComfyError` whose `code` is
    * `"request_timeout"`. `null` disables it. It never bounds an open session.
@@ -247,22 +257,27 @@ export interface RealtimeConnectOptions {
 
 export interface RealtimeSession {
   /**
-   * The open socket. Send and receive on it directly; frames are
-   * MessagePack binary on a `fal` session and JSON text on a `google` one
-   * (see {@link wireFormat}). No codec is bundled.
+   * The open socket. Send and receive on it directly, in the encoding
+   * {@link wireFormat} names. No codec is bundled.
    */
   socket: RealtimeSocket;
-  /** The `ws(s)://` URL the session was opened on. Never carries a credential. */
+  /**
+   * The `ws(s)://` URL the session was opened on: the catalog's `connect_url`
+   * on the configured Router host. Never carries a credential.
+   */
   url: string;
-  provider: RealtimeProvider;
   /** The catalog id, as passed to `connect`. */
   model: string;
-  /** `"json"` on the `google` leg, `"msgpack"` on the `fal` leg. */
+  /** From the catalog block: `"msgpack"` (binary frames) or `"json"` (text frames). */
   wireFormat: "msgpack" | "json";
+  /** From the catalog block: `"websocket"` or `"websocket_media_frames"`. */
+  transport: "websocket" | "websocket_media_frames";
+  /** The catalog block the session was opened from, including its informational fields. */
+  realtime: RealtimeConnection;
   /**
-   * The subprotocol the `101` selected: always `comfy-realtime.v1`, which is
-   * what Router selects — `connect` closes and rejects a session on which
-   * the server selected anything else.
+   * The subprotocol the `101` selected. `comfy-realtime.v1` whenever the
+   * block lists it (Router's realtime routes all do today) — `connect` then
+   * closes and rejects a session on which the server selected anything else.
    */
   subprotocol: string;
   /**
@@ -324,9 +339,9 @@ function isWsConstructor(ctor: unknown): ctor is WsConstructor {
 
 /**
  * Split and check a realtime catalog id: two or more `/`-separated segments
- * of `[a-z0-9._-]`, none empty, `.` or `..`. Stricter than `parseModelId`
- * because the id is pasted into the path whole, slashes and all — every
- * segment must be safe to place there unencoded.
+ * of `[a-z0-9._-]`, none empty, `.` or `..`. Looser than `parseModelId` in
+ * allowing a variant segment, which the catalog lookup then finds by walking
+ * the catalog rather than through the two-segment detail route.
  */
 function parseRealtimeModelId(model: string): string[] {
   const shape = 'expected a catalog model ID such as "google/genie-4"';
@@ -375,42 +390,171 @@ function extraProtocols(protocols: unknown): string[] {
   return extra as string[];
 }
 
-function refuseUnservedModel(model: string): void {
-  const where = Object.hasOwn(NOT_ON_THE_BROKER, model)
-    ? NOT_ON_THE_BROKER[model]
-    : model.startsWith("reactor/")
-      ? "not served by Comfy Router's realtime surface"
-      : undefined;
-  if (where !== undefined) {
-    throw new ComfyError(`realtime.connect: "${model}" is ${where}`, {
-      code: "realtime_unsupported_model",
-    });
-  }
+const TRANSPORTS_THIS_HELPER_OPENS: ReadonlySet<string> = new Set([
+  "websocket",
+  "websocket_media_frames",
+]);
+
+const WIRE_FORMATS: ReadonlySet<string> = new Set(["json", "msgpack"]);
+
+/** A path on the Router host: one leading `/`; no scheme, host, whitespace, backslash or fragment. */
+const CONNECT_PATH = /^\/(?!\/)[^\s\\#]*$/;
+
+function malformedBlock(model: string, what: string, requestId: string | null): ComfyError {
+  return new ComfyError(
+    `realtime.connect: the catalog entry for "${model}" has a \`realtime\` block ${what}`,
+    { code: "unexpected_response", requestId },
+  );
 }
 
-function servingProvider(model: string, override: RealtimeProvider | undefined): RealtimeProvider {
-  if (override !== undefined) {
-    if (override !== "fal" && override !== "google") {
-      throw new TypeError(
-        `realtime.connect: options.provider must be "fal" or "google", got ${JSON.stringify(override)}`,
-      );
+/**
+ * Read the `realtime` block off a Router catalog entry (a `GET /v2/models`
+ * item, or a `GET /v2/models/{provider}/{model}` body): `null` when the entry
+ * has none — an HTTP-only model — and a {@link RealtimeConnection} otherwise.
+ *
+ * Checks the block's SHAPE (every field the right JSON type, `connect_url` a
+ * path on the Router host) and throws a `ComfyError` with
+ * `code: "unexpected_response"` when it is wrong. It does not judge VALUES: a
+ * `transport` this release cannot open is returned as-is, for `connect` to
+ * refuse by name.
+ */
+export function readRealtimeBlock(
+  entry: unknown,
+  model = "this model",
+  requestId: string | null = null,
+): RealtimeConnection | null {
+  if (entry === null || typeof entry !== "object") return null;
+  const raw = (entry as { realtime?: unknown }).realtime;
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw malformedBlock(model, "that is not an object", requestId);
+  }
+  const block = raw as Record<string, unknown>;
+  for (const field of ["connect_url", "method", "transport", "wire_format"] as const) {
+    if (typeof block[field] !== "string" || block[field] === "") {
+      throw malformedBlock(model, `without a string \`${field}\``, requestId);
     }
-    return override;
   }
-  return Object.hasOwn(REALTIME_SERVING_PROVIDERS, model)
-    ? REALTIME_SERVING_PROVIDERS[model]
-    : DEFAULT_SERVING_PROVIDER;
+  const connectUrl = block.connect_url as string;
+  if (!CONNECT_PATH.test(connectUrl)) {
+    throw malformedBlock(
+      model,
+      `whose \`connect_url\` is not a path on the Router host: ${JSON.stringify(connectUrl)}`,
+      requestId,
+    );
+  }
+  const auth = block.auth;
+  if (!Array.isArray(auth) || !auth.every((m) => typeof m === "string")) {
+    throw malformedBlock(model, "whose `auth` is not an array of strings", requestId);
+  }
+  const maxSeconds = block.max_session_seconds;
+  return {
+    connectUrl,
+    method: (block.method as string).toUpperCase(),
+    transport: block.transport as string,
+    wireFormat: block.wire_format as string,
+    auth: Object.freeze([...(auth as string[])]),
+    billingUnit: typeof block.billing_unit === "string" ? block.billing_unit : null,
+    maxSessionSeconds:
+      typeof maxSeconds === "number" && Number.isFinite(maxSeconds) ? maxSeconds : null,
+  };
 }
 
-/** The `ws(s)://` URL for `model` on `provider`, against the configured Router host. */
-function realtimeUrl(provider: RealtimeProvider, segments: readonly string[]): string {
-  // `fillRoute` encodes a `/` inside a value, so the model's own slashes are
-  // spliced in first; each segment is already restricted to characters that
-  // need no encoding.
-  const path = fillRoute(REALTIME_ROUTE_TEMPLATE.replace("{model}", segments.join("/")), {
-    provider,
+/** A model whose catalog data says this helper cannot open it. */
+function unsupported(
+  model: string,
+  why: string,
+  code: string,
+  realtime: RealtimeConnection | null,
+  requestId: string | null,
+): ComfyError {
+  return new ComfyError(`realtime.connect: "${model}" ${why}`, {
+    code,
+    requestId,
+    details: realtime === null ? null : { realtime },
   });
-  return resolveBaseUrl().replace(/^http(s?):/i, "ws$1:") + path;
+}
+
+/** Where and how the catalog read goes, resolved once per connect. */
+interface CatalogEndpoint {
+  baseUrl: string;
+  authorization: string;
+}
+
+async function getJson(
+  url: string,
+  endpoint: CatalogEndpoint,
+  signal: AbortSignal | undefined,
+): Promise<{ body: unknown; requestId: string | null }> {
+  // `fetch` refuses a URL carrying `user:password@`; the credential travels
+  // as the `Authorization` header instead.
+  const response = await fetch(withoutUserinfo(url), {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${endpoint.authorization}`,
+      Accept: "application/json",
+      "User-Agent": buildUserAgent(),
+    },
+    signal,
+  });
+  const text = await response.text();
+  const requestId = response.headers.get(REQUEST_ID_HEADER);
+  if (!response.ok) throw errorFromResponse(response, text, null);
+  try {
+    return { body: JSON.parse(text), requestId };
+  } catch (err) {
+    throw new ComfyError(
+      `realtime.connect: the catalog read returned a ${String(response.status)} whose body is not JSON`,
+      { code: "unexpected_response", httpStatus: response.status, requestId, cause: err },
+    );
+  }
+}
+
+/**
+ * Fetch `model`'s catalog entry. A two-segment id is one
+ * `GET /v2/models/{provider}/{model}`; an id with a variant segment, which
+ * that route cannot address, is found by walking `GET /v2/models`.
+ */
+async function fetchCatalogEntry(
+  model: string,
+  segments: readonly string[],
+  endpoint: CatalogEndpoint,
+  signal: AbortSignal | undefined,
+): Promise<{ entry: unknown; requestId: string | null }> {
+  if (segments.length === 2) {
+    const path = fillRoute(RUN_ROUTE_TEMPLATE, { provider: segments[0], model: segments[1] });
+    const { body, requestId } = await getJson(endpoint.baseUrl + path, endpoint, signal);
+    return { entry: body, requestId };
+  }
+  const asked = new Set<string>();
+  let cursor: string | null = null;
+  let requestId: string | null = null;
+  for (;;) {
+    const url = new URL(endpoint.baseUrl + CATALOG_ROUTE_TEMPLATE);
+    if (cursor !== null) url.searchParams.set("cursor", cursor);
+    const page = await getJson(url.toString(), endpoint, signal);
+    requestId = page.requestId;
+    const body = page.body as { data?: unknown; has_more?: unknown; next_cursor?: unknown } | null;
+    const data = Array.isArray(body?.data) ? (body.data as unknown[]) : [];
+    const found = data.find(
+      (item) =>
+        item !== null && typeof item === "object" && (item as { id?: unknown }).id === model,
+    );
+    if (found !== undefined) return { entry: found, requestId };
+    const next = typeof body?.next_cursor === "string" ? body.next_cursor : "";
+    if (body?.has_more !== true || next === "" || asked.has(next)) break;
+    asked.add(next);
+    cursor = next;
+  }
+  throw new NotFound(`realtime.connect: "${model}" is not in the Router model catalog`, {
+    code: "model_not_found",
+    requestId,
+  });
+}
+
+/** `connect_url` on the configured Router host, as a `ws(s)://` URL. */
+function realtimeUrl(baseUrl: string, connectUrl: string): string {
+  return baseUrl.replace(/^http(s?):/i, "ws$1:") + connectUrl;
 }
 
 /** `url` without any `user:password@` part. */
@@ -685,19 +829,27 @@ function openWithWhatwg(
  * Open a realtime session on `model` (its full catalog id, e.g.
  * `"google/genie-4"` or `"xai/grok-voice/realtime"`).
  *
- * Resolves once the `101` is in and the socket is open. Rejects with:
+ * Reads the model's catalog entry first and connects to the `connect_url` its
+ * `realtime` block names, with that block's `wire_format` and `auth`. Resolves
+ * once the `101` is in and the socket is open. Rejects with:
+ * - a `ComfyError` with `code: "realtime_unsupported_model"`, before any
+ *   socket opens, when the catalog entry has no `realtime` block;
+ * - a `ComfyError` with `code: "realtime_unsupported_transport"`, before any
+ *   socket opens, when the block's `method`/`transport`/`wire_format` is not
+ *   a WebSocket upgrade this helper opens — a `POST` `session_post` mint or a
+ *   `webrtc` session; `details.realtime` carries the block;
+ * - a `ComfyError` with `code: "realtime_unsupported_auth"` when the block
+ *   does not accept the credential in hand (`X-API-Key`, or `idToken`);
+ * - the catalog read's own error (a {@link NotFound} for an unknown model, a
+ *   `401`, ...), mapped as `comfy.models` maps one;
  * - a `routerErrors` class (with {@link RouterError.refusalCode}) when Router
  *   refused the upgrade and the transport could read why (`ws`);
- * - {@link RealtimeUpgradeFailed} when the upgrade failed and it could not;
- * - a `ComfyError` with `code: "realtime_unsupported_model"`, before any
- *   socket opens, for a realtime model served somewhere other than the
- *   WebSocket broker — the message names where (skipped when
- *   `options.provider` names the leg explicitly);
- * - {@link RealtimeUpgradeFailed} too when the socket opened but the server
- *   selected a subprotocol other than `comfy-realtime.v1`;
- * - a `ComfyError` with `code: "request_timeout"` when the upgrade outlasts
- *   `options.timeoutMs` (on `ws`, a refusal whose status arrived in time but
- *   whose body did not still rejects with its typed class);
+ * - {@link RealtimeUpgradeFailed} when the upgrade failed and it could not, or
+ *   when the socket opened but the server selected a subprotocol other than
+ *   `comfy-realtime.v1`;
+ * - a `ComfyError` with `code: "request_timeout"` when the catalog read plus
+ *   the upgrade outlast `options.timeoutMs` (on `ws`, a refusal whose status
+ *   arrived in time but whose body did not still rejects with its typed class);
  * - {@link MissingCredentials} when no credential is available for the
  *   transport in use;
  * - the abort reason when `options.signal` fires first.
@@ -707,10 +859,12 @@ export async function connect(
   options: RealtimeConnectOptions = {},
 ): Promise<RealtimeSession> {
   const segments = parseRealtimeModelId(model);
-  // An explicit serving leg is trusted as-is: it is the escape hatch for the
-  // day the broker starts serving one of those models.
-  if (options.provider === undefined) refuseUnservedModel(model);
-  const provider = servingProvider(model, options.provider);
+  if ((options as { provider?: unknown }).provider !== undefined) {
+    throw new TypeError(
+      "realtime.connect: options.provider is gone — Comfy picks the serving leg, and connect " +
+        "reads the route from the model's catalog entry",
+    );
+  }
   const extra = extraProtocols(options.protocols);
   const { signal, idToken } = options;
   const timeoutMs =
@@ -741,13 +895,11 @@ export async function connect(
   }
   if (signal?.aborted) throw abortReason(signal);
 
-  // The host and the credential are read together, before the `await` below
+  // The host and the credential are read together, before the first `await`
   // yields: a `comfy.config` landing in between must not send the newly
-  // configured credential to the previously configured host.
-  const url = realtimeUrl(provider, segments);
-  // What the session and every error message show: a base URL's
-  // `user:password@` part is a credential, and stays off both.
-  const shownUrl = withoutUserinfo(url);
+  // configured credential to the previously configured host. Both the catalog
+  // read and the upgrade go to this pair.
+  const baseUrl = resolveBaseUrl();
   let apiKey: string | undefined;
   let noApiKey: unknown;
   if (idToken === undefined) {
@@ -761,13 +913,7 @@ export async function connect(
   // Headers reach the server on `ws`, and on Node's own WebSocket; a browser's
   // drops them, which is why it has to authenticate with `idToken`.
   const canSendHeaders = transport.kind === "ws" || isNode();
-
-  let protocols: string[];
-  let headers: Record<string, string> | null;
-  if (idToken !== undefined) {
-    protocols = [REALTIME_SUBPROTOCOL, REALTIME_BEARER_SUBPROTOCOL_PREFIX + idToken, ...extra];
-    headers = canSendHeaders ? { "User-Agent": buildUserAgent() } : null;
-  } else {
+  if (idToken === undefined) {
     if (!canSendHeaders) {
       throw new MissingCredentials(
         "realtime.connect: a browser must pass options.idToken — a WebSocket upgrade from a " +
@@ -776,8 +922,6 @@ export async function connect(
       );
     }
     if (apiKey === undefined) throw noApiKey;
-    protocols = [REALTIME_SUBPROTOCOL, ...extra];
-    headers = { "X-API-Key": apiKey, "User-Agent": buildUserAgent() };
   }
   if (signal?.aborted) throw abortReason(signal);
 
@@ -787,9 +931,84 @@ export async function connect(
     timeoutMs === null ? undefined : AbortSignal.timeout(Math.ceil(clampTimerMs(timeoutMs)));
   const handshakeSignal =
     deadline === undefined ? signal : signal ? AbortSignal.any([signal, deadline]) : deadline;
+
   let socket: RealtimeSocket;
   let requestId: string | null = null;
+  let block: RealtimeConnection;
+  let shownUrl = "";
+  let offersRealtimeSubprotocol: boolean;
   try {
+    const catalog = await fetchCatalogEntry(
+      model,
+      segments,
+      { baseUrl, authorization: idToken ?? (apiKey as string) },
+      handshakeSignal,
+    );
+    const read = readRealtimeBlock(catalog.entry, model, catalog.requestId);
+    if (read === null) {
+      throw unsupported(
+        model,
+        "has no `realtime` block in its catalog entry, so Router does not serve it as a " +
+          "realtime session",
+        "realtime_unsupported_model",
+        null,
+        catalog.requestId,
+      );
+    }
+    block = read;
+    if (
+      block.method !== "GET" ||
+      !TRANSPORTS_THIS_HELPER_OPENS.has(block.transport) ||
+      !WIRE_FORMATS.has(block.wireFormat)
+    ) {
+      throw unsupported(
+        model,
+        `is served as ${block.method} ${block.connectUrl} (transport ${JSON.stringify(block.transport)}, ` +
+          `wire format ${JSON.stringify(block.wireFormat)}), which is not a WebSocket upgrade ` +
+          "realtime.connect can open; use the catalog block in this error's details.realtime",
+        "realtime_unsupported_transport",
+        block,
+        catalog.requestId,
+      );
+    }
+
+    // Only the methods the block lists are used. Router refuses a bearer entry
+    // offered without `comfy-realtime.v1`, so the token path needs both.
+    offersRealtimeSubprotocol = block.auth.includes(REALTIME_SUBPROTOCOL);
+    let protocols: string[];
+    let headers: Record<string, string> | null;
+    if (idToken !== undefined) {
+      if (!block.auth.includes("comfy-bearer") || !offersRealtimeSubprotocol) {
+        throw unsupported(
+          model,
+          `does not accept an ID token (its catalog auth is ${JSON.stringify(block.auth)}) — ` +
+            "connect with an API key instead",
+          "realtime_unsupported_auth",
+          block,
+          catalog.requestId,
+        );
+      }
+      protocols = [REALTIME_SUBPROTOCOL, REALTIME_BEARER_SUBPROTOCOL_PREFIX + idToken, ...extra];
+      headers = canSendHeaders ? { "User-Agent": buildUserAgent() } : null;
+    } else {
+      if (!block.auth.includes("x-api-key")) {
+        throw unsupported(
+          model,
+          `does not accept X-API-Key (its catalog auth is ${JSON.stringify(block.auth)}) — ` +
+            "pass options.idToken instead",
+          "realtime_unsupported_auth",
+          block,
+          catalog.requestId,
+        );
+      }
+      protocols = [...(offersRealtimeSubprotocol ? [REALTIME_SUBPROTOCOL] : []), ...extra];
+      headers = { "X-API-Key": apiKey as string, "User-Agent": buildUserAgent() };
+    }
+
+    const url = realtimeUrl(baseUrl, block.connectUrl);
+    // What the session and every error message show: a base URL's
+    // `user:password@` part is a credential, and stays off both.
+    shownUrl = withoutUserinfo(url);
     if (transport.kind === "ws") {
       const opened = await openWithWs(
         transport.ctor,
@@ -815,8 +1034,9 @@ export async function connect(
     // The caller's abort wins; then a refusal already read as a typed class.
     if (signal?.aborted) throw abortReason(signal);
     if (deadline?.aborted && !(err instanceof RouterError)) {
+      const what = shownUrl === "" ? "catalog read" : `WebSocket upgrade to ${shownUrl}`;
       throw new ComfyError(
-        `realtime.connect: the WebSocket upgrade to ${shownUrl} exceeded its ${String(timeoutMs)}ms ` +
+        `realtime.connect: the ${what} for "${model}" exceeded its ${String(timeoutMs)}ms ` +
           "deadline; raise it with timeoutMs, or pass timeoutMs: null and your own signal",
         { code: "request_timeout", cause: err },
       );
@@ -824,12 +1044,13 @@ export async function connect(
     throw err;
   }
 
-  // The server must select ours. Anything else is not the framing `wireFormat`
-  // promises — and if it echoed the `comfy-bearer.` entry, `subprotocol` would
-  // carry the caller's ID token to whatever logs the session.
-  if (socket.protocol !== REALTIME_SUBPROTOCOL) {
+  // The server must select ours when it was offered. Anything else is not the
+  // framing `wireFormat` promises — and if it echoed the `comfy-bearer.` entry,
+  // `subprotocol` would carry the caller's ID token to whatever logs the session.
+  const selectedBearer = socket.protocol.startsWith(REALTIME_BEARER_SUBPROTOCOL_PREFIX);
+  if (selectedBearer || (offersRealtimeSubprotocol && socket.protocol !== REALTIME_SUBPROTOCOL)) {
     socket.close(REALTIME_CLOSE_CODES.normal);
-    const selected = socket.protocol.startsWith(REALTIME_BEARER_SUBPROTOCOL_PREFIX)
+    const selected = selectedBearer
       ? "the comfy-bearer entry"
       : socket.protocol === ""
         ? "no subprotocol"
@@ -855,9 +1076,10 @@ export async function connect(
   return {
     socket,
     url: shownUrl,
-    provider,
     model,
-    wireFormat: provider === "google" ? "json" : "msgpack",
+    wireFormat: block.wireFormat as "msgpack" | "json",
+    transport: block.transport as "websocket" | "websocket_media_frames",
+    realtime: block,
     subprotocol: socket.protocol,
     requestId,
     close(code = REALTIME_CLOSE_CODES.normal, reason?: string) {

@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Duplex } from "node:stream";
 
@@ -8,15 +8,14 @@ import { WebSocket as WsWebSocket, WebSocketServer } from "ws";
 import { buildUserAgent } from "../low/index.js";
 import { comfy } from "./comfy.js";
 import { config } from "./credentials.js";
-import { ComfyError, MissingCredentials, RealtimeUpgradeFailed } from "./exceptions.js";
+import { ComfyError, MissingCredentials, NotFound, RealtimeUpgradeFailed } from "./exceptions.js";
 import {
   connect,
   DEFAULT_REALTIME_CONNECT_TIMEOUT_MS,
+  readRealtimeBlock,
   realtime,
   REALTIME_BEARER_SUBPROTOCOL_PREFIX,
   REALTIME_CLOSE_CODES,
-  REALTIME_ROUTE_TEMPLATE,
-  REALTIME_SERVING_PROVIDERS,
   REALTIME_SUBPROTOCOL,
   type RealtimeSession,
 } from "./realtime.js";
@@ -24,53 +23,204 @@ import * as routerErrors from "./routerErrors.js";
 
 const CREDENTIAL = "comfyui-realtime-test-key";
 
+const ALL_AUTH = ["x-api-key", "comfy-realtime.v1", "comfy-bearer"];
+
+function entry(id: string, realtimeBlock?: Record<string, unknown>): Record<string, unknown> {
+  const [provider, ...rest] = id.split("/");
+  return {
+    id,
+    provider,
+    model: rest.join("/"),
+    billing: {},
+    ...(realtimeBlock === undefined ? {} : { realtime: realtimeBlock }),
+  };
+}
+
+/**
+ * The catalog the stub Router serves: one entry per shape `connect` has to
+ * handle. Nothing about a route is known to the client but what is here.
+ */
+const CATALOG: Record<string, Record<string, unknown>> = Object.fromEntries(
+  [
+    entry("google/genie-4", {
+      connect_url: "/v2/realtime/google/google/genie-4",
+      method: "GET",
+      transport: "websocket",
+      wire_format: "json",
+      auth: ALL_AUTH,
+      billing_unit: "per_second",
+      max_session_seconds: 120,
+    }),
+    entry("fal-ai/live-avatar", {
+      connect_url: "/v2/realtime/fal/fal-ai/live-avatar",
+      method: "GET",
+      transport: "websocket_media_frames",
+      wire_format: "msgpack",
+      auth: ALL_AUTH,
+      billing_unit: "per_second",
+      max_session_seconds: 300,
+    }),
+    // A variant id: not addressable on the two-segment detail route, so it
+    // is found by walking the catalog.
+    entry("xai/grok-voice/realtime", {
+      connect_url: "/v2/realtime/fal/xai/grok-voice/realtime",
+      method: "GET",
+      transport: "websocket",
+      wire_format: "msgpack",
+      auth: ALL_AUTH,
+      billing_unit: "per_second",
+      max_session_seconds: 600,
+    }),
+    entry("fish/live-3", {
+      connect_url: "/v2/realtime/fish/sessions",
+      method: "POST",
+      transport: "session_post",
+      wire_format: "json",
+      auth: ["x-api-key", "comfy-bearer"],
+      billing_unit: "per_second",
+      max_session_seconds: 900,
+    }),
+    entry("fal-ai/lingbot-world-2", {
+      connect_url: "/v2/realtime/wma/fal",
+      method: "POST",
+      transport: "webrtc",
+      wire_format: "json",
+      auth: ["x-api-key"],
+      billing_unit: "per_second",
+      max_session_seconds: 120,
+    }),
+    entry("acme/key-only", {
+      connect_url: "/v2/realtime/acme/acme/key-only",
+      method: "GET",
+      transport: "websocket",
+      wire_format: "json",
+      auth: ["x-api-key"],
+    }),
+    entry("bfl/flux-2-pro"),
+  ].map((e) => [e.id as string, e]),
+);
+
+/** Entries per `GET /v2/models` page, small so the walk crosses pages. */
+const PAGE_SIZE = 2;
+
 interface Upgrade {
   url: string;
   headers: IncomingMessage["headers"];
 }
 
-/** A loopback `ws` server that accepts every upgrade and records it. */
-async function startAcceptingServer(): Promise<{
+interface CatalogRequest {
+  url: string;
+  authorization: string | undefined;
+}
+
+interface RouterOptions {
+  catalog?: Record<string, Record<string, unknown>>;
+  /** Never answer a catalog read. */
+  stallCatalog?: boolean;
+  /** Take over the upgrade; by default every upgrade is accepted over `ws`. */
+  upgrade?: (req: IncomingMessage, socket: Duplex, head: Buffer) => void;
+  handleProtocols?: (offered: Set<string>) => string | false;
+  onConnection?: (socket: WsWebSocket, req: IncomingMessage) => void;
+}
+
+/**
+ * A loopback stub Router: serves the catalog (`GET /v2/models` and
+ * `GET /v2/models/{provider}/{model}`) and, by default, accepts every
+ * WebSocket upgrade over `ws`, recording all of it.
+ */
+async function startRouter(options: RouterOptions = {}): Promise<{
   baseUrl: string;
   upgrades: Upgrade[];
   closes: number[];
+  catalogRequests: CatalogRequest[];
+  held: Duplex[];
   close(): Promise<void>;
 }> {
+  const catalog = options.catalog ?? CATALOG;
   const upgrades: Upgrade[] = [];
   const closes: number[] = [];
+  const catalogRequests: CatalogRequest[] = [];
+  const held: Duplex[] = [];
   const wss = new WebSocketServer({
-    port: 0,
-    host: "127.0.0.1",
-    handleProtocols: (offered) =>
-      offered.has(REALTIME_SUBPROTOCOL) ? REALTIME_SUBPROTOCOL : false,
+    noServer: true,
+    handleProtocols:
+      options.handleProtocols ??
+      ((offered) => (offered.has(REALTIME_SUBPROTOCOL) ? REALTIME_SUBPROTOCOL : false)),
   });
   wss.on("headers", (headers) => headers.push("X-Comfy-Request-Id: req-101"));
-  wss.on("connection", (socket, req) => {
+  wss.on("connection", (socket: WsWebSocket, req: IncomingMessage) => {
     upgrades.push({ url: req.url ?? "", headers: req.headers });
     socket.on("close", (code) => closes.push(code));
+    options.onConnection?.(socket, req);
   });
-  await new Promise<void>((resolve) => wss.once("listening", () => resolve()));
-  const { port } = wss.address() as AddressInfo;
+
+  const server: Server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    catalogRequests.push({ url: req.url ?? "", authorization: req.headers.authorization });
+    if (options.stallCatalog) return;
+    const json = (status: number, body: unknown, headers: Record<string, string> = {}) => {
+      res.writeHead(status, {
+        "Content-Type": "application/json",
+        "X-Comfy-Request-Id": "req-catalog",
+        ...headers,
+      });
+      res.end(JSON.stringify(body));
+    };
+    const url = new URL(req.url ?? "/", "http://stub");
+    if (url.pathname === "/v2/models") {
+      const all = Object.values(catalog);
+      const start = Number(url.searchParams.get("cursor") ?? "0");
+      const data = all.slice(start, start + PAGE_SIZE);
+      const more = start + PAGE_SIZE < all.length;
+      json(200, {
+        data,
+        has_more: more,
+        next_cursor: more ? String(start + PAGE_SIZE) : null,
+        limit: PAGE_SIZE,
+      });
+      return;
+    }
+    const match = /^\/v2\/models\/([^/]+)\/([^/]+)$/.exec(url.pathname);
+    const found = match ? catalog[`${match[1]}/${match[2]}`] : undefined;
+    if (found !== undefined) {
+      json(200, found);
+      return;
+    }
+    json(
+      404,
+      { detail: "Model not found.", error_type: "model_not_found" },
+      { "X-Comfy-Error-Type": "model_not_found" },
+    );
+  });
+  server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+    held.push(socket);
+    if (options.upgrade) {
+      options.upgrade(req, socket, head);
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const { port } = server.address() as AddressInfo;
   return {
     baseUrl: `http://127.0.0.1:${String(port)}`,
     upgrades,
     closes,
+    catalogRequests,
+    held,
     close: () =>
       new Promise((resolve) => {
         for (const client of wss.clients) client.terminate();
-        wss.close(() => resolve());
+        for (const socket of held) socket.destroy();
+        server.closeAllConnections();
+        wss.close();
+        server.close(() => resolve());
       }),
   };
 }
 
-/** A plain HTTP server that answers every upgrade with one scripted refusal. */
-async function startRefusingServer(
-  status: number,
-  headers: Record<string, string>,
-  body: string,
-): Promise<{ baseUrl: string; close(): Promise<void> }> {
-  const server: Server = createServer();
-  server.on("upgrade", (_req: IncomingMessage, socket: Duplex) => {
+/** An upgrade handler that answers with one scripted refusal. */
+function refusal(status: number, headers: Record<string, string>, body: string) {
+  return (_req: IncomingMessage, socket: Duplex) => {
     const lines = [
       `HTTP/1.1 ${String(status)} Refused`,
       ...Object.entries(headers).map(([k, v]) => `${k}: ${v}`),
@@ -80,18 +230,11 @@ async function startRefusingServer(
       body,
     ];
     socket.end(lines.join("\r\n"));
-  });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-  const { port } = server.address() as AddressInfo;
-  return {
-    baseUrl: `http://127.0.0.1:${String(port)}`,
-    close: () =>
-      new Promise((resolve) => {
-        server.closeAllConnections();
-        server.close(() => resolve());
-      }),
   };
 }
+
+/** An upgrade handler that takes the upgrade and never answers it. */
+const stall = () => {};
 
 const sessions: RealtimeSession[] = [];
 const cleanups: (() => Promise<void>)[] = [];
@@ -106,19 +249,19 @@ afterEach(async () => {
   config({ credentials: undefined, baseUrl: undefined });
 });
 
-async function accepting() {
-  const server = await startAcceptingServer();
+async function router(options?: RouterOptions) {
+  const server = await startRouter(options);
   cleanups.push(server.close);
   config({ baseUrl: server.baseUrl });
   return server;
 }
 
-async function refusing(status: number, headers: Record<string, string>, body: string) {
-  const server = await startRefusingServer(status, headers, body);
-  cleanups.push(server.close);
-  config({ baseUrl: server.baseUrl });
-  return server;
-}
+const accepting = () => router();
+
+const refusing = (status: number, headers: Record<string, string>, body: string) =>
+  router({ upgrade: refusal(status, headers, body) });
+
+const stalling = () => router({ upgrade: stall });
 
 async function open(model: string, options?: Parameters<typeof connect>[1]) {
   const session = await connect(model, { WebSocket: WsWebSocket, ...options });
@@ -148,7 +291,7 @@ class FailingWhatwgSocket extends EventTarget {
 }
 
 describe("constants", () => {
-  it("pins the broker's close codes and the route", () => {
+  it("pins the broker's close codes and the subprotocols", () => {
     expect(REALTIME_CLOSE_CODES).toEqual({
       normal: 1000,
       policyViolation: 1008,
@@ -156,14 +299,14 @@ describe("constants", () => {
       serviceRestart: 1012,
     });
     expect(Object.isFrozen(REALTIME_CLOSE_CODES)).toBe(true);
-    expect(REALTIME_ROUTE_TEMPLATE).toBe("/v2/realtime/{provider}/{model}");
     expect(REALTIME_SUBPROTOCOL).toBe("comfy-realtime.v1");
     expect(REALTIME_BEARER_SUBPROTOCOL_PREFIX).toBe("comfy-bearer.");
   });
 
-  it("serves genie-4 on the google leg and nothing else off the default", () => {
-    expect(REALTIME_SERVING_PROVIDERS).toEqual({ "google/genie-4": "google" });
-    expect(Object.isFrozen(REALTIME_SERVING_PROVIDERS)).toBe(true);
+  it("keeps no client-side serving table", async () => {
+    const mod: Record<string, unknown> = await import("./realtime.js");
+    expect(mod.REALTIME_SERVING_PROVIDERS).toBeUndefined();
+    expect(mod.REALTIME_ROUTE_TEMPLATE).toBeUndefined();
   });
 
   it("is reachable as comfy.realtime", () => {
@@ -173,56 +316,230 @@ describe("constants", () => {
   });
 });
 
-describe("the session URL", () => {
-  it("interpolates genie-4 whole after the google serving segment", async () => {
+describe("readRealtimeBlock", () => {
+  it("reads the documented block", () => {
+    expect(readRealtimeBlock(CATALOG["google/genie-4"])).toEqual({
+      connectUrl: "/v2/realtime/google/google/genie-4",
+      method: "GET",
+      transport: "websocket",
+      wireFormat: "json",
+      auth: ALL_AUTH,
+      billingUnit: "per_second",
+      maxSessionSeconds: 120,
+    });
+  });
+
+  it("answers null for an entry without a block", () => {
+    expect(readRealtimeBlock(CATALOG["bfl/flux-2-pro"])).toBeNull();
+    expect(readRealtimeBlock({ ...CATALOG["bfl/flux-2-pro"], realtime: null })).toBeNull();
+    expect(readRealtimeBlock(null)).toBeNull();
+  });
+
+  it("keeps a value this release does not know, for connect to refuse by name", () => {
+    const block = readRealtimeBlock({
+      realtime: {
+        connect_url: "/v2/realtime/x",
+        method: "GET",
+        transport: "carrier_pigeon",
+        wire_format: "json",
+        auth: [],
+      },
+    });
+    expect(block?.transport).toBe("carrier_pigeon");
+    expect(block?.billingUnit).toBeNull();
+    expect(block?.maxSessionSeconds).toBeNull();
+  });
+
+  it.each([
+    ["not an object", "ws"],
+    ["no connect_url", { method: "GET", transport: "websocket", wire_format: "json", auth: [] }],
+    [
+      "a full URL",
+      {
+        connect_url: "wss://elsewhere.example/v2/realtime/x",
+        method: "GET",
+        transport: "websocket",
+        wire_format: "json",
+        auth: [],
+      },
+    ],
+    [
+      "a protocol-relative URL",
+      {
+        connect_url: "//elsewhere.example/x",
+        method: "GET",
+        transport: "websocket",
+        wire_format: "json",
+        auth: [],
+      },
+    ],
+    [
+      "auth that is not a string array",
+      {
+        connect_url: "/v2/realtime/x",
+        method: "GET",
+        transport: "websocket",
+        wire_format: "json",
+        auth: "x-api-key",
+      },
+    ],
+  ])("refuses a block with %s", (_what, block) => {
+    let err: unknown;
+    try {
+      readRealtimeBlock({ realtime: block }, "acme/x");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ComfyError);
+    expect((err as ComfyError).code).toBe("unexpected_response");
+  });
+});
+
+describe("catalog-driven connect", () => {
+  it("opens google/genie-4 on the connect_url its catalog entry names, as JSON", async () => {
     const server = await accepting();
     const session = await open("google/genie-4");
+    expect(server.catalogRequests.map((r) => r.url)).toEqual(["/v2/models/google/genie-4"]);
+    expect(server.catalogRequests[0].authorization).toBe(`Bearer ${CREDENTIAL}`);
     expect(server.upgrades[0].url).toBe("/v2/realtime/google/google/genie-4");
     expect(session.url).toBe(
       `${server.baseUrl.replace("http:", "ws:")}/v2/realtime/google/google/genie-4`,
     );
-    expect(session.provider).toBe("google");
     expect(session.wireFormat).toBe("json");
+    expect(session.transport).toBe("websocket");
     expect(session.model).toBe("google/genie-4");
+    expect(session.realtime.maxSessionSeconds).toBe(120);
+    expect(session.realtime.billingUnit).toBe("per_second");
+    expect(session).not.toHaveProperty("provider");
   });
 
-  it("puts a three-segment id on the default fal leg", async () => {
+  it("opens a fal msgpack model found by walking the catalog", async () => {
     const server = await accepting();
     const session = await open("xai/grok-voice/realtime");
+    // A variant id is not addressable on the detail route, so the pages are walked.
+    expect(server.catalogRequests.map((r) => r.url)).toEqual(["/v2/models", "/v2/models?cursor=2"]);
     expect(server.upgrades[0].url).toBe("/v2/realtime/fal/xai/grok-voice/realtime");
-    expect(session.provider).toBe("fal");
     expect(session.wireFormat).toBe("msgpack");
   });
 
-  it("lets options.provider override the serving table", async () => {
+  it("opens a websocket_media_frames transport as a WebSocket too", async () => {
     const server = await accepting();
-    const session = await open("acme/new-voice", { provider: "google" });
-    expect(server.upgrades[0].url).toBe("/v2/realtime/google/acme/new-voice");
-    expect(session.wireFormat).toBe("json");
+    const session = await open("fal-ai/live-avatar");
+    expect(server.upgrades[0].url).toBe("/v2/realtime/fal/fal-ai/live-avatar");
+    expect(session.transport).toBe("websocket_media_frames");
+    expect(session.wireFormat).toBe("msgpack");
+  });
+
+  it("follows the catalog when the route moves, with nothing to update client-side", async () => {
+    const moved = {
+      ...CATALOG,
+      "google/genie-4": entry("google/genie-4", {
+        connect_url: "/v2/realtime/comfy/google/genie-4",
+        method: "GET",
+        transport: "websocket",
+        wire_format: "json",
+        auth: ALL_AUTH,
+      }),
+    };
+    const server = await router({ catalog: moved });
+    await open("google/genie-4");
+    expect(server.upgrades[0].url).toBe("/v2/realtime/comfy/google/genie-4");
   });
 
   it.each([
-    ["fal-ai/lingbot-world-2", "POST /v2/realtime/wma/fal"],
-    ["fal-ai/abot-world-0", "POST /v2/realtime/wma/fal"],
-    ["fish/live-3", "POST /v2/realtime/fish/sessions"],
-    ["reactor/anything", "not served"],
-  ])("refuses %s client-side, naming where it is served", async (model, where) => {
-    FailingWhatwgSocket.constructed = 0;
-    const err = await connect(model, { WebSocket: FailingWhatwgSocket }).catch((e: unknown) => e);
+    ["fish/live-3", "POST /v2/realtime/fish/sessions", "session_post"],
+    ["fal-ai/lingbot-world-2", "POST /v2/realtime/wma/fal", "webrtc"],
+  ])(
+    "refuses %s from its catalog block, before any socket opens",
+    async (model, where, transport) => {
+      const server = await accepting();
+      FailingWhatwgSocket.constructed = 0;
+      const err = await connect(model, { WebSocket: FailingWhatwgSocket }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ComfyError);
+      expect((err as ComfyError).code).toBe("realtime_unsupported_transport");
+      expect((err as Error).message).toContain(where);
+      expect((err as Error).message).toContain(transport);
+      expect((err as ComfyError).details?.realtime).toMatchObject({ transport });
+      expect(FailingWhatwgSocket.constructed).toBe(0);
+      expect(server.upgrades).toEqual([]);
+    },
+  );
+
+  it("refuses a model whose catalog entry has no realtime block", async () => {
+    const server = await accepting();
+    const err = await connect("bfl/flux-2-pro", { WebSocket: WsWebSocket }).catch(
+      (e: unknown) => e,
+    );
     expect(err).toBeInstanceOf(ComfyError);
     expect((err as ComfyError).code).toBe("realtime_unsupported_model");
-    expect((err as Error).message).toContain(where);
-    expect(FailingWhatwgSocket.constructed).toBe(0);
+    expect((err as Error).message).toContain("no `realtime` block");
+    expect((err as ComfyError).requestId).toBe("req-catalog");
+    expect(server.upgrades).toEqual([]);
   });
 
-  it("lets an explicit provider reach a model the table refuses", async () => {
+  it("raises NotFound for a model the catalog does not have", async () => {
+    await accepting();
+    const err = await connect("acme/nope", { WebSocket: WsWebSocket }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(NotFound);
+    expect((err as ComfyError).code).toBe("model_not_found");
+  });
+
+  it("raises NotFound for a variant id the catalog walk does not find", async () => {
+    await accepting();
+    const err = await connect("acme/nope/realtime", { WebSocket: WsWebSocket }).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(NotFound);
+  });
+
+  it("does not offer comfy-realtime.v1 when the block does not list it", async () => {
     const server = await accepting();
-    await open("fish/live-3", { provider: "fal" });
-    expect(server.upgrades[0].url).toBe("/v2/realtime/fal/fish/live-3");
+    const session = await open("acme/key-only");
+    expect(server.upgrades[0].headers["sec-websocket-protocol"]).toBeUndefined();
+    expect(server.upgrades[0].headers["x-api-key"]).toBe(CREDENTIAL);
+    expect(session.subprotocol).toBe("");
+  });
+
+  it("refuses an idToken on a block that does not accept comfy-bearer", async () => {
+    const server = await accepting();
+    const err = await connect("acme/key-only", { idToken: "tok", WebSocket: WsWebSocket }).catch(
+      (e: unknown) => e,
+    );
+    expect((err as ComfyError).code).toBe("realtime_unsupported_auth");
+    expect((err as Error).message).not.toContain("comfy-bearer.tok");
+    expect(server.upgrades).toEqual([]);
+  });
+
+  it("refuses an API key on a block that does not accept x-api-key", async () => {
+    const server = await router({
+      catalog: {
+        "acme/token-only": entry("acme/token-only", {
+          connect_url: "/v2/realtime/acme/acme/token-only",
+          method: "GET",
+          transport: "websocket",
+          wire_format: "json",
+          auth: ["comfy-realtime.v1", "comfy-bearer"],
+        }),
+      },
+    });
+    const err = await connect("acme/token-only", { WebSocket: WsWebSocket }).catch(
+      (e: unknown) => e,
+    );
+    expect((err as ComfyError).code).toBe("realtime_unsupported_auth");
+    expect(server.upgrades).toEqual([]);
+  });
+
+  it("refuses options.provider: callers never name a serving leg", async () => {
+    await expect(
+      connect("google/genie-4", {
+        provider: "google",
+        WebSocket: FailingWhatwgSocket,
+      } as Parameters<typeof connect>[1]),
+    ).rejects.toThrow("options.provider");
   });
 
   it.each(["genie-4", "google/", "Google/genie-4", "a/../b", "a/./b", "a//b", "a/b?c", 42])(
-    "rejects the invalid id %j before any socket opens",
+    "rejects the invalid id %j before any request",
     async (model) => {
       FailingWhatwgSocket.constructed = 0;
       await expect(
@@ -231,12 +548,6 @@ describe("the session URL", () => {
       expect(FailingWhatwgSocket.constructed).toBe(0);
     },
   );
-
-  it("refuses an unknown provider override", async () => {
-    await expect(
-      connect("google/genie-4", { provider: "aws" as "fal", WebSocket: FailingWhatwgSocket }),
-    ).rejects.toBeInstanceOf(TypeError);
-  });
 });
 
 describe("auth", () => {
@@ -313,8 +624,8 @@ describe("auth", () => {
   });
 
   it("names a base URL's credentials on a WHATWG constructor, not MissingCredentials", async () => {
-    await accepting();
-    config({ baseUrl: "http://user:secret@127.0.0.1:1" });
+    const server = await accepting();
+    config({ baseUrl: server.baseUrl.replace("http://", "http://user:secret@") });
     const err = await connect("google/genie-4", { WebSocket: FailingWhatwgSocket }).catch(
       (e: unknown) => e,
     );
@@ -330,6 +641,7 @@ describe("auth", () => {
     const pending = connect("google/genie-4");
     config({ credentials: "comfyui-reconfigured", baseUrl: "http://127.0.0.1:1" });
     sessions.push(await pending);
+    expect(server.catalogRequests[0].authorization).toBe(`Bearer ${CREDENTIAL}`);
     expect(server.upgrades[0].headers["x-api-key"]).toBe(CREDENTIAL);
   });
 
@@ -361,6 +673,7 @@ describe("auth", () => {
   });
 
   it("rethrows a constructor failure that is not about the init shape", async () => {
+    await accepting();
     function CspWebSocket(): never {
       throw new DOMException("blocked by CSP", "SecurityError");
     }
@@ -372,6 +685,7 @@ describe("auth", () => {
   });
 
   it("raises MissingCredentials on a standards-only constructor in key mode", async () => {
+    await accepting();
     class StrictWebSocket extends FailingWhatwgSocket {
       constructor(url: string, init: unknown) {
         if (!Array.isArray(init)) throw new SyntaxError("invalid subprotocol");
@@ -386,6 +700,7 @@ describe("auth", () => {
   it("sends an idToken as the comfy-bearer subprotocol and no credential header", async () => {
     const server = await accepting();
     const session = await open("google/genie-4", { idToken: "tok123" });
+    expect(server.catalogRequests[0].authorization).toBe("Bearer tok123");
     const { headers } = server.upgrades[0];
     expect(headers["x-api-key"]).toBeUndefined();
     expect(headers.authorization).toBeUndefined();
@@ -473,6 +788,7 @@ describe("refusals", () => {
   });
 
   it("raises RealtimeUpgradeFailed from a WHATWG transport that cannot read the refusal", async () => {
+    await accepting();
     const err = await connect("google/genie-4", { WebSocket: FailingWhatwgSocket }).catch(
       (e: unknown) => e,
     );
@@ -491,49 +807,24 @@ describe("refusals", () => {
 
 describe("subprotocol", () => {
   it("closes and rejects a 101 that selected the bearer entry, without echoing the token", async () => {
-    const wss = new WebSocketServer({
-      port: 0,
-      host: "127.0.0.1",
+    const server = await router({
       handleProtocols: (offered) =>
         [...offered].find((p) => p.startsWith("comfy-bearer.")) ?? false,
     });
-    const closes: number[] = [];
-    wss.on("connection", (socket) => socket.on("close", (code) => closes.push(code)));
-    cleanups.push(() => new Promise((resolve) => wss.close(() => resolve())));
-    await new Promise<void>((resolve) => wss.once("listening", () => resolve()));
-    config({ baseUrl: `http://127.0.0.1:${String((wss.address() as AddressInfo).port)}` });
-
     const err = await connect("google/genie-4", {
       idToken: "secret-token",
       WebSocket: WsWebSocket,
     }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(RealtimeUpgradeFailed);
     expect((err as Error).message).not.toContain("secret-token");
-    await expect.poll(() => closes).toEqual([1000]);
+    await expect.poll(() => server.closes).toEqual([1000]);
   });
 });
 
 describe("timeout", () => {
-  /** A plain HTTP server that takes every upgrade and never answers it. */
-  async function stalling(): Promise<Duplex[]> {
-    const server = createServer();
-    const held: Duplex[] = [];
-    server.on("upgrade", (_req: IncomingMessage, socket: Duplex) => held.push(socket));
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-    cleanups.push(
-      () =>
-        new Promise((resolve) => {
-          for (const socket of held) socket.destroy();
-          server.close(() => resolve());
-        }),
-    );
-    config({ baseUrl: `http://127.0.0.1:${String((server.address() as AddressInfo).port)}` });
-    return held;
-  }
-
   it("applies the 30s default deadline when timeoutMs is omitted", async () => {
     expect(DEFAULT_REALTIME_CONNECT_TIMEOUT_MS).toBe(30_000);
-    const held = await stalling();
+    const { held } = await stalling();
     // Stand in for the 30s clock so the test does not wait it out.
     const realTimeout = AbortSignal.timeout.bind(AbortSignal);
     const requested: number[] = [];
@@ -567,43 +858,33 @@ describe("timeout", () => {
   });
 
   it("rejects with request_timeout when the server never answers the upgrade", async () => {
-    const server = createServer();
-    const held: Duplex[] = [];
-    server.on("upgrade", (_req: IncomingMessage, socket: Duplex) => held.push(socket));
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-    cleanups.push(
-      () =>
-        new Promise((resolve) => {
-          for (const socket of held) socket.destroy();
-          server.close(() => resolve());
-        }),
-    );
-    config({ baseUrl: `http://127.0.0.1:${String((server.address() as AddressInfo).port)}` });
+    await stalling();
     const err = await connect("google/genie-4", { timeoutMs: 50, WebSocket: WsWebSocket }).catch(
       (e: unknown) => e,
     );
     expect(err).toBeInstanceOf(ComfyError);
     expect((err as ComfyError).code).toBe("request_timeout");
+    expect((err as Error).message).toContain("WebSocket upgrade");
+  });
+
+  it("bounds a catalog read that never answers by the same deadline", async () => {
+    const server = await router({ stallCatalog: true });
+    const err = await connect("google/genie-4", { timeoutMs: 50, WebSocket: WsWebSocket }).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ComfyError);
+    expect((err as ComfyError).code).toBe("request_timeout");
+    expect((err as Error).message).toContain("catalog read");
+    expect(server.upgrades).toEqual([]);
   });
 
   it("rejects with the typed class when a refusal's body stalls past the deadline", async () => {
-    const server = createServer();
-    const held: Duplex[] = [];
-    server.on("upgrade", (_req: IncomingMessage, socket: Duplex) => {
-      held.push(socket);
-      socket.write("HTTP/1.1 402 Refused\r\nContent-Length: 100\r\n\r\n{");
+    await router({
+      upgrade: (_req, socket) =>
+        socket.write("HTTP/1.1 402 Refused\r\nContent-Length: 100\r\n\r\n{"),
     });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-    cleanups.push(
-      () =>
-        new Promise((resolve) => {
-          for (const socket of held) socket.destroy();
-          server.close(() => resolve());
-        }),
-    );
-    config({ baseUrl: `http://127.0.0.1:${String((server.address() as AddressInfo).port)}` });
     const started = Date.now();
-    const err = await connect("google/genie-4", { timeoutMs: 50, WebSocket: WsWebSocket }).catch(
+    const err = await connect("google/genie-4", { timeoutMs: 200, WebSocket: WsWebSocket }).catch(
       (e: unknown) => e,
     );
     // Still bounded by the deadline, but the status line already named the bucket.
@@ -613,30 +894,19 @@ describe("timeout", () => {
   });
 
   it("keeps the refusalCode a stalled refusal had already sent", async () => {
-    const server = createServer();
-    const held: Duplex[] = [];
     const body = JSON.stringify({
       detail: "A session is already live.",
       error_type: "concurrency_limit_exceeded",
       code: "router.realtime.session_already_live",
     });
-    server.on("upgrade", (_req: IncomingMessage, socket: Duplex) => {
-      held.push(socket);
+    await router({
       // The whole envelope, under a Content-Length that promises more.
-      socket.write(
-        `HTTP/1.1 429 Refused\r\nContent-Length: ${String(body.length + 100)}\r\n\r\n${body}`,
-      );
+      upgrade: (_req, socket) =>
+        socket.write(
+          `HTTP/1.1 429 Refused\r\nContent-Length: ${String(body.length + 100)}\r\n\r\n${body}`,
+        ),
     });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-    cleanups.push(
-      () =>
-        new Promise((resolve) => {
-          for (const socket of held) socket.destroy();
-          server.close(() => resolve());
-        }),
-    );
-    config({ baseUrl: `http://127.0.0.1:${String((server.address() as AddressInfo).port)}` });
-    const err = await connect("google/genie-4", { timeoutMs: 200, WebSocket: WsWebSocket }).catch(
+    const err = await connect("google/genie-4", { timeoutMs: 300, WebSocket: WsWebSocket }).catch(
       (e: unknown) => e,
     );
     expect(err).toBeInstanceOf(routerErrors.ConcurrencyLimitExceeded);
@@ -647,28 +917,17 @@ describe("timeout", () => {
   });
 
   it("rejects with the abort reason when the caller aborts during a stalled refusal", async () => {
-    const server = createServer();
-    const held: Duplex[] = [];
-    server.on("upgrade", (_req: IncomingMessage, socket: Duplex) => {
-      held.push(socket);
-      socket.write("HTTP/1.1 402 Refused\r\nContent-Length: 100\r\n\r\n{");
+    await router({
+      upgrade: (_req, socket) =>
+        socket.write("HTTP/1.1 402 Refused\r\nContent-Length: 100\r\n\r\n{"),
     });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-    cleanups.push(
-      () =>
-        new Promise((resolve) => {
-          for (const socket of held) socket.destroy();
-          server.close(() => resolve());
-        }),
-    );
-    config({ baseUrl: `http://127.0.0.1:${String((server.address() as AddressInfo).port)}` });
     const controller = new AbortController();
     const pending = connect("google/genie-4", {
       signal: controller.signal,
       timeoutMs: null,
       WebSocket: WsWebSocket,
     });
-    setTimeout(() => controller.abort(new Error("gave up")), 50);
+    setTimeout(() => controller.abort(new Error("gave up")), 100);
     await expect(pending).rejects.toThrow("gave up");
   });
 
@@ -690,25 +949,26 @@ describe("abort", () => {
 
   it("rejects a pending connect with the abort reason", async () => {
     // A server that never answers the upgrade keeps the connect pending.
-    const server = createServer();
-    const held: Duplex[] = [];
-    server.on("upgrade", (_req: IncomingMessage, socket: Duplex) => held.push(socket));
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-    cleanups.push(
-      () =>
-        new Promise((resolve) => {
-          for (const socket of held) socket.destroy();
-          server.close(() => resolve());
-        }),
-    );
-    config({ baseUrl: `http://127.0.0.1:${String((server.address() as AddressInfo).port)}` });
+    const { held } = await stalling();
     const controller = new AbortController();
     const pending = connect("google/genie-4", {
       signal: controller.signal,
       WebSocket: WsWebSocket,
     });
-    setTimeout(() => controller.abort(new Error("gave up")), 20);
+    await expect.poll(() => held.length).toBe(1);
+    controller.abort(new Error("gave up"));
     await expect(pending).rejects.toThrow("gave up");
+  });
+
+  it("rejects with the abort reason during the catalog read", async () => {
+    await router({ stallCatalog: true });
+    const controller = new AbortController();
+    const pending = connect("google/genie-4", {
+      signal: controller.signal,
+      WebSocket: WsWebSocket,
+    });
+    setTimeout(() => controller.abort(new Error("gave up early")), 20);
+    await expect(pending).rejects.toThrow("gave up early");
   });
 
   it("closes an open session with 1000", async () => {
@@ -748,17 +1008,10 @@ describe("abort", () => {
 
 describe("after open", () => {
   it("survives a malformed frame on ws when the caller listens only for close", async () => {
-    const wss = new WebSocketServer({
-      port: 0,
-      host: "127.0.0.1",
-      handleProtocols: () => REALTIME_SUBPROTOCOL,
-    });
-    cleanups.push(() => new Promise((resolve) => wss.close(() => resolve())));
     // A frame with every reserved bit set, which `ws` rejects with `error` then `close`.
-    wss.on("connection", (_socket, req) => req.socket.write(Buffer.from([0xf1, 0x00])));
-    await new Promise<void>((resolve) => wss.once("listening", () => resolve()));
-    config({ baseUrl: `http://127.0.0.1:${String((wss.address() as AddressInfo).port)}` });
-
+    await router({
+      onConnection: (_socket, req) => req.socket.write(Buffer.from([0xf1, 0x00])),
+    });
     const session = await open("google/genie-4");
     const closed = new Promise<number>((resolve) =>
       session.socket.addEventListener("close", (event) => resolve(event.code)),
@@ -769,16 +1022,9 @@ describe("after open", () => {
   });
 
   it("types a message event's data for the caller", async () => {
-    const wss = new WebSocketServer({
-      port: 0,
-      host: "127.0.0.1",
-      handleProtocols: () => REALTIME_SUBPROTOCOL,
+    await router({
+      onConnection: (socket) => socket.on("message", (data) => socket.send(String(data))),
     });
-    cleanups.push(() => new Promise((resolve) => wss.close(() => resolve())));
-    wss.on("connection", (socket) => socket.on("message", (data) => socket.send(String(data))));
-    await new Promise<void>((resolve) => wss.once("listening", () => resolve()));
-    config({ baseUrl: `http://127.0.0.1:${String((wss.address() as AddressInfo).port)}` });
-
     const session = await open("google/genie-4");
     const received = new Promise<unknown>((resolve) =>
       session.socket.addEventListener("message", (event) => {
