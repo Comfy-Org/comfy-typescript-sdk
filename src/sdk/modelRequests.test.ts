@@ -237,6 +237,68 @@ describe("comfy.models.submit", () => {
   });
 });
 
+describe("a queue call whose error body is cut off mid-read", () => {
+  it("raises the typed router error its status and headers describe, with the read failure as cause", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 422;
+      server.state.errorType = "invalid_input";
+      server.state.cutBodyTimes = 1;
+
+      const err = (await comfy.models
+        .submit(MODEL, {}, { retry: false })
+        .catch((e: unknown) => e)) as routerErrors.RouterError;
+
+      expect(err).toBeInstanceOf(routerErrors.InvalidInput);
+      expect(err).toBeInstanceOf(routerErrors.RouterError);
+      expect(err.httpStatus).toBe(422);
+      expect(err.errorType).toBe("invalid_input");
+      expect(err.requestId).toBe(REQUEST_ID);
+      expect(err.cause).toBeInstanceOf(TypeError);
+      // The body was never read, so the message must not summarize one.
+      expect(err.message).toBe("HTTP 422");
+      expect((err as routerErrors.InvalidInput).detail).toEqual([]);
+      expect(server.state.requestCount).toBe(1);
+    });
+  });
+
+  it("covers the handle's reads too, and keeps cause non-enumerable", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = (request) =>
+        request.method === "GET" && request.path === STATUS_PATH
+          ? { status: 404, errorType: "request_not_found", cutBody: true }
+          : null;
+
+      const err = (await comfy.models
+        .handle(MODEL, REQUEST_ID)
+        .status({ retry: false })
+        .catch((e: unknown) => e)) as routerErrors.RouterError;
+
+      expect(err).toBeInstanceOf(routerErrors.RequestNotFound);
+      expect(err.httpStatus).toBe(404);
+      expect(err.message).toBe("HTTP 404");
+      expect(err.requestId).toBe(REQUEST_ID);
+      expect(err.cause).toBeInstanceOf(TypeError);
+      expect(Object.keys(err)).not.toContain("cause");
+      expect(server.state.requestCount).toBe(1);
+    });
+  });
+
+  it("does not re-dress a 2xx whose body was cut: that is still the raw read failure", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 201;
+      server.state.cutBodyTimes = 1;
+
+      const err = await comfy.models.submit(MODEL, {}, { retry: false }).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(TypeError);
+      expect(err).not.toBeInstanceOf(ComfyError);
+    });
+  });
+});
+
 describe("comfy.models.submit stamps the Idempotency-Key onto every failure", () => {
   it("stamps a raw transport failure, preserving its TypeError identity", async () => {
     await withRouterStub(async (server) => {

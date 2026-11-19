@@ -59,4 +59,36 @@ describe("errorFromEnvelope", () => {
     const err = errorFromEnvelope(500, { error: { code: "weird_new_code", message: "?" } });
     expect(err.constructor.name).toBe("ApiError");
   });
+
+  it.each(["constructor", "toString", "__proto__", "hasOwnProperty"])(
+    "never resolves a code of %s off Object.prototype",
+    (code) => {
+      const err = errorFromEnvelope(500, { error: { code, message: "?" } });
+      expect(err.constructor.name).toBe("ApiError");
+      expect(err.code).toBe(code);
+      expect(err.message).toBe("?");
+    },
+  );
+
+  it.each([[["a", "b"]], [{ toString: null }], [42]])(
+    "reads a non-string message %j as absent, not as the error's text",
+    (message) => {
+      const err = errorFromEnvelope(503, {
+        error: { code: "queue_full", message: message as unknown as string },
+      });
+      expect(err).toBeInstanceOf(QueueFull);
+      expect(err.message).toBe("HTTP 503");
+    },
+  );
+
+  it.each([[["queue_full"]], [{ toString: null }], [42]])(
+    "reads a non-string code %j as absent, not as a lookup key",
+    (code) => {
+      const err = errorFromEnvelope(503, {
+        error: { code: code as unknown as string, message: "?" },
+      });
+      expect(err.constructor.name).toBe("ApiError");
+      expect(err.code).toBe("error");
+    },
+  );
 });

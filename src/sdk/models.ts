@@ -898,8 +898,17 @@ interface ErrorBody {
 function describeValidationFailures(detail: readonly unknown[]): string {
   const described = detail.map((entry) => {
     const item = (entry ?? {}) as { loc?: unknown; msg?: unknown; type?: unknown };
-    const loc = Array.isArray(item.loc) ? item.loc.join(".") : "";
-    const msg = typeof item.msg === "string" ? item.msg : String(item.type ?? "invalid");
+    // Only strings and numbers are stringified: this runs on the error path, and
+    // an entry off the wire with no usable `toString` must not throw from it.
+    const loc = Array.isArray(item.loc)
+      ? item.loc.filter((seg) => typeof seg === "string" || typeof seg === "number").join(".")
+      : "";
+    const msg =
+      typeof item.msg === "string"
+        ? item.msg
+        : typeof item.type === "string"
+          ? item.type
+          : "invalid";
     return loc ? `${loc}: ${msg}` : msg;
   });
   const count =
@@ -926,6 +935,7 @@ function errorFromResponse(
   response: Response,
   bodyText: string,
   idempotencyKey: string | null,
+  cause?: unknown,
 ): ComfyError {
   const status = response.status;
   const requestId = response.headers.get(REQUEST_ID_HEADER);
@@ -953,7 +963,10 @@ function errorFromResponse(
     message = `HTTP ${String(status)}`;
   }
 
-  const cls = BY_ERROR_TYPE[code] ?? ComfyError;
+  // Own-property lookup only, as `toRouterError` does: a plain index would
+  // resolve an `X-Comfy-Error-Type` of `constructor` or `toString` off
+  // `Object.prototype` and hand back something that is not a ComfyError.
+  const cls = Object.hasOwn(BY_ERROR_TYPE, code) ? BY_ERROR_TYPE[code] : ComfyError;
   return new cls(message, {
     code,
     httpStatus: status,
@@ -968,6 +981,9 @@ function errorFromResponse(
     // `requestId` is already on the error to avoid.
     retryAfter: parseRetryAfter(response.headers),
     idempotencyKey,
+    // Only when given: `ComfyError` sets `cause` on the presence of the key,
+    // so passing `undefined` through would still stamp an empty one.
+    ...(cause === undefined ? {} : { cause }),
   });
 }
 
@@ -1354,6 +1370,15 @@ async function run<TData = unknown>(
       // Non-null once this response has been classified as one to ask again
       // about, and is then the backoff before that re-ask.
       let repeatAfterMs: number | null = null;
+      // The non-2xx response whose body read failed. Kept because its status
+      // and headers are already a complete verdict: once no retry remains, the
+      // typed error they describe is what this call owes, not the reader's
+      // `TypeError: terminated`.
+      //
+      // Asserted rather than annotated: TypeScript does not see the assignment
+      // inside the inner `catch` reach the outer one, and would narrow this to
+      // `null` there for good.
+      let unreadError = null as Response | null;
       try {
         // `withInactivityLimits` derives undici's own headers/body timers from
         // the same remaining budget as `signal`. Without it this call is capped
@@ -1414,7 +1439,12 @@ async function run<TData = unknown>(
           // the `Content-Type`. Decoding is deferred to the one branch that wants
           // a string ({@link decodeUtf8}), which is what `text()` would have done
           // anyway.
-          responseBody = await readBodyWithin(response, maxBytes, model, idempotencyKey);
+          try {
+            responseBody = await readBodyWithin(response, maxBytes, model, idempotencyKey);
+          } catch (exc) {
+            if (!response.ok) unreadError = response;
+            throw exc;
+          }
         } else {
           // Never read: the whole content of a response this call is going to
           // ask again about is "ask again", which the status line already said.
@@ -1439,6 +1469,11 @@ async function run<TData = unknown>(
         // A caller's abort is theirs: never retried, never re-dressed.
         if (options.signal?.aborted) throw exc;
         const delay = nextDelayMs();
+        // After the three exits above on purpose, so a cap breach, a deadline
+        // and a caller abort are never re-dressed as the status they cut short.
+        if (delay === null && unreadError !== null) {
+          throw errorFromResponse(unreadError, "", idempotencyKey, exc);
+        }
         // Out of budget. If this call was COLLECTING, `collectingAt` holds the
         // pace Router named on the 409/504 that started the collect, and the
         // generation is still the server's to hand over — so the failure goes
@@ -1897,6 +1932,11 @@ async function discoveryFetch(
   const timeoutMs =
     options.timeoutMs === undefined ? DEFAULT_DISCOVERY_TIMEOUT_MS : options.timeoutMs;
   const signal = composeSignal(options.signal, timeoutMs);
+  // The non-2xx response whose body read failed, as in `run`: its status and
+  // headers are already the verdict, and with no retry here the first cut-off
+  // read would otherwise surface as the reader's `TypeError: terminated`.
+  // Asserted rather than annotated for the same narrowing reason as there.
+  let unreadError = null as Response | null;
   try {
     const response = await fetch(
       url,
@@ -1906,7 +1946,13 @@ async function discoveryFetch(
     // the deadline covers reading the body too, and translating the abort in
     // only one of the two places would leak a bare DOMException out of the
     // other. A `304` has no body and `.text()` answers "" for it.
-    const text = await response.text();
+    let text: string;
+    try {
+      text = await response.text();
+    } catch (exc) {
+      if (!response.ok) unreadError = response;
+      throw exc;
+    }
     return { response, text };
   } catch (exc) {
     if (isTimeout(exc, options.signal)) {
@@ -1916,6 +1962,10 @@ async function discoveryFetch(
         { code: "request_timeout", cause: exc },
       );
     }
+    // After the deadline and the caller's abort, so neither is re-dressed as
+    // the status it cut short.
+    if (options.signal?.aborted) throw exc;
+    if (unreadError !== null) throw errorFromResponse(unreadError, "", null, exc);
     throw exc;
   }
 }

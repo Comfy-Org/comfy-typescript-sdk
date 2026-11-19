@@ -585,6 +585,15 @@ async function send(call: QueueCall): Promise<QueueResponse> {
     const signal = composeSignal(call.signal, requestMs);
     let response: Response;
     let bodyText: string;
+    // The non-2xx response whose body read failed. Kept because its status
+    // and headers are already a complete verdict: once no retry remains, the
+    // typed router error they describe is what this call owes, not the
+    // reader's `TypeError: terminated`.
+    //
+    // Asserted rather than annotated: TypeScript does not see the assignment
+    // inside the inner `catch` reach the outer one, and would narrow this to
+    // `null` there for good.
+    let unreadError = null as Response | null;
     try {
       response = await fetch(
         call.url,
@@ -594,7 +603,12 @@ async function send(call: QueueCall): Promise<QueueResponse> {
       // body consumption too, so a signal that fires while the body is still
       // streaming rejects HERE, and translating it in only one of the two
       // places would leak a bare DOMException out of the other.
-      bodyText = await response.text();
+      try {
+        bodyText = await response.text();
+      } catch (exc) {
+        if (!response.ok) unreadError = response;
+        throw exc;
+      }
     } catch (exc) {
       // A caller's abort is theirs: never retried, never re-dressed.
       if (call.signal?.aborted) throw exc;
@@ -605,6 +619,27 @@ async function send(call: QueueCall): Promise<QueueResponse> {
         );
       }
       const delay = nextAttemptDelayMs(attempt, retry, clock());
+      // After the two exits above on purpose, so a deadline and a caller
+      // abort are never re-dressed as the status they cut short.
+      if (delay === null && unreadError !== null) {
+        // A string `detail` names the message outright, so this reads `HTTP 422`
+        // like the `models.run` twin — not `InvalidInput`'s "rejected as invalid"
+        // summary of an empty `detail[]`, which would claim a body it never read.
+        const error = toRouterError(unreadError.status, unreadError.headers, {
+          detail: `HTTP ${String(unreadError.status)}`,
+        });
+        // Defined rather than assigned, so `cause` is the non-enumerable own
+        // property ES2022's `new Error(msg, { cause })` makes — the shape the
+        // `models.run` twin of this path gets — and a structured logger or
+        // `JSON.stringify` does not walk into the raw transport failure.
+        Object.defineProperty(error, "cause", {
+          value: exc,
+          writable: true,
+          configurable: true,
+          enumerable: false,
+        });
+        throw error;
+      }
       if (delay === null) throw exc;
       await abortableSleep(delay, call.signal);
       attempt += 1;

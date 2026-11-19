@@ -297,6 +297,34 @@ describe("comfy.models.schema", () => {
     });
   });
 
+  it("raises the typed error its status describes when the error body is cut off", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.status = 404;
+      server.state.errorType = "model_not_found";
+      server.state.cutBodyTimes = 1;
+
+      const err = (await comfy.models.schema("bfl/nope").catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(NotFound);
+      expect(err.code).toBe("model_not_found");
+      expect(err.httpStatus).toBe(404);
+      expect(err.requestId).toBe(REQUEST_ID);
+      expect(err.cause).toBeInstanceOf(TypeError);
+      expect(server.state.requestCount).toBe(1);
+    });
+  });
+
+  it("does not re-dress a 200 whose body was cut: that is still the raw read failure", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.cutBodyTimes = 1;
+      const err = await comfy.models.schema(MODEL).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(TypeError);
+      expect(err).not.toBeInstanceOf(ComfyError);
+    });
+  });
+
   it("maps an unauthorized read through the same table run uses", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
