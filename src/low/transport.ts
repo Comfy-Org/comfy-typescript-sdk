@@ -556,9 +556,6 @@ export class ComfyLow {
    * `GET /api/v2/jobs` — one page of the caller's jobs, newest first. Every
    * `metadata` pair is sent as `metadata[key]=value` and must match exactly.
    * Pass the previous page's `next_cursor` as `cursor` for the next page.
-   *
-   * Ahead of the vendored spec: the operation joins {@link OPERATION_IDS}
-   * when the spec sync that adds it lands.
    */
   async listJobs(
     options: {
@@ -675,6 +672,7 @@ export const OPERATION_IDS = [
   "deleteAsset",
   "getAssetContent",
   "postJobs",
+  "listJobs",
   "getJob",
   "getJobWorkflow",
   "getJobLogs",
@@ -691,6 +689,7 @@ export const OPERATION_METHODS: Record<(typeof OPERATION_IDS)[number], keyof Com
   deleteAsset: "deleteAsset",
   getAssetContent: "getAssetContent",
   postJobs: "postJobs",
+  listJobs: "listJobs",
   getJob: "getJob",
   getJobWorkflow: "getJobWorkflow",
   getJobLogs: "getJobLogs",

@@ -35,6 +35,29 @@ entry. See CONTRIBUTING.md.
   `content_policy_violation` now names the refused input/output, read from
   `X-Comfy-Refusal-Subject` with a fallback to the body's `refusal_subject`;
   `null` when unnamed.
+- **A failed job's category reads as a typed value.** The v2 contract's
+  `JobError.category` says why a user-caused failure on a serverless
+  deployment happened. `job.failureCategory` and `JobFailed.failureCategory`
+  read it as a `FailureCategory` (`invalid_input`, `content_refused`,
+  `out_of_gpu_memory`, `missing_model_or_node`, `workflow_logic` or `other`),
+  or `null` when the error names none. A string the SDK does not know reads
+  as `other`, as the contract has clients tolerate it, while
+  `job.error.category` keeps the raw string. `FailureCategory` is exported
+  from the package root.
+- **A terminal `statusChange` event carries the job's error.** The stream's
+  status frame declares only the status, so on a terminal status other than
+  `succeeded` the SDK now reads the job once, moves the handle to that state
+  and yields the status with `error` set to what `job.error` then holds. If
+  that read fails, or finds the job not yet terminal, the status is yielded
+  without an `error`, the handle is left as it was and the stream raises
+  nothing it did not before. The same event from the poll fallback
+  carries the error too.
+
+### Changed
+
+- The v2 spec is synced to the current contract and `src/low/generated` is
+  regenerated. `ComfyLow.listJobs` is now a spec operation, so
+  `OPERATION_IDS` lists it.
 
 ## [0.5.0] - 2026-10-10
 
