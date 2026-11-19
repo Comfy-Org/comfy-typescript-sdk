@@ -208,7 +208,8 @@ The three other checks:
 
 A CLA check (`.github/workflows/cla.yml`) also runs; only the PR author needs
 to sign. `.github/CODEOWNERS` makes every file require review from
-`@Comfy-Org/comfy-cloud-team` or `@Comfy-Org/core-engine-team`.
+`@Comfy-Org/comfy-cloud-team` or `@Comfy-Org/core-engine-team`. Certain Public API
+changes require approval from a more narrow user group.
 
 ## 5. Non-obvious conventions
 

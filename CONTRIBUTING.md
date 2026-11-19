@@ -222,6 +222,7 @@ allowlisted with the caller's additive `ticket_allowlist:` input instead.
   even when nothing in this repo notices.
 - **Review:** `.github/CODEOWNERS` requires an approving review from a
   maintainer team before merge, and CI plus the CLA check must be green.
+  Certain Public API changes require approval from a more narrow user group.
   CodeRabbit also reviews automatically; its configuration tells it not to
   repeat lint/format findings, so its comments are usually worth reading.
 
