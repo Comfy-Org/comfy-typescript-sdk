@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
 import { describe, expect, it } from "vitest";
 
+import { ApiError, Forbidden, NotFound, Unauthorized, sseErrorFromFrame } from "./errors.js";
 import { OPERATION_IDS, OPERATION_METHODS, ComfyLow } from "./transport.js";
 
 const SPEC_PATH = fileURLToPath(new URL("../../spec/openapi.yaml", import.meta.url));
@@ -73,27 +74,64 @@ describe("hand-maintained model parity (models.ts)", () => {
 });
 
 // `Job.events()` treats an SSE `error` frame as terminal and turns its data
-// (an error envelope) into a typed error via `sseErrorFromFrame`. The server
-// already emits that frame, but the vendored spec does not declare it yet, so
-// there is nothing to compare against. This is a rot guard, not a pin: it
-// fails the day the spec's `x-sse-events` catalog DOES declare `error`. When
-// it fires, check the declared schema is the error envelope and that the frame
-// is terminal (or fix `Job.events()` and `sseErrorFromFrame` to match), then
-// replace this with a real comparison — including the declared codes against
-// `SSE_STATUS_BY_CODE` in `./errors.ts`.
-describe("SSE error frame (not yet in the vendored spec)", () => {
-  it("getJobEvents' x-sse-events catalog does not declare `error` yet", async () => {
+// (an error envelope) into a typed error via `sseErrorFromFrame`. The spec's
+// `x-sse-events` catalog declares that frame, and names its codes only in the
+// description's prose, so the codes are pinned here and each one is checked
+// both ways: the description still names it, and `sseErrorFromFrame` turns it
+// into a typed error with a real status rather than a bare `ApiError` with
+// `httpStatus` `0`. A spec sync that adds a code fails the count below; add it
+// here and to `SSE_STATUS_BY_CODE` in `./errors.ts`.
+describe("SSE error frame matches the vendored spec", () => {
+  const SSE_ERROR_CODES: Record<string, { cls: typeof ApiError; status: number }> = {
+    credential_expired: { cls: Unauthorized, status: 401 },
+    forbidden: { cls: Forbidden, status: 403 },
+    job_not_found: { cls: NotFound, status: 404 },
+  };
+
+  async function errorFrame(): Promise<{ description?: string; schema?: string }> {
     const text = await readFile(SPEC_PATH, "utf-8");
     const doc = parse(text) as {
-      paths: Record<string, Record<string, { operationId?: string; "x-sse-events"?: object }>>;
+      paths: Record<
+        string,
+        Record<
+          string,
+          {
+            operationId?: string;
+            "x-sse-events"?: Record<string, { description?: string; schema?: string }>;
+          }
+        >
+      >;
     };
     const op = Object.values(doc.paths)
       .flatMap((methods) => Object.values(methods))
       .find((candidate) => candidate.operationId === "getJobEvents");
-    expect(op?.["x-sse-events"], "getJobEvents or its x-sse-events catalog moved").toBeDefined();
-    expect(
-      Object.keys(op?.["x-sse-events"] ?? {}),
-      "the spec now declares the SSE `error` frame: replace this rot guard with a real check",
-    ).not.toContain("error");
+    const frame = op?.["x-sse-events"]?.error;
+    expect(frame, "getJobEvents' x-sse-events catalog no longer declares `error`").toBeDefined();
+    return frame ?? {};
+  }
+
+  it("declares the frame terminal, carrying the error envelope", async () => {
+    const frame = await errorFrame();
+    expect(frame.schema).toBe("#/components/schemas/ErrorEnvelope");
+    expect(frame.description).toMatch(/^Terminal event\b/);
+    expect(frame.description).toContain("No `status` event follows it");
+  });
+
+  it("names exactly the codes sseErrorFromFrame types", async () => {
+    const description = (await errorFrame()).description ?? "";
+    // The codes are the snake_case backticked words of the first paragraph
+    // (the browser note after it names no codes).
+    const named = new Set(
+      [...(description.split("\n")[0] ?? "").matchAll(/`([a-z]+(?:_[a-z]+)+|forbidden)`/g)].map(
+        (match) => match[1],
+      ),
+    );
+    expect([...named].sort()).toEqual(Object.keys(SSE_ERROR_CODES).sort());
+    for (const [code, { cls, status }] of Object.entries(SSE_ERROR_CODES)) {
+      const err = sseErrorFromFrame({ error: { code, message: "cut off" } });
+      expect(err, code).toBeInstanceOf(cls);
+      expect(err.httpStatus, code).toBe(status);
+      expect(err.code, code).toBe(code);
+    }
   });
 });

@@ -247,7 +247,18 @@ function okHeaderNames(doc, operation, label) {
  * contract moved the header and nothing compared the two. Read off the run
  * route rather than off the shared `components/responses`, because it is what
  * THIS operation can answer with that the predicate is about.
+ *
+ * Only the COLLECT pace counts. The contract declares two `Retry-After`
+ * header components with opposite meanings: `RouterRetryAfterHeader` (re-send
+ * the same `Idempotency-Key` to collect a generation still running — what
+ * `isCollectable` is about) and `RouterCapacityRetryAfterHeader` (the request
+ * was refused for capacity before anything was submitted; just send it again
+ * later — there is nothing to collect). A `Retry-After` referencing anything
+ * else fails, so a third kind cannot be silently counted as either.
  */
+const COLLECT_RETRY_AFTER_REF = "#/components/headers/RouterRetryAfterHeader";
+const RESEND_RETRY_AFTER_REF = "#/components/headers/RouterCapacityRetryAfterHeader";
+
 export function retryAfterStatuses(doc, pathItem) {
   const responses = deref(doc, pathItem.post.responses ?? {});
   const statuses = [];
@@ -255,26 +266,38 @@ export function retryAfterStatuses(doc, pathItem) {
     const response = deref(doc, rawResponse);
     if (response === null || typeof response !== "object") continue;
     const headers = response.headers ?? {};
-    if (Object.keys(headers).some((name) => name.toLowerCase() === "retry-after")) {
-      // OpenAPI also allows `default` and the `4XX`/`5XX` range forms as
-      // response keys. `Number()` turns those into `NaN`, which compares
-      // unequal to everything (itself included) — the "reads as agreement"
-      // failure this script exists to refuse, arriving through the other
-      // door. Refuse loudly instead: the predicate matches exact statuses.
-      if (!/^\d{3}$/.test(status)) {
-        fail(
-          `spec/router-openapi.yaml: ${RUN_OPERATION_ID} declares a \`Retry-After\` header on ` +
-            `response key ${JSON.stringify(status)}, which is not a single numeric status. ` +
-            "The predicate it is compared against (`isCollectable`) matches exact statuses.",
-        );
-      }
-      statuses.push(Number(status));
+    const retryAfter = Object.entries(headers).find(
+      ([name]) => name.toLowerCase() === "retry-after",
+    )?.[1];
+    if (retryAfter === undefined) continue;
+    const ref = retryAfter?.$ref;
+    if (ref === RESEND_RETRY_AFTER_REF) continue;
+    if (ref !== COLLECT_RETRY_AFTER_REF) {
+      fail(
+        `spec/router-openapi.yaml: ${RUN_OPERATION_ID}'s ${status} declares a \`Retry-After\` ` +
+          `that references ${JSON.stringify(ref ?? null)}, neither ${COLLECT_RETRY_AFTER_REF} ` +
+          `(collect) nor ${RESEND_RETRY_AFTER_REF} (resend). Decide which one it is and ` +
+          "teach retryAfterStatuses in scripts/router-route-contract.mjs.",
+      );
     }
+    // OpenAPI also allows `default` and the `4XX`/`5XX` range forms as
+    // response keys. `Number()` turns those into `NaN`, which compares
+    // unequal to everything (itself included) — the "reads as agreement"
+    // failure this script exists to refuse, arriving through the other
+    // door. Refuse loudly instead: the predicate matches exact statuses.
+    if (!/^\d{3}$/.test(status)) {
+      fail(
+        `spec/router-openapi.yaml: ${RUN_OPERATION_ID} declares a \`Retry-After\` header on ` +
+          `response key ${JSON.stringify(status)}, which is not a single numeric status. ` +
+          "The predicate it is compared against (`isCollectable`) matches exact statuses.",
+      );
+    }
+    statuses.push(Number(status));
   }
   if (statuses.length === 0) {
     fail(
       `spec/router-openapi.yaml: ${RUN_OPERATION_ID} declares no response carrying a ` +
-        "`Retry-After` header. An empty list would read as agreement with any predicate.",
+        "collect `Retry-After` header. An empty list would read as agreement with any predicate.",
     );
   }
   return statuses.sort((a, b) => a - b);

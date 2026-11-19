@@ -5,6 +5,7 @@ import { ApiError } from "../low/errors.js";
 import { ComfyLow } from "../low/index.js";
 import type { RawEvent } from "../low/sse.js";
 import { abortableSleep } from "./abortable-sleep.js";
+import type { StatusChange } from "./events.js";
 import { ComfyError, Forbidden, JobFailed, NotFound, Unauthorized } from "./exceptions.js";
 import { JobFactory } from "./jobs.js";
 
@@ -80,6 +81,129 @@ describe("Job", () => {
     server.state.terminalStatus = "failed";
     const job = await jobs.get("job_01");
     await expect(job.result()).rejects.toBeInstanceOf(JobFailed);
+  });
+
+  describe("failure category", () => {
+    const failure = (category?: unknown) => ({
+      code: "node_execution_error",
+      message: "ran out of memory",
+      ...(category === undefined ? {} : { category }),
+    });
+
+    it("reads a failed job's category as the typed value, on the handle and on JobFailed", async () => {
+      server.state.terminalStatus = "failed";
+      server.state.jobFailure = failure("out_of_gpu_memory");
+      const job = await jobs.get("job_01");
+      expect(job.failureCategory).toBe("out_of_gpu_memory");
+      const thrown = await job.result().catch((exc: unknown) => exc);
+      expect(thrown).toBeInstanceOf(JobFailed);
+      expect((thrown as JobFailed).failureCategory).toBe("out_of_gpu_memory");
+    });
+
+    it.each([
+      ["no category", failure(), null],
+      ["a null category", failure(null), null],
+      ["an unknown string", failure("quota_exceeded"), "other"],
+    ])("reads %s as %s, keeping the raw error", async (_label, jobFailure, expected) => {
+      server.state.terminalStatus = "failed";
+      server.state.jobFailure = jobFailure;
+      const job = await jobs.get("job_01");
+      expect(job.failureCategory).toBe(expected);
+      expect(job.error).toEqual(jobFailure);
+    });
+
+    it("is none for a job that has no error", async () => {
+      const job = await jobs.get("job_01");
+      expect(job.error).toBeNull();
+      expect(job.failureCategory).toBeNull();
+    });
+
+    it("reads the category off the snapshot cancel() returns", async () => {
+      server.state.jobFailure = failure("workflow_logic");
+      const job = await jobs.get("job_01");
+      expect(job.failureCategory).toBeNull();
+      await job.cancel();
+      expect(job.status).toBe("failed");
+      expect(job.failureCategory).toBe("workflow_logic");
+    });
+
+    describe("on the event stream", () => {
+      async function terminalEvent(job: Awaited<ReturnType<JobFactory["get"]>>) {
+        const events = [];
+        for await (const event of job.events()) events.push(event);
+        const last = events.at(-1);
+        expect(last?.kind).toBe("statusChange");
+        return last as StatusChange;
+      }
+
+      beforeEach(() => {
+        server.state.terminalStatus = "failed";
+        server.state.jobFailure = failure("workflow_logic");
+        server.state.pollsToSucceed = 2; // the first read, at get(), sees a running job
+      });
+
+      it("yields the terminal status with the error one read of the job returned, and the handle follows", async () => {
+        const job = await jobs.get("job_01");
+        expect(job.error).toBeNull();
+        const polls = server.state.jobPollCount;
+
+        const last = await terminalEvent(job);
+
+        expect(last.status).toBe("failed");
+        expect(last.error).toEqual(failure("workflow_logic"));
+        expect(last.error).toEqual(job.error);
+        expect(job.failureCategory).toBe("workflow_logic");
+        expect(server.state.jobPollCount).toBe(polls + 1);
+      });
+
+      it("yields a canceled job's terminal status with the error that job holds, none", async () => {
+        server.state.terminalStatus = "canceled";
+        const job = await jobs.get("job_01");
+        const last = await terminalEvent(job);
+        expect(last.status).toBe("canceled");
+        expect(last.error).toBeNull();
+      });
+
+      it("reads nothing more on a succeeded status", async () => {
+        server.state.terminalStatus = "succeeded";
+        const job = await jobs.get("job_01");
+        const polls = server.state.jobPollCount;
+        const last = await terminalEvent(job);
+        expect(last.status).toBe("succeeded");
+        expect(last).not.toHaveProperty("error");
+        expect(server.state.jobPollCount).toBe(polls);
+      });
+
+      it("yields the terminal status without an error, leaving the handle, when the read still reports a running job", async () => {
+        server.state.pollsToSucceed = 3;
+        const job = await jobs.get("job_01");
+        const polls = server.state.jobPollCount;
+        const last = await terminalEvent(job);
+        expect(last.status).toBe("failed");
+        expect(last).not.toHaveProperty("error");
+        expect(job.status).toBe("running");
+        expect(server.state.jobPollCount).toBe(polls + 1);
+      });
+
+      it("yields the terminal status without an error, and raises nothing, when the read fails", async () => {
+        const job = await jobs.get("job_01");
+        server.state.jobPollFailsFrom = server.state.jobPollCount + 1;
+        const last = await terminalEvent(job);
+        expect(last.status).toBe("failed");
+        expect(last).not.toHaveProperty("error");
+        expect(job.error).toBeNull();
+      });
+
+      it("yields the terminal status with the same error from the poll backstop when the stream ends early", async () => {
+        server.state.sseMode = "reconnect"; // the first stream drops before a terminal frame
+        const job = await jobs.get("job_01");
+        const last = await terminalEvent(job);
+        expect(last.status).toBe("failed");
+        expect(last.error).toEqual(job.error);
+        expect(job.failureCategory).toBe("workflow_logic");
+        expect(server.state.eventsConnectCount).toBe(1);
+      });
+    });
   });
 
   it("cancel() moves the job to canceling", async () => {

@@ -19,7 +19,7 @@
  * union is `ComfyEvent`, not `Event` — `Event` is a global DOM/Node type.
  */
 
-import type { RawEvent } from "../low/index.js";
+import type { JobError, RawEvent } from "../low/index.js";
 import type { Output } from "./outputs.js";
 
 export interface Progress {
@@ -50,6 +50,13 @@ export interface StatusChange {
   kind: "statusChange";
   status: string;
   queuePosition: number | null;
+  /**
+   * Why the job ended, on a terminal status other than `succeeded`: the
+   * error `job.error` holds after the stream. The wire frame carries none, so
+   * the SDK reads the job once to fill it, and leaves it out when that read
+   * fails.
+   */
+  error?: JobError | null;
 }
 
 export interface Log {

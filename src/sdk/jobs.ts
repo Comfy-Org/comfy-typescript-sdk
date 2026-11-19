@@ -29,7 +29,14 @@ import {
   type Progress,
   type StatusChange,
 } from "./events.js";
-import { ComfyError, JobFailed, toSdkError, translate } from "./exceptions.js";
+import {
+  ComfyError,
+  failureCategoryOf,
+  type FailureCategory,
+  JobFailed,
+  toSdkError,
+  translate,
+} from "./exceptions.js";
 import { Output } from "./outputs.js";
 
 // Pause before reconnecting an SSE stream that dropped mid-job, without a
@@ -129,6 +136,11 @@ export class Job {
   /** Failure detail when the job ended `failed`, otherwise `null`. */
   get error(): LowJob["error"] {
     return this.model.error;
+  }
+
+  /** Why the job failed, when its error names a category, otherwise `null`. A category the SDK does not know reads as `other`; `job.error.category` keeps the raw string. */
+  get failureCategory(): FailureCategory | null {
+    return failureCategoryOf(this.model.error);
   }
 
   /** When the server accepted this job. Set for every job, from submit onwards. */
@@ -318,6 +330,30 @@ export class Job {
   }
 
   /**
+   * A terminal `status` frame other than `succeeded`, carrying the error of a
+   * fresh read of the job. The frame declares only the status, so the error
+   * comes from one `GET`, which also moves the handle to the state it read. A
+   * read that fails, or that still reports a job not yet terminal, leaves the
+   * frame and the handle as they were, rather than raising where the stream
+   * delivered a terminal frame or reporting an error of a job still running.
+   */
+  private async withReadError(event: StatusChange, signal?: AbortSignal): Promise<StatusChange> {
+    if (event.status === SUCCESS) return event;
+    let read: LowJob;
+    try {
+      read = await translate(() =>
+        this.low.getJob(this.model.urls.self || this.model.id, { signal }),
+      );
+    } catch (exc) {
+      if (signal?.aborted) throw exc;
+      return event;
+    }
+    if (!isTerminal(read.status)) return event;
+    this.model = read;
+    return { ...event, error: read.error };
+  }
+
+  /**
    * Typed live event iterator. Auto-reconnects with no replay; falls back
    * to polling to detect terminal status if the stream ends early. An
    * aborted `signal` stops both the current SSE connection/poll and the
@@ -361,7 +397,7 @@ export class Job {
           }
           if (event.kind === "statusChange" && isTerminal(event.status)) {
             terminalSeen = true;
-            yield event;
+            yield await this.withReadError(event, signal);
             return;
           }
           yield event;
@@ -395,6 +431,7 @@ export class Job {
           kind: "statusChange",
           status: this.status,
           queuePosition: null,
+          ...(this.status === SUCCESS ? {} : { error: this.model.error }),
         };
         yield statusChange;
         return;
