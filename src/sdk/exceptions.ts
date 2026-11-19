@@ -146,17 +146,44 @@ export class QueueFull extends ComfyError {
   }
 }
 
+const FAILURE_CATEGORIES = [
+  "invalid_input",
+  "content_refused",
+  "out_of_gpu_memory",
+  "missing_model_or_node",
+  "workflow_logic",
+  "other",
+] as const;
+
+/** Why a job failed, for a failure the caller's own job caused. */
+export type FailureCategory = (typeof FAILURE_CATEGORIES)[number];
+
+/**
+ * The {@link FailureCategory} a job's `error` carries, or `null` when it names
+ * none. The spec has clients tolerate a value it adds later as `other`, so a
+ * string outside the six reads as `other` rather than throwing.
+ */
+export function failureCategoryOf(error: JobError | null | undefined): FailureCategory | null {
+  const raw: unknown = error?.category;
+  if (raw === undefined || raw === null) return null;
+  return (FAILURE_CATEGORIES as readonly unknown[]).includes(raw)
+    ? (raw as FailureCategory)
+    : "other";
+}
+
 /**
  * A job reached a non-success terminal state. `error` carries the
  * node-level detail (`code`, `nodeId`, `message`, `traceback`) when the
- * platform provided one.
+ * platform provided one, and `failureCategory` the category it names.
  */
 export class JobFailed extends ComfyError {
   readonly error: JobError | null;
+  readonly failureCategory: FailureCategory | null;
 
   constructor(message: string, options: { error?: JobError | null } = {}) {
     super(message, { code: options.error?.code ?? "job_failed" });
     this.error = options.error ?? null;
+    this.failureCategory = failureCategoryOf(this.error);
   }
 }
 
