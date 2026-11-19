@@ -449,8 +449,56 @@ describe("subprotocol", () => {
 });
 
 describe("timeout", () => {
-  it("defaults to a bounded upgrade", () => {
+  /** A plain HTTP server that takes every upgrade and never answers it. */
+  async function stalling(): Promise<Duplex[]> {
+    const server = createServer();
+    const held: Duplex[] = [];
+    server.on("upgrade", (_req: IncomingMessage, socket: Duplex) => held.push(socket));
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    cleanups.push(
+      () =>
+        new Promise((resolve) => {
+          for (const socket of held) socket.destroy();
+          server.close(() => resolve());
+        }),
+    );
+    config({ baseUrl: `http://127.0.0.1:${String((server.address() as AddressInfo).port)}` });
+    return held;
+  }
+
+  it("applies the 30s default deadline when timeoutMs is omitted", async () => {
     expect(DEFAULT_REALTIME_CONNECT_TIMEOUT_MS).toBe(30_000);
+    const held = await stalling();
+    // Stand in for the 30s clock so the test does not wait it out.
+    const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+    const requested: number[] = [];
+    const deadline = new AbortController();
+    AbortSignal.timeout = (ms: number) => {
+      requested.push(ms);
+      return deadline.signal;
+    };
+    try {
+      const pending = connect("google/genie-4", { WebSocket: WsWebSocket }).catch(
+        (e: unknown) => e,
+      );
+      await expect.poll(() => held.length).toBe(1);
+      expect(requested).toEqual([DEFAULT_REALTIME_CONNECT_TIMEOUT_MS]);
+      deadline.abort(new DOMException("timed out", "TimeoutError"));
+      const err = await pending;
+      expect(err).toBeInstanceOf(ComfyError);
+      expect((err as ComfyError).code).toBe("request_timeout");
+    } finally {
+      AbortSignal.timeout = realTimeout;
+    }
+  });
+
+  it("rounds a fractional timeoutMs up instead of throwing a RangeError", async () => {
+    await stalling();
+    const err = await connect("google/genie-4", { timeoutMs: 50.5, WebSocket: WsWebSocket }).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ComfyError);
+    expect((err as ComfyError).code).toBe("request_timeout");
   });
 
   it("rejects with request_timeout when the server never answers the upgrade", async () => {

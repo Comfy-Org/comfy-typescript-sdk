@@ -671,7 +671,9 @@ export async function connect(
   if (signal?.aborted) throw abortReason(signal);
 
   // Clamped, as in `models.ts`: past ~25 days `AbortSignal.timeout` would fire at once.
-  const deadline = timeoutMs === null ? undefined : AbortSignal.timeout(clampTimerMs(timeoutMs));
+  // Rounded up because it also throws a RangeError on a fractional delay.
+  const deadline =
+    timeoutMs === null ? undefined : AbortSignal.timeout(Math.ceil(clampTimerMs(timeoutMs)));
   const handshakeSignal =
     deadline === undefined ? signal : signal ? AbortSignal.any([signal, deadline]) : deadline;
   let socket: RealtimeSocket;
