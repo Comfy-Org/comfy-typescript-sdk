@@ -80,6 +80,15 @@ entry. See CONTRIBUTING.md.
   quote is available — none sent, one that could not be read, an idempotent
   replay, or a handle rebuilt by `comfy.models.handle` — and `null` never means
   free. A malformed quote never fails the submit.
+- **A typed `RateLimited` for the v2 `rate_limited` code.** A `429` whose
+  envelope names `rate_limited` — the account's request-rate window, which
+  the job read and cancel routes document — now raises `RateLimited`, exported
+  from the package root and a `ComfyError` like the rest, instead of a bare
+  `ComfyError`. `retryAfter` carries the server's `Retry-After`, or `null`
+  when it named none. It is distinct from `QueueFull` (queue depth) and is not
+  `routerErrors.RateLimited`, which the queued `comfy.models.submit` /
+  `subscribe` surface raises for the Router contract; `comfy.models.run` still
+  reports that bucket as a `ComfyError` with `code: "rate_limited"`. The low layer gains the matching `RateLimited` `ApiError`.
 - **A failed job's category reads as a typed value.** The v2 contract's
   `JobError.category` says why a user-caused failure on a serverless
   deployment happened. `job.failureCategory` and `JobFailed.failureCategory`

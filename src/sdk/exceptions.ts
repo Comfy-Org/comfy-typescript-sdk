@@ -186,6 +186,18 @@ export class QueueFull extends ComfyError {
   }
 }
 
+/**
+ * The account's request-rate window was exhausted. `retryAfter` is the pace
+ * to resume at, `null` when the server named none.
+ *
+ * Distinct from {@link QueueFull}, which is bounded queue DEPTH rather than
+ * request rate, and from `routerErrors.RateLimited`, which the queued
+ * `comfy.models.submit` / `subscribe` surface throws for the Router contract's
+ * bucket of the same name. `comfy.models.run` raises neither: it reports that
+ * bucket as a plain `ComfyError` with `code: "rate_limited"`.
+ */
+export class RateLimited extends ComfyError {}
+
 const FAILURE_CATEGORIES = [
   "invalid_input",
   "content_refused",
@@ -237,6 +249,7 @@ const BY_CODE: Record<string, ComfyErrorClass> = {
   blob_not_found: BlobNotFound,
   idempotency_key_reuse: IdempotencyKeyReuse,
   insufficient_credits: InsufficientCredits,
+  rate_limited: RateLimited,
   not_found: NotFound,
   // public-api returns entity-specific 404 codes even though the spec documents
   // the generic not_found; map them so a missing job/asset raises the typed

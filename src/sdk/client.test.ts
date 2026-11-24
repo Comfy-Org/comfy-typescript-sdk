@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { StubServer } from "../../test/support/stub-server.js";
+import { RateLimited, routerErrors } from "../index.js";
 import { abortableSleep } from "./abortable-sleep.js";
 import { BASE_URL_ENV_VAR, Comfy } from "./client.js";
 import { CREDENTIALS_ENV_VAR } from "./credentials.js";
@@ -38,6 +39,25 @@ describe("Comfy", () => {
     vi.unstubAllEnvs();
     await server.stop();
     vi.mocked(abortableSleep).mockClear();
+  });
+
+  it("raises the root RateLimited for a v2 rate_limited 429 on jobs.get", async () => {
+    server.state.jobGetError = {
+      status: 429,
+      code: "rate_limited",
+      message: "slow down",
+      retryAfter: "7",
+    };
+    const err = await client.jobs.get("job_01").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RateLimited);
+    expect(err).toBeInstanceOf(ComfyError);
+    expect(err).not.toBeInstanceOf(QueueFull);
+    expect(err).not.toBeInstanceOf(routerErrors.RouterError);
+    const rateLimited = err as RateLimited;
+    expect(rateLimited.code).toBe("rate_limited");
+    expect(rateLimited.httpStatus).toBe(429);
+    expect(rateLimited.retryAfter).toBe(7);
+    expect(rateLimited.message).toBe("slow down");
   });
 
   it("rejects a UI-format workflow before any network call", async () => {

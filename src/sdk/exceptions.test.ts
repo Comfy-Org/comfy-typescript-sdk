@@ -13,6 +13,7 @@ import {
   MissingAsset,
   NotFound,
   QueueFull,
+  RateLimited,
   Unauthorized,
   WorkflowFormatUi,
   failureCategoryOf,
@@ -81,6 +82,7 @@ describe("toSdkError", () => {
     ["blob_not_found", BlobNotFound],
     ["idempotency_key_reuse", IdempotencyKeyReuse],
     ["insufficient_credits", InsufficientCredits],
+    ["rate_limited", RateLimited],
     ["not_found", NotFound],
     ["job_not_found", NotFound],
     ["asset_not_found", NotFound],
@@ -115,6 +117,27 @@ describe("toSdkError", () => {
     const sdkError = toSdkError(apiError);
     expect(sdkError).toBeInstanceOf(QueueFull);
     expect((sdkError as QueueFull).retryAfter).toBeNull();
+  });
+
+  it("carries retryAfter onto RateLimited", () => {
+    const apiError = new ApiError("slow down", {
+      code: "rate_limited",
+      httpStatus: 429,
+      retryAfter: 7,
+    });
+    const sdkError = toSdkError(apiError);
+    expect(sdkError).toBeInstanceOf(RateLimited);
+    expect(sdkError).not.toBeInstanceOf(QueueFull);
+    expect(sdkError.code).toBe("rate_limited");
+    expect(sdkError.httpStatus).toBe(429);
+    expect(sdkError.retryAfter).toBe(7);
+  });
+
+  it("preserves an absent retryAfter on RateLimited", () => {
+    const apiError = new ApiError("slow down", { code: "rate_limited", httpStatus: 429 });
+    const sdkError = toSdkError(apiError);
+    expect(sdkError).toBeInstanceOf(RateLimited);
+    expect(sdkError.retryAfter).toBeNull();
   });
 
   it("carries retryAfter onto every error, not only QueueFull", () => {

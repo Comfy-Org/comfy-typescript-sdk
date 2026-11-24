@@ -9,6 +9,7 @@ import {
   Job,
   Asset,
   models,
+  RateLimited,
   routerErrors,
   Unauthorized,
   Workflow,
@@ -52,13 +53,20 @@ describe("public surface", () => {
     );
   });
 
-  it("keeps the three colliding names distinct from the workflow-API exceptions", () => {
+  it("keeps the four colliding names distinct from the workflow-API exceptions", () => {
     // `Unauthorized` at the root is a workflow-API `ComfyError`;
-    // `routerErrors.Unauthorized` is a `RouterError`. Same spelling as the
-    // Python SDK's, unrelated classes, so neither may answer for the other.
+    // `routerErrors.Unauthorized` is a `RouterError`. Unrelated classes, so
+    // neither may answer for the other — unlike the Python SDK, which shares
+    // one class object per name (see `router-errors-namespaced` in
+    // `surface-parity.test.ts`).
     expect(routerErrors.Unauthorized).not.toBe(Unauthorized);
     expect(new routerErrors.Unauthorized("boom")).not.toBeInstanceOf(Unauthorized);
     expect(new Unauthorized("boom")).not.toBeInstanceOf(routerErrors.RouterError);
+    // The same holds for the v2 `rate_limited` code and the Router bucket.
+    expect(routerErrors.RateLimited).not.toBe(RateLimited);
+    expect(new routerErrors.RateLimited("boom")).not.toBeInstanceOf(RateLimited);
+    expect(new RateLimited("boom")).not.toBeInstanceOf(routerErrors.RouterError);
+    expect(new RateLimited("boom")).toBeInstanceOf(ComfyError);
   });
 
   it("exports the idiomatic classes and the shared error base", () => {

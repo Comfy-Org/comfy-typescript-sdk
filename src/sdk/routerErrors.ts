@@ -51,12 +51,16 @@
  *   done until a class exists for it here.
  *
  * These classes are namespaced (`routerErrors.*`) rather than exported from
- * the package root because three of the twenty-one names — `Unauthorized`,
- * `Forbidden`, `InsufficientCredits` — already exist at the root as
- * workflow-API exceptions descending from `ComfyError`. The Python SDK has
- * the same three at the top level of `comfy_sdk`, so both SDKs resolve the
- * collision the same way: a dedicated module, and the class names themselves
- * left untouched.
+ * the package root because four of the twenty-one names — `Unauthorized`,
+ * `Forbidden`, `InsufficientCredits`, `RateLimited` — already exist at the
+ * root as workflow-API exceptions descending from `ComfyError`, and here the
+ * root class and the `routerErrors.*` class are two unrelated classes. The
+ * Python SDK resolves the same collision differently: `comfy_sdk` re-exports
+ * ONE class object per name out of `comfy_sdk.router_exceptions`, so its root
+ * `RateLimited` is a `RouterError` and `except RateLimited` also catches a
+ * Router 429, where `instanceof RateLimited` here does not. The names match,
+ * so the name-only parity check cannot see this; it is declared in
+ * `surface-parity.test.ts`'s `router-errors-namespaced` entry instead.
  *
  * One of the twenty-one buckets — `byok_credential_rejected`, the most recent
  * the vendored contract grew — is newer than the Python SDK's table. Until its

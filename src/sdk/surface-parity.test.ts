@@ -227,9 +227,14 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
       "re-exports the router hierarchy from `router_exceptions`, so the two modules share one " +
       "class object per name rather than two classes wearing one name. This SDK publishes the " +
       "same class under the `routerErrors` namespace — `routerErrors.RouterError`, also " +
-      "reachable as `@comfyorg/sdk/errors` — because three of those names are already taken at " +
+      "reachable as `@comfyorg/sdk/errors` — because four of those names are already taken at " +
       "its root by the workflow-API exceptions. Same class, different address: the rot guard " +
-      "below proves it is really in the namespace rather than missing.",
+      "below proves it is really in the namespace rather than missing. Those four colliding " +
+      "names — `Unauthorized`, `Forbidden`, `InsufficientCredits`, `RateLimited` — are where " +
+      "the two SDKs genuinely differ, and a name-only comparison cannot see it: Python's root " +
+      "names ARE the Router classes, so `except RateLimited` also catches a Router 429, while " +
+      "this SDK's root names are workflow-API `ComfyError`s unrelated to `routerErrors.*` " +
+      "(asserted in `src/index.test.ts`), so `instanceof RateLimited` does not.",
     pythonOnlyExportedErrorClasses: ["RouterError"],
   },
   {
