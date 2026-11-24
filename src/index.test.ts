@@ -55,8 +55,10 @@ describe("public surface", () => {
 
   it("keeps the four colliding names distinct from the workflow-API exceptions", () => {
     // `Unauthorized` at the root is a workflow-API `ComfyError`;
-    // `routerErrors.Unauthorized` is a `RouterError`. Same spelling as the
-    // Python SDK's, unrelated classes, so neither may answer for the other.
+    // `routerErrors.Unauthorized` is a `RouterError`. Unrelated classes, so
+    // neither may answer for the other — unlike the Python SDK, which shares
+    // one class object per name (see `router-errors-namespaced` in
+    // `surface-parity.test.ts`).
     expect(routerErrors.Unauthorized).not.toBe(Unauthorized);
     expect(new routerErrors.Unauthorized("boom")).not.toBeInstanceOf(Unauthorized);
     expect(new Unauthorized("boom")).not.toBeInstanceOf(routerErrors.RouterError);

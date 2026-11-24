@@ -1172,7 +1172,10 @@ unchanged.
 They live in their own namespace because four of the names —
 `Unauthorized`, `Forbidden`, `InsufficientCredits`, `RateLimited` — are already taken above by
 the workflow-API exceptions, which are unrelated classes descending from
-`ComfyError`:
+`ComfyError`. That is the one place a snippet does not transfer: the Python SDK
+shares one class per name, so there `except RateLimited` also catches a Router
+refusal, while here `instanceof RateLimited` does not — catch
+`routerErrors.RateLimited` for that:
 
 ```ts
 import { routerErrors } from "@comfyorg/sdk";
