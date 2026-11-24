@@ -334,6 +334,57 @@ describe("models.run: following a 202 handoff", () => {
       expect(posts(server)).toHaveLength(1);
     });
   });
+
+  it("does not resolve past run's deadline when a poll is slow to answer", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      const script = handoffScript({
+        statuses: [{ request_id: QUEUED_ID, status: "COMPLETED" }],
+      });
+      server.state.respond = (request) => {
+        // The handoff answers at once; every queue read after it takes longer
+        // than the whole run deadline, but less than the per-request floor
+        // the queue reads would otherwise get.
+        if (request.method === "POST") server.state.delayMs = 700;
+        return script(request);
+      };
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { respondAsync: true, timeoutMs: 300, idempotencyKey: "key-7" })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("request_timeout");
+      expect(err.details).toEqual({ queuedRequestId: QUEUED_ID });
+      expect(server.state.requests.some((r) => r.path === REQUEST_PATH)).toBe(false);
+      expect(server.state.requests.some((r) => r.method === "PUT" && r.path === CANCEL_PATH)).toBe(
+        true,
+      );
+    });
+  });
+
+  it("re-throws the caller's abort untouched during a slow poll", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      const script = handoffScript();
+      server.state.respond = (request) => {
+        if (request.method === "POST") server.state.delayMs = 700;
+        return script(request);
+      };
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 200);
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { respondAsync: true, timeoutMs: 5_000, signal: controller.signal })
+        .catch((e: unknown) => e)) as Error;
+
+      // The caller's AbortError, not the deadline's request_timeout.
+      expect(err.name).toBe("AbortError");
+      expect(server.state.requests.some((r) => r.method === "PUT" && r.path === CANCEL_PATH)).toBe(
+        true,
+      );
+    });
+  });
 });
 
 describe("appliedRespondAsync", () => {
@@ -342,6 +393,9 @@ describe("appliedRespondAsync", () => {
     ["RESPOND-ASYNC", true],
     [" respond-async ", true],
     ["return=minimal, respond-async", true],
+    ['other="x, respond-async=1"', false],
+    ['other="x\\", respond-async"', false],
+    ['other="x, y", respond-async', true],
     ["respond-async; wait=10", true],
     ["respond-async=1", true],
     ["return=minimal", false],

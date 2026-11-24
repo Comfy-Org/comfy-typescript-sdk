@@ -305,9 +305,35 @@ export const RESPOND_ASYNC = "respond-async";
  */
 export function appliedRespondAsync(raw: string | null): boolean {
   if (raw === null) return false;
-  return raw
-    .split(",")
-    .some((preference) => preference.split(/[;=]/)[0].trim().toLowerCase() === RESPOND_ASYNC);
+  return splitPreferences(raw).some(
+    (preference) => preference.split(/[;=]/)[0].trim().toLowerCase() === RESPOND_ASYNC,
+  );
+}
+
+/**
+ * Split an RFC 7240 preference list on its top-level commas only. A value may
+ * be a quoted-string, and a comma inside one — `other="x, respond-async"` —
+ * belongs to that value, not to a second preference. A backslash inside a
+ * quoted-string escapes the next character, quotes included.
+ */
+function splitPreferences(raw: string): string[] {
+  const preferences: string[] = [];
+  let start = 0;
+  let quoted = false;
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i];
+    if (quoted) {
+      if (ch === "\\") i += 1;
+      else if (ch === '"') quoted = false;
+    } else if (ch === '"') {
+      quoted = true;
+    } else if (ch === ",") {
+      preferences.push(raw.slice(start, i));
+      start = i + 1;
+    }
+  }
+  preferences.push(raw.slice(start));
+  return preferences;
 }
 
 /**
@@ -1774,10 +1800,13 @@ async function run<TData = unknown>(
     let result: RunResult<TData>;
     try {
       result = await pending.get({
-        signal: options.signal,
         // What is left of THIS call's deadline, so the handoff cannot outlive
-        // the `timeoutMs` the caller gave `run`. Floored at 0, which `get`
-        // reads as "look once".
+        // the `timeoutMs` the caller gave `run`. Passed as a signal as well as
+        // a budget: the queue reads floor each request's own timeout (see
+        // MIN_REQUEST_TIMEOUT_MS), so the budget alone would let one slow poll
+        // or result fetch finish past the deadline. The caller's own signal is
+        // composed in, and stays distinguishable by `options.signal.aborted`.
+        signal: composeSignal(options.signal, waitMs === null ? null : Math.max(0, waitMs)),
         timeoutMs: waitMs === null ? null : Math.max(0, waitMs),
         retry: options.retry ?? {},
         maxBytes: options.maxBytes,
