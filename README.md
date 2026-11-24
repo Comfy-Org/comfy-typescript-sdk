@@ -394,6 +394,17 @@ Polling is **poll-authoritative**: there is no stream to reconcile against on th
 
 **A `200` is not the same thing as a success here.** The server reports a failed _and_ a cancelled request as `COMPLETED` carrying an `error_type`, so `get()` rejects with the matching typed exception from [`routerErrors`](#router-errors-comfymodelsrun) rather than handing the failure back as a result. `events()` deliberately does not reject **for that case** — a completion carrying an `error_type` is yielded as an observation, because `events()` is a view of the queue's progress and `get()` is the one that collects. It can still reject for reasons that are not the request's own outcome: a transport failure, an exhausted `timeoutMs`, or an aborted `signal`. So keep those handlers; it is only the completion error that arrives as data rather than a throw.
 
+When the server quotes the request on admission, the quote is on `handle.estimate` — a `CostEstimate`, priced in US dollars at Comfy's standard list price (or, for a model billed the cost its vendor reports, from the vendor's published price list):
+
+```ts
+const { estimate } = handle;
+if (estimate?.isExact) console.log(`$${estimate.amount}`);
+else if (estimate?.isEstimated) console.log(`$${estimate.minAmount}–$${estimate.maxAmount}`);
+else if (estimate?.isFree) console.log("free");
+```
+
+Read `isExact` / `isEstimated` / `isFree` / `isUnknown` rather than `source`: `source` is the server's open string, and a value this release does not recognise reads as unknown. An unknown quote's `reason` is `not_quotable`, `unpriced_model`, `byok` (your own provider key — Comfy bills nothing) or `pricing_unavailable` (transient; the run is still charged); read any other value as `not_quotable`. Dollar figures (`amount`, `minAmount`, `maxAmount`) are decimal **strings**, so nothing is rounded; the `*Cents` and `credits` figures are numbers for arithmetic, and `raw` is the object as sent. It is a quote, not the charge: not a price lock — the run is charged at the rates in force when it is rated (`pricingAsOf` says when the quote's rate card was read) — not your contract rate if your workspace has negotiated pricing, and not what a vendor-reported model is billed, which is the cost the vendor reports after the run. `estimate` is `null` when no quote is available: the server sent none, sent one this SDK could not read (the submit still succeeds), the submit was an idempotent replay (the original quote is not stored), or the handle was rebuilt with `comfy.models.handle`. **`null` never means free.**
+
 Rebuild a handle in another process from the two ids that address the request, with no call made:
 
 ```ts
@@ -745,8 +756,9 @@ that fetches by URL, e.g. an image-to-image model behind Comfy Router — see
 [Image to image — upload an asset first](#image-to-image--upload-an-asset-first).
 
 A committed asset also exposes `jobId` — the ID of the job that produced it,
-`undefined` for an asset you uploaded yourself (which has no producing job)
-— and `expiresAt`, its retention deadline (`undefined` if it never expires).
+`undefined` for an asset no job produced, such as a fresh upload (an upload
+whose file path and bytes match an existing job output resolves to that output
+and carries its job) — and `expiresAt`, its retention deadline (`undefined` if it never expires).
 Delete one with `asset.delete()` on a handle you already hold (throws if the
 handle was never committed — there's nothing to delete yet), or
 `client.assets.delete(id)` to delete by UUID without fetching first. Deleting

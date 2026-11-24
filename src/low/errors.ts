@@ -96,6 +96,9 @@ const BY_CODE: Record<string, ApiErrorClass> = {
   job_not_found: NotFound,
   asset_not_found: NotFound,
   unauthorized: Unauthorized,
+  // The terminal SSE `error` frame on `GET /jobs/{id}/events` names an expired
+  // credential with its own code; it is still a 401-class failure.
+  credential_expired: Unauthorized,
   forbidden: Forbidden,
 };
 
@@ -115,12 +118,19 @@ interface ErrorEnvelopeBody {
     message?: string;
     details?: Record<string, unknown> | null;
   };
+  /** Not part of the ErrorEnvelope contract: echo's `HTTPError` body shape,
+   * `{"message": "..."}`, which a request-decoder 400 or a BodyLimit 413
+   * reaches the caller as instead of an envelope. */
+  message?: string;
 }
 
 /**
  * Build the typed exception for an error response. Falls back to a
  * status-derived code when the body is missing or not a well-formed
- * envelope, so a bare 401 with no JSON still maps to `Unauthorized`.
+ * envelope, so a bare 401 with no JSON still maps to `Unauthorized`; a bare
+ * `{message}` body (echo's HTTPError shape, e.g. a request-decoder 400 or a
+ * BodyLimit 413) still contributes its message. A non-empty envelope message
+ * wins over a top-level one; an empty or non-string message counts as absent.
  */
 export function errorFromEnvelope(
   httpStatus: number,
@@ -131,6 +141,10 @@ export function errorFromEnvelope(
   let code = err && typeof err === "object" ? err.code : undefined;
   let message = err && typeof err === "object" ? err.message : undefined;
   const details = err && typeof err === "object" ? err.details : undefined;
+  if (typeof message !== "string" || !message) message = undefined;
+  if (message === undefined && body && typeof body === "object") {
+    if (typeof body.message === "string" && body.message) message = body.message;
+  }
 
   if (!code) {
     code = CODE_BY_STATUS[httpStatus] ?? "error";
@@ -139,11 +153,91 @@ export function errorFromEnvelope(
     message = `HTTP ${httpStatus}`;
   }
 
-  const cls = BY_CODE[code] ?? ApiError;
+  // Own-property lookup: `code` is server-controlled, and a code such as
+  // `constructor` must not resolve through `Object.prototype`.
+  const cls = Object.hasOwn(BY_CODE, code) ? BY_CODE[code] : ApiError;
   return new cls(message, {
     code,
     httpStatus,
     details: details && typeof details === "object" ? details : null,
     retryAfter: options.retryAfter ?? null,
   });
+}
+
+/**
+ * The HTTP status each terminal SSE `error` frame code stands in for. The
+ * frame arrives inside a `200` stream, so there is no response status to read;
+ * this keeps `httpStatus` meaningful on the typed error the frame becomes.
+ * Covers every code `BY_CODE` maps to `Unauthorized`, `Forbidden` or
+ * `NotFound`, so a frame naming the generic `unauthorized` / `not_found`
+ * carries the same status as the specific one.
+ */
+const SSE_STATUS_BY_CODE: Record<string, number> = {
+  unauthorized: 401,
+  credential_expired: 401,
+  forbidden: 403,
+  not_found: 404,
+  job_not_found: 404,
+  asset_not_found: 404,
+};
+
+/**
+ * Build the typed exception for the terminal `error` frame of
+ * `GET /jobs/{id}/events`, whose `data` is an error envelope. The server sends
+ * it when it ends the stream for a reason other than the job finishing. The
+ * envelope's `code` is kept verbatim; a code with no known status yields a bare
+ * {@link ApiError} with `httpStatus` `0`. A frame with no message keeps its raw
+ * payload (or names the frame) rather than reporting a nonexistent `HTTP 0`.
+ */
+export function sseErrorFromFrame(data: Record<string, unknown>): ApiError {
+  // Every field is narrowed by a runtime check rather than an assertion: the
+  // frame is server-controlled and has not been validated against the schema.
+  const raw = data.error;
+  const err = isRecord(raw) ? raw : undefined;
+  const code = typeof err?.code === "string" && err.code ? err.code : "error";
+  const httpStatus = Object.hasOwn(SSE_STATUS_BY_CODE, code) ? SSE_STATUS_BY_CODE[code] : 0;
+  // With no envelope message, keep whatever the server did say: a string
+  // `error`, a non-JSON line (`raw`), a non-object JSON value (`value`), or
+  // failing those the payload itself.
+  const stated =
+    (typeof err?.message === "string" && err.message) ||
+    (typeof raw === "string" && raw) ||
+    (err === undefined ? framePayloadText(data) : "");
+  // The fallback interpolates `code`, which is server-controlled too, so it is
+  // sanitized as a whole; `error.code` itself stays verbatim.
+  const message =
+    sanitizeFrameMessage(stated) ||
+    sanitizeFrameMessage(`event stream ended with an \`error\` frame (${code})`);
+  const details = isRecord(err?.details) ? err.details : null;
+  return errorFromEnvelope(httpStatus, { error: { code, message, details } });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function framePayloadText(data: Record<string, unknown>): string {
+  const payload = Object.hasOwn(data, "raw")
+    ? data.raw
+    : Object.hasOwn(data, "value")
+      ? data.value
+      : data;
+  if (typeof payload === "string") return payload;
+  if (payload && typeof payload === "object" && Object.keys(payload).length === 0) return "";
+  return JSON.stringify(payload) ?? "";
+}
+
+/** Longest server-stated reason an SSE `error` frame may put in `Error.message`. */
+const MAX_FRAME_MESSAGE_LENGTH = 500;
+
+/**
+ * The server's stated reason, made safe for a log line: line breaks (a
+ * multi-line `data:` field arrives joined with `\n`) collapse to a space, and
+ * the text is bounded so a frame cannot pin megabytes on the error.
+ */
+function sanitizeFrameMessage(text: string): string {
+  const flat = text.replace(/[\r\n]+/g, " ").trim();
+  return flat.length > MAX_FRAME_MESSAGE_LENGTH
+    ? `${flat.slice(0, MAX_FRAME_MESSAGE_LENGTH)}…`
+    : flat;
 }

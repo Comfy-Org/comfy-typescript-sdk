@@ -89,7 +89,9 @@ export async function* iterateSse(
     .pipeThrough(new EventSourceParserStream());
 
   for await (const message of stream) {
-    if (message.data === "") {
+    // An empty payload carries nothing to dispatch, except on the terminal
+    // `error` frame, whose arrival alone means the server is ending the stream.
+    if (message.data === "" && message.event !== "error") {
       continue;
     }
     yield { event: message.event || "message", data: parseData(message.data) };
