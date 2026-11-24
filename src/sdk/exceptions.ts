@@ -187,11 +187,21 @@ export class QueueFull extends ComfyError {
 }
 
 /**
- * The account's request-rate window was exhausted. `retryAfter` is the pace
+ * The server refused the request with `rate_limited`. `retryAfter` is the pace
  * to resume at, `null` when the server named none.
  *
- * Distinct from {@link QueueFull}, which is bounded queue DEPTH rather than
- * request rate, and from `routerErrors.RateLimited`, which the queued
+ * The v2 contract documents this code as the caller being past a request rate
+ * limit. In practice that is one possible cause, not the only one: a job submit
+ * can also be answered with it when the server is temporarily unable to admit
+ * the submission for a reason that has no code of its own. (`queue_full`,
+ * `deployment_not_ready` and `deployment_unavailable` do have their own, and
+ * are not this class.) Nothing structured tells the two apart, and `message` is
+ * not guaranteed to either (it is the generic `HTTP 429` when the server sent
+ * no text), so do not branch on it. The remedy is the same: back off, for
+ * `retryAfter` when it is set.
+ *
+ * Distinct from {@link QueueFull}, which is bounded queue DEPTH, and from
+ * `routerErrors.RateLimited`, which the queued
  * `comfy.models.submit` / `subscribe` surface throws for the Router contract's
  * bucket of the same name. `comfy.models.run` raises neither: it reports that
  * bucket as a plain `ComfyError` with `code: "rate_limited"`.
