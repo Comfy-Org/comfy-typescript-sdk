@@ -26,7 +26,9 @@ entry. See CONTRIBUTING.md.
   model's catalog entry and its `realtime` block (`connect_url`, `method`,
   `transport`, `wire_format`, `auth`), opens `connect_url` against the
   `comfy.models` host, sends `X-API-Key` in Node or a `comfy-bearer.<token>`
-  subprotocol entry from a browser (`idToken`), offers `comfy-realtime.v1`
+  subprotocol entry from a browser (`idToken`, a signed-in user's short-lived
+  Firebase ID token — never a `comfyui-` API key, since subprotocol entries
+  are not redacted the way `Authorization` is), offers `comfy-realtime.v1`
   when the block lists it, and resolves with the open socket plus its
   `wireFormat`, `transport`, the block itself, the selected subprotocol and
   `X-Comfy-Request-Id`. Comfy picks the serving leg; there is no client-side
@@ -36,11 +38,11 @@ entry. See CONTRIBUTING.md.
   from the catalog data before any socket opens. `readRealtimeBlock` reads the
   block off any catalog entry. `REALTIME_CLOSE_CODES` names the codes the
   broker closes a session with. The catalog read and the upgrade are bounded
-  by `timeoutMs` (default `DEFAULT_REALTIME_CONNECT_TIMEOUT_MS`, 30 s), and a
-  `101` that selected any subprotocol other than `comfy-realtime.v1` is closed
-  and rejected. Extra `protocols` and the `idToken` are checked against the
-  subprotocol token grammar up front, so a comma cannot split one entry into
-  two on the wire.
+  by `timeoutMs` (default `DEFAULT_REALTIME_CONNECT_TIMEOUT_MS`, 30 s). A
+  `101` that echoes the `comfy-bearer.` entry, or — when `comfy-realtime.v1`
+  was offered — selects anything other than it, is closed and rejected. Extra
+  `protocols` and the `idToken` are checked against the subprotocol token
+  grammar up front, so a comma cannot split one entry into two on the wire.
 - **`RouterError.refusalCode`** — the finer `code` a realtime refusal body
   carries (`router.realtime.session_already_live`, say), beside the coarse
   `errorType`; `null` on every response without one.
