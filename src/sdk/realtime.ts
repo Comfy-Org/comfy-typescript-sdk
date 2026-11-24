@@ -84,12 +84,15 @@
  * # Billing and closes
  *
  * A session is billed in the block's `billing_unit` (per second in v1) up to
- * its `max_session_seconds`; when billing starts depends on the model (Router
- * may wait for the model's first frame rather than the `101`). Router allows
- * one live WebSocket session per workspace, so close a session you are done
- * with — and expect a retryable `429` `session_already_live` for a short while
- * after a close, until Router has released the first session. The codes the
- * broker itself closes with after the `101` are in {@link REALTIME_CLOSE_CODES}.
+ * its `max_session_seconds`; when billing starts depends on the model. Router
+ * may allow a short grace period for the model's first frame: a frame within
+ * it starts billing there, a session that ends within it without one is not
+ * billed, and once it passes with no frame billing counts from the `101`.
+ * Router allows one live WebSocket session per workspace, so close a session
+ * you are done with — and expect a retryable `429` `session_already_live` for
+ * a short while after a close, until Router has released the first session.
+ * The codes the broker itself closes with after the `101` are in
+ * {@link REALTIME_CLOSE_CODES}.
  *
  * `realtime` lives on the module-level `comfy` namespace only, not on the
  * `Comfy` class, for the reason `comfy.models` does — see `./models.ts`.

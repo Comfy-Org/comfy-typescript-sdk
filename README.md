@@ -652,16 +652,21 @@ const session = await comfy.realtime.connect("google/genie-4", { idToken });
 ```
 
 Sessions are **billed per second**; when billing starts depends on the model
-(for `google/genie-4` it waits for the model's first frame, other models bill
-from the moment the upgrade succeeds). Router allows **one live WebSocket
-session per workspace** — a second one is refused with `429` (`refusalCode`
-`router.realtime.session_already_live`) until the first is released, so close
-a session you are done with (or pass a `signal`). That release can trail the
+(other than `google/genie-4`, models bill from the moment the upgrade
+succeeds). A `google/genie-4` session gets a short grace period, set by Router:
+if the first frame arrives within it, billing starts at that frame, and a
+session that ends within it without a frame is not billed. Once it passes with
+no frame, the session is billed from the upgrade, so a stalled session does not
+stay free — close it. Router allows **one live WebSocket session per
+workspace** — a second one is refused with `429` (`refusalCode`
+`router.realtime.session_already_live`) until the first is released, so close a
+session you are done with (or pass a `signal`). That release can trail the
 socket's `close` event briefly, so treat this `429` as retryable: wait (for its
 `retryAfter`, when set) and connect again. The upgrade itself is bounded by
 `timeoutMs` (default 30 seconds, `null` to disable), which rejects with
-`code: "request_timeout"` and never bounds an open session; on `ws`, a refusal whose status arrived in time but
-whose body did not still raises its typed Router error.
+`code: "request_timeout"` and never bounds an open session; on `ws`, a refusal
+whose status arrived in time but whose body did not still raises its typed
+Router error.
 
 `connect` only opens what the catalog says is a WebSocket upgrade (`GET`,
 `websocket` or `websocket_media_frames`). A model whose entry has no `realtime`
