@@ -130,6 +130,21 @@ export class InsufficientCredits extends ComfyError {}
 export class MissingCredentials extends ComfyError {}
 
 /**
+ * A `comfy.realtime.connect` WebSocket upgrade failed on a transport that
+ * cannot say why. `code` is `"realtime_upgrade_failed"`.
+ *
+ * The WHATWG `WebSocket` (a browser's, or Node's global one) reports a refused
+ * upgrade as a bare `error` event followed by a `1006` close: the refusal's
+ * status, headers and body are not exposed to script at all, so there is no
+ * bucket to raise a `routerErrors` class from. This is that "we could not
+ * read it" outcome, kept distinct from a typed Router refusal on purpose — it
+ * is deliberately NOT a `RouterError`, whose subclass set is pinned to the
+ * Router contract's buckets. In Node, installing the optional `ws` package
+ * makes `connect` read the refusal and raise the typed class instead.
+ */
+export class RealtimeUpgradeFailed extends ComfyError {}
+
+/**
  * Backpressure: the queue is full. `retryAfter` is seconds to wait when
  * supplied.
  *
@@ -151,8 +166,10 @@ export class QueueFull extends ComfyError {
  * to resume at, `null` when the server named none.
  *
  * Distinct from {@link QueueFull}, which is bounded queue DEPTH rather than
- * request rate, and from `routerErrors.RateLimited`, which `comfy.models.*`
- * throws for the Router contract's bucket of the same name.
+ * request rate, and from `routerErrors.RateLimited`, which the queued
+ * `comfy.models.submit` / `subscribe` surface throws for the Router contract's
+ * bucket of the same name. `comfy.models.run` raises neither: it reports that
+ * bucket as a plain `ComfyError` with `code: "rate_limited"`.
  */
 export class RateLimited extends ComfyError {}
 
@@ -215,6 +232,9 @@ const BY_CODE: Record<string, ComfyErrorClass> = {
   job_not_found: NotFound,
   asset_not_found: NotFound,
   unauthorized: Unauthorized,
+  // The code the terminal SSE `error` frame of job.events() uses for an
+  // expired credential.
+  credential_expired: Unauthorized,
   forbidden: Forbidden,
 };
 
@@ -228,7 +248,8 @@ export function toSdkError(exc: ApiError): ComfyError {
       details: exc.details,
     });
   }
-  const cls = BY_CODE[exc.code] ?? ComfyError;
+  // Own-property lookup: the code is server-controlled (see low/errors.ts).
+  const cls = Object.hasOwn(BY_CODE, exc.code) ? BY_CODE[exc.code] : ComfyError;
   return new cls(exc.message, {
     code: exc.code,
     httpStatus: exc.httpStatus,

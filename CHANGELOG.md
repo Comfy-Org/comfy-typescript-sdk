@@ -19,14 +19,59 @@ entry. See CONTRIBUTING.md.
 
 ### Added
 
+- **`comfy.realtime.connect(model, options)` opens a Comfy Router realtime
+  session.** Router serves its realtime models (`google/genie-4`,
+  `xai/grok-voice/realtime`) over a WebSocket upgrade, and integrators had to
+  hand-roll the URL, the auth rule and the refusal mapping. `connect` reads the
+  model's catalog entry and its `realtime` block (`connect_url`, `method`,
+  `transport`, `wire_format`, `auth`), opens `connect_url` against the
+  `comfy.models` host, sends `X-API-Key` in Node or a `comfy-bearer.<token>`
+  subprotocol entry from a browser (`idToken`, a signed-in user's short-lived
+  Firebase ID token — never a `comfyui-` API key, since subprotocol entries
+  are not redacted the way `Authorization` is), offers `comfy-realtime.v1`
+  when the block lists it, and resolves with the open socket plus its
+  `wireFormat`, `transport`, the block itself, the selected subprotocol and
+  `X-Comfy-Request-Id`. Comfy picks the serving leg; there is no client-side
+  serving table and no `provider` option. No codec is bundled. A model with no
+  `realtime` block (`realtime_unsupported_model`), or one served as a `POST`
+  session mint or over WebRTC (`realtime_unsupported_transport`), is refused
+  from the catalog data before any socket opens. `readRealtimeBlock` reads the
+  block off any catalog entry. `REALTIME_CLOSE_CODES` names the codes the
+  broker closes a session with. The catalog read and the upgrade are bounded
+  by `timeoutMs` (default `DEFAULT_REALTIME_CONNECT_TIMEOUT_MS`, 30 s). A
+  `101` that echoes the `comfy-bearer.` entry, or — when `comfy-realtime.v1`
+  was offered — selects anything other than it, is closed and rejected. Extra
+  `protocols` and the `idToken` are checked against the subprotocol token
+  grammar up front, so a comma cannot split one entry into two on the wire.
+- **`RouterError.refusalCode`** — the finer `code` a realtime refusal body
+  carries (`router.realtime.session_already_live`, say), beside the coarse
+  `errorType`; `null` on every response without one.
+- **`RealtimeUpgradeFailed`** (`code: "realtime_upgrade_failed"`), raised when
+  an upgrade fails on a WebSocket transport that cannot read why — a
+  browser's, or Node's built-in one.
+- **`ws` is an optional peer dependency.** When it is installed, `connect`
+  uses it in Node and a refused upgrade raises the typed `routerErrors` class
+  instead of `RealtimeUpgradeFailed`.
+- **A queued submit's cost quote is on the handle.** When Router quotes a
+  request on admission, `comfy.models.submit` now reads it into
+  `RequestHandle.estimate`, a new exported `CostEstimate`: `source` as the
+  server's open string, `isExact` / `isEstimated` / `isFree` / `isUnknown` to
+  branch on (an unrecognised source reads as unknown), the dollar figures `amount` /
+  `minAmount` / `maxAmount` as decimal strings, their `*Cents` and `credits`
+  counterparts as numbers, `reason`, `currency`, `provider`, `model`,
+  `pricingAsOf`, and the untouched `raw` object. `estimate` is `null` when no
+  quote is available — none sent, one that could not be read, an idempotent
+  replay, or a handle rebuilt by `comfy.models.handle` — and `null` never means
+  free. A malformed quote never fails the submit.
 - **A typed `RateLimited` for the v2 `rate_limited` code.** A `429` whose
   envelope names `rate_limited` — the account's request-rate window, which
   the job read and cancel routes document — now raises `RateLimited`, exported
   from the package root and a `ComfyError` like the rest, instead of a bare
   `ComfyError`. `retryAfter` carries the server's `Retry-After`, or `null`
   when it named none. It is distinct from `QueueFull` (queue depth) and is not
-  `routerErrors.RateLimited`, which `comfy.models.*` raises for the Router
-  contract. The low layer gains the matching `RateLimited` `ApiError`.
+  `routerErrors.RateLimited`, which the queued `comfy.models.submit` /
+  `subscribe` surface raises for the Router contract; `comfy.models.run` still
+  reports that bucket as a `ComfyError` with `code: "rate_limited"`. The low layer gains the matching `RateLimited` `ApiError`.
 - **A failed job's category reads as a typed value.** The v2 contract's
   `JobError.category` says why a user-caused failure on a serverless
   deployment happened. `job.failureCategory` and `JobFailed.failureCategory`
@@ -60,6 +105,65 @@ entry. See CONTRIBUTING.md.
 - The v2 spec is synced to the current contract and `src/low/generated` is
   regenerated. `ComfyLow.listJobs` is now a spec operation, so
   `OPERATION_IDS` lists it.
+- **`RequestHandle.get()` / `models.subscribe()` now return the `binary` arm
+  of `RunResult` when the queued result route answers a non-JSON
+  `Content-Type`**, matching `models.run` and the Router spec's `*/*` arm. The
+  result request now sends `Accept: application/json, */*;q=0.9` and is read
+  within the same `DEFAULT_MAX_RESPONSE_BYTES` cap `run` applies. Not reachable
+  on today's Router, which refuses binary models at submit; forward-compatible
+  only.
+- **A queued result route answering `200` with an empty body now raises
+  `invalid_response`** instead of resolving to `{ kind: "json", data: {} }`.
+  An empty `200` is a truncated or malformed response, not a result.
+- **A queued result `200` with no `Content-Type` whose body is not JSON
+  (including invalid UTF-8) now resolves as `kind: "binary"` with
+  `contentType: ""`** instead of raising `invalid_response`, as `run` does. A
+  body that declares a JSON type and does not parse still raises
+  `invalid_response`.
+- **A queued result larger than `DEFAULT_MAX_RESPONSE_BYTES` now raises
+  `response_too_large`** where it used to be read with no limit. `get()` and
+  `subscribe()` take a per-call `maxBytes` with the same meaning as
+  `models.run`'s (`null` disables the cap), and the request stays collectable,
+  so a later `get()` with a larger cap still fetches it. The error carries the
+  queued request's id as `details.queuedRequestId`, which is how a
+  `subscribe()` caller — who gets no handle back — reaches it. `get()` takes
+  the new `GetOptions` (`WaitOptions` plus `maxBytes`), so `events()` no
+  longer accepts a cap it would ignore. The cap applies to the result `200`
+  only: a `202` from the result route is diagnosed without reading its body,
+  and an error answer is truncated rather than refused, so it still reports
+  its own diagnosis.
+- **An error body under a `maxBytes` smaller than 1 MiB is now read to 1 MiB
+  before it is truncated**, on `models.run` and the queued result read alike,
+  so a small result cap no longer cuts the envelope a body-only `error_type`
+  or a validation `detail[]` is parsed from. `models.run` also drops the body
+  of a `2xx` other than `200` unread, so an oversized `202` reports
+  `unexpected_response` rather than `response_too_large`.
+- **A compressed response is measured by its decoded bytes.** The
+  `Content-Length` of a body whose `Content-Encoding` `fetch` decodes (`gzip`,
+  `deflate`, `br`, `zstd`) counts the encoded bytes, while `maxBytes` caps the
+  decoded ones, so it no longer refuses such a response before reading it; the
+  bytes read are counted against the cap as before. Any other coding,
+  `identity` included, reaches the reader undecoded, so its `Content-Length`
+  still refuses before the read. `maxBytes` also now rejects a fraction with a `TypeError` at the
+  call, as it already did `NaN` and negatives, rather than failing inside the
+  read as `response_too_large`.
+- **Breaking (`@comfyorg/sdk/low` types):** the low layer's `JobMetadata`,
+  `JobListItem` and `JobListPage` types now come
+  from the vendored v2 spec, which declares the `GET /api/v2/jobs` list. The
+  hand-written copies they replace had drifted from it: `JobListItem.status`
+  is now the `JobStatus` union rather than `string`, `create_time` and
+  `update_time` are required, `release_version` is declared, and
+  `deployment_id` is no longer a declared field (it is still read, if sent,
+  into `JobSummary.deploymentId`). `JobListPage` is an alias of the generated
+  `JobList`. A `JobListItem` literal without `create_time`/`update_time` no
+  longer compiles, and `item.deployment_id` is now `unknown` — narrow it before
+  use.
+
+### Fixed
+
+- `job.events()` now ends with a typed error (`Unauthorized` with code
+  `credential_expired`, `Forbidden`, or `NotFound`) when the server sends the
+  terminal `error` event, instead of silently reconnecting.
 
 ## [0.5.0] - 2026-10-10
 
@@ -167,6 +271,7 @@ entry. See CONTRIBUTING.md.
 
 ### Fixed
 
+- **A non-envelope `{message}` error body now keeps the server's message.** echo's request-decoder `400` and its `BodyLimit` `413` answer `{"message": "<diagnostic>"}` rather than an `ErrorEnvelope`, and that response used to collapse to `HTTP <status>` with the diagnostic lost. The message is now kept; the error's `code` is still the status-derived one (`"error"` for a `400` or `413`), and an envelope's own non-empty message still wins when a body carries both.
 - **`idempotencyKey` is now stamped onto _every_ error `comfy.models.run` and `comfy.models.submit` throw, including raw transport failures and aborts.** Previously only the `run` response-path `ComfyError` carried it; undici's transport-failure `TypeError` ("fetch failed"), an already-aborted signal's `AbortError`, and the queue path's `RouterError` (e.g. a bare `502` `ProviderError`) all escaped without it. On a transport failure the server never minted an `X-Comfy-Request-Id`, so the key is the only value that correlates the failure to the server-side record. It is now attached as an own `idempotencyKey` property on the raw throwable (its class, `name`, message and stack are otherwise untouched), and `routerErrors.RouterError` gained a typed `idempotencyKey` field. A failure to collect a generation additionally carries the `Retry-After` pace Router named, rather than reporting none. Where the throwable is one the caller owns and other calls share — an `AbortController`'s `signal.reason`, which `fetch` hands to every concurrent call on that controller — each call receives an equivalent per-call error carrying ITS OWN key instead, so no caller reads a key belonging to another generation and `controller.signal.reason` is left unmodified. Mirrors the Python SDK's `exceptions.translating(idempotency_key=…)`.
 - **The `droppedParams` doc comments now match the vendored Router contract.**
   The TSDoc on `parseDroppedParams` and `RunJsonResult.droppedParams` still

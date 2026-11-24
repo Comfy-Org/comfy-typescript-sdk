@@ -54,6 +54,9 @@ export interface ServerState {
   /** POST /jobs returns this error envelope instead of 201; `message`
    * defaults to `job error <code>`. */
   jobError: { status: number; code: string; message?: string } | null;
+  /** POST /jobs returns this bare `{message}` body — echo's HTTPError
+   * shape, no envelope — instead of 201. */
+  jobBareError: { status: number; message: string } | null;
   /** POST /jobs returns this error envelope only when the body carries
    * `metadata`, as the server's own metadata check does. */
   metadataError: { status: number; code: string; message: string } | null;
@@ -163,6 +166,11 @@ export interface ServerState {
    * `refresh()` rather than having held them all along.
    */
   jobFieldOverrides: Record<string, unknown> | null;
+  /** When set, `GET /jobs/{id}/events` sends one `running` status frame,
+   * then the terminal `event: error` frame carrying an envelope with this
+   * code, then closes — the server cutting a stream it can no longer serve
+   * (`credential_expired`, `forbidden`, `job_not_found`). */
+  sseErrorFrameCode: string | null;
   /** How many times `GET /jobs/{id}/logs` was hit. */
   jobLogsCount: number;
   /** The exact request path of the last `GET .../jobs/{id}/logs`, so a test
@@ -216,6 +224,7 @@ function defaultState(): ServerState {
     omitQueueFullRetryAfter: false,
     omitEventsRetryAfter: false,
     jobError: null,
+    jobBareError: null,
     metadataError: null,
     jobMetadata: null,
     jobListPages: { "": { jobs: [] } },
@@ -242,6 +251,7 @@ function defaultState(): ServerState {
     jobUrlsIncludeLogs: true,
     jobLogsGone: false,
     jobFieldOverrides: null,
+    sseErrorFrameCode: null,
     jobLogsCount: 0,
     jobLogsLastPath: null,
     deletedAssets: new Set(),
@@ -657,6 +667,12 @@ export class StubServer {
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     };
 
+    if (state.sseErrorFrameCode !== null) {
+      frame("status", { status: "running" });
+      frame("error", { error: { code: state.sseErrorFrameCode, message: "Stream ended" } });
+      res.end();
+      return;
+    }
     if (state.sseMode === "reconnect" && state.eventsConnectCount === 1) {
       frame("progress", { value: state.firstReconnectProgress, nodes_done: 4, nodes_total: 10 });
       res.end();
@@ -736,6 +752,11 @@ export class StubServer {
     if (state.metadataError !== null && body.metadata !== undefined) {
       const { status, code, message } = state.metadataError;
       sendError(res, status, code, message);
+      return;
+    }
+
+    if (state.jobBareError !== null) {
+      sendJson(res, state.jobBareError.status, { message: state.jobBareError.message });
       return;
     }
 
