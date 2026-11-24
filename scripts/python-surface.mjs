@@ -61,6 +61,23 @@ export const PYTHON_MODELS_CLASSES = ["Models", "AsyncModels"];
  */
 export const PYTHON_MODELS_DATA_CLASSES = ["RouterRunResult"];
 
+/**
+ * Public classes `exceptions.py` supplies that are VALUE TYPES, not errors.
+ *
+ * The module publishes `FailureCategory`, the enum a `JobFailed` carries as its
+ * `category`, next to the errors. The TypeScript SDK spells the same thing as a
+ * string-literal union type, which has no runtime export to compare against.
+ *
+ * Named rather than recognized by shape (an `Enum` base, say): a shape has to
+ * survive `StrEnum`, aliased imports, multiline bases and a move to a sibling
+ * module, and where it misfires it drops a real error class silently. A new
+ * value type that is not listed here fails the parity test by name instead.
+ *
+ * Kept honest by {@link extractExportedErrorClasses}, which fails on an entry
+ * the Python root no longer publishes through `exceptions.py`.
+ */
+export const PYTHON_EXCEPTIONS_VALUE_TYPES = ["FailureCategory"];
+
 class ExtractionError extends Error {}
 
 function fail(message) {
@@ -628,7 +645,8 @@ function relativeReexports(source) {
 /**
  * Error classes the package root re-exports — the names `comfy_sdk.__all__`
  * publishes that `comfy_sdk/exceptions.py` supplies, whether by defining them
- * or by re-exporting them from a sibling module (see {@link relativeReexports}).
+ * or by re-exporting them from a sibling module (see {@link relativeReexports}),
+ * less the value types named in {@link PYTHON_EXCEPTIONS_VALUE_TYPES}.
  *
  * The router errors are NOT categorically excluded, and the note that used to
  * say so is why this needed fixing. The Python SDK now flattens the shared
@@ -640,14 +658,29 @@ function relativeReexports(source) {
  */
 export function extractExportedErrorClasses(exceptionsSource, initSource) {
   const defined = [...exceptionsSource.matchAll(/^class\s+(\w+)\s*\(/gm)].map((m) => m[1]);
-  if (defined.length === 0) fail(`${PYTHON_SOURCE_FILES.exceptions}: no classes found.`);
-
   const supplied = new Set([...defined, ...relativeReexports(exceptionsSource)]);
+  if (supplied.size === 0) {
+    fail(`${PYTHON_SOURCE_FILES.exceptions}: no classes defined or re-exported.`);
+  }
+
   const exported = new Set(dunderAll(initSource, PYTHON_SOURCE_FILES.packageInit));
-  const names = [...supplied].filter((name) => exported.has(name)).sort();
+  const published = [...supplied].filter((name) => exported.has(name));
+
+  // Same rot rule as PYTHON_MODELS_DATA_CLASSES: an entry that excludes nothing
+  // would go on excusing the name, and hide the day it comes back as an error.
+  const goneValueTypes = PYTHON_EXCEPTIONS_VALUE_TYPES.filter((name) => !published.includes(name));
+  if (goneValueTypes.length > 0) {
+    fail(
+      `${PYTHON_SOURCE_FILES.exceptions}: PYTHON_EXCEPTIONS_VALUE_TYPES names ` +
+        `${goneValueTypes.join(", ")}, which the package root no longer publishes through ` +
+        "this module. Delete the entry rather than leaving it to excuse a name that is gone.",
+    );
+  }
+
+  const names = published.filter((name) => !PYTHON_EXCEPTIONS_VALUE_TYPES.includes(name)).sort();
   if (names.length === 0) {
     fail(
-      `${PYTHON_SOURCE_FILES.exceptions}: none of its classes appear in ` +
+      `${PYTHON_SOURCE_FILES.exceptions}: none of its error classes appear in ` +
         `${PYTHON_SOURCE_FILES.packageInit}'s \`__all__\`.`,
     );
   }

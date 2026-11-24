@@ -28,6 +28,8 @@ pnpm test                  # see which symbols actually diverged
 
 Then either mirror the change in this SDK, or — if the difference is deliberate — add it to the `INTENTIONAL_ASYMMETRIES` allowlist in `src/sdk/surface-parity.test.ts` with the reason. An allowlist entry is a design decision, not a way to quiet a failure.
 
+If the name that diverged under "package root" is not an error class at all — a value type the Python `exceptions` module publishes beside its errors, such as the `FailureCategory` enum — add it to `PYTHON_EXCEPTIONS_VALUE_TYPES` in `scripts/python-surface.mjs` and sync again. The extractor fails on an entry the Python root no longer publishes.
+
 ## Credential resolution
 
 `scripts/python-surface.mjs` also reads the Python client's credential resolution — the `COMFY_API_KEY` / `COMFY_BASE_URL` variable names, the Comfy Cloud base URL, the order `_resolve_api_key` tries its sources in, and the error it raises when they are exhausted against Comfy Cloud — into the snapshot's `credentialResolution` section. This is behaviour a name-only check cannot see, in the same sense the status fallback table is.
