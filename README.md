@@ -259,9 +259,19 @@ const { data, requestId } = await comfy.models.run(
 );
 ```
 
-`run` accepts a third options argument: `signal`, `timeoutMs`, `maxBytes`, `idempotencyKey`, and `retry`.
+`run` accepts a third options argument: `signal`, `timeoutMs`, `maxBytes`, `idempotencyKey`, `retry`, and `respondAsync` (below).
 
 The default deadline is **20 minutes** — minutes rather than seconds, because the finished generation is the response and a short default would abort work that had already been paid for. It covers the whole call, retries included, rather than restarting per attempt, which is also why it is twenty and not ten: Comfy's own deadline is ten minutes, so a default of ten would leave nothing for the collect described below. Pass `timeoutMs: null` to disable it, and prefer pairing that with a `signal`.
+
+#### Not holding the connection for a slow model — `respondAsync`
+
+A slow submit-and-poll model can keep `run`'s one HTTP connection open for minutes. `respondAsync: true` asks Comfy to hand such a call off to the queue instead, so no one connection has to stay open for the whole generation: the request carries `Prefer: respond-async` (RFC 7240), and when Comfy honours it — only for models its operators have enabled the handoff for — it answers `202` with `Preference-Applied: respond-async` and a queue handle. `run` then polls that handle (the same status and result reads as `comfy.models.handle`) and resolves to exactly the result it would have returned from a `200`. The polls collect the one generation the `POST` started; they never start or bill another.
+
+```ts
+const { data } = await comfy.models.run("some/slow-model", { prompt }, { respondAsync: true });
+```
+
+It is off by default, and a call without it sends no `Prefer` header and keeps today's `200`. With it, a model the handoff is not enabled for still answers `200`, which `run` returns as usual. `timeoutMs` and `signal` bound the polling too; if either ends the call while the handed-off request is still running, `run` makes one best-effort cancel of it (as `subscribe` does) before rejecting — but not once the queue has reported it finished, since its result is still collectable. Failures keep `run`'s error contract: a handed-off request that fails rejects with the same `ComfyError` the `200` path would raise, and a rejection after the handoff carries the queued request's id on `details.queuedRequestId` for `comfy.models.handle` — except an abort whose `signal.reason` is an object the SDK cannot copy (such as your own `Error` subclass), which is rethrown untouched; re-run under the same `idempotencyKey` to recover the id. Retrying with the same `idempotencyKey` — with or without `respondAsync` — replays the handoff rather than starting a second generation, and `run` follows the replayed handle either way (Router marks the replay `Idempotent-Replayed`, and omits `Preference-Applied` when the retry sent no `Prefer`). Any other `202` that does not carry `Preference-Applied: respond-async` is still raised as `unexpected_response`.
 
 #### How much of a response it will buffer
 

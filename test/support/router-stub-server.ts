@@ -41,6 +41,8 @@ export interface RecordedRequest {
   idempotencyKey: string | null;
   /** The request's `Accept` header, or `null` when it sent none. */
   accept: string | null;
+  /** The request's `Prefer` header (RFC 7240), or `null` when it sent none. */
+  prefer: string | null;
 }
 
 /** A scripted answer from {@link RouterServerState.respond}. */
@@ -376,6 +378,7 @@ export class RouterStubServer {
       body: raw,
       idempotencyKey: state.lastIdempotencyKey,
       accept: state.lastAccept,
+      prefer: header(req, "prefer"),
     };
     state.requests.push(recorded);
 

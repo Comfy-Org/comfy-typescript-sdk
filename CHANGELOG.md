@@ -19,6 +19,22 @@ entry. See CONTRIBUTING.md.
 
 ### Added
 
+- **`respondAsync` on `comfy.models.run`.** Opt in to sending
+  `Prefer: respond-async` so Router can hand a slow model off to the queue
+  instead of holding the connection. On a `202` carrying
+  `Preference-Applied: respond-async`, `run` polls the returned handle through
+  the existing queued reads and resolves to the same `RunResult` a `200` gives;
+  the polls do not bill again. Off by default — a call without it sends no
+  `Prefer` header — and a `200` answered despite the header is returned as
+  before. A same-key retry without the option follows the replayed handoff
+  (`Idempotent-Replayed`, which Router sends without `Preference-Applied`);
+  any other `202` without `Preference-Applied` is still
+  `unexpected_response`. Failures after the handoff raise the same
+  `ComfyError` the `200` path does (not `routerErrors.*`), each carrying
+  `details.queuedRequestId` — as does the caller's own abort, which stays
+  their `AbortError`, unless its reason is an object the SDK cannot copy (a
+  custom `Error` subclass), which is rethrown untouched — and a deadline that
+  runs out after the generation finished does not cancel it.
 - **`refusalSubject` on `routerErrors.RouterError`, and the
   `REFUSAL_SUBJECTS` list.** A `ContentPolicyViolation` now says which input
   or output was refused (`"output_audio"`, `"input_image"`, …) when Router
