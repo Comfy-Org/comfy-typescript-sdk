@@ -643,9 +643,10 @@ export function extractExportedErrorClasses(exceptionsSource, initSource) {
   // the errors they describe -- `class FailureCategory(str, Enum)` is the
   // `category` a `JobFailed` carries -- and those are not error classes: the
   // TypeScript SDK spells the same thing as a string-literal union type, which
-  // has no runtime export to compare against.
+  // has no runtime export to compare against. Comments are stripped from a
+  // multiline base list first, so `ComfyError,  # Enum category` still counts.
   const defined = [...exceptionsSource.matchAll(/^class\s+(\w+)\s*\(([^)]*)\)/gm)]
-    .filter((m) => !/\bEnum\b/.test(m[2]))
+    .filter((m) => !/\bEnum\b/.test(m[2].replace(/#.*$/gm, "")))
     .map((m) => m[1]);
   if (defined.length === 0) fail(`${PYTHON_SOURCE_FILES.exceptions}: no classes found.`);
 

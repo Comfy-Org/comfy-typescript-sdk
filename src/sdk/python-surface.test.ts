@@ -32,4 +32,19 @@ describe("extractExportedErrorClasses", () => {
 
     expect(extractExportedErrorClasses(exceptions, init)).toEqual(["ComfyError", "JobFailed"]);
   });
+
+  it("does not read a comment in a multiline base list as an Enum base", () => {
+    const exceptions = [
+      "class ComfyError(Exception):",
+      "    pass",
+      "",
+      "class JobFailed(",
+      "    ComfyError,  # carries an Enum category",
+      "):",
+      "    pass",
+    ].join("\n");
+    const init = ["__all__ = [", '    "ComfyError",', '    "JobFailed",', "]"].join("\n");
+
+    expect(extractExportedErrorClasses(exceptions, init)).toEqual(["ComfyError", "JobFailed"]);
+  });
 });
