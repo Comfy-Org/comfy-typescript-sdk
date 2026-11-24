@@ -617,6 +617,7 @@ import { decode, encode } from "@msgpack/msgpack"; // your choice of codec
 comfy.config({ credentials: "comfyui-..." }); // or COMFY_API_KEY
 
 const voice = await comfy.realtime.connect("xai/grok-voice");
+// listen before any other `await`: frames sent on connect arrive right after
 voice.socket.binaryType = "arraybuffer";
 voice.socket.addEventListener("message", (event) => {
   if (event.data instanceof ArrayBuffer) console.log(decode(event.data));

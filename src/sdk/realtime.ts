@@ -264,7 +264,9 @@ export interface RealtimeConnectOptions {
 export interface RealtimeSession {
   /**
    * The open socket. Send and receive on it directly, in the encoding
-   * {@link wireFormat} names. No codec is bundled.
+   * {@link wireFormat} names. No codec is bundled. Add a `message` listener
+   * before the first further `await`: frames a model sends on connect are
+   * delivered right after `connect` resolves.
    */
   socket: RealtimeSocket;
   /**
@@ -307,6 +309,9 @@ interface WsSocket extends RealtimeSocket {
   on(event: string, listener: (...args: never[]) => void): unknown;
   once(event: string, listener: (...args: never[]) => void): unknown;
   terminate(): void;
+  /** `ws` 8.3 and later; an older injected class is driven without them. */
+  pause?(): void;
+  resume?(): void;
 }
 
 type WsConstructor = new (
@@ -720,7 +725,17 @@ function openWithWs(
         }),
       );
     });
-    socket.once("open", () => settle(() => resolve({ socket, requestId })));
+    socket.once("open", () =>
+      settle(() => {
+        // `ws` delivers frames that arrived with the `101` before any promise
+        // continuation runs, so without this a greeting is gone before the
+        // caller awaiting `connect` can listen for it. The timer is a later
+        // task: the caller's continuation, and any listener it adds, run first.
+        socket.pause?.();
+        setTimeout(() => socket.resume?.(), 0);
+        resolve({ socket, requestId });
+      }),
+    );
     // Kept attached for the socket's whole life, and a no-op once settled: an
     // EventEmitter with no `error` listener throws, which would crash the
     // process on `terminate()` above, or on a malformed frame after open from

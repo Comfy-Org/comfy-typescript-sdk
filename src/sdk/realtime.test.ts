@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Duplex } from "node:stream";
@@ -1038,6 +1039,31 @@ describe("after open", () => {
     // No close frame arrives, so the close is a bare 1006 — but it arrives
     // instead of an unhandled `error` taking the process down.
     expect(await closed).toBe(1006);
+  });
+
+  it("delivers frames that arrived in the same packet as the 101", async () => {
+    await router({
+      upgrade: (req, socket) => {
+        const key = `${String(req.headers["sec-websocket-key"])}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`;
+        const accept = createHash("sha1").update(key).digest("base64");
+        const text = (s: string) => Buffer.concat([Buffer.from([0x81, s.length]), Buffer.from(s)]);
+        socket.write(
+          Buffer.concat([
+            Buffer.from(
+              "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+                `Sec-WebSocket-Accept: ${accept}\r\n` +
+                `Sec-WebSocket-Protocol: ${REALTIME_SUBPROTOCOL}\r\n\r\n`,
+            ),
+            text("greeting"),
+            text("second"),
+          ]),
+        );
+      },
+    });
+    const session = await open("google/genie-4");
+    const received: unknown[] = [];
+    session.socket.addEventListener("message", (event) => received.push(event.data));
+    await expect.poll(() => received).toEqual(["greeting", "second"]);
   });
 
   it("types a message event's data for the caller", async () => {
