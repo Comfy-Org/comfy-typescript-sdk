@@ -1174,8 +1174,10 @@ They live in their own namespace because four of the names —
 the workflow-API exceptions, which are unrelated classes descending from
 `ComfyError`. That is the one place a snippet does not transfer: the Python SDK
 shares one class per name, so there `except RateLimited` also catches a Router
-refusal, while here `instanceof RateLimited` does not — catch
-`routerErrors.RateLimited` for that:
+refusal, while here `instanceof RateLimited` does not. For a Router rate limit,
+catch `routerErrors.RateLimited` on the queued `comfy.models.submit` /
+`subscribe` surface; `comfy.models.run` reports it as a `ComfyError` with
+`code === "rate_limited"`, which neither class matches:
 
 ```ts
 import { routerErrors } from "@comfyorg/sdk";
