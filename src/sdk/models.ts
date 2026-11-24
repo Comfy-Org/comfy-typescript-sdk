@@ -108,13 +108,20 @@ import {
 } from "./exceptions.js";
 import {
   handle,
-  type RequestHandle,
+  isWaitEnded,
+  RequestHandle,
   submit,
   subscribe,
   type SubmitOptions,
   type SubscribeOptions,
 } from "./modelRequests.js";
-import { fillRoute, type ModelId, parseModelId, routerRunQuery } from "./modelRoutes.js";
+import {
+  fillRoute,
+  type ModelId,
+  parseModelId,
+  parseRequestId,
+  routerRunQuery,
+} from "./modelRoutes.js";
 import { parseRetryAfter, readRefusalSubject, REFUSAL_SUBJECT_HEADER } from "./routerErrors.js";
 import {
   isCollectable,
@@ -268,6 +275,39 @@ export const IDEMPOTENT_REPLAYED_HEADER = "Idempotent-Replayed";
  */
 export function parseReplayed(raw: string | null): boolean {
   return raw !== null;
+}
+
+/**
+ * `Prefer` (RFC 7240) — the request header {@link RunOptions.respondAsync}
+ * sends, carrying {@link RESPOND_ASYNC}.
+ */
+export const PREFER_HEADER = "Prefer";
+
+/**
+ * `Preference-Applied` (RFC 7240) — the response header Router echoes
+ * {@link RESPOND_ASYNC} on when it honoured the preference and answered with a
+ * `202` handle instead of the finished result.
+ */
+export const PREFERENCE_APPLIED_HEADER = "Preference-Applied";
+
+/** The RFC 7240 preference asking Router for a `202` handle on a slow model. */
+export const RESPOND_ASYNC = "respond-async";
+
+/**
+ * Did the server say it applied `respond-async`?
+ *
+ * RFC 7240 makes the header a comma-separated list of preferences, each a
+ * token optionally followed by `=value` and `;`-parameters, and preference
+ * names compare case-insensitively — so a `Preference-Applied` that applies
+ * several preferences, or spells this one in capitals, still counts. Anything
+ * else, the header's absence included, is `false`: a `202` the server did not
+ * mark as the handoff is not a handle this SDK knows how to follow.
+ */
+export function appliedRespondAsync(raw: string | null): boolean {
+  if (raw === null) return false;
+  return raw
+    .split(",")
+    .some((preference) => preference.split(/[;=]/)[0].trim().toLowerCase() === RESPOND_ASYNC);
 }
 
 /**
@@ -722,6 +762,42 @@ export interface RunOptions {
    * wrong, and is normalised to the wire spelling for you.
    */
   fallbackProvider?: boolean | string;
+  /**
+   * Ask Router to hand a slow model off to the queue instead of holding this
+   * connection for the whole generation. Off by default: a call that does not
+   * set it sends exactly the request it always did and gets the `200` it
+   * always got.
+   *
+   * Set, the request carries `Prefer: respond-async` (RFC 7240). Router MAY
+   * then answer `202` with `Preference-Applied: respond-async` and a queue
+   * handle — it does so only for a model its operators have enabled the
+   * handoff for, and answers every other call with the ordinary `200`, which
+   * this call returns exactly as it would without the option. On the `202`,
+   * `run` follows the handle on the queued routes (`comfy.models.handle`'s
+   * status and result reads) until the generation completes and resolves to
+   * the SAME {@link RunResult} it would have returned from the `200`. Those
+   * reads collect the one generation the `POST` started; they never start or
+   * bill another.
+   *
+   * {@link timeoutMs} and {@link signal} still bound the whole call, polling
+   * included. If either ends it while the handed-off request is still
+   * running, `run` makes one best-effort cancel of that request — the same
+   * rule `comfy.models.subscribe` follows, so a caller who has stopped
+   * waiting is not left paying for a generation nobody will collect — and
+   * then rejects.
+   *
+   * A `202` WITHOUT `Preference-Applied: respond-async` is not a handle this
+   * call follows: it is raised as `unexpected_response`, as it always was.
+   * Conversely a `202` that DOES carry it is followed even on a call that did
+   * not set this option — which only happens when an earlier call under the
+   * same {@link idempotencyKey} set it and the server is replaying that
+   * answer, and following it is how the retry collects the one generation
+   * rather than starting a second.
+   *
+   * `Prefer` is a header, not part of the query or body, so the same
+   * {@link idempotencyKey} can be retried with and without this option.
+   */
+  respondAsync?: boolean;
 }
 
 /**
@@ -1474,6 +1550,9 @@ async function run<TData = unknown>(
     Accept: "application/json, */*;q=0.9",
     "Idempotency-Key": idempotencyKey,
     "User-Agent": buildUserAgent(),
+    // Only on an opted-in call, so the default request is byte-for-byte what
+    // it always was and keeps today's 200 hold-and-return.
+    ...(options.respondAsync === true ? { [PREFER_HEADER]: RESPOND_ASYNC } : {}),
   };
   const body = JSON.stringify(input);
 
@@ -1583,7 +1662,21 @@ async function run<TData = unknown>(
           repeatAfterMs = nextDelayMs();
         }
 
-        if (repeatAfterMs === null && response.ok && response.status !== 200) {
+        if (
+          repeatAfterMs === null &&
+          response.status === 202 &&
+          appliedRespondAsync(response.headers.get(PREFERENCE_APPLIED_HEADER))
+        ) {
+          // The handoff: the body is the queue handle this call is about to
+          // follow, so it IS read — inside this `try`, under the same
+          // deadline and cap as a result.
+          responseBody = await readBodyWithin(
+            response,
+            maxBytes,
+            `models.run("${model}")`,
+            idempotencyKey,
+          );
+        } else if (repeatAfterMs === null && response.ok && response.status !== 200) {
           // A 2xx that is not the 200 result — a 202 handle, a 204 — is
           // diagnosed by `finish` from its status line alone, so its body is
           // dropped unread rather than downloaded and capped for nothing.
@@ -1655,9 +1748,109 @@ async function run<TData = unknown>(
         countAttempt();
         continue;
       }
+      if (
+        response.status === 202 &&
+        appliedRespondAsync(response.headers.get(PREFERENCE_APPLIED_HEADER))
+      ) {
+        return await followHandoff(response, responseBody);
+      }
       return finish<TData>(model, response, responseBody, idempotencyKey);
     }
   }
+
+  /**
+   * Follow a `202` + `Preference-Applied: respond-async` to the finished
+   * result, through the queued routes `comfy.models.handle` reads — there is
+   * no second poll API, and those reads collect rather than bill.
+   */
+  async function followHandoff(
+    accepted: Response,
+    acceptedBody: Uint8Array,
+  ): Promise<RunResult<TData>> {
+    const httpRequestId = accepted.headers.get(REQUEST_ID_HEADER);
+    const queuedRequestId = handoffRequestId(model, acceptedBody, httpRequestId, idempotencyKey);
+    const pending = new RequestHandle<TData>(model, queuedRequestId, options.retry ?? {});
+    const waitMs = clock().remainingMs;
+    let result: RunResult<TData>;
+    try {
+      result = await pending.get({
+        signal: options.signal,
+        // What is left of THIS call's deadline, so the handoff cannot outlive
+        // the `timeoutMs` the caller gave `run`. Floored at 0, which `get`
+        // reads as "look once".
+        timeoutMs: waitMs === null ? null : Math.max(0, waitMs),
+        retry: options.retry ?? {},
+        maxBytes: options.maxBytes,
+      });
+    } catch (exc) {
+      if (!isWaitEnded(exc, options.signal)) throw exc;
+      // The caller stopped waiting — by abort or by deadline — on a
+      // generation still running server side. Same rule as `subscribe`: one
+      // best-effort cancel, so nobody pays for a result nobody will collect.
+      await pending.cancelBestEffort();
+      if (options.signal?.aborted) throw exc;
+      throw new ComfyError(
+        `models.run("${model}") exceeded its ${String(timeoutMs)}ms deadline before the model finished; ` +
+          `the handed-off request ${queuedRequestId} was cancelled (best effort). ` +
+          "Raise timeoutMs, or pass timeoutMs: null and your own signal",
+        {
+          code: "request_timeout",
+          cause: exc,
+          idempotencyKey,
+          details: { queuedRequestId },
+        },
+      );
+    }
+    // A 202 served off the key's record means this call ran nothing new, which
+    // is what `replayed` reports — the result read itself never carries the
+    // marker.
+    return parseReplayed(accepted.headers.get(IDEMPOTENT_REPLAYED_HEADER))
+      ? { ...result, replayed: true }
+      : result;
+  }
+}
+
+/**
+ * The queued request id a handoff `202` names, or a {@link ComfyError}.
+ *
+ * The body is the queue's handle — the same `request_id`-carrying document
+ * `comfy.models.submit`'s acceptance is. One with no usable id is a generation
+ * the server accepted that this call cannot reach, so it rejects, carrying the
+ * `Idempotency-Key`: re-sending `run` under that key replays the same `202`
+ * rather than starting a second generation.
+ */
+function handoffRequestId(
+  model: string,
+  body: Uint8Array,
+  requestId: string | null,
+  idempotencyKey: string,
+): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(decodeUtf8(body));
+  } catch {
+    parsed = null;
+  }
+  const raw =
+    parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>).request_id
+      : undefined;
+  let reason: string | null = null;
+  if (typeof raw !== "string" || raw === "") {
+    reason = "its body named no request_id";
+  } else {
+    try {
+      return parseRequestId(raw, "the request_id the handoff named");
+    } catch (exc) {
+      reason = `it named a request_id that cannot address a route: ${String(exc)}`;
+    }
+  }
+  throw new ComfyError(
+    `models.run("${model}") was handed off to the queue (202, Preference-Applied: respond-async) ` +
+      `but ${reason}, so the generation cannot be followed; re-run with the same idempotencyKey ` +
+      "to replay the handoff rather than start another",
+    { code: "unexpected_response", httpStatus: 202, requestId, idempotencyKey },
+  );
 }
 
 /** UTF-8, non-fatal, BOM-stripping — the same decode `Response.text()` does. */
@@ -1756,7 +1949,8 @@ function finish<TData>(
   // in production.
   if (response.status === 202) {
     throw new ComfyError(
-      `models.run("${model}") received a 202 (accepted, not finished) where a completed result was expected`,
+      `models.run("${model}") received a 202 (accepted, not finished) where a completed result was expected, ` +
+        "and it did not carry Preference-Applied: respond-async, so it is not a handoff this call can follow",
       { code: "unexpected_response", httpStatus: 202, requestId, idempotencyKey },
     );
   }

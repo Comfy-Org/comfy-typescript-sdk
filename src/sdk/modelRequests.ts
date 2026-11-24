@@ -1650,7 +1650,7 @@ export async function subscribe<TData = unknown>(
  * a transport failure or a typed router error is not one, since the request
  * may be perfectly healthy and the caller can still reach it by its id.
  */
-function isWaitEnded(exc: unknown, callerSignal: AbortSignal | undefined): boolean {
+export function isWaitEnded(exc: unknown, callerSignal: AbortSignal | undefined): boolean {
   if (callerSignal?.aborted) return true;
   if (exc instanceof ComfyError && exc.code === "request_timeout") return true;
   return exc instanceof Error && (exc.name === "AbortError" || exc.name === "TimeoutError");

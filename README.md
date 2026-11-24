@@ -259,9 +259,19 @@ const { data, requestId } = await comfy.models.run(
 );
 ```
 
-`run` accepts a third options argument: `signal`, `timeoutMs`, `maxBytes`, `idempotencyKey`, and `retry`.
+`run` accepts a third options argument: `signal`, `timeoutMs`, `maxBytes`, `idempotencyKey`, `retry`, and `respondAsync` (below).
 
 The default deadline is **20 minutes** — minutes rather than seconds, because the finished generation is the response and a short default would abort work that had already been paid for. It covers the whole call, retries included, rather than restarting per attempt, which is also why it is twenty and not ten: Comfy's own deadline is ten minutes, so a default of ten would leave nothing for the collect described below. Pass `timeoutMs: null` to disable it, and prefer pairing that with a `signal`.
+
+#### Not holding the connection for a slow model — `respondAsync`
+
+A slow submit-and-poll model can keep `run`'s one HTTP connection open for minutes, and a finished result lost in transit on that connection is lost. `respondAsync: true` asks Comfy to hand such a call off to the queue instead: the request carries `Prefer: respond-async` (RFC 7240), and when Comfy honours it — only for models its operators have enabled the handoff for — it answers `202` with `Preference-Applied: respond-async` and a queue handle. `run` then polls that handle (the same status and result reads as `comfy.models.handle`) and resolves to exactly the result it would have returned from a `200`. The polls collect the one generation the `POST` started; they never start or bill another.
+
+```ts
+const { data } = await comfy.models.run("some/slow-model", { prompt }, { respondAsync: true });
+```
+
+It is off by default, and a call without it sends no `Prefer` header and keeps today's `200`. With it, a model the handoff is not enabled for still answers `200`, which `run` returns as usual. `timeoutMs` and `signal` bound the polling too; if either ends the call while the handed-off request is still running, `run` makes one best-effort cancel of it (as `subscribe` does) before rejecting. A `202` that does not carry `Preference-Applied: respond-async` is still raised as `unexpected_response`. Retrying with the same `idempotencyKey` — with or without `respondAsync` — replays the handoff rather than starting a second generation, and `run` follows the replayed handle either way.
 
 #### How much of a response it will buffer
 

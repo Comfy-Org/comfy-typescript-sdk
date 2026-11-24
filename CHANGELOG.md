@@ -19,6 +19,14 @@ entry. See CONTRIBUTING.md.
 
 ### Added
 
+- **`respondAsync` on `comfy.models.run`.** Opt in to sending
+  `Prefer: respond-async` so Router can hand a slow model off to the queue
+  instead of holding the connection. On a `202` carrying
+  `Preference-Applied: respond-async`, `run` polls the returned handle through
+  the existing queued reads and resolves to the same `RunResult` a `200` gives;
+  the polls do not bill again. Off by default — a call without it sends no
+  `Prefer` header — and a `200` answered despite the header is returned as
+  before. A `202` without `Preference-Applied` is still `unexpected_response`.
 - **`refusalSubject` on `routerErrors.RouterError`, and the
   `REFUSAL_SUBJECTS` list.** A `ContentPolicyViolation` now says which input
   or output was refused (`"output_audio"`, `"input_image"`, …) when Router
