@@ -269,7 +269,7 @@ Two things to know before you touch it:
   `exportedErrorClassesAheadOfPython` tolerate that in ONE direction —
   TypeScript leading — and each has a rot guard that fails the moment the
   Python snapshot grows the same name, which is the signal to delete the entry
-  rather than to grow it. The first carries `QueueBacklogFull` and the third
+  rather than to grow it. The first carries `ByokCredentialRejected` and the third
   carries `RealtimeUpgradeFailed` (raised by `comfy.realtime.connect`, which
   the Python SDK has no twin of yet). Do not reach for any of them to excuse
   something this SDK invented:
