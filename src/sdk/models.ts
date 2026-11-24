@@ -1937,9 +1937,8 @@ async function run<TData = unknown>(
       !Object.isExtensible(stamped)
     )
       return stamped;
-    const record = stamped as Record<string, unknown>;
     try {
-      if (record.details === undefined) record.details = { queuedRequestId };
+      writeQueuedRequestId(stamped, queuedRequestId);
     } catch {
       // As in `writeStamp`: a write that raises must not replace the abort.
     }
@@ -2006,15 +2005,31 @@ async function run<TData = unknown>(
     // the key — but with the queued id written beside it, since the
     // connection failing says nothing about the generation behind it.
     if (exc !== null && typeof exc === "object" && Object.isExtensible(exc)) {
-      const record = exc as Record<string, unknown>;
       try {
-        if (record.details === undefined) record.details = { queuedRequestId };
+        writeQueuedRequestId(exc, queuedRequestId);
       } catch {
         // As in `writeStamp`: a write that raises must not replace the failure.
       }
     }
     return exc;
   }
+}
+
+/**
+ * Put `queuedRequestId` on `target.details`, keeping any object-valued
+ * `details` it already carries. The merge goes onto a fresh object, never into
+ * the existing one: a stand-in for the caller's abort reason shares its
+ * `details` object with `controller.signal.reason` (the stand-in is a
+ * descriptor copy), so writing into it would change the caller's reason.
+ * A `details` that is not a plain object (a string, an array) is left as it
+ * is. May raise, as any write to a foreign object may; the caller catches it.
+ */
+function writeQueuedRequestId(target: object, queuedRequestId: string): void {
+  const record = target as Record<string, unknown>;
+  const details = record.details;
+  if (details === undefined || details === null) record.details = { queuedRequestId };
+  else if (typeof details === "object" && !Array.isArray(details))
+    record.details = { ...(details as Record<string, unknown>), queuedRequestId };
 }
 
 /**

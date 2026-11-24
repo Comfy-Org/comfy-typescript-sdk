@@ -575,6 +575,47 @@ describe("models.run: following a 202 handoff", () => {
     });
   });
 
+  it("merges the queued id into details the caller's abort reason already carries", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      const script = handoffScript();
+      server.state.respond = (request) => {
+        if (request.method === "POST") server.state.delayMs = 700;
+        return script(request);
+      };
+      const controller = new AbortController();
+      const reason = Object.assign(new DOMException("stopped", "AbortError"), {
+        details: { source: "user" },
+      });
+      setTimeout(() => controller.abort(reason), 200);
+
+      const err = (await comfy.models
+        .run(
+          MODEL,
+          {},
+          {
+            respondAsync: true,
+            timeoutMs: 5_000,
+            signal: controller.signal,
+            idempotencyKey: "key-11",
+          },
+        )
+        .catch((e: unknown) => e)) as Error & {
+        idempotencyKey?: string;
+        details?: Record<string, unknown>;
+      };
+
+      expect(err.name).toBe("AbortError");
+      expect(err.idempotencyKey).toBe("key-11");
+      expect(err.details).toEqual({ source: "user", queuedRequestId: QUEUED_ID });
+      // The caller's reason, and the details object it shares with the
+      // stand-in, are left exactly as they built them.
+      expect(err).not.toBe(reason);
+      expect(reason.details).toEqual({ source: "user" });
+      expect((reason as unknown as Record<string, unknown>).idempotencyKey).toBeUndefined();
+    });
+  });
+
   it("carries the queued id on a caller's abort during the result fetch, without cancelling", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
