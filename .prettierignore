@@ -19,3 +19,10 @@ parity/python-surface.json
 # `CLAUDE.md` would match at any depth and quietly exempt a future nested shim
 # too. Anchor it to the root file this comment is about.
 /CLAUDE.md
+
+# Vendored specs, written one-way by the upstream sync workflow (the files say
+# DO NOT HAND-EDIT). Reformatting them turned every sync into a whole-file
+# rewrite and failed `pnpm format:check` on each rolling sync PR. Keep the
+# upstream bytes as they arrive.
+spec/openapi.yaml
+spec/router-openapi.yaml
