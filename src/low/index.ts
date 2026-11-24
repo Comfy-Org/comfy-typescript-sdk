@@ -27,9 +27,7 @@ export {
   type ComfyLowOptions,
   type RequestOptions,
   type AssetContentUrl,
-  type JobListItem,
   type JobListPage,
-  type JobMetadata,
   type JobWorkflowFormat,
   type JobWorkflowResult,
 } from "./transport.js";
