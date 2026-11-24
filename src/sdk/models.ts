@@ -109,6 +109,7 @@ import {
 import {
   handle,
   isWaitEnded,
+  type QueueUpdate,
   RequestHandle,
   submit,
   subscribe,
@@ -122,7 +123,13 @@ import {
   parseRequestId,
   routerRunQuery,
 } from "./modelRoutes.js";
-import { parseRetryAfter, readRefusalSubject, REFUSAL_SUBJECT_HEADER } from "./routerErrors.js";
+import {
+  InvalidInput,
+  parseRetryAfter,
+  readRefusalSubject,
+  REFUSAL_SUBJECT_HEADER,
+  RouterError,
+} from "./routerErrors.js";
 import {
   isCollectable,
   isRetryableStatus,
@@ -225,6 +232,15 @@ const MAX_PRESIZED_CAPACITY = 16 * INITIAL_BODY_CAPACITY;
  * reads take on by inheriting `RunOptions.maxBytes`'s semantics).
  */
 const MIN_ERROR_BODY_BYTES = 1_048_576;
+
+/**
+ * The bound on a respond-async handoff's `202` body — the queue handle `run`
+ * follows. A control document of a few hundred bytes, so it gets its own
+ * bound rather than the caller's result cap: a `maxBytes` sized for a small
+ * result must not refuse the handle of a generation the server has already
+ * accepted, which would leave it running with no id to collect or cancel by.
+ */
+const HANDOFF_HANDLE_MAX_BYTES = 1_048_576;
 
 /**
  * Stand-in for the body of a response this call never read, so the one
@@ -810,7 +826,18 @@ export interface RunOptions {
    * running, `run` makes one best-effort cancel of that request — the same
    * rule `comfy.models.subscribe` follows, so a caller who has stopped
    * waiting is not left paying for a generation nobody will collect — and
-   * then rejects.
+   * then rejects. Only the polling earns that cancel: once the queue has
+   * reported the generation finished, a deadline that runs out while its
+   * result downloads rejects WITHOUT cancelling, since the result is still
+   * collectable.
+   *
+   * Failures keep `run`'s own error contract whichever path the server
+   * chose: a request that completes failed rejects with the same `ComfyError`
+   * (subclass) the `200` path raises for that `error_type`, with the queued
+   * surface's `routerErrors.*` error as its `cause`. Every rejection after the
+   * handoff carries the queued request's id on `details.queuedRequestId`
+   * beside the `Idempotency-Key`, so a generation still running can be
+   * collected with `comfy.models.handle(model, id)`.
    *
    * A `202` WITHOUT `Preference-Applied: respond-async` is not a handle this
    * call follows: it is raised as `unexpected_response`, as it always was.
@@ -1695,11 +1722,14 @@ async function run<TData = unknown>(
         ) {
           // The handoff: the body is the queue handle this call is about to
           // follow, so it IS read — inside this `try`, under the same
-          // deadline and cap as a result.
+          // deadline as a result but under HANDOFF_HANDLE_MAX_BYTES rather
+          // than the caller's result cap. A read that fails here leaves no id
+          // to cancel by; the `Idempotency-Key` every exit is stamped with is
+          // what replays this same `202` instead.
           responseBody = await readBodyWithin(
             response,
-            maxBytes,
-            `models.run("${model}")`,
+            HANDOFF_HANDLE_MAX_BYTES,
+            `the respond-async handle of models.run("${model}")`,
             idempotencyKey,
           );
         } else if (repeatAfterMs === null && response.ok && response.status !== 200) {
@@ -1796,23 +1826,32 @@ async function run<TData = unknown>(
     const httpRequestId = accepted.headers.get(REQUEST_ID_HEADER);
     const queuedRequestId = handoffRequestId(model, acceptedBody, httpRequestId, idempotencyKey);
     const pending = new RequestHandle<TData>(model, queuedRequestId, options.retry ?? {});
+    const retryPolicy = options.retry ?? {};
     const waitMs = clock().remainingMs;
-    let result: RunResult<TData>;
+    // What is left of THIS call's deadline, so the handoff cannot outlive the
+    // `timeoutMs` the caller gave `run`. Passed as a signal as well as a
+    // budget: the queue reads floor each request's own timeout (see
+    // MIN_REQUEST_TIMEOUT_MS), so the budget alone would let one slow poll or
+    // result fetch finish past the deadline. The caller's own signal is
+    // composed in, and stays distinguishable by `options.signal.aborted`.
+    const signal = composeSignal(options.signal, waitMs === null ? null : Math.max(0, waitMs));
+
+    // Polled and collected as two phases, the way `subscribe` does it, so only
+    // the polling can earn the cleanup cancel: once the queue has reported the
+    // completion the generation is finished and billed, and a deadline that
+    // runs out while its result downloads must not cancel what is still
+    // collectable through `comfy.models.handle`.
+    let completion: QueueUpdate | null = null;
     try {
-      result = await pending.get({
-        // What is left of THIS call's deadline, so the handoff cannot outlive
-        // the `timeoutMs` the caller gave `run`. Passed as a signal as well as
-        // a budget: the queue reads floor each request's own timeout (see
-        // MIN_REQUEST_TIMEOUT_MS), so the budget alone would let one slow poll
-        // or result fetch finish past the deadline. The caller's own signal is
-        // composed in, and stays distinguishable by `options.signal.aborted`.
-        signal: composeSignal(options.signal, waitMs === null ? null : Math.max(0, waitMs)),
+      // Floored at 0, which `events` reads as "look once".
+      for await (const update of pending.events({
+        signal,
         timeoutMs: waitMs === null ? null : Math.max(0, waitMs),
-        retry: options.retry ?? {},
-        maxBytes: options.maxBytes,
-      });
+        retry: retryPolicy,
+      }))
+        completion = update;
     } catch (exc) {
-      if (!isWaitEnded(exc, options.signal)) throw exc;
+      if (!isWaitEnded(exc, options.signal)) throw asRunError(exc, queuedRequestId);
       // The caller stopped waiting — by abort or by deadline — on a
       // generation still running server side. Same rule as `subscribe`: one
       // best-effort cancel, so nobody pays for a result nobody will collect.
@@ -1830,12 +1869,117 @@ async function run<TData = unknown>(
         },
       );
     }
+
+    let result: RunResult<TData>;
+    try {
+      const left = clock().remainingMs;
+      result = await pending.collect(completion, {
+        signal,
+        budgetMs: left === null ? null : Math.max(0, left),
+        retry: retryPolicy,
+        // The cap `run` validated before sending, not a re-read of options.
+        maxBytes,
+      });
+    } catch (exc) {
+      if (options.signal?.aborted) throw exc;
+      if (!isWaitEnded(exc, options.signal)) throw asRunError(exc, queuedRequestId);
+      throw new ComfyError(
+        `models.run("${model}") exceeded its ${String(timeoutMs)}ms deadline while collecting the result ` +
+          `of the handed-off request ${queuedRequestId}, which had already finished and was not cancelled; ` +
+          `collect it with comfy.models.handle("${model}", "${queuedRequestId}").get()`,
+        {
+          code: "request_timeout",
+          cause: exc,
+          idempotencyKey,
+          details: { queuedRequestId },
+        },
+      );
+    }
     // A 202 served off the key's record means this call ran nothing new, which
     // is what `replayed` reports — the result read itself never carries the
-    // marker.
-    return parseReplayed(accepted.headers.get(IDEMPOTENT_REPLAYED_HEADER))
-      ? { ...result, replayed: true }
-      : result;
+    // marker. The two disclosure headers are on the `202` as well: the queued
+    // result route carries neither, and it is the `POST` whose input Router
+    // translated or rerouted, so a `null` from the result read is the result
+    // route's silence, not "nothing was dropped".
+    return {
+      ...result,
+      servingProvider: result.servingProvider ?? accepted.headers.get(FALLBACK_PROVIDER_HEADER),
+      droppedParams:
+        result.droppedParams ?? parseDroppedParams(accepted.headers.get(DROPPED_PARAMS_HEADER)),
+      ...(parseReplayed(accepted.headers.get(IDEMPOTENT_REPLAYED_HEADER))
+        ? { replayed: true }
+        : {}),
+    };
+  }
+
+  /**
+   * A failure following the handoff, in `run`'s own error contract.
+   *
+   * The queued reads raise `routerErrors.*`, but `run` raises `ComfyError` for
+   * the same failure on its `200` path, and which path a call takes is the
+   * server's choice — so a caller's `instanceof ComfyError` must not depend on
+   * it. The Router error is mapped the way {@link errorFromResponse} maps the
+   * same bucket, and kept as `cause`. Every failure leaves carrying the queued
+   * request id on `details.queuedRequestId` and the `Idempotency-Key`: a
+   * caller of `run` never saw the handoff, and the generation it started may
+   * still be running and collectable by that id.
+   */
+  function asRunError(exc: unknown, queuedRequestId: string): unknown {
+    if (exc instanceof RouterError) {
+      const status = exc.httpStatus;
+      const code =
+        exc.errorType !== ""
+          ? exc.errorType
+          : status !== null
+            ? `http_${String(status)}`
+            : "unexpected_response";
+      const cls = Object.hasOwn(BY_ERROR_TYPE, code) ? BY_ERROR_TYPE[code] : ComfyError;
+      return new cls(exc.message, {
+        code,
+        ...(status === null ? {} : { httpStatus: status }),
+        details: {
+          queuedRequestId,
+          ...(exc instanceof InvalidInput && exc.detail.length > 0 ? { detail: exc.detail } : {}),
+        },
+        requestId: exc.requestId,
+        retryAfter: exc.retryAfter,
+        idempotencyKey,
+        refusalSubject: exc.refusalSubject,
+        cause: exc,
+      });
+    }
+    if (exc instanceof ComfyError) {
+      if (typeof exc.details?.queuedRequestId === "string" && exc.idempotencyKey !== null)
+        return exc;
+      // Rebuilt rather than written into: `details` is shared state on an
+      // error this module did not construct. Only a plain `ComfyError` — the
+      // `invalid_response` and `response_too_large` the queued reads raise —
+      // is rebuilt, so no subclass a caller narrows on is lost.
+      if (Object.getPrototypeOf(exc) !== ComfyError.prototype) return exc;
+      return new ComfyError(exc.message, {
+        code: exc.code,
+        ...(exc.httpStatus === undefined ? {} : { httpStatus: exc.httpStatus }),
+        details: { ...exc.details, queuedRequestId },
+        requestId: exc.requestId,
+        retryAfter: exc.retryAfter,
+        idempotencyKey: exc.idempotencyKey ?? idempotencyKey,
+        refusalSubject: exc.refusalSubject,
+        cause: exc,
+      });
+    }
+    // A raw transport failure that outlasted the retry budget. It travels on
+    // as the same object — as on `run`'s own path, where the outer stamp adds
+    // the key — but with the queued id written beside it, since the
+    // connection failing says nothing about the generation behind it.
+    if (exc !== null && typeof exc === "object" && Object.isExtensible(exc)) {
+      const record = exc as Record<string, unknown>;
+      try {
+        if (record.details === undefined) record.details = { queuedRequestId };
+      } catch {
+        // As in `writeStamp`: a write that raises must not replace the failure.
+      }
+    }
+    return exc;
   }
 }
 

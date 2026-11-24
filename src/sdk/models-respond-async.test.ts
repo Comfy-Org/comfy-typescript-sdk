@@ -11,7 +11,7 @@ import {
   withRouterStub,
 } from "../../test/support/router-stub-server.js";
 import { appliedRespondAsync } from "./models.js";
-import { comfy, ComfyError, config, CREDENTIALS_ENV_VAR } from "./index.js";
+import { comfy, ComfyError, config, CREDENTIALS_ENV_VAR, InsufficientCredits } from "./index.js";
 import * as routerErrors from "./routerErrors.js";
 
 const CREDENTIAL = "comfyui-test-credential";
@@ -304,12 +304,128 @@ describe("models.run: following a 202 handoff", () => {
         ],
       });
 
-      const err = await comfy.models
-        .run(MODEL, {}, { respondAsync: true })
-        .catch((e: unknown) => e);
+      const err = (await comfy.models
+        .run(MODEL, {}, { respondAsync: true, idempotencyKey: "key-8" })
+        .catch((e: unknown) => e)) as ComfyError;
 
-      expect(err).toBeInstanceOf(routerErrors.ProviderError);
+      // `run`'s own error family, as the same failure on the `200` path
+      // raises — not the queued surface's `routerErrors.*` — with that one
+      // kept as the cause.
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err).not.toBeInstanceOf(routerErrors.RouterError);
+      expect(err.code).toBe("provider_error");
+      expect(err.idempotencyKey).toBe("key-8");
+      expect(err.details).toEqual({ queuedRequestId: QUEUED_ID });
+      expect(err.cause).toBeInstanceOf(routerErrors.ProviderError);
       expect(server.state.requests.some((r) => r.path === REQUEST_PATH)).toBe(false);
+    });
+  });
+
+  it("maps a failed result read onto run's typed ComfyError, carrying the queued id", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      const script = handoffScript();
+      server.state.respond = (request) => {
+        if (request.method === "GET" && request.path === REQUEST_PATH) {
+          return {
+            status: 402,
+            body: { detail: "out of credits", error_type: "insufficient_credits" },
+            headers: { "X-Comfy-Error-Type": "insufficient_credits" },
+          };
+        }
+        return script(request);
+      };
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { respondAsync: true, idempotencyKey: "key-9" })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(InsufficientCredits);
+      expect(err.code).toBe("insufficient_credits");
+      expect(err.httpStatus).toBe(402);
+      expect(err.idempotencyKey).toBe("key-9");
+      expect(err.details).toEqual({ queuedRequestId: QUEUED_ID });
+      expect(server.state.requests.some((r) => r.method === "PUT")).toBe(false);
+    });
+  });
+
+  it("carries the queued id on an invalid_response from the status read", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = handoffScript({ statuses: [{ request_id: QUEUED_ID }] });
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { respondAsync: true, idempotencyKey: "key-10" })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("invalid_response");
+      expect(err.idempotencyKey).toBe("key-10");
+      expect(err.details).toMatchObject({ queuedRequestId: QUEUED_ID });
+      expect(server.state.requests.some((r) => r.method === "PUT")).toBe(false);
+    });
+  });
+
+  it("does not cancel a finished generation when the deadline ends its result download", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      const script = handoffScript({
+        statuses: [{ request_id: QUEUED_ID, status: "COMPLETED" }],
+      });
+      server.state.respond = (request) => {
+        // The poll answers at once and reports COMPLETED; the result read
+        // after it outlasts the whole run deadline.
+        if (request.method === "GET" && request.path === STATUS_PATH) server.state.delayMs = 700;
+        return script(request);
+      };
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { respondAsync: true, timeoutMs: 300, idempotencyKey: "key-11" })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("request_timeout");
+      expect(err.idempotencyKey).toBe("key-11");
+      expect(err.details).toEqual({ queuedRequestId: QUEUED_ID });
+      expect(err.message).toContain("not cancelled");
+      expect(server.state.requests.some((r) => r.method === "PUT")).toBe(false);
+    });
+  });
+
+  it("reports the fallback provider and dropped params the handoff 202 disclosed", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = handoffScript({
+        accepted: {
+          status: 202,
+          body: HANDLE_BODY,
+          headers: {
+            "Preference-Applied": "respond-async",
+            "X-Comfy-Router-Fallback-Provider": "alt-provider",
+            "X-Comfy-Router-Dropped-Params": "seed",
+          },
+        },
+      });
+
+      const result = await comfy.models.run(MODEL, {}, { respondAsync: true });
+
+      expect(result.servingProvider).toBe("alt-provider");
+      expect(result.droppedParams).toEqual(["seed"]);
+    });
+  });
+
+  it("reads the handoff handle under its own bound, not a small result cap", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = handoffScript();
+
+      const result = await comfy.models.run(
+        MODEL,
+        {},
+        { respondAsync: true, maxBytes: JSON.stringify(PAYLOAD).length },
+      );
+
+      expect(result).toMatchObject({ kind: "json", data: PAYLOAD });
     });
   });
 

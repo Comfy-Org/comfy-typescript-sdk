@@ -27,6 +27,9 @@ entry. See CONTRIBUTING.md.
   the polls do not bill again. Off by default — a call without it sends no
   `Prefer` header — and a `200` answered despite the header is returned as
   before. A `202` without `Preference-Applied` is still `unexpected_response`.
+  Failures after the handoff raise the same `ComfyError` the `200` path does
+  (not `routerErrors.*`), each carrying `details.queuedRequestId`, and a
+  deadline that runs out after the generation finished does not cancel it.
 - **`refusalSubject` on `routerErrors.RouterError`, and the
   `REFUSAL_SUBJECTS` list.** A `ContentPolicyViolation` now says which input
   or output was refused (`"output_audio"`, `"input_image"`, …) when Router
