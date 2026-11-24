@@ -149,7 +149,12 @@ export class Asset {
     return this.createdNewValue;
   }
 
-  /** ID of the job that produced this asset. `undefined` for an uploaded asset (no producing job) and always `undefined` before commit. */
+  /**
+   * ID of the job that produced this asset. `undefined` for an asset no job
+   * produced, such as a fresh upload, and always `undefined` before commit.
+   * An upload whose file path and bytes match an existing job output resolves
+   * to that output, so it carries the output's job.
+   */
   get jobId(): string | undefined {
     return this.jobIdValue;
   }
