@@ -64,6 +64,12 @@ entry. See CONTRIBUTING.md.
   longer compiles, and `item.deployment_id` is now `unknown` — narrow it before
   use.
 
+### Fixed
+
+- `job.events()` now ends with a typed error (`Unauthorized` with code
+  `credential_expired`, `Forbidden`, or `NotFound`) when the server sends the
+  terminal `error` event, instead of silently reconnecting.
+
 ## [0.5.0] - 2026-10-10
 
 ### Added
