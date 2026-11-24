@@ -83,17 +83,18 @@ entry. See CONTRIBUTING.md.
 - **A typed `RateLimited` for the v2 `rate_limited` code.** A `429` whose
   envelope names `rate_limited` now raises `RateLimited`, exported from the
   package root and a `ComfyError` like the rest, instead of a bare
-  `ComfyError`. An exhausted account request-rate window is one possible
-  cause, not the only one: the server can send the same code when it is
-  temporarily unable to admit a submission. The exception does not identify
-  which, and `message` is not guaranteed to (it is the generic `HTTP 429` when
-  the server sent no text); back off either way.
-  `retryAfter` carries the server's `Retry-After`, or `null` when it named
-  none. It is distinct from `QueueFull` (queue depth) and is not
-  `routerErrors.RateLimited`, which the queued `comfy.models.submit` /
-  `subscribe` surface raises for the Router contract; `comfy.models.run` still
-  reports that bucket as a `ComfyError` with `code: "rate_limited"`. The low
-  layer gains the matching `RateLimited` `ApiError`.
+  `ComfyError`. The v2 contract documents the code as the caller being past a
+  request rate limit. In practice that is one possible cause, not the only one:
+  a job submit can also be answered with it when the server is temporarily
+  unable to admit the submission for a reason that has no code of its own.
+  Nothing structured tells the two apart, and `message` is not guaranteed to
+  either; back off, for `retryAfter` when it is set. `retryAfter` carries the
+  server's `Retry-After`, or `null` when it named none. It is distinct from
+  `QueueFull` (queue depth) and is not `routerErrors.RateLimited`, which the
+  queued `comfy.models.submit` / `subscribe` surface raises for the Router
+  contract; `comfy.models.run` still reports that bucket as a `ComfyError` with
+  `code: "rate_limited"`. The low layer gains the matching `RateLimited`
+  `ApiError`.
 - **A failed job's category reads as a typed value.** The v2 contract's
   `JobError.category` says why a user-caused failure on a serverless
   deployment happened. `job.failureCategory` and `JobFailed.failureCategory`

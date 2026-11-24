@@ -1125,16 +1125,18 @@ are only exposed by direct `ComfyLow` calls.
 - `QueueFull` (carries `retryAfter: number | null`; `submit()` retries 429
   responses with `Retry-After` for a bounded budget, including deployment warm-up)
 - `RateLimited` — the server refused the request with `rate_limited`;
-  `retryAfter` is the pace to resume at, `null` when the server named none. An
-  exhausted account request-rate window is one possible cause, not the only one:
-  the server can send the same code when it is temporarily unable to admit a
-  submission. The exception does not identify which, and `message` is not
-  guaranteed to (it is the generic `HTTP 429` when the server sent no text);
-  back off either way. Distinct from `QueueFull` (queue
-  depth), and not the same class as `routerErrors.RateLimited`, which the queued
-  `comfy.models.submit` / `subscribe` surface raises for the Router contract
-  (`comfy.models.run` reports that bucket as a `ComfyError` with
-  `code: "rate_limited"` instead)
+  `retryAfter` is the pace to resume at, `null` when the server named none. The
+  v2 contract documents the code as the caller being past a request rate limit.
+  In practice that is one possible cause, not the only one: a job submit can
+  also be answered with it when the server is temporarily unable to admit the
+  submission for a reason that has no code of its own (`queue_full`,
+  `deployment_not_ready` and `deployment_unavailable` do). Nothing structured
+  tells the two apart, and `message` is not guaranteed to either, so do not
+  branch on it; back off, for `retryAfter` when it is set. Distinct from
+  `QueueFull` (queue depth), and not the same class as
+  `routerErrors.RateLimited`, which the queued `comfy.models.submit` /
+  `subscribe` surface raises for the Router contract (`comfy.models.run` reports
+  that bucket as a `ComfyError` with `code: "rate_limited"` instead)
 - `JobFailed` — a job reached a non-`succeeded` terminal state (carries the
   node-level `error` detail when the platform provided one, and its
   `failureCategory`)
