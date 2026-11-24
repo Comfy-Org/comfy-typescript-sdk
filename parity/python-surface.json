@@ -124,6 +124,7 @@
     "MissingAsset",
     "NotFound",
     "QueueFull",
+    "RateLimited",
     "RouterError",
     "Unauthorized",
     "WorkflowFormatUi"

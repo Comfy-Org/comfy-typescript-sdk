@@ -62,6 +62,10 @@ export class QueueFull extends ApiError {
   static override readonly code = "queue_full";
 }
 
+export class RateLimited extends ApiError {
+  static override readonly code = "rate_limited";
+}
+
 export class InsufficientCredits extends ApiError {
   static override readonly code = "insufficient_credits";
 }
@@ -88,6 +92,7 @@ const BY_CODE: Record<string, ApiErrorClass> = {
   blob_not_found: BlobNotFound,
   idempotency_key_reuse: IdempotencyKeyReuse,
   queue_full: QueueFull,
+  rate_limited: RateLimited,
   insufficient_credits: InsufficientCredits,
   not_found: NotFound,
   // public-api currently returns entity-specific 404 codes even though the spec

@@ -51,10 +51,10 @@
  *   done until a class exists for it here.
  *
  * These classes are namespaced (`routerErrors.*`) rather than exported from
- * the package root because three of the twenty-one names — `Unauthorized`,
- * `Forbidden`, `InsufficientCredits` — already exist at the root as
- * workflow-API exceptions descending from `ComfyError`. The Python SDK has
- * the same three at the top level of `comfy_sdk`, so both SDKs resolve the
+ * the package root because four of the twenty-one names — `Unauthorized`,
+ * `Forbidden`, `InsufficientCredits`, `RateLimited` — already exist at the
+ * root as workflow-API exceptions descending from `ComfyError`. The Python SDK
+ * has the same four at the top level of `comfy_sdk`, so both SDKs resolve the
  * collision the same way: a dedicated module, and the class names themselves
  * left untouched.
  *

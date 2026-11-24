@@ -219,7 +219,7 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
       "re-exports the router hierarchy from `router_exceptions`, so the two modules share one " +
       "class object per name rather than two classes wearing one name. This SDK publishes the " +
       "same class under the `routerErrors` namespace — `routerErrors.RouterError`, also " +
-      "reachable as `@comfyorg/sdk/errors` — because three of those names are already taken at " +
+      "reachable as `@comfyorg/sdk/errors` — because four of those names are already taken at " +
       "its root by the workflow-API exceptions. Same class, different address: the rot guard " +
       "below proves it is really in the namespace rather than missing.",
     pythonOnlyExportedErrorClasses: ["RouterError"],

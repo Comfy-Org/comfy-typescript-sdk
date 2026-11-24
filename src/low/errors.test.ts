@@ -10,6 +10,7 @@ import {
   MissingAsset,
   NotFound,
   QueueFull,
+  RateLimited,
   Unauthorized,
   WorkflowFormatUi,
   errorFromEnvelope,
@@ -24,6 +25,7 @@ describe("errorFromEnvelope", () => {
     ["blob_not_found", 404, BlobNotFound],
     ["idempotency_key_reuse", 422, IdempotencyKeyReuse],
     ["queue_full", 429, QueueFull],
+    ["rate_limited", 429, RateLimited],
     ["insufficient_credits", 402, InsufficientCredits],
     ["not_found", 404, NotFound],
     ["job_not_found", 404, NotFound],
@@ -53,6 +55,16 @@ describe("errorFromEnvelope", () => {
       { retryAfter: 3 },
     );
     expect(err.retryAfter).toBe(3);
+  });
+
+  it("carries retryAfter onto RateLimited", () => {
+    const err = errorFromEnvelope(
+      429,
+      { error: { code: "rate_limited", message: "slow down" } },
+      { retryAfter: 7 },
+    );
+    expect(err).toBeInstanceOf(RateLimited);
+    expect(err.retryAfter).toBe(7);
   });
 
   it("falls back to a bare ApiError for an unmapped code", () => {

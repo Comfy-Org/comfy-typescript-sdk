@@ -1022,6 +1022,11 @@ are only exposed by direct `ComfyLow` calls.
 - `InsufficientCredits`
 - `QueueFull` (carries `retryAfter: number | null`; `submit()` retries 429
   responses with `Retry-After` for a bounded budget, including deployment warm-up)
+- `RateLimited` — the account's request-rate window was exhausted; `retryAfter`
+  is the pace to resume at, `null` when the server named none. Distinct from
+  `QueueFull` (queue depth, not request rate), and not the same class as
+  `routerErrors.RateLimited`, which `comfy.models.*` raises for the Router
+  contract
 - `JobFailed` — a job reached a non-`succeeded` terminal state (carries the
   node-level `error` detail when the platform provided one, and its
   `failureCategory`)
@@ -1061,8 +1066,8 @@ per bucket, all descending from `RouterError`. The Python SDK spells every one
 of these names identically, so a snippet transfers between the two languages
 unchanged.
 
-They live in their own namespace because three of the names —
-`Unauthorized`, `Forbidden`, `InsufficientCredits` — are already taken above by
+They live in their own namespace because four of the names —
+`Unauthorized`, `Forbidden`, `InsufficientCredits`, `RateLimited` — are already taken above by
 the workflow-API exceptions, which are unrelated classes descending from
 `ComfyError`:
 

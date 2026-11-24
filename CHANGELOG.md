@@ -19,6 +19,14 @@ entry. See CONTRIBUTING.md.
 
 ### Added
 
+- **A typed `RateLimited` for the v2 `rate_limited` code.** A `429` whose
+  envelope names `rate_limited` — the account's request-rate window, which
+  the job read and cancel routes document — now raises `RateLimited`, exported
+  from the package root and a `ComfyError` like the rest, instead of a bare
+  `ComfyError`. `retryAfter` carries the server's `Retry-After`, or `null`
+  when it named none. It is distinct from `QueueFull` (queue depth) and is not
+  `routerErrors.RateLimited`, which `comfy.models.*` raises for the Router
+  contract. The low layer gains the matching `RateLimited` `ApiError`.
 - **A failed job's category reads as a typed value.** The v2 contract's
   `JobError.category` says why a user-caused failure on a serverless
   deployment happened. `job.failureCategory` and `JobFailed.failureCategory`

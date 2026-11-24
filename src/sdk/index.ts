@@ -82,6 +82,7 @@ export {
   MissingCredentials,
   NotFound,
   QueueFull,
+  RateLimited,
   Unauthorized,
   WorkflowFormatUi,
 } from "./exceptions.js";
@@ -92,8 +93,8 @@ export {
  * `routerErrors.RouterError`. Also reachable as `@comfyorg/sdk/errors`.
  *
  * They are namespaced rather than flattened into the exports above because
- * three of the twenty-one names (`Unauthorized`, `Forbidden`,
- * `InsufficientCredits`) are already taken here by the workflow-API
+ * four of the twenty-one names (`Unauthorized`, `Forbidden`,
+ * `InsufficientCredits`, `RateLimited`) are already taken here by the workflow-API
  * exceptions, which descend from `ComfyError`. See `./routerErrors.ts`.
  */
 export * as routerErrors from "./routerErrors.js";

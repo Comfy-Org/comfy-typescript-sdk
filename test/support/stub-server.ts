@@ -85,6 +85,9 @@ export interface ServerState {
    * succeeded one carry none, as on the real server.
    */
   jobFailure: Record<string, unknown> | null;
+  /** `GET /jobs/{id}` returns this error envelope instead of the job, with
+   * `retryAfter` as its `Retry-After` header when set. */
+  jobGetError: { status: number; code: string; message: string; retryAfter?: string } | null;
   /** `GET /jobs/{id}` answers 500 `internal_error` from this poll number on
    * (counted from 1), so a test can fail the read a stream makes after its
    * terminal frame. */
@@ -221,6 +224,7 @@ function defaultState(): ServerState {
     jobListError: null,
     jobListThrottle: null,
     jobFailure: null,
+    jobGetError: null,
     jobPollFailsFrom: null,
     pollsToSucceed: 1,
     terminalStatus: "succeeded",
@@ -551,6 +555,12 @@ export class StubServer {
     const state = this.state;
     if (state.hangJobPoll) return; // never respond; the caller must abort client-side
     state.jobPollCount += 1;
+    if (state.jobGetError !== null) {
+      const { status, code, message, retryAfter } = state.jobGetError;
+      const headers = retryAfter === undefined ? {} : { "Retry-After": retryAfter };
+      sendJson(res, status, { error: { code, message } }, headers);
+      return;
+    }
     if (state.jobPollFailsFrom !== null && state.jobPollCount >= state.jobPollFailsFrom) {
       sendError(res, 500, "internal_error", "poll failed");
       return;
