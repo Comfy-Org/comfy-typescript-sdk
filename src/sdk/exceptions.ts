@@ -192,7 +192,10 @@ export class QueueFull extends ComfyError {
  *
  * An exhausted account request-rate window is one possible cause, not the only
  * one: the server can send the same code when it is temporarily unable to admit
- * a submission. The class alone does not say which, so read `message`.
+ * a submission. This exception does not identify which. `message` is whatever
+ * text the server sent, with no guarantee it names the cause, and is the
+ * generic `HTTP 429` when the server sent none. Either way the remedy is the
+ * same: back off, for `retryAfter` when it is set.
  *
  * Distinct from {@link QueueFull}, which is bounded queue DEPTH, and from
  * `routerErrors.RateLimited`, which the queued

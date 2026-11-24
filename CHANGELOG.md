@@ -85,7 +85,9 @@ entry. See CONTRIBUTING.md.
   package root and a `ComfyError` like the rest, instead of a bare
   `ComfyError`. An exhausted account request-rate window is one possible
   cause, not the only one: the server can send the same code when it is
-  temporarily unable to admit a submission, so read `message` for which.
+  temporarily unable to admit a submission. The exception does not identify
+  which, and `message` is not guaranteed to (it is the generic `HTTP 429` when
+  the server sent no text); back off either way.
   `retryAfter` carries the server's `Retry-After`, or `null` when it named
   none. It is distinct from `QueueFull` (queue depth) and is not
   `routerErrors.RateLimited`, which the queued `comfy.models.submit` /
