@@ -414,6 +414,10 @@ export interface GetOptions extends WaitOptions {
    * (carrying `maxBytes`, and the queued request's id as `queuedRequestId`,
    * on `details`) and is not retried. The request stays collectable, so a
    * later call with a larger cap can still fetch it.
+   *
+   * It caps decoded bytes held, not time or bytes on the wire: a compressed
+   * body that decodes to nothing never reaches it. Unlike `run`, this wait has
+   * no deadline by default, so set `timeoutMs` or `signal` to bound that too.
    */
   maxBytes?: number | null;
 }
@@ -456,6 +460,9 @@ export interface SubscribeOptions extends SubmitOptions {
    * call returns no handle, so collect it with
    * `comfy.models.handle(model, err.details?.queuedRequestId as string)
    * .get({ maxBytes })` and a larger cap. It is NOT cancelled: the generation is already paid for.
+   *
+   * As on {@link GetOptions.maxBytes}, it bounds neither time nor bytes on the
+   * wire, and there is no default deadline: use `timeoutMs` or `signal`.
    */
   maxBytes?: number | null;
 }
