@@ -77,15 +77,18 @@
  * caller says otherwise, `null` to disable — checked against `Content-Length`
  * before the body is read and against the bytes as they are read, since a
  * chunked response declares no length and a declared one is a claim rather
- * than a bound. A breach is the one failure here that is deliberately kept out
+ * than a bound. It caps DECODED bytes, so the `Content-Length` of a body
+ * `fetch` decompresses is not checked up front; only the read-side count
+ * applies to it. A breach is the one failure here that is deliberately kept out
  * of the retry loop: re-asking would re-download the same oversized body on
  * every attempt.
  *
  * The cap never decides what a response MEANS, though. A response is
  * classified from its status line and headers first, and a body is read only
  * for the response this call is going to hand back — a retryable or
- * collectable one is dropped unread — while an error response is truncated at
- * the cap rather than refused, so the bucket it carries survives.
+ * collectable one is dropped unread — while an error response is truncated
+ * rather than refused, at the cap or MIN_ERROR_BODY_BYTES (1 MiB), whichever is
+ * larger, so the bucket it carries survives a small cap.
  */
 
 import { clampTimerMs, withInactivityLimits } from "../low/dispatcher.js";
