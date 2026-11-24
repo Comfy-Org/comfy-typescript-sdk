@@ -668,6 +668,25 @@ describe("comfy.models.run failures", () => {
     }
   });
 
+  it("keeps a bucket named after an Object.prototype key a typed ComfyError", async () => {
+    // `X-Comfy-Error-Type` is server-controlled. A plain index into the bucket
+    // table would resolve these off `Object.prototype`: `constructor` builds a
+    // `String` wrapper, `toString` is not a constructor at all.
+    for (const errorType of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.status = 400;
+        server.state.errorType = errorType;
+        server.state.body = { detail: "nope", error_type: errorType };
+        const err = await comfy.models.run(MODEL, {}).catch((e: unknown) => e);
+        if (!(err instanceof ComfyError)) throw err;
+        expect(err.constructor, errorType).toBe(ComfyError);
+        expect(err.code).toBe(errorType);
+        expect(err.httpStatus).toBe(400);
+      });
+    }
+  });
+
   it("branches the two buckets only the header can name, off a shared status", async () => {
     // `not_enabled` shares its 403 with `forbidden` and `service_unavailable`
     // its 503 with a load balancer's own; the header is the only thing that

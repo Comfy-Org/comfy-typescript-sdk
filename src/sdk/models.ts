@@ -999,7 +999,10 @@ function errorFromResponse(
     message = `HTTP ${String(status)}`;
   }
 
-  const cls = BY_ERROR_TYPE[code] ?? ComfyError;
+  // Own-property lookup only, as in `toRouterError`: `code` is server-controlled,
+  // and a plain index would resolve `constructor` or `toString` off
+  // `Object.prototype` into something that is not a ComfyError constructor.
+  const cls = Object.hasOwn(BY_ERROR_TYPE, code) ? BY_ERROR_TYPE[code] : ComfyError;
   return new cls(message, {
     code,
     httpStatus: status,
@@ -1719,7 +1722,19 @@ function finish<TData>(
   // call COST is not recoverable from the body either, and `null` has to stay
   // distinguishable from a reported `"0"`.
   const creditsUsed = parseCreditsUsed(response.headers.get(CREDITS_USED_HEADER));
-  if (!response.ok) throw errorFromResponse(response, decodeUtf8(responseBody), idempotencyKey);
+  if (!response.ok) {
+    let bodyText: string;
+    try {
+      bodyText = decodeUtf8(responseBody);
+    } catch {
+      // An error page too long to hold as a string — reachable with
+      // `maxBytes: null`. Its envelope is out of reach, so the typed error is
+      // diagnosed from the status line and `X-Comfy-Error-Type` alone, as the
+      // queued read in `./modelRequests.ts` does.
+      bodyText = "";
+    }
+    throw errorFromResponse(response, bodyText, idempotencyKey);
+  }
 
   // A 202 is a task handle, not a result. This route is the synchronous one,
   // so a 202 here means the response is not the finished generation the
