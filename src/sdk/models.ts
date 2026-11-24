@@ -834,18 +834,25 @@ export interface RunOptions {
    * Failures keep `run`'s own error contract whichever path the server
    * chose: a request that completes failed rejects with the same `ComfyError`
    * (subclass) the `200` path raises for that `error_type`, with the queued
-   * surface's `routerErrors.*` error as its `cause`. Every rejection after the
+   * surface's `routerErrors.*` error as its `cause`. A rejection after the
    * handoff carries the queued request's id on `details.queuedRequestId`
    * beside the `Idempotency-Key`, so a generation still running can be
-   * collected with `comfy.models.handle(model, id)`.
+   * collected with `comfy.models.handle(model, id)` — with one exception: an
+   * abort whose `signal.reason` is an object this SDK cannot faithfully copy
+   * (a custom `Error` subclass, for one) is rethrown as that very reason,
+   * unwritten, so it carries neither; re-running under the same
+   * `idempotencyKey` replays the handoff and recovers the id.
    *
-   * A `202` WITHOUT `Preference-Applied: respond-async` is not a handle this
-   * call follows: it is raised as `unexpected_response`, as it always was.
-   * Conversely a `202` that DOES carry it is followed even on a call that did
-   * not set this option — which only happens when an earlier call under the
-   * same {@link idempotencyKey} set it and the server is replaying that
-   * answer, and following it is how the retry collects the one generation
-   * rather than starting a second.
+   * A `202` carrying neither `Preference-Applied: respond-async` nor
+   * `Idempotent-Replayed` is not a handle this call follows: it is raised as
+   * `unexpected_response`, as it always was. A replayed `202` is followed even
+   * on a call that did not set this option, with or without
+   * `Preference-Applied` (Router echoes the preference only to a request that
+   * sent `Prefer`) — which only happens when an earlier call under the same
+   * {@link idempotencyKey} set it and the server is replaying that handoff,
+   * and following it is how the retry collects the one generation rather than
+   * starting a second. A replayed `202` whose body names no usable
+   * `request_id` stays `unexpected_response`.
    *
    * `Prefer` is a header, not part of the query or body, so the same
    * {@link idempotencyKey} can be retried with and without this option.
@@ -1715,13 +1722,9 @@ async function run<TData = unknown>(
           repeatAfterMs = nextDelayMs();
         }
 
-        if (
-          repeatAfterMs === null &&
-          response.status === 202 &&
-          appliedRespondAsync(response.headers.get(PREFERENCE_APPLIED_HEADER))
-        ) {
-          // The handoff: the body is the queue handle this call is about to
-          // follow, so it IS read — inside this `try`, under the same
+        if (repeatAfterMs === null && isHandoffCandidate(response)) {
+          // The handoff (or a same-key replay of one): the body is the queue
+          // handle this call is about to follow, so it IS read — inside this `try`, under the same
           // deadline as a result but under HANDOFF_HANDLE_MAX_BYTES rather
           // than the caller's result cap. A read that fails here leaves no id
           // to cancel by; the `Idempotency-Key` every exit is stamped with is
@@ -1808,7 +1811,24 @@ async function run<TData = unknown>(
         response.status === 202 &&
         appliedRespondAsync(response.headers.get(PREFERENCE_APPLIED_HEADER))
       ) {
-        return await followHandoff(response, responseBody);
+        return await followHandoff(
+          response,
+          handoffRequestId(
+            model,
+            responseBody,
+            response.headers.get(REQUEST_ID_HEADER),
+            idempotencyKey,
+          ),
+        );
+      }
+      if (isHandoffCandidate(response)) {
+        // A replayed `202` with no `Preference-Applied`: Router echoes the
+        // preference only to a request that sent `Prefer`, so a same-key
+        // retry WITHOUT `respondAsync` gets the earlier handoff back unmarked.
+        // It is followed only when its body is a usable handle; anything else
+        // stays the `unexpected_response` an unmarked 202 always was.
+        const replayedId = readHandoffRequestId(responseBody);
+        if (typeof replayedId === "string") return await followHandoff(response, replayedId);
       }
       return finish<TData>(model, response, responseBody, idempotencyKey);
     }
@@ -1821,10 +1841,8 @@ async function run<TData = unknown>(
    */
   async function followHandoff(
     accepted: Response,
-    acceptedBody: Uint8Array,
+    queuedRequestId: string,
   ): Promise<RunResult<TData>> {
-    const httpRequestId = accepted.headers.get(REQUEST_ID_HEADER);
-    const queuedRequestId = handoffRequestId(model, acceptedBody, httpRequestId, idempotencyKey);
     const pending = new RequestHandle<TData>(model, queuedRequestId, options.retry ?? {});
     const retryPolicy = options.retry ?? {};
     const waitMs = clock().remainingMs;
@@ -2033,20 +2051,27 @@ function writeQueuedRequestId(target: object, queuedRequestId: string): void {
 }
 
 /**
- * The queued request id a handoff `202` names, or a {@link ComfyError}.
- *
- * The body is the queue's handle — the same `request_id`-carrying document
- * `comfy.models.submit`'s acceptance is. One with no usable id is a generation
- * the server accepted that this call cannot reach, so it rejects, carrying the
- * `Idempotency-Key`: re-sending `run` under that key replays the same `202`
- * rather than starting a second generation.
+ * Is this a `202` `run` may follow to the queue? One carrying
+ * `Preference-Applied: respond-async`, or one Router served off an
+ * `Idempotency-Key` record (`Idempotent-Replayed`) — the replay of an earlier
+ * opted-in call's handoff, which Router sends WITHOUT `Preference-Applied`
+ * when the retry did not send `Prefer`. A replayed candidate is still only
+ * followed when its body is a usable handle; see {@link readHandoffRequestId}.
  */
-function handoffRequestId(
-  model: string,
-  body: Uint8Array,
-  requestId: string | null,
-  idempotencyKey: string,
-): string {
+function isHandoffCandidate(response: Response): boolean {
+  return (
+    response.status === 202 &&
+    (appliedRespondAsync(response.headers.get(PREFERENCE_APPLIED_HEADER)) ||
+      parseReplayed(response.headers.get(IDEMPOTENT_REPLAYED_HEADER)))
+  );
+}
+
+/**
+ * The queued request id a handoff `202` body names, or why it names none.
+ * The body is the queue's handle — the same `request_id`-carrying document
+ * `comfy.models.submit`'s acceptance is.
+ */
+function readHandoffRequestId(body: Uint8Array): string | { reason: string } {
   let parsed: unknown;
   try {
     parsed = JSON.parse(decodeUtf8(body));
@@ -2057,16 +2082,31 @@ function handoffRequestId(
     parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
       ? (parsed as Record<string, unknown>).request_id
       : undefined;
-  let reason: string | null = null;
-  if (typeof raw !== "string" || raw === "") {
-    reason = "its body named no request_id";
-  } else {
-    try {
-      return parseRequestId(raw, "the request_id the handoff named");
-    } catch (exc) {
-      reason = `it named a request_id that cannot address a route: ${String(exc)}`;
-    }
+  if (typeof raw !== "string" || raw === "") return { reason: "its body named no request_id" };
+  try {
+    return parseRequestId(raw, "the request_id the handoff named");
+  } catch (exc) {
+    return { reason: `it named a request_id that cannot address a route: ${String(exc)}` };
   }
+}
+
+/**
+ * The queued request id a handoff `202` names, or a {@link ComfyError}.
+ *
+ * A handle with no usable id is a generation
+ * the server accepted that this call cannot reach, so it rejects, carrying the
+ * `Idempotency-Key`: re-sending `run` under that key replays the same `202`
+ * rather than starting a second generation.
+ */
+function handoffRequestId(
+  model: string,
+  body: Uint8Array,
+  requestId: string | null,
+  idempotencyKey: string,
+): string {
+  const read = readHandoffRequestId(body);
+  if (typeof read === "string") return read;
+  const reason = read.reason;
   throw new ComfyError(
     `models.run("${model}") was handed off to the queue (202, Preference-Applied: respond-async) ` +
       `but ${reason}, so the generation cannot be followed; re-run with the same idempotencyKey ` +

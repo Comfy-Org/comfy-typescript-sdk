@@ -223,12 +223,14 @@ describe("models.run: following a 202 handoff", () => {
     await withRouterStub(async (server) => {
       useStub(server);
       // An earlier opted-in call under this key was handed off and its answer
-      // lost; the retry does not set respondAsync, and Router replays the 202.
+      // lost; the retry does not set respondAsync, and Router replays the 202
+      // — marked replayed, but with no Preference-Applied, since the retry
+      // sent no Prefer for it to echo.
       server.state.respond = handoffScript({
         accepted: {
           status: 202,
           body: HANDLE_BODY,
-          headers: { "Preference-Applied": "respond-async", "Idempotent-Replayed": "true" },
+          headers: { "Idempotent-Replayed": "true" },
         },
       });
 
@@ -239,6 +241,48 @@ describe("models.run: following a 202 handoff", () => {
       expect(posts(server)).toHaveLength(1);
       expect(posts(server)[0].prefer).toBeNull();
       expect(posts(server)[0].idempotencyKey).toBe("key-4");
+    });
+  });
+
+  it("collects a replayed handoff that still echoes Preference-Applied", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = handoffScript({
+        accepted: {
+          status: 202,
+          body: HANDLE_BODY,
+          headers: { "Preference-Applied": "respond-async", "Idempotent-Replayed": "true" },
+        },
+      });
+
+      const result = await comfy.models.run(MODEL, {}, { idempotencyKey: "key-4b" });
+
+      expect(result.data).toEqual(PAYLOAD);
+      expect(result.replayed).toBe(true);
+      expect(posts(server)).toHaveLength(1);
+    });
+  });
+
+  it("rejects a replayed 202 whose body is not a handle as unexpected_response", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = handoffScript({
+        accepted: {
+          status: 202,
+          body: { status: "IN_QUEUE" },
+          headers: { "Idempotent-Replayed": "true" },
+        },
+      });
+
+      const err = (await comfy.models
+        .run(MODEL, {}, { idempotencyKey: "key-4c" })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("unexpected_response");
+      expect(err.httpStatus).toBe(202);
+      expect(err.idempotencyKey).toBe("key-4c");
+      expect(server.state.requests).toHaveLength(1);
     });
   });
 
