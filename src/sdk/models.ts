@@ -1860,7 +1860,7 @@ async function run<TData = unknown>(
       // generation still running server side. Same rule as `subscribe`: one
       // best-effort cancel, so nobody pays for a result nobody will collect.
       await pending.cancelBestEffort();
-      if (callerStoppedFirst) throw exc;
+      if (callerStoppedFirst) throw callerAbort(exc, queuedRequestId);
       throw new ComfyError(
         `models.run("${model}") exceeded its ${String(timeoutMs)}ms deadline before the model finished; ` +
           `the handed-off request ${queuedRequestId} was cancelled (best effort). ` +
@@ -1885,7 +1885,7 @@ async function run<TData = unknown>(
         maxBytes,
       });
     } catch (exc) {
-      if (options.signal?.aborted) throw exc;
+      if (options.signal?.aborted) throw callerAbort(exc, queuedRequestId);
       if (!isWaitEnded(exc, options.signal)) throw asRunError(exc, queuedRequestId);
       throw new ComfyError(
         `models.run("${model}") exceeded its ${String(timeoutMs)}ms deadline while collecting the result ` +
@@ -1914,6 +1914,36 @@ async function run<TData = unknown>(
         ? { replayed: true }
         : {}),
     };
+  }
+
+  /**
+   * The caller's own abort after the handoff, still the abort it was — same
+   * class, `name` and message, never re-dressed — but carrying the queued
+   * request id on `details.queuedRequestId` beside the `Idempotency-Key`, so
+   * a generation the abort left running (or finished and uncollected) can
+   * still be reached with `comfy.models.handle`.
+   *
+   * Written only onto a call-private object: the stamp first swaps the
+   * caller's shared `signal.reason` for a per-call stand-in, and when no
+   * faithful stand-in exists the reason travels on with the key only, so
+   * `controller.signal.reason` is never written to.
+   */
+  function callerAbort(exc: unknown, queuedRequestId: string): unknown {
+    const stamped = stampIdempotencyKey(exc, idempotencyKey, { callerSignal: options.signal });
+    if (
+      stamped === null ||
+      typeof stamped !== "object" ||
+      stamped === (options.signal?.reason as unknown) ||
+      !Object.isExtensible(stamped)
+    )
+      return stamped;
+    const record = stamped as Record<string, unknown>;
+    try {
+      if (record.details === undefined) record.details = { queuedRequestId };
+    } catch {
+      // As in `writeStamp`: a write that raises must not replace the abort.
+    }
+    return stamped;
   }
 
   /**

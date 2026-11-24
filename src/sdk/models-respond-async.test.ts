@@ -535,6 +535,88 @@ describe("models.run: following a 202 handoff", () => {
       );
     });
   });
+
+  it("carries the queued id on the caller's abort without writing to its signal reason", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      const script = handoffScript();
+      server.state.respond = (request) => {
+        if (request.method === "POST") server.state.delayMs = 700;
+        return script(request);
+      };
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 200);
+
+      const err = (await comfy.models
+        .run(
+          MODEL,
+          {},
+          {
+            respondAsync: true,
+            timeoutMs: 5_000,
+            signal: controller.signal,
+            idempotencyKey: "key-9",
+          },
+        )
+        .catch((e: unknown) => e)) as Error & {
+        idempotencyKey?: string;
+        details?: Record<string, unknown>;
+      };
+
+      expect(err.name).toBe("AbortError");
+      expect(err).not.toBeInstanceOf(ComfyError);
+      expect(err.idempotencyKey).toBe("key-9");
+      expect(err.details).toEqual({ queuedRequestId: QUEUED_ID });
+      // A call-private stand-in: the caller's own reason is left as they built it.
+      expect(err).not.toBe(controller.signal.reason);
+      const reason = controller.signal.reason as Record<string, unknown>;
+      expect(reason.details).toBeUndefined();
+      expect(reason.idempotencyKey).toBeUndefined();
+    });
+  });
+
+  it("carries the queued id on a caller's abort during the result fetch, without cancelling", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      const script = handoffScript({
+        statuses: [{ request_id: QUEUED_ID, status: "COMPLETED" }],
+      });
+      server.state.respond = (request) => {
+        // The completion answers at once; the result fetch after it is slow.
+        if (request.path === STATUS_PATH) server.state.delayMs = 700;
+        return script(request);
+      };
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 200);
+
+      const err = (await comfy.models
+        .run(
+          MODEL,
+          {},
+          {
+            respondAsync: true,
+            timeoutMs: 5_000,
+            signal: controller.signal,
+            idempotencyKey: "key-10",
+          },
+        )
+        .catch((e: unknown) => e)) as Error & {
+        idempotencyKey?: string;
+        details?: Record<string, unknown>;
+      };
+
+      expect(err.name).toBe("AbortError");
+      expect(err.idempotencyKey).toBe("key-10");
+      expect(err.details).toEqual({ queuedRequestId: QUEUED_ID });
+      expect(server.state.requests.some((r) => r.method === "GET" && r.path === REQUEST_PATH)).toBe(
+        true,
+      );
+      // Finished and billed: still collectable, so never cancelled.
+      expect(server.state.requests.some((r) => r.method === "PUT" && r.path === CANCEL_PATH)).toBe(
+        false,
+      );
+    });
+  });
 });
 
 describe("appliedRespondAsync", () => {
