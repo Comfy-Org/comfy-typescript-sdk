@@ -386,26 +386,29 @@ export class RouterError extends Error {
    * Router sets it only on a {@link ContentPolicyViolation}, and only when the
    * provider named the refused subject with a machine-readable code, so its
    * absence is the common case and means "not said", not "the whole request".
-   * It lets a caller change the one thing that was refused rather than give up:
+   * It lets a caller change the one thing that was refused rather than give
+   * up. Router names a subject on a `comfy.models.run` refusal today, which
+   * that method raises as a `ComfyError` with
+   * `code: "content_policy_violation"` carrying the same value, read the same
+   * way, on `ComfyError.refusalSubject`:
    *
    * ```ts
    * try {
-   *   return await comfy.models.subscribe(model, input);
+   *   return await comfy.models.run(model, input);
    * } catch (err) {
-   *   if (err instanceof routerErrors.ContentPolicyViolation && err.refusalSubject === "output_audio") {
-   *     return comfy.models.subscribe(model, { ...input, generate_audio: false });
+   *   if (err instanceof ComfyError && err.code === "content_policy_violation" && err.refusalSubject === "output_audio") {
+   *     return comfy.models.run(model, { ...input, generate_audio: false });
    *   }
    *   throw err;
    * }
    * ```
    *
-   * The surfaces that raise `routerErrors.*` carry it here — the queued
+   * The surfaces that raise `routerErrors.*` read it here — the queued
    * `submit`, and a refused completion from `subscribe` or
    * `RequestHandle.get()` (`status()` and `events()` report a completion as
-   * data and do not throw). `comfy.models.run` maps its failures into the
-   * `ComfyError` family instead — a refusal there is a `ComfyError` with
-   * `code: "content_policy_violation"` — and carries the same value, read the
-   * same way, on `ComfyError.refusalSubject`.
+   * data and do not throw). Router's terminal queue status does not carry a
+   * subject yet, so on a refused queued completion this is `null` until
+   * Router starts sending one; do not build a queued retry branch on it today.
    *
    * It is the raw string, not narrowed to {@link REFUSAL_SUBJECTS}: a newer
    * server may send a subject this release does not know, and a caller should
