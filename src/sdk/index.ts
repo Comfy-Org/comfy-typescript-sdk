@@ -51,6 +51,7 @@ export {
   RequestHandle,
   type CostEstimate,
   type QueueUpdate,
+  type GetOptions,
   type SubmitOptions,
   type SubscribeOptions,
   type WaitOptions,
