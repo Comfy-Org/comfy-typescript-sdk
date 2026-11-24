@@ -77,15 +77,18 @@
  * caller says otherwise, `null` to disable — checked against `Content-Length`
  * before the body is read and against the bytes as they are read, since a
  * chunked response declares no length and a declared one is a claim rather
- * than a bound. A breach is the one failure here that is deliberately kept out
+ * than a bound. It caps DECODED bytes, so the `Content-Length` of a body
+ * `fetch` decompresses is not checked up front; only the read-side count
+ * applies to it. A breach is the one failure here that is deliberately kept out
  * of the retry loop: re-asking would re-download the same oversized body on
  * every attempt.
  *
  * The cap never decides what a response MEANS, though. A response is
  * classified from its status line and headers first, and a body is read only
  * for the response this call is going to hand back — a retryable or
- * collectable one is dropped unread — while an error response is truncated at
- * the cap rather than refused, so the bucket it carries survives.
+ * collectable one is dropped unread — while an error response is truncated
+ * rather than refused, at the cap or MIN_ERROR_BODY_BYTES (1 MiB), whichever is
+ * larger, so the bucket it carries survives a small cap.
  */
 
 import { clampTimerMs, withInactivityLimits } from "../low/dispatcher.js";
@@ -191,9 +194,36 @@ const RESPONSE_TOO_LARGE = "response_too_large";
 const INITIAL_BODY_CAPACITY = 65_536;
 
 /**
+ * Most a declared `Content-Length` may pre-size the capped read's buffer to.
+ * An in-cap header is still only a claim: a peer that declares 64 MiB and then
+ * stalls after a few bytes would otherwise have the full allocation committed
+ * before the first `read()`. Past this the buffer grows by doubling, in step
+ * with the bytes actually received, and a vetted length only clamps the last
+ * step to an exact fit.
+ */
+const MAX_PRESIZED_CAPACITY = 16 * INITIAL_BODY_CAPACITY;
+
+/**
+ * Least an error body is read to before it is truncated, whatever the caller's
+ * `maxBytes`. The cap is sized for a RESULT, and an error envelope carries
+ * more than prose — the body-only `error_type` and a validation failure's
+ * `detail[]` are parsed out of it — so a small result cap cutting the
+ * envelope mid-document would silently degrade the typed error. Still a
+ * bound: an error page is never read past `max(maxBytes, this)`.
+ *
+ * Its own literal rather than an alias of MAX_PRESIZED_CAPACITY, which answers
+ * a different question (how much a stalling peer's `Content-Length` may
+ * pre-commit): tuning that one down must not silently shrink this floor, which
+ * `RunOptions.maxBytes` and the CHANGELOG promise as 1 MiB (and the queued
+ * reads take on by inheriting `RunOptions.maxBytes`'s semantics).
+ */
+const MIN_ERROR_BODY_BYTES = 1_048_576;
+
+/**
  * Stand-in for the body of a response this call never read, so the one
- * variable `finish` reads is always assigned. Never reaches `finish`: the
- * loop repeats instead.
+ * variable `finish` reads is always assigned. Reaches `finish` only for a 2xx
+ * other than 200, which it diagnoses from the status line without the body;
+ * otherwise the loop repeats instead.
  */
 const EMPTY_BODY = new Uint8Array(0);
 
@@ -598,7 +628,10 @@ export interface RunOptions {
    * all** and the connection is dropped — the cheap exit, and the one that
    * avoids the download rather than merely the allocation. The bytes actually
    * read are then counted against the same cap, since `Content-Length` is
-   * absent on a chunked response and is not a promise on any of them.
+   * absent on a chunked response, counts the compressed size on one whose
+   * `Content-Encoding` `fetch` decodes (`gzip`, `deflate`, `br`, `zstd` — it
+   * is not consulted there; any other coding, `identity` included, leaves the
+   * body raw and the header in force), and is not a promise on any of them.
    *
    * A breach raises a {@link ComfyError} with `code: "response_too_large"`,
    * carrying `maxBytes` and the offending size on `details`. It is NOT
@@ -618,7 +651,10 @@ export interface RunOptions {
    * this call DOES hand back is truncated at the cap instead of refused: the
    * bucket a caller branches on comes from the status and the header, and
    * losing `Unauthorized` or `InsufficientCredits` to a cap breach would cost
-   * more than the body was worth. Only a RESULT past the cap raises.
+   * more than the body was worth. Only a RESULT past the cap raises. An error
+   * body is read to at least 1 MiB even under a smaller cap, so the envelope
+   * its typed error is parsed from survives: below 1 MiB the cap bounds the
+   * result, not the error page.
    */
   maxBytes?: number | null;
   /**
@@ -928,11 +964,14 @@ function describeValidationFailures(detail: readonly unknown[]): string {
  * classified. A body that is neither (a proxy's HTML error page, say) still
  * produces a typed error, from the header and the status.
  *
+ * Exported for `./realtime.ts`, whose catalog lookup maps a failed read the
+ * same way; it is not part of the `comfy.models` namespace.
+ *
  * A richer exception hierarchy per bucket is a separate piece of work; what
  * this owes a caller today is a `code` to branch on, the status, the details
  * intact, and the request id.
  */
-function errorFromResponse(
+export function errorFromResponse(
   response: Response,
   bodyText: string,
   idempotencyKey: string | null,
@@ -963,7 +1002,10 @@ function errorFromResponse(
     message = `HTTP ${String(status)}`;
   }
 
-  const cls = BY_ERROR_TYPE[code] ?? ComfyError;
+  // Own-property lookup only, as in `toRouterError`: `code` is server-controlled,
+  // and a plain index would resolve `constructor` or `toString` off
+  // `Object.prototype` into something that is not a ComfyError constructor.
+  const cls = Object.hasOwn(BY_ERROR_TYPE, code) ? BY_ERROR_TYPE[code] : ComfyError;
   return new cls(message, {
     code,
     httpStatus: status,
@@ -982,7 +1024,9 @@ function errorFromResponse(
 }
 
 /**
- * Resolve `options.maxBytes` to a cap, or to `null` for "no cap".
+ * Resolve `options.maxBytes` to a cap, or to `null` for "no cap". `caller`
+ * names the surface in the rejection — `run` here, the queued result read in
+ * `./modelRequests.ts`.
  *
  * Validated at the call site rather than in the read, for the reason the
  * credentials check is: a process that asked for a cap it cannot have should
@@ -990,12 +1034,19 @@ function errorFromResponse(
  * explicit check — every comparison against it is false, so it would read as
  * "no cap" and silently undo the ceiling the caller thought they set.
  */
-function resolveMaxBytes(maxBytes: number | null | undefined): number | null {
+export function resolveMaxBytes(
+  maxBytes: number | null | undefined,
+  caller = "models.run",
+): number | null {
   if (maxBytes === undefined) return DEFAULT_MAX_RESPONSE_BYTES;
   if (maxBytes === null) return null;
-  if (typeof maxBytes !== "number" || !Number.isFinite(maxBytes) || maxBytes < 0) {
+  // `Number.isInteger` also refuses `NaN` and the infinities. A fraction is
+  // refused here too: it would otherwise reach `new Uint8Array(...)` in the
+  // read and leave as a `RangeError` reported as a cap breach, whose "lower
+  // maxBytes" advice cannot fix an argument that is simply not a size.
+  if (typeof maxBytes !== "number" || !Number.isInteger(maxBytes) || maxBytes < 0) {
     throw new TypeError(
-      "models.run(options.maxBytes): expected a non-negative number of bytes, " +
+      `${caller}(options.maxBytes): expected a non-negative whole number of bytes, ` +
         // A number renders raw and everything else keeps its quoting:
         // `JSON.stringify` writes `NaN` as `null`, which is the one value the
         // same sentence calls valid, so the rejection would name what it
@@ -1016,13 +1067,54 @@ function resolveMaxBytes(maxBytes: number | null | undefined): number | null {
  * proxy can send something that is not a number at all. Neither is a length to
  * refuse a response over, and neither needs to be: an undeclared length is
  * exactly what the read-side count below exists for.
+ *
+ * Nor is the length of an ENCODED body. `Content-Length` counts the bytes on
+ * the wire, but `fetch` undoes a `gzip`/`br`/`deflate` `Content-Encoding`
+ * before the reader sees anything, and the cap governs those decoded bytes —
+ * so a compressed body declared past the cap can still decode to one inside
+ * it (a small one, whose fixed compression overhead outweighs what it saves),
+ * and one declared inside it can decode to far more. Either way the count is
+ * the only honest measure, so a response `fetch` decodes declares nothing here.
+ *
+ * Only one `fetch` decodes, though. It undoes a coding list only when EVERY
+ * token is one it knows; any other token — an unknown coding, `identity`, the
+ * empty entry a trailing comma leaves — makes it hand over the encoded bytes
+ * untouched, and then `Content-Length` IS the size the cap governs. Treating
+ * those as undeclared would let one bogus header switch off the cheap refusal
+ * and buy a full `maxBytes` download. `zstd` is listed although not every
+ * runtime decodes it: wrongly calling a body decoded only skips the cheap
+ * refusal, while wrongly calling it raw would refuse a body that decodes
+ * inside the cap.
  */
 function declaredLength(response: Response): number | null {
+  if (isDecodedByFetch(response.headers.get("Content-Encoding"))) return null;
   const raw = response.headers.get("Content-Length");
   if (raw === null) return null;
   const value = raw.trim();
   if (!/^\d+$/.test(value)) return null;
   return Number(value);
+}
+
+/** The content codings `fetch` undoes before the reader sees the body. */
+const FETCH_DECODED_CODINGS: ReadonlySet<string> = new Set([
+  "gzip",
+  "x-gzip",
+  "deflate",
+  "br",
+  "zstd",
+]);
+
+/**
+ * Does `fetch` hand over this body decoded? Only when the header names at
+ * least one coding and every one of them is a coding it undoes — the rule
+ * undici applies, which drops the whole decoder chain on any other token.
+ */
+function isDecodedByFetch(contentEncoding: string | null): boolean {
+  if (contentEncoding === null || contentEncoding.trim() === "") return false;
+  return contentEncoding
+    .toLowerCase()
+    .split(",")
+    .every((coding) => FETCH_DECODED_CODINGS.has(coding.trim()));
 }
 
 /**
@@ -1047,12 +1139,13 @@ type CapBreach =
  * apart.
  */
 function tooLarge(
-  model: string,
+  subject: string,
   response: Response,
-  idempotencyKey: string,
+  idempotencyKey: string | null,
   maxBytes: number,
   breach: CapBreach,
   cause?: unknown,
+  extraDetails: Record<string, unknown> = {},
 ): ComfyError {
   const cap = `${String(maxBytes)}-byte maxBytes cap`;
   const advice =
@@ -1077,10 +1170,10 @@ function tooLarge(
     // again.
     what = `exceeds the ${cap} (abandoned after ${String(breach.bytesRead)} bytes)`;
   }
-  return new ComfyError(`models.run("${model}") response body ${what}; ${advice}`, {
+  return new ComfyError(`${subject} response body ${what}; ${advice}`, {
     code: RESPONSE_TOO_LARGE,
     httpStatus: response.status,
-    details: { maxBytes, ...breach },
+    details: { ...extraDetails, maxBytes, ...breach },
     requestId: response.headers.get(REQUEST_ID_HEADER),
     // Set on every other response-derived error, and documented as "any
     // failure that carried the header has it" — a cap breach on a paced
@@ -1099,7 +1192,7 @@ function tooLarge(
  * The code alone is not the test, for the reason {@link tooLarge} gives: the
  * server controls `code`. `details.maxBytes` is set nowhere else.
  */
-function isTooLarge(exc: unknown): boolean {
+export function isTooLarge(exc: unknown): boolean {
   return (
     exc instanceof ComfyError &&
     exc.code === RESPONSE_TOO_LARGE &&
@@ -1130,25 +1223,51 @@ function isTooLarge(exc: unknown): boolean {
  * response was actually carrying. The cap still bounds the allocation; it
  * just no longer overrides the verdict.
  *
+ * An error body is read to at least MIN_ERROR_BODY_BYTES even under a smaller
+ * cap, so a result cap sized small does not cut the envelope the typed error
+ * is parsed from.
+ *
  * With no cap the runtime's own buffering does the work, which is what this
  * route did before the cap existed.
+ *
+ * `subject` names the call in a cap-breach message (`models.run("a/b")`), and
+ * `idempotencyKey` is stamped on that error — `null` for a route that sends
+ * none, such as the queued result read in modelRequests.ts.
+ *
+ * Only a 2xx is capped; the callers never read a 2xx other than a 200 (they
+ * drop its body unread, since its status line is the whole diagnosis).
+ * `extra.details` is merged into a cap breach's `details`, for a caller with
+ * an identifier of its own to hand back.
  */
-async function readBodyWithin(
+export async function readBodyWithin(
   response: Response,
   maxBytes: number | null,
-  model: string,
-  idempotencyKey: string,
+  subject: string,
+  idempotencyKey: string | null,
+  extra: { details?: Record<string, unknown> } = {},
 ): Promise<Uint8Array> {
   if (maxBytes === null) return new Uint8Array(await response.arrayBuffer());
 
   const truncate = !response.ok;
+  // Where the read stops: the cap for a result, and never less than
+  // MIN_ERROR_BODY_BYTES for an error body, which is truncated there instead.
+  const limit = truncate ? Math.max(maxBytes, MIN_ERROR_BODY_BYTES) : maxBytes;
+  const extraDetails = extra.details ?? {};
   const declared = declaredLength(response);
   if (!truncate && declared !== null && declared > maxBytes) {
     // Drop the connection rather than leave a body nothing will ever read
     // streaming into the buffer — not downloading it is the whole point of
     // checking the header first.
     await response.body?.cancel().catch(() => undefined);
-    throw tooLarge(model, response, idempotencyKey, maxBytes, { contentLength: declared });
+    throw tooLarge(
+      subject,
+      response,
+      idempotencyKey,
+      maxBytes,
+      { contentLength: declared },
+      undefined,
+      extraDetails,
+    );
   }
 
   const body = response.body;
@@ -1168,13 +1287,17 @@ async function readBodyWithin(
     try {
       return new Uint8Array(byteLength);
     } catch (exc) {
+      // `limit`, not `maxBytes`: on an error body the read is governed by the
+      // MIN_ERROR_BODY_BYTES floor, and the cap this reports has to be the
+      // bound that was actually applied (the two are equal on a result).
       throw tooLarge(
-        model,
+        subject,
         response,
         idempotencyKey,
-        maxBytes,
+        limit,
         { bytesRead, allocationFailedAt: byteLength },
         exc,
+        extraDetails,
       );
     }
   };
@@ -1187,15 +1310,46 @@ async function readBodyWithin(
   // which is the threat this cap is for — and concatenating at the end holds
   // every chunk AND the finished copy at once. Here each chunk is copied in
   // and dropped as it arrives, and the buffer is never larger than the cap.
-  let buffer = allocate(Math.min(declared ?? INITIAL_BODY_CAPACITY, maxBytes), 0);
+  //
+  // Pre-sized from `Content-Length` only when that header was vetted above: an
+  // error response's is not, and a bogus huge one on a near-empty error page
+  // would otherwise buy a `maxBytes` allocation for almost nothing. Even a
+  // vetted one pre-sizes no further than MAX_PRESIZED_CAPACITY, since being
+  // under the cap does not make it true. The allocation also cancels the
+  // reader on failure, since it sits outside the `try` below and a locked,
+  // unread stream would leak its socket.
+  const initial = Math.min(
+    truncate ? INITIAL_BODY_CAPACITY : (declared ?? INITIAL_BODY_CAPACITY),
+    MAX_PRESIZED_CAPACITY,
+    limit,
+  );
+  let buffer: Uint8Array;
+  try {
+    buffer = allocate(initial, 0);
+  } catch (exc) {
+    await reader.cancel().catch(() => undefined);
+    throw exc;
+  }
   let total = 0;
-  /** Grow to hold `needed` bytes, keeping the `total` already written. */
+  /**
+   * Grow to hold `needed` bytes, keeping the `total` already written.
+   *
+   * By doubling, so each step commits at most as much again as the peer has
+   * actually delivered: jumping to a declared length in one hop would let a
+   * peer that declares 64 MiB, sends a little past the pre-size and stalls
+   * pin the whole declaration — the amplification MAX_PRESIZED_CAPACITY is
+   * there to close. A vetted `Content-Length` only clamps the step that would
+   * overshoot it, so an honest body still ends on an exact fit.
+   */
   const reserve = (needed: number): void => {
     if (needed <= buffer.byteLength) return;
     let capacity = buffer.byteLength === 0 ? INITIAL_BODY_CAPACITY : buffer.byteLength;
     while (capacity < needed) capacity *= 2;
-    // `needed` never exceeds the cap, so clamping here cannot undershoot it.
-    const grown = allocate(Math.min(capacity, maxBytes), total);
+    if (!truncate && declared !== null && needed <= declared) {
+      capacity = Math.min(capacity, declared);
+    }
+    // `needed` never exceeds the limit, so clamping here cannot undershoot it.
+    const grown = allocate(Math.min(capacity, limit), total);
     grown.set(buffer.subarray(0, total));
     buffer = grown;
   };
@@ -1206,15 +1360,23 @@ async function readBodyWithin(
       const { done, value } = await reader.read();
       if (done) break;
       const received = total + value.byteLength;
-      if (received > maxBytes) {
+      if (received > limit) {
         if (!truncate) {
-          throw tooLarge(model, response, idempotencyKey, maxBytes, { bytesRead: received });
+          throw tooLarge(
+            subject,
+            response,
+            idempotencyKey,
+            maxBytes,
+            { bytesRead: received },
+            undefined,
+            extraDetails,
+          );
         }
-        const room = maxBytes - total;
+        const room = limit - total;
         if (room > 0) {
-          reserve(maxBytes);
+          reserve(limit);
           buffer.set(value.subarray(0, room), total);
-          total = maxBytes;
+          total = limit;
         }
         truncated = true;
         break;
@@ -1411,7 +1573,12 @@ async function run<TData = unknown>(
           repeatAfterMs = nextDelayMs();
         }
 
-        if (repeatAfterMs === null) {
+        if (repeatAfterMs === null && response.ok && response.status !== 200) {
+          // A 2xx that is not the 200 result — a 202 handle, a 204 — is
+          // diagnosed by `finish` from its status line alone, so its body is
+          // dropped unread rather than downloaded and capped for nothing.
+          await response.body?.cancel().catch(() => undefined);
+        } else if (repeatAfterMs === null) {
           // Inside the same `try` as the fetch on purpose: the deadline covers
           // body consumption too, so a signal that fires while the result is
           // still streaming rejects HERE, and translating it in only one of the
@@ -1424,7 +1591,12 @@ async function run<TData = unknown>(
           // the `Content-Type`. Decoding is deferred to the one branch that wants
           // a string ({@link decodeUtf8}), which is what `text()` would have done
           // anyway.
-          responseBody = await readBodyWithin(response, maxBytes, model, idempotencyKey);
+          responseBody = await readBodyWithin(
+            response,
+            maxBytes,
+            `models.run("${model}")`,
+            idempotencyKey,
+          );
         } else {
           // Never read: the whole content of a response this call is going to
           // ask again about is "ask again", which the status line already said.
@@ -1488,9 +1660,9 @@ const UTF8 = new TextDecoder();
  * JSON (`22 FF 22` becomes the document `"\uFFFD"`), which would hand a
  * caller a corrupted string where the bytes of their generation should be.
  */
-const UTF8_STRICT = new TextDecoder("utf-8", { fatal: true });
+export const UTF8_STRICT = new TextDecoder("utf-8", { fatal: true });
 
-function decodeUtf8(bytes: Uint8Array): string {
+export function decodeUtf8(bytes: Uint8Array): string {
   return UTF8.decode(bytes);
 }
 
@@ -1505,7 +1677,7 @@ function decodeUtf8(bytes: Uint8Array): string {
  * — which matches neither the exact type nor the `+json` suffix, and would
  * send an ordinary JSON result down the binary branch.
  */
-function mediaTypeOf(contentType: string): string {
+export function mediaTypeOf(contentType: string): string {
   return contentType.split(";")[0].split(",")[0].trim().toLowerCase();
 }
 
@@ -1524,7 +1696,7 @@ function mediaTypeOf(contentType: string): string {
  * value with no `type/subtype` at all (`garbage+json`) is not read as a
  * document on the strength of its last five characters.
  */
-function isJsonMediaType(mediaType: string): boolean {
+export function isJsonMediaType(mediaType: string): boolean {
   const slash = mediaType.indexOf("/");
   if (slash === -1) return false;
   const subtype = mediaType.slice(slash + 1);
@@ -1553,7 +1725,19 @@ function finish<TData>(
   // call COST is not recoverable from the body either, and `null` has to stay
   // distinguishable from a reported `"0"`.
   const creditsUsed = parseCreditsUsed(response.headers.get(CREDITS_USED_HEADER));
-  if (!response.ok) throw errorFromResponse(response, decodeUtf8(responseBody), idempotencyKey);
+  if (!response.ok) {
+    let bodyText: string;
+    try {
+      bodyText = decodeUtf8(responseBody);
+    } catch {
+      // An error page too long to hold as a string — reachable with
+      // `maxBytes: null`. Its envelope is out of reach, so the typed error is
+      // diagnosed from the status line and `X-Comfy-Error-Type` alone, as the
+      // queued read in `./modelRequests.ts` does.
+      bodyText = "";
+    }
+    throw errorFromResponse(response, bodyText, idempotencyKey);
+  }
 
   // A 202 is a task handle, not a result. This route is the synchronous one,
   // so a 202 here means the response is not the finished generation the
@@ -1609,14 +1793,16 @@ function finish<TData>(
   }
 
   let data: unknown;
+  // Set once the body is a string: a throw before that is the decode's.
+  let decoded = false;
   try {
     // Strictly when nothing declared a type: invalid UTF-8 is then a fact
     // about the body rather than a field of U+FFFDs, and JSON has to be
     // valid UTF-8 anyway, so refusing it costs no document that would have
     // parsed.
-    data = JSON.parse(
-      mediaType === "" ? UTF8_STRICT.decode(responseBody) : decodeUtf8(responseBody),
-    );
+    const text = mediaType === "" ? UTF8_STRICT.decode(responseBody) : decodeUtf8(responseBody);
+    decoded = true;
+    data = JSON.parse(text);
   } catch (exc) {
     // No `Content-Type` at all and a body that is not JSON: nothing claimed
     // this was a document, so it is the binary branch with no media type to
@@ -1624,6 +1810,16 @@ function finish<TData>(
     // wasn't is still the error it always was — that is the server
     // contradicting its own header, which no caller can do anything useful
     // with a `Uint8Array` of.
+    //
+    // With no type declared, ANY throw counts as "not JSON": invalid UTF-8,
+    // a body too long to hold as a string (which `maxBytes: null` makes
+    // reachable), or a nesting too deep for the parser's stack. Nothing
+    // claimed a document, and a re-collect fails the same way, so the bytes
+    // are the one lossless answer — raising would make a billed generation
+    // uncollectable. A declared-JSON body that fails without a `SyntaxError`
+    // is this process running out of room, not the server contradicting its
+    // header, and the message says so; it keeps the `requestId` and
+    // `idempotencyKey` a caller needs to re-collect.
     if (mediaType === "") {
       return {
         kind: "binary",
@@ -1637,7 +1833,11 @@ function finish<TData>(
       };
     }
     throw new ComfyError(
-      `models.run("${model}") returned a ${String(response.status)} whose body is not JSON`,
+      exc instanceof SyntaxError
+        ? `models.run("${model}") returned a ${String(response.status)} whose body is not JSON`
+        : `models.run("${model}") returned a ${String(response.status)} whose body this ` +
+            `process ran out of resources ${decoded ? "parsing" : "decoding"} (see cause); ` +
+            "the body itself may be valid JSON",
       {
         code: "unexpected_response",
         httpStatus: response.status,
@@ -2157,9 +2357,14 @@ function list(options: ListOptions = {}): ModelList {
  * `submit`, `subscribe` and `handle` are imported from `./modelRequests.ts`
  * rather than declared here: the queued surface is a file's worth of polling,
  * pacing and completion handling, and folding it into this module would bury
- * `run` in it. The dependency runs ONE WAY — that module imports nothing from
- * this one at run time, only `RunResult` as an erased type — which is what
- * keeps reading these three at module-evaluation time safe.
+ * `run` in it. The two modules import each other — that one reads header
+ * names, the body reader and the media-type helpers back from this one — so
+ * this initializer, the one top-level read on either side of the cycle, is
+ * safe for a narrower reason than the absence of a cycle: `submit`,
+ * `subscribe` and `handle` are function DECLARATIONS, bound before either
+ * module evaluates, so this reads them under either import order. Turning
+ * any of the three into a `const` would make this a TDZ `ReferenceError`
+ * whenever `./modelRequests.ts` is imported first.
  */
 export const models: Models = Object.freeze({
   run,
