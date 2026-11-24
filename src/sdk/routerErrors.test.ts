@@ -249,6 +249,17 @@ describe("toRouterError", () => {
     },
   );
 
+  it("carries a string body code as refusalCode, and null when the body has none", () => {
+    const headers = new Headers({ [ERROR_TYPE_HEADER]: "rate_limited" });
+    expect(toRouterError(429, headers, { detail: "slow down" }).refusalCode).toBeNull();
+    expect(toRouterError(429, headers, null).refusalCode).toBeNull();
+    expect(toRouterError(429, headers, { code: 7 }).refusalCode).toBeNull();
+    expect(toRouterError(429, headers, { code: "router.realtime.rate_limited" }).refusalCode).toBe(
+      "router.realtime.rate_limited",
+    );
+    expect(new RouterError("x").refusalCode).toBeNull();
+  });
+
   it("reads the bucket off the header even when the body disagrees", () => {
     // The header is the contract: the 422 body carries no error_type at all,
     // so a body field can never be the primary source.

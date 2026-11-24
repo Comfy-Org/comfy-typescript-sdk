@@ -130,6 +130,21 @@ export class InsufficientCredits extends ComfyError {}
 export class MissingCredentials extends ComfyError {}
 
 /**
+ * A `comfy.realtime.connect` WebSocket upgrade failed on a transport that
+ * cannot say why. `code` is `"realtime_upgrade_failed"`.
+ *
+ * The WHATWG `WebSocket` (a browser's, or Node's global one) reports a refused
+ * upgrade as a bare `error` event followed by a `1006` close: the refusal's
+ * status, headers and body are not exposed to script at all, so there is no
+ * bucket to raise a `routerErrors` class from. This is that "we could not
+ * read it" outcome, kept distinct from a typed Router refusal on purpose — it
+ * is deliberately NOT a `RouterError`, whose subclass set is pinned to the
+ * Router contract's buckets. In Node, installing the optional `ws` package
+ * makes `connect` read the refusal and raise the typed class instead.
+ */
+export class RealtimeUpgradeFailed extends ComfyError {}
+
+/**
  * Backpressure: the queue is full. `retryAfter` is seconds to wait when
  * supplied.
  *

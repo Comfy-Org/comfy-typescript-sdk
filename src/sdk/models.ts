@@ -964,11 +964,14 @@ function describeValidationFailures(detail: readonly unknown[]): string {
  * classified. A body that is neither (a proxy's HTML error page, say) still
  * produces a typed error, from the header and the status.
  *
+ * Exported for `./realtime.ts`, whose catalog lookup maps a failed read the
+ * same way; it is not part of the `comfy.models` namespace.
+ *
  * A richer exception hierarchy per bucket is a separate piece of work; what
  * this owes a caller today is a `code` to branch on, the status, the details
  * intact, and the request id.
  */
-function errorFromResponse(
+export function errorFromResponse(
   response: Response,
   bodyText: string,
   idempotencyKey: string | null,

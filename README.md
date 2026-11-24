@@ -592,6 +592,94 @@ class client's setting and is untouched by this.
 partner model — use the class client instead: `await new Comfy({ apiKey
 }).run(workflow)`, as in the Quickstart below.
 
+### Realtime sessions — `comfy.realtime.connect()`
+
+Comfy Router serves its realtime models over a WebSocket, and publishes how
+to reach each one on its catalog entry: an optional `realtime` block with the
+`connect_url` path, `method`, `transport`, `wire_format` and accepted `auth`.
+`comfy.realtime.connect(model)` reads that block, opens `connect_url` on the
+same host `comfy.models` uses, authenticates the upgrade with a method the
+block lists, and resolves with the open socket. Comfy picks the serving leg;
+you never name one. No codec is bundled: `session.wireFormat` says whether
+the model speaks MessagePack binary frames (for example
+`xai/grok-voice`) or JSON text frames (`google/genie-4`), and
+`session.realtime` carries the whole block, including the informational
+`billingUnit` and `maxSessionSeconds`.
+
+In Node, install the optional `ws` peer dependency so a refused upgrade raises
+the typed Router error (`routerErrors.InsufficientCredits`,
+`routerErrors.ConcurrencyLimitExceeded`, ...) with its `refusalCode`; without
+it, Node's built-in `WebSocket` is used and a refusal raises
+`RealtimeUpgradeFailed`, because that transport does not expose the status.
+
+```ts
+import { comfy } from "@comfyorg/sdk";
+import { decode, encode } from "@msgpack/msgpack"; // your choice of codec
+
+comfy.config({ credentials: "comfyui-..." }); // or COMFY_API_KEY
+
+const voice = await comfy.realtime.connect("xai/grok-voice");
+// listen before any other `await`: frames sent on connect arrive right after
+voice.socket.binaryType = "arraybuffer";
+voice.socket.addEventListener("message", (event) => {
+  if (event.data instanceof ArrayBuffer) console.log(decode(event.data));
+});
+voice.socket.send(encode(message)); // the model's own message shape
+// ...
+voice.close();
+```
+
+A JSON session is the same call, with text frames instead. Only one
+session may be live at a time, and `close()` returns as soon as the close has
+started, so wait for the socket's `close` event before opening the next one:
+
+```ts
+// after voice.close(): wait for it to finish closing (3 is CLOSED)
+if (voice.socket.readyState !== 3) {
+  await new Promise((resolve) => voice.socket.addEventListener("close", resolve));
+}
+const genie = await comfy.realtime.connect("google/genie-4");
+genie.socket.addEventListener("message", (event) => {
+  if (typeof event.data === "string") console.log(JSON.parse(event.data));
+});
+genie.socket.send(JSON.stringify(message)); // the model's own message shape
+// ...
+genie.close();
+```
+
+A browser cannot put an API key on a WebSocket upgrade, so it authenticates
+with a signed-in user's ID token, which travels as a subprotocol entry:
+
+```ts
+const session = await comfy.realtime.connect("google/genie-4", { idToken });
+```
+
+Sessions are **billed per second**; when billing starts depends on the model
+(other than `google/genie-4`, models bill from the moment the upgrade
+succeeds). A `google/genie-4` session gets a short grace period, set by Router:
+if the first frame arrives within it, billing starts at that frame, and a
+session that ends within it without a frame is not billed. Once it passes with
+no frame, the session is billed from the upgrade, so a stalled session does not
+stay free — close it. Router allows **one live WebSocket session per
+workspace** — a second one is refused with `429` (`refusalCode`
+`router.realtime.session_already_live`) until the first is released, so close a
+session you are done with (or pass a `signal`). That release can trail the
+socket's `close` event briefly, so treat this `429` as retryable: wait (for its
+`retryAfter`, when set) and connect again. The upgrade itself is bounded by
+`timeoutMs` (default 30 seconds, `null` to disable), which rejects with
+`code: "request_timeout"` and never bounds an open session; on `ws`, a refusal
+whose status arrived in time but whose body did not still raises its typed
+Router error.
+
+`connect` only opens what the catalog says is a WebSocket upgrade (`GET`,
+`websocket` or `websocket_media_frames`). A model whose entry has no `realtime`
+block is refused with `code: "realtime_unsupported_model"`; one served another
+way — a `POST` `session_post` mint, or a `webrtc` session — is refused with
+`code: "realtime_unsupported_transport"`, and the error's `details.realtime`
+carries the block so you can reach the route yourself. Both happen before any
+socket opens. `readRealtimeBlock(entry)` reads the same block off any
+`comfy.models.list()` entry.
+
 ### Module formats
 
 The package is **ESM-only** — it publishes no CommonJS build, and its
