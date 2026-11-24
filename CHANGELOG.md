@@ -19,6 +19,17 @@ entry. See CONTRIBUTING.md.
 
 ### Added
 
+- **A queued submit's cost quote is on the handle.** When Router quotes a
+  request on admission, `comfy.models.submit` now reads it into
+  `RequestHandle.estimate`, a new exported `CostEstimate`: `source` as the
+  server's open string, `isExact` / `isEstimated` / `isFree` / `isUnknown` to
+  branch on (an unrecognised source reads as unknown), the dollar figures `amount` /
+  `minAmount` / `maxAmount` as decimal strings, their `*Cents` and `credits`
+  counterparts as numbers, `reason`, `currency`, `provider`, `model`,
+  `pricingAsOf`, and the untouched `raw` object. `estimate` is `null` when no
+  quote is available — none sent, one that could not be read, an idempotent
+  replay, or a handle rebuilt by `comfy.models.handle` — and `null` never means
+  free. A malformed quote never fails the submit.
 - **A failed job's category reads as a typed value.** The v2 contract's
   `JobError.category` says why a user-caused failure on a serverless
   deployment happened. `job.failureCategory` and `JobFailed.failureCategory`
@@ -105,6 +116,12 @@ entry. See CONTRIBUTING.md.
   `JobList`. A `JobListItem` literal without `create_time`/`update_time` no
   longer compiles, and `item.deployment_id` is now `unknown` — narrow it before
   use.
+
+### Fixed
+
+- `job.events()` now ends with a typed error (`Unauthorized` with code
+  `credential_expired`, `Forbidden`, or `NotFound`) when the server sends the
+  terminal `error` event, instead of silently reconnecting.
 
 ## [0.5.0] - 2026-10-10
 
@@ -212,6 +229,7 @@ entry. See CONTRIBUTING.md.
 
 ### Fixed
 
+- **A non-envelope `{message}` error body now keeps the server's message.** echo's request-decoder `400` and its `BodyLimit` `413` answer `{"message": "<diagnostic>"}` rather than an `ErrorEnvelope`, and that response used to collapse to `HTTP <status>` with the diagnostic lost. The message is now kept; the error's `code` is still the status-derived one (`"error"` for a `400` or `413`), and an envelope's own non-empty message still wins when a body carries both.
 - **`idempotencyKey` is now stamped onto _every_ error `comfy.models.run` and `comfy.models.submit` throw, including raw transport failures and aborts.** Previously only the `run` response-path `ComfyError` carried it; undici's transport-failure `TypeError` ("fetch failed"), an already-aborted signal's `AbortError`, and the queue path's `RouterError` (e.g. a bare `502` `ProviderError`) all escaped without it. On a transport failure the server never minted an `X-Comfy-Request-Id`, so the key is the only value that correlates the failure to the server-side record. It is now attached as an own `idempotencyKey` property on the raw throwable (its class, `name`, message and stack are otherwise untouched), and `routerErrors.RouterError` gained a typed `idempotencyKey` field. A failure to collect a generation additionally carries the `Retry-After` pace Router named, rather than reporting none. Where the throwable is one the caller owns and other calls share — an `AbortController`'s `signal.reason`, which `fetch` hands to every concurrent call on that controller — each call receives an equivalent per-call error carrying ITS OWN key instead, so no caller reads a key belonging to another generation and `controller.signal.reason` is left unmodified. Mirrors the Python SDK's `exceptions.translating(idempotency_key=…)`.
 - **The `droppedParams` doc comments now match the vendored Router contract.**
   The TSDoc on `parseDroppedParams` and `RunJsonResult.droppedParams` still

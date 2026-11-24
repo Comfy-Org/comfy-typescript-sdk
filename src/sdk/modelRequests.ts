@@ -243,6 +243,109 @@ export interface QueueUpdate {
   raw: Record<string, unknown>;
 }
 
+/**
+ * What Comfy quoted for a queued request when it admitted it — the submit
+ * response's `estimate` object, read into camelCase.
+ *
+ * Priced before dispatch in US dollars, at Comfy's standard list price — or,
+ * for a model billed the cost its vendor reports, from the vendor's published
+ * price list. It is a QUOTE, not the charge, in three ways:
+ *
+ * - it is not a price lock: the run is charged at the rates in force when it
+ *   is rated, which can differ from those in force at {@link pricingAsOf};
+ * - it does not reflect contract rates: a workspace with negotiated pricing is
+ *   quoted the list price and charged its contract rate, so `exact` means
+ *   exact at list price, not that workspace's charge;
+ * - a vendor-reported model is billed the amount the vendor reports after the
+ *   run, never the quoted figure verbatim.
+ *
+ * Read {@link source} first; it says which of the figures exist:
+ *
+ * - `exact` carries {@link amount} (and {@link amountCents}, {@link credits});
+ * - `free` carries an {@link amount} of `"0"` — the rate card prices the
+ *   request at zero;
+ * - `estimated` carries {@link minAmount} and {@link maxAmount} and no amount;
+ * - `unknown` carries no figure, and a {@link reason}.
+ *
+ * An absent amount never means free.
+ */
+export interface CostEstimate {
+  /**
+   * `"exact"`, `"estimated"`, `"free"` or `"unknown"`, verbatim — or whatever
+   * a newer server sends. An OPEN string, like {@link QueueUpdate.status}: a
+   * source added server side reaches the caller as itself. Branch on
+   * {@link isExact} / {@link isEstimated} / {@link isFree} /
+   * {@link isUnknown} rather than on
+   * this, so an unrecognised value lands in `isUnknown` as the contract says
+   * it must.
+   */
+  source: string;
+  /** `source` is `"exact"`: {@link amount} is the figure. */
+  isExact: boolean;
+  /** `source` is `"estimated"`: the figure is the {@link minAmount}–{@link maxAmount} range. */
+  isEstimated: boolean;
+  /**
+   * `source` is `"free"`: the rate card prices this request at zero, and
+   * {@link amount} is `"0"`. The only case in which a quote says free.
+   */
+  isFree: boolean;
+  /**
+   * `source` is `"unknown"` OR a value this release does not recognise — no
+   * figure can be relied on. Not a statement that the run is free.
+   */
+  isUnknown: boolean;
+  /** Always `"USD"` today. */
+  currency: string;
+  /** The provider leg this quote is for — on a queued submit, the leg that will run. */
+  provider: string;
+  /** The `{provider}/{model}` id the quote prices. */
+  model: string;
+  /**
+   * When the rate card this quote was priced from was fetched, as the
+   * server's own ISO-8601 string (not parsed into a `Date`).
+   */
+  pricingAsOf: string;
+  /**
+   * Dollars as a decimal STRING (`"0.04"`), present on an exact quote, and
+   * `"0"` on a free one. A
+   * string on purpose: it is exact to eight decimals on the wire, and a
+   * `number` would round it. `null` when the server sent none.
+   */
+  amount: string | null;
+  /** Lower bound in dollars as a decimal string, on an estimated quote, else `null`. */
+  minAmount: string | null;
+  /** Upper bound in dollars as a decimal string, on an estimated quote, else `null`. */
+  maxAmount: string | null;
+  /** {@link amount} in US cents, unrounded, for arithmetic; `null` when absent. */
+  amountCents: number | null;
+  /** {@link minAmount} in US cents; `null` when absent. */
+  minAmountCents: number | null;
+  /** {@link maxAmount} in US cents; `null` when absent. */
+  maxAmountCents: number | null;
+  /** {@link amount} in Comfy credits, rounded to 2 decimals; `null` when absent. */
+  credits: number | null;
+  /**
+   * Why there is no figure, on an unknown quote, verbatim; `null` when absent:
+   *
+   * - `"not_quotable"` — the call cannot be priced before it runs;
+   * - `"unpriced_model"` — the rate card does not price this request;
+   * - `"byok"` — the run uses your own provider key, so Comfy bills nothing
+   *   for it;
+   * - `"pricing_unavailable"` — the rate card could not be read when the
+   *   request was admitted; transient, and the run is still charged as usual.
+   *
+   * The contract reads any other value as `"not_quotable"`, so branch on the
+   * three specific values and treat everything else as `"not_quotable"`.
+   */
+  reason: string | null;
+  /**
+   * The decoded `estimate` object, unmodified — the escape hatch for a field
+   * this interface does not model yet. A frozen copy, not the response body
+   * itself.
+   */
+  raw: Readonly<Record<string, unknown>>;
+}
+
 /** Options accepted by {@link Models.submit}. */
 export interface SubmitOptions {
   /**
@@ -386,6 +489,9 @@ function text(value: unknown): string | null {
   return trimmed === "" ? null : trimmed;
 }
 
+/** A Router dollar figure: `"0.04"`, `"12"` — digits, an optional fraction, nothing else. */
+const DOLLARS = /^\d+(?:\.\d+)?$/;
+
 function invalidResponse(
   message: string,
   requestId: string | null,
@@ -488,6 +594,134 @@ function requestIdOf(body: unknown, response: QueueResponse): string {
       response.status,
     );
   }
+}
+
+/**
+ * Read a Router cost estimate object into a {@link CostEstimate}, or `null`.
+ *
+ * Lenient by design, and it NEVER throws: it is read off a submit the server
+ * has already accepted, so a quote this SDK cannot read must not turn a
+ * queued (and possibly billed) request into a failed call that lost its
+ * handle. Any malformed shape — not an object, a required field missing or
+ * not a non-empty string, an optional field present with the wrong type, a
+ * dollar figure that is not a decimal numeral, an `exact` quote with no
+ * `amount` or an `estimated` one missing a bound — reads as `null`, "no quote
+ * available", rather than as a partial quote whose missing figure a caller
+ * could mistake for zero.
+ */
+export function costEstimateOf(value: unknown): CostEstimate | null {
+  if (!isRecord(value)) return null;
+  // Verbatim, NOT through `text()`: trimming would read `" exact "` as a
+  // trusted exact quote, where the contract says an unrecognised spelling is
+  // `unknown`.
+  const source =
+    typeof value.source === "string" && value.source.trim() !== "" ? value.source : null;
+  const currency = text(value.currency);
+  const provider = text(value.provider);
+  const model = text(value.model);
+  const pricingAsOf = text(value.pricing_as_of);
+  if (
+    source === null ||
+    currency === null ||
+    provider === null ||
+    model === null ||
+    pricingAsOf === null
+  ) {
+    return null;
+  }
+  // `undefined` marks a field present with the wrong type; one of those makes
+  // the whole object malformed.
+  const optionalText = (field: unknown): string | null | undefined =>
+    field === undefined || field === null ? null : typeof field === "string" ? field : undefined;
+  const optionalNumber = (field: unknown): number | null | undefined =>
+    field === undefined || field === null
+      ? null
+      : typeof field === "number" && Number.isFinite(field)
+        ? field
+        : undefined;
+  // The contract's dollar string: a plain decimal, no sign and no exponent. An
+  // empty or non-numeric one would print as a bare `$`, or as `0` through
+  // `Number("")`.
+  const optionalDollars = (field: unknown): string | null | undefined => {
+    const read = optionalText(field);
+    return typeof read === "string" && !DOLLARS.test(read) ? undefined : read;
+  };
+  const amount = optionalDollars(value.amount);
+  const minAmount = optionalDollars(value.min_amount);
+  const maxAmount = optionalDollars(value.max_amount);
+  const reason = optionalText(value.reason);
+  const amountCents = optionalNumber(value.amount_cents);
+  const minAmountCents = optionalNumber(value.min_amount_cents);
+  const maxAmountCents = optionalNumber(value.max_amount_cents);
+  const credits = optionalNumber(value.credits);
+  if (
+    amount === undefined ||
+    minAmount === undefined ||
+    maxAmount === undefined ||
+    reason === undefined ||
+    amountCents === undefined ||
+    minAmountCents === undefined ||
+    maxAmountCents === undefined ||
+    credits === undefined
+  ) {
+    return null;
+  }
+  const isExact = source === "exact";
+  const isEstimated = source === "estimated";
+  const isFree = source === "free";
+  // The figure the source promises must be there: an `exact` quote without its
+  // `amount`, or a range missing a bound, is the partial quote rejected above.
+  if (isExact && amount === null) return null;
+  // A `free` quote's amount is the contract's "0"; one carrying a charge is a
+  // contradiction, and reading it as free would under-report a real cost.
+  // The cents and credits figures are checked too, so a quote whose dollar
+  // string says "0" while its cents say otherwise is not booked as free.
+  if (
+    isFree &&
+    (amount === null ||
+      Number(amount) !== 0 ||
+      (amountCents !== null && amountCents !== 0) ||
+      (credits !== null && credits !== 0))
+  ) {
+    return null;
+  }
+  if (isEstimated && (minAmount === null || maxAmount === null)) return null;
+  return Object.freeze({
+    source,
+    isExact,
+    isEstimated,
+    isFree,
+    // The contract: "read any other value as `unknown`".
+    isUnknown: !isExact && !isEstimated && !isFree,
+    currency,
+    provider,
+    model,
+    pricingAsOf,
+    amount,
+    minAmount,
+    maxAmount,
+    amountCents,
+    minAmountCents,
+    maxAmountCents,
+    credits,
+    reason,
+    // A copy, so freezing it does not freeze the caller's decoded body and
+    // nothing holding the estimate can change what it reports. Every field the
+    // contract declares is a scalar, so one level is the whole object.
+    raw: Object.freeze({ ...value }),
+  });
+}
+
+/**
+ * The quote a submit response carries, or `null`.
+ *
+ * `null` on an idempotent replay even if the body somehow carried one: the
+ * server does not store the original quote, so whatever a replayed body held
+ * is not the quote the request was admitted under.
+ */
+function submitEstimateOf(body: unknown, response: QueueResponse): CostEstimate | null {
+  if (parseReplayed(response.headers.get(IDEMPOTENT_REPLAYED_HEADER))) return null;
+  return isRecord(body) ? costEstimateOf(body.estimate) : null;
 }
 
 /**
@@ -860,12 +1094,30 @@ export class RequestHandle<TData = unknown> {
    */
   readonly requestId: string;
 
+  /**
+   * What Comfy quoted for this request when it admitted it, or `null`.
+   *
+   * `null` means NO QUOTE IS AVAILABLE — never "no charge". It is `null` on a
+   * handle rebuilt by `comfy.models.handle` (the quote is not stored anywhere
+   * a later process could fetch it), on an idempotent replay of a submit (the
+   * server does not keep the original quote either), when the server did not
+   * send one, and when the one it sent could not be read. See
+   * {@link CostEstimate} for how far to trust a quote that is present.
+   */
+  readonly estimate: CostEstimate | null;
+
   readonly #retry: RetryOptions | false;
 
   /** @internal — built by `comfy.models.submit` / `comfy.models.handle`. */
-  constructor(model: string, requestId: string, retry: RetryOptions | false = {}) {
+  constructor(
+    model: string,
+    requestId: string,
+    retry: RetryOptions | false = {},
+    estimate: CostEstimate | null = null,
+  ) {
     this.model = model;
     this.requestId = requestId;
+    this.estimate = estimate;
     this.#retry = retry;
     Object.freeze(this);
   }
@@ -1298,7 +1550,12 @@ export async function submit<TData = unknown>(
         what: "submit",
       });
       const body = decode(response, [200, 201, 202]);
-      return new RequestHandle<TData>(model, requestIdOf(body, response), options.retry ?? {});
+      return new RequestHandle<TData>(
+        model,
+        requestIdOf(body, response),
+        options.retry ?? {},
+        submitEstimateOf(body, response),
+      );
     },
     {
       // See `models.run`: one `AbortController` shared across concurrent calls
