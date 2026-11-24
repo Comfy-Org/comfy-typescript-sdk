@@ -747,8 +747,9 @@ that fetches by URL, e.g. an image-to-image model behind Comfy Router — see
 [Image to image — upload an asset first](#image-to-image--upload-an-asset-first).
 
 A committed asset also exposes `jobId` — the ID of the job that produced it,
-`undefined` for an asset you uploaded yourself (which has no producing job)
-— and `expiresAt`, its retention deadline (`undefined` if it never expires).
+`undefined` for an asset no job produced, such as a fresh upload (an upload
+whose file path and bytes match an existing job output resolves to that output
+and carries its job) — and `expiresAt`, its retention deadline (`undefined` if it never expires).
 Delete one with `asset.delete()` on a handle you already hold (throws if the
 handle was never committed — there's nothing to delete yet), or
 `client.assets.delete(id)` to delete by UUID without fetching first. Deleting
