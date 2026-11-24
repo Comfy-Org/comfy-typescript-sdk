@@ -600,7 +600,7 @@ same host `comfy.models` uses, authenticates the upgrade with a method the
 block lists, and resolves with the open socket. Comfy picks the serving leg;
 you never name one. No codec is bundled: `session.wireFormat` says whether
 the model speaks MessagePack binary frames (for example
-`xai/grok-voice/realtime`) or JSON text frames (`google/genie-4`), and
+`xai/grok-voice`) or JSON text frames (`google/genie-4`), and
 `session.realtime` carries the whole block, including the informational
 `billingUnit` and `maxSessionSeconds`.
 
@@ -616,7 +616,7 @@ import { decode, encode } from "@msgpack/msgpack"; // your choice of codec
 
 comfy.config({ credentials: "comfyui-..." }); // or COMFY_API_KEY
 
-const voice = await comfy.realtime.connect("xai/grok-voice/realtime");
+const voice = await comfy.realtime.connect("xai/grok-voice");
 voice.socket.binaryType = "arraybuffer";
 voice.socket.addEventListener("message", (event) => {
   if (event.data instanceof ArrayBuffer) console.log(decode(event.data));
@@ -651,13 +651,16 @@ with a signed-in user's ID token, which travels as a subprotocol entry:
 const session = await comfy.realtime.connect("google/genie-4", { idToken });
 ```
 
-Sessions are **billed per second from the moment the upgrade succeeds**, and
-Router allows **one live WebSocket session per workspace** — a second one is
-refused with `429` (`refusalCode` `router.realtime.session_already_live`)
-until the first closes, so close a session you are done with (or pass a
-`signal`). The upgrade itself is bounded by `timeoutMs` (default 30 seconds,
-`null` to disable), which rejects with `code: "request_timeout"` and never
-bounds an open session; on `ws`, a refusal whose status arrived in time but
+Sessions are **billed per second**; when billing starts depends on the model
+(for `google/genie-4` it waits for the model's first frame, other models bill
+from the moment the upgrade succeeds). Router allows **one live WebSocket
+session per workspace** — a second one is refused with `429` (`refusalCode`
+`router.realtime.session_already_live`) until the first is released, so close
+a session you are done with (or pass a `signal`). That release can trail the
+socket's `close` event briefly, so treat this `429` as retryable: wait (for its
+`retryAfter`, when set) and connect again. The upgrade itself is bounded by
+`timeoutMs` (default 30 seconds, `null` to disable), which rejects with
+`code: "request_timeout"` and never bounds an open session; on `ws`, a refusal whose status arrived in time but
 whose body did not still raises its typed Router error.
 
 `connect` only opens what the catalog says is a WebSocket upgrade (`GET`,

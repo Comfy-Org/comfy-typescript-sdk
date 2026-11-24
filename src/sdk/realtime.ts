@@ -6,7 +6,7 @@
  * import { encode, decode } from "@msgpack/msgpack";
  *
  * comfy.config({ credentials: "comfyui-..." });
- * const session = await comfy.realtime.connect("xai/grok-voice/realtime");
+ * const session = await comfy.realtime.connect("xai/grok-voice");
  * session.socket.binaryType = "arraybuffer";
  * session.socket.addEventListener("message", (event) => {
  *   if (event.data instanceof ArrayBuffer) console.log(decode(event.data));
@@ -83,11 +83,13 @@
  *
  * # Billing and closes
  *
- * A session is billed from the `101` in the block's `billing_unit` (per second
- * in v1) up to its `max_session_seconds`, and Router allows one live WebSocket
- * session per workspace, so close a session you are done with. After the
- * `101` the broker ends a session only with the codes in
- * {@link REALTIME_CLOSE_CODES}.
+ * A session is billed in the block's `billing_unit` (per second in v1) up to
+ * its `max_session_seconds`; when billing starts depends on the model (Router
+ * may wait for the model's first frame rather than the `101`). Router allows
+ * one live WebSocket session per workspace, so close a session you are done
+ * with — and expect a retryable `429` `session_already_live` for a short while
+ * after a close, until Router has released the first session. The codes the
+ * broker itself closes with after the `101` are in {@link REALTIME_CLOSE_CODES}.
  *
  * `realtime` lives on the module-level `comfy` namespace only, not on the
  * `Comfy` class, for the reason `comfy.models` does — see `./models.ts`.
@@ -108,8 +110,9 @@ export const REALTIME_SUBPROTOCOL = "comfy-realtime.v1";
 export const REALTIME_BEARER_SUBPROTOCOL_PREFIX = "comfy-bearer.";
 
 /**
- * Close codes the broker sends after the `101`. Any other code a client sees —
- * notably `1006` — is a bare close with no close frame (a dropped connection).
+ * Selected close codes the broker sends after the `101`; the list is not
+ * exhaustive, since Router passes a valid upstream close code (such as `1001`)
+ * through. `1006` is a bare close with no close frame (a dropped connection).
  * They are for reading a close, not for sending one: a WHATWG `WebSocket`
  * throws if the application closes with anything but `1000` or `3000`–`4999`.
  */
@@ -827,7 +830,7 @@ function openWithWhatwg(
 
 /**
  * Open a realtime session on `model` (its full catalog id, e.g.
- * `"google/genie-4"` or `"xai/grok-voice/realtime"`).
+ * `"google/genie-4"` or `"xai/grok-voice"`).
  *
  * Reads the model's catalog entry first and connects to the `connect_url` its
  * `realtime` block names, with that block's `wire_format` and `auth`. Resolves

@@ -62,8 +62,8 @@ const CATALOG: Record<string, Record<string, unknown>> = Object.fromEntries(
     }),
     // A variant id: not addressable on the two-segment detail route, so it
     // is found by walking the catalog.
-    entry("xai/grok-voice/realtime", {
-      connect_url: "/v2/realtime/fal/xai/grok-voice/realtime",
+    entry("acme/voice/realtime", {
+      connect_url: "/v2/realtime/fal/acme/voice/realtime",
       method: "GET",
       transport: "websocket",
       wire_format: "msgpack",
@@ -97,6 +97,17 @@ const CATALOG: Record<string, Record<string, unknown>> = Object.fromEntries(
       auth: ["x-api-key"],
     }),
     entry("bfl/flux-2-pro"),
+    // Router's catalog id is two segments; `connect_url` keeps the longer
+    // live endpoint path.
+    entry("xai/grok-voice", {
+      connect_url: "/v2/realtime/fal/xai/grok-voice/realtime",
+      method: "GET",
+      transport: "websocket",
+      wire_format: "msgpack",
+      auth: ALL_AUTH,
+      billing_unit: "per_second",
+      max_session_seconds: 600,
+    }),
   ].map((e) => [e.id as string, e]),
 );
 
@@ -413,12 +424,20 @@ describe("catalog-driven connect", () => {
     expect(session).not.toHaveProperty("provider");
   });
 
-  it("opens a fal msgpack model found by walking the catalog", async () => {
+  it("opens a fal msgpack model at its connect_url, not its catalog id", async () => {
     const server = await accepting();
-    const session = await open("xai/grok-voice/realtime");
+    const session = await open("xai/grok-voice");
+    expect(server.catalogRequests.map((r) => r.url)).toEqual(["/v2/models/xai/grok-voice"]);
+    expect(server.upgrades[0].url).toBe("/v2/realtime/fal/xai/grok-voice/realtime");
+    expect(session.wireFormat).toBe("msgpack");
+  });
+
+  it("finds a variant id by walking the catalog", async () => {
+    const server = await accepting();
+    const session = await open("acme/voice/realtime");
     // A variant id is not addressable on the detail route, so the pages are walked.
     expect(server.catalogRequests.map((r) => r.url)).toEqual(["/v2/models", "/v2/models?cursor=2"]);
-    expect(server.upgrades[0].url).toBe("/v2/realtime/fal/xai/grok-voice/realtime");
+    expect(server.upgrades[0].url).toBe("/v2/realtime/fal/acme/voice/realtime");
     expect(session.wireFormat).toBe("msgpack");
   });
 
@@ -769,7 +788,7 @@ describe("refusals", () => {
         code: "router.realtime.session_already_live",
       }),
     );
-    const err = (await connect("xai/grok-voice/realtime", { WebSocket: WsWebSocket }).catch(
+    const err = (await connect("xai/grok-voice", { WebSocket: WsWebSocket }).catch(
       (e: unknown) => e,
     )) as routerErrors.RouterError;
     expect(err).toBeInstanceOf(routerErrors.ConcurrencyLimitExceeded);
