@@ -275,11 +275,11 @@ await comfy.models.run("some/video-model", { prompt }, { maxBytes: 512 * 1024 * 
 await comfy.models.run("some/video-model", { prompt }, { maxBytes: null });
 ```
 
-It is checked twice, because the two checks catch different responses. A `Content-Length` over the cap is refused **before the body is read** and the connection is dropped, so the oversized response is never downloaded rather than downloaded and discarded. The bytes actually read are then counted against the same cap, since a chunked response declares no length at all and a declared one is a claim by the sender rather than a bound on it.
+It is checked twice, because the two checks catch different responses. A `Content-Length` over the cap is refused **before the body is read** and the connection is dropped, so the oversized response is never downloaded rather than downloaded and discarded. The bytes actually read are then counted against the same cap, since a chunked response declares no length at all and a declared one is a claim by the sender rather than a bound on it. The cap governs the **decoded** bytes: for a body `fetch` decompresses (`Content-Encoding` `gzip`, `deflate`, `br` or `zstd`) the `Content-Length` counts the compressed bytes on the wire, so it is not used to refuse early and only the read-side count applies — a compressed response declared past the cap that decodes inside it succeeds. Any other coding, `identity` included, reaches the reader undecoded, and its `Content-Length` still refuses before the read.
 
 A result over the cap raises a `ComfyError` with `code: "response_too_large"`, carrying `maxBytes` and the offending size on `details`. It is **not retried** — it is a verdict about the response rather than a transport failure, and re-asking would re-download the same oversized body on every attempt. Check `details.maxBytes` rather than the code alone if you branch on it: `code` on an error derived from a response is whatever the server's `X-Comfy-Error-Type` said, so an upstream can answer with the same string, and only a cap breach raised here carries `maxBytes`.
 
-The cap never changes what a response _means_. A response `run` is going to retry or collect is classified from its status and headers, and its body is dropped unread — so an intermediary answering a `503` with a huge error page does not turn a retryable failure into a fatal one, and does not abandon a generation the server is still holding behind a `409`/`504`. An error response `run` does hand back is truncated at the cap instead of refused, so an oversized error body still arrives as `Unauthorized`, `InsufficientCredits`, or whatever bucket its status and header name.
+The cap never changes what a response _means_. A response `run` is going to retry or collect is classified from its status and headers, and its body is dropped unread — so an intermediary answering a `503` with a huge error page does not turn a retryable failure into a fatal one, and does not abandon a generation the server is still holding behind a `409`/`504`. An error response `run` does hand back is truncated instead of refused, so an oversized error body still arrives as `Unauthorized`, `InsufficientCredits`, or whatever bucket its status and header name. It is truncated at the cap or at 1 MiB, whichever is larger: a `maxBytes` chosen for small results does not cut short the error envelope a body-only `error_type` or a validation `detail[]` is parsed from, so with `maxBytes: 64` a 2,000-byte error body is still read in full.
 
 #### Retries
 
@@ -391,6 +391,8 @@ The handle carries four operations:
 | `handle.events(options?)` | the poll loop with its updates exposed — an async iterable yielding the first observation, every change of status or queue position, and the completion     |
 
 Polling is **poll-authoritative**: there is no stream to reconcile against on this surface, and `events()` is the poll loop rather than SSE. It backs off adaptively, and a `Retry-After` the server names on a poll beats that schedule — the server knows its own pace — capped at 60 seconds so one header cannot park a caller behind it.
+
+The result route's `200` declares the same two branches as the run route's, and `get()` (and `subscribe`) branch on its `Content-Type` exactly as `run` does: a model whose partner answers with its own media type resolves to the [`kind: "binary"`](#binary-results--a-model-that-returns-audio-image-or-video-bytes) arm. Router refuses binary models at submit today, so a queued result is JSON in practice; the binary arm is there for when that changes. The result is read within the same `maxBytes` cap as `run`'s (64 MiB by default, `null` to disable), and `get()` and `subscribe()` both take it per call. A result past the cap rejects with `response_too_large` and stays collectable, so another `get()` with a larger cap can still fetch it. The cap counts decoded bytes, not time or bytes on the wire, and unlike `run` the queued wait has no default deadline: pass `timeoutMs` or a `signal` to bound a result download that stalls or never decodes to anything.
 
 **A `200` is not the same thing as a success here.** The server reports a failed _and_ a cancelled request as `COMPLETED` carrying an `error_type`, so `get()` rejects with the matching typed exception from [`routerErrors`](#router-errors-comfymodelsrun) rather than handing the failure back as a result. `events()` deliberately does not reject **for that case** — a completion carrying an `error_type` is yielded as an observation, because `events()` is a view of the queue's progress and `get()` is the one that collects. It can still reject for reasons that are not the request's own outcome: a transport failure, an exhausted `timeoutMs`, or an aborted `signal`. So keep those handlers; it is only the completion error that arrives as data rather than a throw.
 
@@ -589,6 +591,94 @@ class client's setting and is untouched by this.
 **To run a workflow _graph_** — your own ComfyUI node graph rather than a
 partner model — use the class client instead: `await new Comfy({ apiKey
 }).run(workflow)`, as in the Quickstart below.
+
+### Realtime sessions — `comfy.realtime.connect()`
+
+Comfy Router serves its realtime models over a WebSocket, and publishes how
+to reach each one on its catalog entry: an optional `realtime` block with the
+`connect_url` path, `method`, `transport`, `wire_format` and accepted `auth`.
+`comfy.realtime.connect(model)` reads that block, opens `connect_url` on the
+same host `comfy.models` uses, authenticates the upgrade with a method the
+block lists, and resolves with the open socket. Comfy picks the serving leg;
+you never name one. No codec is bundled: `session.wireFormat` says whether
+the model speaks MessagePack binary frames (for example
+`xai/grok-voice`) or JSON text frames (`google/genie-4`), and
+`session.realtime` carries the whole block, including the informational
+`billingUnit` and `maxSessionSeconds`.
+
+In Node, install the optional `ws` peer dependency so a refused upgrade raises
+the typed Router error (`routerErrors.InsufficientCredits`,
+`routerErrors.ConcurrencyLimitExceeded`, ...) with its `refusalCode`; without
+it, Node's built-in `WebSocket` is used and a refusal raises
+`RealtimeUpgradeFailed`, because that transport does not expose the status.
+
+```ts
+import { comfy } from "@comfyorg/sdk";
+import { decode, encode } from "@msgpack/msgpack"; // your choice of codec
+
+comfy.config({ credentials: "comfyui-..." }); // or COMFY_API_KEY
+
+const voice = await comfy.realtime.connect("xai/grok-voice");
+// listen before any other `await`: frames sent on connect arrive right after
+voice.socket.binaryType = "arraybuffer";
+voice.socket.addEventListener("message", (event) => {
+  if (event.data instanceof ArrayBuffer) console.log(decode(event.data));
+});
+voice.socket.send(encode(message)); // the model's own message shape
+// ...
+voice.close();
+```
+
+A JSON session is the same call, with text frames instead. Only one
+session may be live at a time, and `close()` returns as soon as the close has
+started, so wait for the socket's `close` event before opening the next one:
+
+```ts
+// after voice.close(): wait for it to finish closing (3 is CLOSED)
+if (voice.socket.readyState !== 3) {
+  await new Promise((resolve) => voice.socket.addEventListener("close", resolve));
+}
+const genie = await comfy.realtime.connect("google/genie-4");
+genie.socket.addEventListener("message", (event) => {
+  if (typeof event.data === "string") console.log(JSON.parse(event.data));
+});
+genie.socket.send(JSON.stringify(message)); // the model's own message shape
+// ...
+genie.close();
+```
+
+A browser cannot put an API key on a WebSocket upgrade, so it authenticates
+with a signed-in user's ID token, which travels as a subprotocol entry:
+
+```ts
+const session = await comfy.realtime.connect("google/genie-4", { idToken });
+```
+
+Sessions are **billed per second**; when billing starts depends on the model
+(other than `google/genie-4`, models bill from the moment the upgrade
+succeeds). A `google/genie-4` session gets a short grace period, set by Router:
+if the first frame arrives within it, billing starts at that frame, and a
+session that ends within it without a frame is not billed. Once it passes with
+no frame, the session is billed from the upgrade, so a stalled session does not
+stay free — close it. Router allows **one live WebSocket session per
+workspace** — a second one is refused with `429` (`refusalCode`
+`router.realtime.session_already_live`) until the first is released, so close a
+session you are done with (or pass a `signal`). That release can trail the
+socket's `close` event briefly, so treat this `429` as retryable: wait (for its
+`retryAfter`, when set) and connect again. The upgrade itself is bounded by
+`timeoutMs` (default 30 seconds, `null` to disable), which rejects with
+`code: "request_timeout"` and never bounds an open session; on `ws`, a refusal
+whose status arrived in time but whose body did not still raises its typed
+Router error.
+
+`connect` only opens what the catalog says is a WebSocket upgrade (`GET`,
+`websocket` or `websocket_media_frames`). A model whose entry has no `realtime`
+block is refused with `code: "realtime_unsupported_model"`; one served another
+way — a `POST` `session_post` mint, or a `webrtc` session — is refused with
+`code: "realtime_unsupported_transport"`, and the error's `details.realtime`
+carries the block so you can reach the route yourself. Both happen before any
+socket opens. `readRealtimeBlock(entry)` reads the same block off any
+`comfy.models.list()` entry.
 
 ### Module formats
 

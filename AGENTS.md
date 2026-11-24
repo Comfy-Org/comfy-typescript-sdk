@@ -225,7 +225,10 @@ to sign. `.github/CODEOWNERS` makes every file require review from
   `.github/workflows/publish.yml` injects the release tag's version at build
   time, so the committed value is a placeholder. `pnpm build` regenerates
   `src/low/version.ts` from whatever `package.json` says, so a version edit
-  shows up as an unexpected dirty file.
+  shows up as an unexpected dirty file. What a release DOES need is its
+  changelog: the publish workflow refuses a `vX.Y.Z` tag unless
+  `CHANGELOG.md` has a `## [X.Y.Z]` section, so cut the changelog in a PR
+  before tagging (prereleases are exempt).
 - **`oxfmt` formats Markdown, not just TypeScript.** `pnpm format:check` fails
   on an unformatted `.md` file, so a docs-only PR can fail the `test` job. Run
   `pnpm format` after editing any Markdown.
@@ -258,18 +261,21 @@ Two things to know before you touch it:
   Python SDK's surface moved. Run `pnpm sync:python-surface`, commit the
   refreshed snapshot, then run `pnpm test` to see which symbols diverged.
 - **Deliberate divergences go in the `INTENTIONAL_ASYMMETRIES` allowlist** at
-  the top of the test, each with a stated reason. Seven are declared today.
+  the top of the test, each with a stated reason. Nine are declared today.
   Anything not declared there fails. Adding an entry is a design decision — the
   test also fails on an entry that no longer applies, so the list cannot rot
   into a blanket exemption.
 - **A LEAD is not an asymmetry, and has its own field.** The two SDKs ship on
-  separate pull requests, so one of them carries a new Router bucket — or a new
-  `models` method — first. `routerErrorClassesAheadOfPython` and
-  `modelsMethodsAheadOfPython` tolerate that in ONE direction — TypeScript
-  leading — and each has a rot guard that fails the moment the Python snapshot
-  grows the same name, which is the signal to delete the entry rather than to
-  grow it. Neither field carries an entry today. Do
-  not reach for either field to excuse something this SDK invented:
+  separate pull requests, so one of them carries a new Router bucket, a new
+  `models` method or a new root error class first.
+  `routerErrorClassesAheadOfPython`, `modelsMethodsAheadOfPython` and
+  `exportedErrorClassesAheadOfPython` tolerate that in ONE direction —
+  TypeScript leading — and each has a rot guard that fails the moment the
+  Python snapshot grows the same name, which is the signal to delete the entry
+  rather than to grow it. The first carries `ByokCredentialRejected` and the third
+  carries `RealtimeUpgradeFailed` (raised by `comfy.realtime.connect`, which
+  the Python SDK has no twin of yet). Do not reach for any of them to excuse
+  something this SDK invented:
   `router-spec-coverage.test.ts` only passes for a bucket the vendored Router
   contract actually declares.
 - **Three fields point the other way, and they do not mean the same thing.**

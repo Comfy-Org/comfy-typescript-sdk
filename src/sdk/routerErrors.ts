@@ -324,6 +324,8 @@ export interface RouterErrorOptions {
   refusalSubject?: string | null;
   /** See {@link RouterError.idempotencyKey}. */
   idempotencyKey?: string | null;
+  /** See {@link RouterError.refusalCode}. */
+  refusalCode?: string | null;
 }
 
 /**
@@ -430,6 +432,19 @@ export class RouterError extends Error {
    */
   readonly idempotencyKey: string | null;
 
+  /**
+   * The finer-grained refusal reason a realtime session upgrade names in its
+   * body's `code` field (`router.realtime.session_already_live`, say), or
+   * `null` when the body carried none — which is every non-realtime response.
+   *
+   * It sits BESIDE {@link errorType} rather than replacing it: the coarse
+   * bucket stays the thing to branch on, and this is the detail that tells
+   * two refusals in the same bucket apart (a `429` for a session already live
+   * on the workspace versus one for the concurrency limit). An open string,
+   * for the same reason `errorType` is not narrowed. See `./realtime.ts`.
+   */
+  readonly refusalCode: string | null;
+
   constructor(message: string, options: RouterErrorOptions = {}) {
     super(message);
     // Restore the prototype explicitly. Extending a built-in is the classic
@@ -447,6 +462,7 @@ export class RouterError extends Error {
     this.retryAfter = options.retryAfter ?? null;
     this.refusalSubject = options.refusalSubject ?? null;
     this.idempotencyKey = options.idempotencyKey ?? null;
+    this.refusalCode = options.refusalCode ?? null;
   }
 }
 
@@ -825,6 +841,7 @@ interface RequestErrorBody {
   detail?: unknown;
   error_type?: unknown;
   refusal_subject?: unknown;
+  code?: unknown;
 }
 
 /**
@@ -926,6 +943,7 @@ export function toRouterError(status: number, headers: HeadersLike, body: unknow
     httpStatus: status,
     retryAfter: parseRetryAfter(headers),
     refusalSubject,
+    refusalCode: typeof envelope.code === "string" ? envelope.code : null,
   };
   // Own-property lookup only. A plain `BY_ERROR_TYPE[errorType]` would resolve
   // an `error_type` of `constructor` or `toString` off `Object.prototype` and

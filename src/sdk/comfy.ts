@@ -26,6 +26,7 @@
 
 import { config } from "./credentials.js";
 import { models } from "./models.js";
+import { realtime } from "./realtime.js";
 
 /** The module-level `comfy` namespace. Frozen — it is shared process-wide. */
-export const comfy = Object.freeze({ config, models });
+export const comfy = Object.freeze({ config, models, realtime });
