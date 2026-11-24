@@ -1852,11 +1852,15 @@ async function run<TData = unknown>(
         completion = update;
     } catch (exc) {
       if (!isWaitEnded(exc, options.signal)) throw asRunError(exc, queuedRequestId);
+      // Which of the two ended the wait is decided now, before the cleanup
+      // await: a caller abort that lands during the cancel must not re-dress
+      // a deadline as theirs and drop the queued id.
+      const callerStoppedFirst = options.signal?.aborted === true;
       // The caller stopped waiting — by abort or by deadline — on a
       // generation still running server side. Same rule as `subscribe`: one
       // best-effort cancel, so nobody pays for a result nobody will collect.
       await pending.cancelBestEffort();
-      if (options.signal?.aborted) throw exc;
+      if (callerStoppedFirst) throw exc;
       throw new ComfyError(
         `models.run("${model}") exceeded its ${String(timeoutMs)}ms deadline before the model finished; ` +
           `the handed-off request ${queuedRequestId} was cancelled (best effort). ` +

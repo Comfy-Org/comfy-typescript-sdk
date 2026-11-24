@@ -451,6 +451,40 @@ describe("models.run: following a 202 handoff", () => {
     });
   });
 
+  it("keeps the deadline's request_timeout when the caller aborts during the cleanup cancel", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      const script = handoffScript({
+        statuses: [{ request_id: QUEUED_ID, status: "IN_PROGRESS" }],
+      });
+      const controller = new AbortController();
+      server.state.respond = (request) => {
+        // The deadline has already ended the wait when the cancel goes out;
+        // the caller's abort arrives only after that.
+        if (request.method === "PUT") controller.abort();
+        return script(request);
+      };
+
+      const err = (await comfy.models
+        .run(
+          MODEL,
+          {},
+          {
+            respondAsync: true,
+            timeoutMs: 300,
+            signal: controller.signal,
+            idempotencyKey: "key-8",
+          },
+        )
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(controller.signal.aborted).toBe(true);
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("request_timeout");
+      expect(err.details).toEqual({ queuedRequestId: QUEUED_ID });
+    });
+  });
+
   it("does not resolve past run's deadline when a poll is slow to answer", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
