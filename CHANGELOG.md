@@ -19,6 +19,19 @@ entry. See CONTRIBUTING.md.
 
 ### Added
 
+- **Two more Router error classes, `routerErrors.BudgetExceeded` and
+  `routerErrors.BudgetCheckUnavailable`**, for the spend-cap buckets the
+  vendored Router contract now declares. `BudgetExceeded` (`budget_exceeded`,
+  `402`) is a hard spend cap that has been reached: it is not
+  `InsufficientCredits` (the workspace is out of credits), and sending the
+  same request again is refused the same way, so it is not retried.
+  `BudgetCheckUnavailable` (`budget_check_unavailable`, `503`) is a hard spend
+  cap that could not be checked: it clears on its own, `models.run` retries it
+  on its ordinary backoff like `service_unavailable`, and `retryAfter` carries
+  the `Retry-After` delay the contract asks a manual re-send to wait. On
+  `comfy.models.run` both surface as a `ComfyError` whose `code` is the
+  bucket. Both are `RouterError`s, and `ROUTER_ERROR_TYPES` now lists
+  twenty-three buckets.
 - **`respondAsync` on `comfy.models.run`.** Opt in to sending
   `Prefer: respond-async` so Router can hand a slow model off to the queue
   instead of holding the connection. On a `202` carrying

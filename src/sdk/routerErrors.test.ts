@@ -5,6 +5,8 @@ import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 import {
+  BudgetCheckUnavailable,
+  BudgetExceeded,
   ByokCredentialRejected,
   Cancelled,
   ClientDisconnected,
@@ -49,6 +51,8 @@ const CLASSES: Array<[RouterErrorType, typeof RouterError]> = [
   ["provider_error", ProviderError],
   ["provider_timeout", ProviderTimeout],
   ["insufficient_credits", InsufficientCredits],
+  ["budget_exceeded", BudgetExceeded],
+  ["budget_check_unavailable", BudgetCheckUnavailable],
   ["model_not_found", ModelNotFound],
   ["unauthorized", Unauthorized],
   ["forbidden", Forbidden],
@@ -88,14 +92,16 @@ async function raise(response: Response): Promise<never> {
 }
 
 describe("the closed error-type set", () => {
-  it("is the seven request-level buckets plus the fourteen transport-level ones", () => {
-    expect(REQUEST_ERROR_TYPES).toHaveLength(7);
-    expect(TRANSPORT_ERROR_TYPES).toHaveLength(14);
-    expect(new Set(ROUTER_ERROR_TYPES).size).toBe(21);
+  it("is the eight request-level buckets plus the fifteen transport-level ones", () => {
+    expect(REQUEST_ERROR_TYPES).toHaveLength(8);
+    expect(TRANSPORT_ERROR_TYPES).toHaveLength(15);
+    expect(new Set(ROUTER_ERROR_TYPES).size).toBe(23);
     // The whole set is the two tiers and nothing else, and each tier keeps its
     // own order inside it. It is not `[...REQUEST, ...TRANSPORT]`: the contract
-    // lists `byok_credential_rejected`, a request-level bucket, after the
-    // transport-level ones, and `router-spec-coverage.test.ts` pins that order.
+    // lists the transport-level `budget_check_unavailable` among the
+    // request-level buckets and `byok_credential_rejected`, a request-level
+    // bucket, after the transport-level ones, and
+    // `router-spec-coverage.test.ts` pins that order.
     expect([...ROUTER_ERROR_TYPES].sort()).toEqual(
       [...REQUEST_ERROR_TYPES, ...TRANSPORT_ERROR_TYPES].sort(),
     );
@@ -325,6 +331,43 @@ describe("toRouterError", () => {
     expect(byok.errorType).toBe("byok_credential_rejected");
     expect(byok.httpStatus).toBe(401);
     expect(toRouterError(401, new Headers(), null)).toBeInstanceOf(Unauthorized);
+  });
+
+  it("tells budget_exceeded from insufficient_credits on a 402 by the header alone", () => {
+    // Both answer `402`. The first says a hard spend cap stopped the call, the
+    // second that the workspace is out of credits, so a caller who tops up
+    // credits for a cap breach gets nowhere. A header-less `402` keeps reading
+    // as `insufficient_credits`, as the status table has always said.
+    const capped = toRouterError(402, new Headers({ [ERROR_TYPE_HEADER]: "budget_exceeded" }), {
+      detail: "A hard spend cap has been reached.",
+      error_type: "budget_exceeded",
+    });
+    expect(capped).toBeInstanceOf(BudgetExceeded);
+    expect(capped).toBeInstanceOf(RouterError);
+    expect(capped).not.toBeInstanceOf(InsufficientCredits);
+    expect(capped.errorType).toBe("budget_exceeded");
+    expect(capped.httpStatus).toBe(402);
+    expect(capped.message).toBe("A hard spend cap has been reached.");
+    expect(toRouterError(402, new Headers(), null)).toBeInstanceOf(InsufficientCredits);
+  });
+
+  it("tells budget_check_unavailable from service_unavailable on a 503, keeping its Retry-After", () => {
+    // Both answer `503` and both clear on their own; the bucket says which
+    // dependency could not answer. The contract asks for a wait of
+    // `Retry-After` first, so the pace must survive onto the error.
+    const unchecked = toRouterError(
+      503,
+      new Headers({ [ERROR_TYPE_HEADER]: "budget_check_unavailable", [RETRY_AFTER_HEADER]: "3" }),
+      { detail: "A hard spend cap could not be checked.", error_type: "budget_check_unavailable" },
+    );
+    expect(unchecked).toBeInstanceOf(BudgetCheckUnavailable);
+    expect(unchecked).not.toBeInstanceOf(ServiceUnavailable);
+    expect(unchecked).not.toBeInstanceOf(BudgetExceeded);
+    expect(unchecked.errorType).toBe("budget_check_unavailable");
+    expect(unchecked.httpStatus).toBe(503);
+    expect(unchecked.retryAfter).toBe(3);
+    // A header-less 503 still raises the base class: see the no-mapping test.
+    expect(toRouterError(503, new Headers(), null).constructor).toBe(RouterError);
   });
 
   it("raises ResultExpired for a 410 that names result_expired, and is not request_not_found", () => {

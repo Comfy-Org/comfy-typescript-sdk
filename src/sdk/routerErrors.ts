@@ -4,11 +4,11 @@
  *
  * Router answers every failure with a coarse, machine-readable bucket on the
  * `X-Comfy-Error-Type` response header (and, for the request-level body
- * shape, in `error_type` as well). The bucket set is *closed* at twenty-one
- * values in this release: seven request-level and fourteen transport-level. This
+ * shape, in `error_type` as well). The bucket set is *closed* at twenty-three
+ * values in this release: eight request-level and fifteen transport-level. This
  * module turns that value into a class an integrator can `catch`. The names
  * below are the shared set: the Python SDK spells every one of them
- * identically (bar the newest, see the end of this comment), so a snippet, a doc page or a forum answer transfers between
+ * identically, so a snippet, a doc page or a forum answer transfers between
  * the two languages unchanged. They are the PascalCase of the wire value,
  * which is idiomatic in both languages — no per-language casing deviation was
  * needed, and none should be introduced.
@@ -51,7 +51,7 @@
  *   done until a class exists for it here.
  *
  * These classes are namespaced (`routerErrors.*`) rather than exported from
- * the package root because four of the twenty-one names — `Unauthorized`,
+ * the package root because four of the twenty-three names — `Unauthorized`,
  * `Forbidden`, `InsufficientCredits`, `RateLimited` — already exist at the
  * root as workflow-API exceptions descending from `ComfyError`, and here the
  * root class and the `routerErrors.*` class are two unrelated classes. The
@@ -62,15 +62,14 @@
  * so the name-only parity check cannot see this; it is declared in
  * `surface-parity.test.ts`'s `router-errors-namespaced` entry instead.
  *
- * One of the twenty-one buckets — `byok_credential_rejected`, the most recent
- * the vendored contract grew — is newer than the Python SDK's table. Until its
- * twin lands it is declared as leading the Python SDK in
- * `surface-parity.test.ts`'s allowlist, which fails once the Python side
- * catches up so the entry cannot outlive the lead.
+ * A bucket the vendored contract grows before the Python SDK's table does is
+ * declared as leading the Python SDK in `surface-parity.test.ts`'s allowlist
+ * (`routerErrorClassesAheadOfPython`), which fails once the Python side catches
+ * up so the entry cannot outlive the lead. None is declared today.
  */
 
 /**
- * The seven request-level buckets, in the order the error contract lists them.
+ * The eight request-level buckets, in the order the error contract lists them.
  *
  * Two distinctions here are load-bearing rather than cosmetic, because a
  * caller branches on them:
@@ -80,6 +79,10 @@
  * - `provider_timeout` is an *upstream* stall, not a Comfy-side deadline. A
  *   deadline that expires on our side shares the same `504` but arrives as
  *   `deadline_exceeded`.
+ *
+ * - `budget_exceeded` is **not** `insufficient_credits`. Both answer `402`,
+ *   but this one says a hard spend cap set on the workspace was reached while
+ *   the workspace may still hold credits (see {@link BudgetExceeded}).
  *
  * The last one, `byok_credential_rejected`, was added after the transport-level
  * buckets: the contract lists it at the very end of its set, and it keeps its
@@ -92,28 +95,36 @@ export const REQUEST_ERROR_TYPES = [
   "provider_error",
   "provider_timeout",
   "insufficient_credits",
+  "budget_exceeded",
   "model_not_found",
   "byok_credential_rejected",
 ] as const;
 
 /**
- * The fourteen transport-level buckets, in the order the error contract lists
+ * The fifteen transport-level buckets, in the order the error contract lists
  * them. They are part of the same closed set — a caller reads one value off
  * one header — but they are raised before or around the model call rather
  * than derived from a provider response.
+ *
+ * The first, `budget_check_unavailable`, is listed ahead of the others because
+ * the contract places it beside `budget_exceeded`, in the middle of the
+ * request-level run; it is a transport-level bucket all the same (a spend cap
+ * that could not be CHECKED, answered `503`).
  *
  * The last five (`cancelled`, `queue_timeout`, `request_not_found`,
  * `queue_backlog_full`, `result_expired`) are the QUEUE tier: they are reported
  * by the queued `submit`/`handle` surface, the first four by status codes an
  * older bucket already owns and the last by `410`, which no other bucket uses.
- * Counting the request-level `byok_credential_rejected` too, six HTTP statuses
- * here carry more than one bucket, and the status alone cannot tell them apart
+ * Counting the request-level `byok_credential_rejected` and `budget_exceeded`
+ * too, eight HTTP statuses here carry more than one bucket, and the status alone cannot tell them apart
  * — so a caller that branches on status gets the wrong answer for all but the
  * oldest member of each:
  *
  * - `401` is `unauthorized` (the caller's Comfy credential was missing or
  *   invalid) **or** `byok_credential_rejected` (the provider refused the key
  *   the caller supplied for it, so the Comfy credential was fine).
+ * - `402` is `insufficient_credits` (the workspace is out of credits) **or**
+ *   `budget_exceeded` (a hard spend cap was reached).
  * - `403` is `forbidden` (an entitlement decision about this caller) **or**
  *   `not_enabled` (a state of the Router rollout, nothing to do with the
  *   caller's entitlements).
@@ -125,6 +136,9 @@ export const REQUEST_ERROR_TYPES = [
  *   own in-flight calls finishes) **or** `rate_limited` (clears only when a
  *   time window rolls) **or** `queue_backlog_full` (clears as the caller's own
  *   QUEUED requests finish).
+ * - `503` is `service_unavailable` (a dependency of Router's is down) **or**
+ *   `budget_check_unavailable` (the spend cap could not be checked). Both
+ *   clear on their own and both are retried.
  * - `504` is `provider_timeout` (the partner ran out of time) **or**
  *   `deadline_exceeded` (Comfy stopped holding the connection) **or**
  *   `queue_timeout` (a queued request was never admitted).
@@ -134,6 +148,7 @@ export const REQUEST_ERROR_TYPES = [
  * the older member of each shared status.
  */
 export const TRANSPORT_ERROR_TYPES = [
+  "budget_check_unavailable",
   "unauthorized",
   "forbidden",
   "concurrency_limit_exceeded",
@@ -152,9 +167,11 @@ export const TRANSPORT_ERROR_TYPES = [
 
 /**
  * The closed error-type set for this release, in the order the contract lists
- * it: the six oldest request-level buckets, the transport-level ones, then
- * `byok_credential_rejected`, a request-level bucket the contract added after
- * them. That is why this is not
+ * it: the five oldest request-level buckets, then `budget_exceeded`
+ * (request-level) and `budget_check_unavailable` (transport-level), which the
+ * contract lists together, then `model_not_found`, the transport-level ones,
+ * and finally `byok_credential_rejected`, a request-level bucket the contract
+ * added after them. That is why this is not
  * `[...REQUEST_ERROR_TYPES, ...TRANSPORT_ERROR_TYPES]`: each tier keeps its own
  * order, and `router-spec-coverage.test.ts` checks the whole list and each tier
  * against the contract.
@@ -165,6 +182,8 @@ export const ROUTER_ERROR_TYPES = [
   "provider_error",
   "provider_timeout",
   "insufficient_credits",
+  "budget_exceeded",
+  "budget_check_unavailable",
   "model_not_found",
   "unauthorized",
   "forbidden",
@@ -186,7 +205,7 @@ export const ROUTER_ERROR_TYPES = [
   | (typeof TRANSPORT_ERROR_TYPES)[number]
 )[];
 
-/** One of the twenty-one buckets this release knows about. */
+/** One of the twenty-three buckets this release knows about. */
 export type RouterErrorType = (typeof ROUTER_ERROR_TYPES)[number];
 
 /** `X-Comfy-Error-Type` — the coarse bucket, set on every Router error response. */
@@ -528,6 +547,21 @@ export class InsufficientCredits extends RouterError {
   static override readonly errorType = "insufficient_credits";
 }
 
+/**
+ * A hard spend cap has been reached, and the answer is `402`. Sending the same
+ * request again is refused the same way while the cap stays reached, so do
+ * not retry it.
+ *
+ * It shares `402` with {@link InsufficientCredits} and is not the same thing:
+ * that one says the workspace has run out of credits, whereas this says a
+ * spend cap stopped the call, which says nothing about the credit balance.
+ * The response body's `budget` names the exhausted cap, and `blocking_budgets`
+ * lists every exhausted one; both are visible to a workspace Owner.
+ */
+export class BudgetExceeded extends RouterError {
+  static override readonly errorType = "budget_exceeded";
+}
+
 /** No such model — the `{provider}/{model}` pair is not one Router serves. */
 export class ModelNotFound extends RouterError {
   static override readonly errorType = "model_not_found";
@@ -550,6 +584,21 @@ export class ByokCredentialRejected extends RouterError {
 }
 
 // -- transport-level buckets -------------------------------------------------
+
+/**
+ * Router could not check a hard spend cap, so it refused the call, and the
+ * answer is `503`.
+ *
+ * It clears on its own, like {@link ServiceUnavailable} on the same status, and
+ * is retried the same way: `models.run` re-sends it under the call's own
+ * `Idempotency-Key` on the ordinary 5xx backoff. The contract asks a caller to
+ * wait the `Retry-After` delay first, which {@link RouterError.retryAfter}
+ * carries for a manual re-send. It is not {@link BudgetExceeded}: no cap was
+ * found to be reached.
+ */
+export class BudgetCheckUnavailable extends RouterError {
+  static override readonly errorType = "budget_check_unavailable";
+}
 
 /** Authentication is required, or the credential presented was not valid. */
 export class Unauthorized extends RouterError {
@@ -761,6 +810,8 @@ const BY_ERROR_TYPE: Record<string, RouterErrorClass> = {
   provider_error: ProviderError,
   provider_timeout: ProviderTimeout,
   insufficient_credits: InsufficientCredits,
+  budget_exceeded: BudgetExceeded,
+  budget_check_unavailable: BudgetCheckUnavailable,
   model_not_found: ModelNotFound,
   unauthorized: Unauthorized,
   forbidden: Forbidden,
@@ -803,7 +854,9 @@ const BY_ERROR_TYPE: Record<string, RouterErrorClass> = {
  * same reason: the table keeps naming `model_not_found` for `404` and the
  * run-route member for `409`/`429`/`504`. So does `byok_credential_rejected`,
  * which shares `401` with `unauthorized`: a header-less `401` keeps reading as
- * a rejected Comfy credential. Guessing the newer member of a shared status
+ * a rejected Comfy credential, and `budget_exceeded`, which shares `402` with
+ * `insufficient_credits`: a header-less `402` keeps reading as out of credits.
+ * Guessing the newer member of a shared status
  * would relabel failures this table has always classified, on exactly the
  * responses that carry the least evidence. `result_expired` shares `410` with
  * no other bucket, but the Python SDK's table maps no `410` either, so a
@@ -823,7 +876,8 @@ const BY_ERROR_TYPE: Record<string, RouterErrorClass> = {
  * - `503` from an intermediary is not Router's `service_unavailable`: that
  *   bucket is Router's own statement that a dependency of ITS is briefly down,
  *   and a gateway's `503` says nothing about whether the request ever reached
- *   Router to have such a statement made about it.
+ *   Router to have such a statement made about it. The same holds for
+ *   `budget_check_unavailable`, Router's other `503`.
  */
 const ERROR_TYPE_BY_STATUS: Record<number, string> = {
   401: "unauthorized",

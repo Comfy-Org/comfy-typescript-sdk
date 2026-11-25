@@ -250,17 +250,6 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
     exportedErrorClassesBehindPython: ["AlreadyCompleted", "CancelRefused"],
   },
   {
-    id: "byok-credential-bucket-lands-first-in-typescript",
-    why:
-      "The vendored Router contract grew a request-level bucket, `byok_credential_rejected` (the " +
-      "provider refused the key the caller supplied for it, answered `401`), and this SDK's " +
-      "spec-coverage gate requires a class per bucket the moment the spec declares one. The " +
-      "Python SDK has not reconciled the same spec sync yet, so its surface snapshot does not " +
-      "carry it. This is a LEAD, not a divergence: the rot guard below fails the moment the " +
-      "Python snapshot grows it, which is the signal to delete this entry.",
-    routerErrorClassesAheadOfPython: [["ByokCredentialRejected", "byok_credential_rejected"]],
-  },
-  {
     id: "realtime-sessions-land-first-in-typescript",
     why:
       "`comfy.realtime.connect` opens a Router realtime WebSocket session, and the Python SDK " +
