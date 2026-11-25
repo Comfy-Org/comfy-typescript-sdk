@@ -365,6 +365,9 @@ describe("toRouterError", () => {
         // Dropped whole: a required field is missing or mistyped.
         { scope_kind: "workspace", resets_at: "2026-12-01T00:00:00Z" },
         { ...visible, set_by: 7 },
+        // Dropped whole: blank says no more than absent does.
+        { ...visible, scope_kind: "" },
+        { ...visible, set_by: "  " },
         "workspace",
         null,
         // Kept, minus the optional fields that are not what the contract says.
@@ -401,6 +404,18 @@ describe("toRouterError", () => {
     const bare = new BudgetExceeded("capped");
     expect(bare.budget).toBeUndefined();
     expect(bare.blockingBudgets).toEqual([]);
+  });
+
+  it("copies and freezes the budget detail a hand-built BudgetExceeded is given", () => {
+    const budget = { scopeKind: "workspace", resetsAt: "2026-12-01T00:00:00Z", setBy: "owner" };
+    const entry = { ...budget, mode: "hard" };
+    const capped = new BudgetExceeded("capped", { budget, blockingBudgets: [entry] });
+    budget.scopeKind = "user";
+    entry.mode = "soft";
+    expect(capped.budget?.scopeKind).toBe("workspace");
+    expect(capped.blockingBudgets[0]?.mode).toBe("hard");
+    expect(Object.isFrozen(capped.budget)).toBe(true);
+    expect(capped.blockingBudgets.every((b) => Object.isFrozen(b))).toBe(true);
   });
 
   it("reads budget detail off a queued completion that reports budget_exceeded", () => {

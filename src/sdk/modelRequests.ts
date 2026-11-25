@@ -1124,7 +1124,9 @@ export class RequestHandle<TData = unknown> {
    * `comfy.models.handle` is always `null` here. Unlike {@link estimate} it
    * survives an idempotent replay, because Router stores the header with the
    * `Idempotency-Key` record and replays it unchanged. The queued status and
-   * result routes never carry it, so this is the only place it can be read.
+   * result routes never carry it, so {@link collect} copies it onto the
+   * result's own `droppedParams` — which is how `comfy.models.subscribe`,
+   * which returns that result rather than the handle, still reports it.
    */
   readonly droppedParams: readonly string[] | null;
 
@@ -1333,7 +1335,11 @@ export class RequestHandle<TData = unknown> {
     }
     const requestId = response.headers.get(REQUEST_ID_HEADER);
     const servingProvider = response.headers.get(FALLBACK_PROVIDER_HEADER);
-    const droppedParams = parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER));
+    // The result route does not carry the dropped-params header, so a `null`
+    // there is its silence: fall back to the acceptance's disclosure, as
+    // `run`'s queued handoff does, or `subscribe` would always report `null`.
+    const droppedParams =
+      parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER)) ?? this.droppedParams;
     const replayed = parseReplayed(response.headers.get(IDEMPOTENT_REPLAYED_HEADER));
     const creditsUsed = parseCreditsUsed(response.headers.get(CREDITS_USED_HEADER));
     if (response.status !== 200) {

@@ -24,15 +24,19 @@ entry. See CONTRIBUTING.md.
   same way `models.run` reads its own: one entry per native field the
   `model_provider` leg will drop, and why. `null` means nothing was said — no
   header, or a handle rebuilt by `comfy.models.handle`, since the queued
-  status and result routes never carry it. Unlike `estimate` it survives an
-  idempotent replay, because Router replays the stored header.
+  status and result routes never carry it. The result `handle.get()` and
+  `comfy.models.subscribe` resolve to carries the same disclosure on its own
+  `droppedParams`. Unlike `estimate` it survives an idempotent replay, because
+  Router replays the stored header.
 - **`budget` and `blockingBudgets` on `routerErrors.BudgetExceeded`**, read
   from the `402` body's `budget` and `blocking_budgets` and typed as the new
   `routerErrors.SpendBudgetDetail` (frozen, camelCased:
   `scopeKind`, `resetsAt`, `setBy`, and the Owner-visible `id`, `scopeId`, `mode`,
   `limitMicroUsd`, `spentMicroUsd`, `limitCredits`, `spentCredits`). `budget`
   is `undefined` and `blockingBudgets` is empty when the body carries none; an
-  Owner-visible field the body left out stays absent, never zero.
+  Owner-visible field the body left out stays absent, never zero. An entry
+  whose `scope_kind`, `resets_at` or `set_by` is missing or blank is dropped,
+  and an amount is kept only as the safe integer the contract's `int64` allows.
 - **Two more Router error classes, `routerErrors.BudgetExceeded` and
   `routerErrors.BudgetCheckUnavailable`**, for the spend-cap buckets the
   vendored Router contract now declares. `BudgetExceeded` (`budget_exceeded`,

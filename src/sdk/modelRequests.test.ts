@@ -526,6 +526,35 @@ describe("RequestHandle.droppedParams", () => {
     config({ credentials: CREDENTIAL });
     expect(comfy.models.handle(MODEL, REQUEST_ID).droppedParams).toBeNull();
   });
+
+  it("reaches the result get() returns, and so subscribe()'s", async () => {
+    // The result route never carries the header, so without the acceptance's
+    // disclosure a subscribe caller would always read `null`.
+    const submitHeaders = { "X-Comfy-Router-Dropped-Params": JSON.stringify(DROPPED) };
+    const [collected, subscribed] = await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = queueScript({ statuses: [DONE], submitHeaders });
+      const handle = await comfy.models.submit(MODEL, { prompt: "a cat" });
+      const viaCollect = await handle.get();
+      server.state.respond = queueScript({ statuses: [DONE], submitHeaders });
+      return [viaCollect, await comfy.models.subscribe(MODEL, { prompt: "a cat" })];
+    });
+    expect(collected.droppedParams).toEqual(DROPPED);
+    expect(subscribed.droppedParams).toEqual(DROPPED);
+  });
+
+  it("lets the result route's own header win over the acceptance's", async () => {
+    const result = await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = queueScript({
+        statuses: [DONE],
+        submitHeaders: { "X-Comfy-Router-Dropped-Params": JSON.stringify(DROPPED) },
+        resultHeaders: { "X-Comfy-Router-Dropped-Params": JSON.stringify(["seed"]) },
+      });
+      return await (await comfy.models.submit(MODEL, { prompt: "a cat" })).get();
+    });
+    expect(result.droppedParams).toEqual(["seed"]);
+  });
 });
 
 describe("a submit refused 402 budget_exceeded", () => {

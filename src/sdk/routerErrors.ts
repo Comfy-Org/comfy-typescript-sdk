@@ -634,8 +634,12 @@ export class BudgetExceeded extends RouterError {
     } = {},
   ) {
     super(message, options);
-    this.budget = options.budget;
-    this.blockingBudgets = Object.freeze([...(options.blockingBudgets ?? [])]);
+    // Copied and frozen here too, not only by `parseSpendBudget`: a hand-built
+    // error (a test double) must not be changeable after the throw either.
+    this.budget = options.budget === undefined ? undefined : Object.freeze({ ...options.budget });
+    this.blockingBudgets = Object.freeze(
+      (options.blockingBudgets ?? []).map((entry) => Object.freeze({ ...entry })),
+    );
   }
 }
 
@@ -1021,7 +1025,7 @@ function parseDetailEntry(raw: unknown): ValidationErrorDetail | null {
 
 /**
  * Parse one `RouterSpendBudgetDetail`, keeping it only if its three required
- * fields are present strings — the same rule as {@link parseDetailEntry}: a
+ * fields are present, non-blank strings — the same rule as {@link parseDetailEntry}: a
  * budget with no `scope_kind` is worse than no budget at all. An optional field
  * of the wrong type is left out rather than failing the whole entry, and an
  * amount counts only as a safe integer, since the contract declares `int64`
@@ -1031,8 +1035,7 @@ function parseDetailEntry(raw: unknown): ValidationErrorDetail | null {
 function parseSpendBudget(raw: unknown): SpendBudgetDetail | null {
   if (!isRecord(raw)) return null;
   const { scope_kind, resets_at, set_by } = raw;
-  if (typeof scope_kind !== "string" || typeof resets_at !== "string") return null;
-  if (typeof set_by !== "string") return null;
+  if (!isPresent(scope_kind) || !isPresent(resets_at) || !isPresent(set_by)) return null;
   const parsed: { -readonly [K in keyof SpendBudgetDetail]: SpendBudgetDetail[K] } = {
     scopeKind: scope_kind,
     resetsAt: resets_at,
@@ -1048,6 +1051,11 @@ function parseSpendBudget(raw: unknown): SpendBudgetDetail | null {
   if (isAmount(raw.limit_credits)) parsed.limitCredits = raw.limit_credits;
   if (isAmount(raw.spent_credits)) parsed.spentCredits = raw.spent_credits;
   return Object.freeze(parsed);
+}
+
+/** A string that says something: blank is absent, as everywhere else here. */
+function isPresent(value: unknown): value is string {
+  return typeof value === "string" && value.trim() !== "";
 }
 
 function isAmount(value: unknown): value is number {

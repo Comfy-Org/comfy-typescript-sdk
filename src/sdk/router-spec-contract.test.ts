@@ -643,6 +643,23 @@ describe("refusal subject wire names (spec/router-openapi.yaml)", () => {
     // The parser drops an entry missing one of the first three, so those must
     // be exactly the fields the contract requires.
     expect(at(schema, "required")).toEqual(SPEND_BUDGET_DETAIL_FIELDS.slice(0, 3));
+    // `parseSpendBudget` keeps the identifiers only as strings and the amounts
+    // only as integers, so a retyped field would be dropped without a word.
+    const types = Object.fromEntries(
+      SPEND_BUDGET_DETAIL_FIELDS.map((name) => [name, at(schema, "properties", name, "type")]),
+    );
+    expect(types, "update parseSpendBudget in src/sdk/routerErrors.ts").toEqual({
+      scope_kind: "string",
+      resets_at: "string",
+      set_by: "string",
+      id: "string",
+      scope_id: "string",
+      mode: "string",
+      limit_micro_usd: "integer",
+      spent_micro_usd: "integer",
+      limit_credits: "integer",
+      spent_credits: "integer",
+    });
     const ref = "#/components/schemas/RouterSpendBudgetDetail";
     const properties = at(doc, "components", "schemas", "RouterErrorResponse", "properties");
     expect(at(properties, "budget", "$ref")).toBe(ref);
