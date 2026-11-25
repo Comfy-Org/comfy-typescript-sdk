@@ -238,7 +238,7 @@ entry. See CONTRIBUTING.md.
 - `job.events()` now ends with a typed error (`Unauthorized` with code
   `credential_expired`, `Forbidden`, or `NotFound`) when the server sends the
   terminal `error` event, instead of silently reconnecting.
-- **A non-envelope `{message}` error body now keeps the server's message.** echo's request-decoder `400` and its `BodyLimit` `413` answer `{"message": "<diagnostic>"}` rather than an `ErrorEnvelope`, and that response used to collapse to `HTTP <status>` with the diagnostic lost. The message is now kept; the error's `code` is still the status-derived one (`"error"` for a `400` or `413`), and an envelope's own non-empty message still wins when a body carries both.
+- **A non-envelope `{message}` error body now keeps the server's message.** The server's request-decoder `400` and its body-size-limit `413` answer `{"message": "<diagnostic>"}` rather than an `ErrorEnvelope`, and that response used to collapse to `HTTP <status>` with the diagnostic lost. The message is now kept; the error's `code` is still the status-derived one (`"error"` for a `400` or `413`), and an envelope's own non-empty message still wins when a body carries both.
 
 ## [0.5.0] - 2026-10-10
 
