@@ -510,10 +510,10 @@ describe("RequestHandle.droppedParams", () => {
     expect((await submitWith()).droppedParams).toBeNull();
   });
 
-  it("survives an idempotent replay, unlike the estimate", async () => {
-    // Router stores this header with the key's record and replays it, so a
-    // replayed acceptance's disclosure is still the one the request was
-    // admitted under.
+  it("is read off an idempotent replay too, unlike the estimate", async () => {
+    // A replayed acceptance still carries the header, and the handle reports
+    // what THAT response said — Router may recompute it on replay, so it is
+    // not promised to be the original submission's disclosure.
     const handle = await submitWith({
       "X-Comfy-Router-Dropped-Params": JSON.stringify(DROPPED),
       "Idempotent-Replayed": "true",

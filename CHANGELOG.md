@@ -26,8 +26,10 @@ entry. See CONTRIBUTING.md.
   header, or a handle rebuilt by `comfy.models.handle`, since the queued
   status and result routes never carry it. The result `handle.get()` and
   `comfy.models.subscribe` resolve to carries the same disclosure on its own
-  `droppedParams`. Unlike `estimate` it survives an idempotent replay, because
-  Router replays the stored header.
+  `droppedParams`. Unlike `estimate` an idempotent replay still carries one,
+  but it is the disclosure that submit response received: Router may recompute
+  it on replay, so after a translator update it can differ from the original
+  submission's.
 - **`budget` and `blockingBudgets` on `routerErrors.BudgetExceeded`**, read
   from the `402` body's `budget` and `blocking_budgets` and typed as the new
   `routerErrors.SpendBudgetDetail` (frozen, camelCased:

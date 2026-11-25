@@ -1121,9 +1121,12 @@ export class RequestHandle<TData = unknown> {
    * `null` means NOTHING WAS SAID, not "nothing dropped": the header is absent
    * when no translation ran or nothing was dropped, and it is also not stored
    * anywhere a later process could fetch it, so a handle rebuilt by
-   * `comfy.models.handle` is always `null` here. Unlike {@link estimate} it
-   * survives an idempotent replay, because Router stores the header with the
-   * `Idempotency-Key` record and replays it unchanged. The queued status and
+   * `comfy.models.handle` is always `null` here. It is the disclosure THIS
+   * submit response carried, not a guarantee about the original submission:
+   * unlike {@link estimate} an idempotent replay still carries one, but Router
+   * may recompute it on replay, so after a translator update a replay can
+   * report what the leg drops now rather than what it dropped when the
+   * request was first queued. The queued status and
    * result routes never carry it, so {@link collect} copies it onto the
    * result's own `droppedParams` — which is how `comfy.models.subscribe`,
    * which returns that result rather than the handle, still reports it.
