@@ -69,7 +69,11 @@ import {
   MODEL_REQUESTS_ROUTE_TEMPLATE,
 } from "./modelRequests.js";
 import { isCollectable } from "./retry.js";
-import { REFUSAL_SUBJECT_HEADER, REFUSAL_SUBJECTS } from "./routerErrors.js";
+import {
+  REFUSAL_SUBJECT_HEADER,
+  REFUSAL_SUBJECTS,
+  SPEND_BUDGET_DETAIL_FIELDS,
+} from "./routerErrors.js";
 
 describe("router route contract (spec/router-openapi.yaml)", () => {
   it("spells RUN_ROUTE_TEMPLATE the path the contract declares for runRouterModel", async () => {
@@ -622,6 +626,45 @@ describe("refusal subject wire names (spec/router-openapi.yaml)", () => {
         "in src/sdk/routerErrors.ts and src/sdk/models.ts",
     ).toBeDefined();
     expect(at(property, "type")).toBe("string");
+  });
+
+  it("reads every RouterSpendBudgetDetail field, and the two RouterErrorResponse fields that carry one", () => {
+    // `BudgetExceeded.budget` / `.blockingBudgets` read these by wire name. A
+    // sync that adds or renames one should redden here rather than have the
+    // parser drop it without a word.
+    const schema = at(doc, "components", "schemas", "RouterSpendBudgetDetail");
+    const declared = entries(at(schema, "properties")).map(([name]) => name);
+    expect(declared.length, "could not read RouterSpendBudgetDetail.properties").toBeGreaterThan(0);
+    expect(
+      [...declared].sort(),
+      "update SPEND_BUDGET_DETAIL_FIELDS, SpendBudgetDetail and parseSpendBudget in " +
+        "src/sdk/routerErrors.ts",
+    ).toEqual([...SPEND_BUDGET_DETAIL_FIELDS].sort());
+    // The parser drops an entry missing one of the first three, so those must
+    // be exactly the fields the contract requires.
+    expect(at(schema, "required")).toEqual(SPEND_BUDGET_DETAIL_FIELDS.slice(0, 3));
+    // `parseSpendBudget` keeps the identifiers only as strings and the amounts
+    // only as integers, so a retyped field would be dropped without a word.
+    const types = Object.fromEntries(
+      SPEND_BUDGET_DETAIL_FIELDS.map((name) => [name, at(schema, "properties", name, "type")]),
+    );
+    expect(types, "update parseSpendBudget in src/sdk/routerErrors.ts").toEqual({
+      scope_kind: "string",
+      resets_at: "string",
+      set_by: "string",
+      id: "string",
+      scope_id: "string",
+      mode: "string",
+      limit_micro_usd: "integer",
+      spent_micro_usd: "integer",
+      limit_credits: "integer",
+      spent_credits: "integer",
+    });
+    const ref = "#/components/schemas/RouterSpendBudgetDetail";
+    const properties = at(doc, "components", "schemas", "RouterErrorResponse", "properties");
+    expect(at(properties, "budget", "$ref")).toBe(ref);
+    expect(at(properties, "blocking_budgets", "type")).toBe("array");
+    expect(at(properties, "blocking_budgets", "items", "$ref")).toBe(ref);
   });
 
   it("lists REFUSAL_SUBJECTS exactly as the contract's closed vocabulary", () => {

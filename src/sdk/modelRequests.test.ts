@@ -481,6 +481,141 @@ describe("RequestHandle.estimate", () => {
   });
 });
 
+describe("RequestHandle.droppedParams", () => {
+  const DROPPED = [
+    "moderation (fal applies its own, non-configurable safety filtering)",
+    "seed (not supported by this provider)",
+  ];
+
+  async function submitWith(submitHeaders?: Record<string, string>): Promise<RequestHandle> {
+    return await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = queueScript({ statuses: [DONE], submitHeaders });
+      return await comfy.models.submit(MODEL, { prompt: "a cat" });
+    });
+  }
+
+  it("reads the acceptance's X-Comfy-Router-Dropped-Params as a JSON array, commas intact", async () => {
+    const handle = await submitWith({ "X-Comfy-Router-Dropped-Params": JSON.stringify(DROPPED) });
+    expect(handle.droppedParams).toEqual(DROPPED);
+    expect(Object.isFrozen(handle.droppedParams)).toBe(true);
+  });
+
+  it("keeps a header that is not a JSON array of strings as one entry, as run does", async () => {
+    const handle = await submitWith({ "X-Comfy-Router-Dropped-Params": "seed, moderation" });
+    expect(handle.droppedParams).toEqual(["seed, moderation"]);
+  });
+
+  it("is null when the acceptance carries no header", async () => {
+    expect((await submitWith()).droppedParams).toBeNull();
+  });
+
+  it("is read off an idempotent replay too, unlike the estimate", async () => {
+    // A replayed acceptance still carries the header, and the handle reports
+    // what THAT response said — Router may recompute it on replay, so it is
+    // not promised to be the original submission's disclosure.
+    const handle = await submitWith({
+      "X-Comfy-Router-Dropped-Params": JSON.stringify(DROPPED),
+      "Idempotent-Replayed": "true",
+    });
+    expect(handle.droppedParams).toEqual(DROPPED);
+  });
+
+  it("is null on a handle rebuilt by comfy.models.handle", () => {
+    forbidNetwork();
+    config({ credentials: CREDENTIAL });
+    expect(comfy.models.handle(MODEL, REQUEST_ID).droppedParams).toBeNull();
+  });
+
+  it("reaches the result get() returns, and so subscribe()'s", async () => {
+    // The result route never carries the header, so without the acceptance's
+    // disclosure a subscribe caller would always read `null`.
+    const submitHeaders = { "X-Comfy-Router-Dropped-Params": JSON.stringify(DROPPED) };
+    const [collected, subscribed] = await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = queueScript({ statuses: [DONE], submitHeaders });
+      const handle = await comfy.models.submit(MODEL, { prompt: "a cat" });
+      const viaCollect = await handle.get();
+      server.state.respond = queueScript({ statuses: [DONE], submitHeaders });
+      return [viaCollect, await comfy.models.subscribe(MODEL, { prompt: "a cat" })];
+    });
+    expect(collected.droppedParams).toEqual(DROPPED);
+    expect(subscribed.droppedParams).toEqual(DROPPED);
+  });
+
+  it("lets the result route's own header win over the acceptance's", async () => {
+    const result = await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = queueScript({
+        statuses: [DONE],
+        submitHeaders: { "X-Comfy-Router-Dropped-Params": JSON.stringify(DROPPED) },
+        resultHeaders: { "X-Comfy-Router-Dropped-Params": JSON.stringify(["seed"]) },
+      });
+      return await (await comfy.models.submit(MODEL, { prompt: "a cat" })).get();
+    });
+    expect(result.droppedParams).toEqual(["seed"]);
+  });
+});
+
+describe("a submit refused 402 budget_exceeded", () => {
+  const BUDGET = {
+    id: "bud_1",
+    scope_kind: "workspace",
+    scope_id: "ws_1",
+    mode: "hard",
+    limit_micro_usd: 5_000_000,
+    spent_micro_usd: 5_000_000,
+    limit_credits: 1055,
+    spent_credits: 1055,
+    resets_at: "2026-12-01T00:00:00Z",
+    set_by: "owner",
+  };
+
+  async function refuse(body: Record<string, unknown>): Promise<routerErrors.BudgetExceeded> {
+    return await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = () => ({
+        status: 402,
+        errorType: "budget_exceeded",
+        body: {
+          detail: "A hard spend cap has been reached.",
+          error_type: "budget_exceeded",
+          ...body,
+        },
+      });
+      const err: unknown = await comfy.models.submit(MODEL, {}).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(routerErrors.BudgetExceeded);
+      // Terminal: the cap stays reached, so a re-send is refused the same way.
+      expect(server.state.requestCount).toBe(1);
+      return err as routerErrors.BudgetExceeded;
+    });
+  }
+
+  it("carries the body's budget and blocking_budgets, camelCased", async () => {
+    const err = await refuse({ budget: BUDGET, blocking_budgets: [BUDGET] });
+    const expected = {
+      id: "bud_1",
+      scopeKind: "workspace",
+      scopeId: "ws_1",
+      mode: "hard",
+      limitMicroUsd: 5_000_000,
+      spentMicroUsd: 5_000_000,
+      limitCredits: 1055,
+      spentCredits: 1055,
+      resetsAt: "2026-12-01T00:00:00Z",
+      setBy: "owner",
+    };
+    expect(err.budget).toEqual(expected);
+    expect(err.blockingBudgets).toEqual([expected]);
+  });
+
+  it("is undefined and empty when the body carries no budget detail", async () => {
+    const err = await refuse({});
+    expect(err.budget).toBeUndefined();
+    expect(err.blockingBudgets).toEqual([]);
+  });
+});
+
 describe("comfy.models.submit stamps the Idempotency-Key onto every failure", () => {
   it("stamps a raw transport failure, preserving its TypeError identity", async () => {
     await withRouterStub(async (server) => {

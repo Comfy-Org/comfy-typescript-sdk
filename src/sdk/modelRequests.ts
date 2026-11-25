@@ -1113,6 +1113,26 @@ export class RequestHandle<TData = unknown> {
    */
   readonly estimate: CostEstimate | null;
 
+  /**
+   * The native input fields Router said the `model_provider` leg will drop,
+   * off the submit response's `X-Comfy-Router-Dropped-Params` — read exactly as
+   * `RunJsonResult.droppedParams` is on `run`, one entry per field and why.
+   *
+   * `null` means NOTHING WAS SAID, not "nothing dropped": the header is absent
+   * when no translation ran or nothing was dropped, and it is also not stored
+   * anywhere a later process could fetch it, so a handle rebuilt by
+   * `comfy.models.handle` is always `null` here. It is the disclosure THIS
+   * submit response carried, not a guarantee about the original submission:
+   * unlike {@link estimate} an idempotent replay still carries one, but Router
+   * may recompute it on replay, so after a translator update a replay can
+   * report what the leg drops now rather than what it dropped when the
+   * request was first queued. The queued status and
+   * result routes never carry it, so {@link collect} copies it onto the
+   * result's own `droppedParams` — which is how `comfy.models.subscribe`,
+   * which returns that result rather than the handle, still reports it.
+   */
+  readonly droppedParams: readonly string[] | null;
+
   readonly #retry: RetryOptions | false;
 
   /** @internal — built by `comfy.models.submit` / `comfy.models.handle`. */
@@ -1121,10 +1141,12 @@ export class RequestHandle<TData = unknown> {
     requestId: string,
     retry: RetryOptions | false = {},
     estimate: CostEstimate | null = null,
+    droppedParams: readonly string[] | null = null,
   ) {
     this.model = model;
     this.requestId = requestId;
     this.estimate = estimate;
+    this.droppedParams = droppedParams === null ? null : Object.freeze([...droppedParams]);
     this.#retry = retry;
     Object.freeze(this);
   }
@@ -1316,7 +1338,11 @@ export class RequestHandle<TData = unknown> {
     }
     const requestId = response.headers.get(REQUEST_ID_HEADER);
     const servingProvider = response.headers.get(FALLBACK_PROVIDER_HEADER);
-    const droppedParams = parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER));
+    // The result route does not carry the dropped-params header, so a `null`
+    // there is its silence: fall back to the acceptance's disclosure, as
+    // `run`'s queued handoff does, or `subscribe` would always report `null`.
+    const droppedParams =
+      parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER)) ?? this.droppedParams;
     const replayed = parseReplayed(response.headers.get(IDEMPOTENT_REPLAYED_HEADER));
     const creditsUsed = parseCreditsUsed(response.headers.get(CREDITS_USED_HEADER));
     if (response.status !== 200) {
@@ -1562,6 +1588,7 @@ export async function submit<TData = unknown>(
         requestIdOf(body, response),
         options.retry ?? {},
         submitEstimateOf(body, response),
+        parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER)),
       );
     },
     {
