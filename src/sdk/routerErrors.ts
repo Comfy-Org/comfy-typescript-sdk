@@ -330,6 +330,62 @@ export interface ValidationErrorDetail {
   input?: unknown;
 }
 
+/**
+ * One hard spend budget, as a `402 budget_exceeded` body names it — the
+ * camelCase of the contract's `RouterSpendBudgetDetail`.
+ *
+ * Only {@link scopeKind}, {@link resetsAt} and {@link setBy} are required.
+ * The contract says the identifiers, the mode and the amounts are visible to
+ * workspace Owners, so expect them to be missing for anyone else. A missing
+ * field is left absent here, never filled with a zero, so read an absent
+ * amount as "not disclosed", never as "nothing spent".
+ *
+ * The strings are open, not unions: the contract declares no closed vocabulary
+ * for `scope_kind`, `mode` or `set_by`, and a newer server's value must reach
+ * the caller verbatim.
+ */
+export interface SpendBudgetDetail {
+  /** What the budget is set on (`scope_kind`), verbatim. */
+  readonly scopeKind: string;
+  /** When the budget resets (`resets_at`), as the ISO-8601 date-time string Router sent. */
+  readonly resetsAt: string;
+  /** Who set the budget (`set_by`), verbatim. */
+  readonly setBy: string;
+  /** The budget's id (`id`) — Owner-visible. */
+  readonly id?: string;
+  /** The id of the scope the budget is set on (`scope_id`) — Owner-visible. */
+  readonly scopeId?: string;
+  /** The budget's mode (`mode`), verbatim — Owner-visible. */
+  readonly mode?: string;
+  /** The budget's limit in millionths of a US dollar (`limit_micro_usd`) — Owner-visible. */
+  readonly limitMicroUsd?: number;
+  /** What has been spent against it, in millionths of a US dollar (`spent_micro_usd`) — Owner-visible. */
+  readonly spentMicroUsd?: number;
+  /** The budget's limit in Comfy credits (`limit_credits`) — Owner-visible. */
+  readonly limitCredits?: number;
+  /** What has been spent against it, in Comfy credits (`spent_credits`) — Owner-visible. */
+  readonly spentCredits?: number;
+}
+
+/**
+ * The wire names of every `RouterSpendBudgetDetail` field
+ * {@link SpendBudgetDetail} reads. Pinned to the vendored Router contract by
+ * `router-spec-contract.test.ts`, so a sync that adds or renames one fails
+ * there rather than being dropped here without a word.
+ */
+export const SPEND_BUDGET_DETAIL_FIELDS = [
+  "scope_kind",
+  "resets_at",
+  "set_by",
+  "id",
+  "scope_id",
+  "mode",
+  "limit_micro_usd",
+  "spent_micro_usd",
+  "limit_credits",
+  "spent_credits",
+] as const;
+
 export interface RouterErrorOptions {
   /**
    * The raw `error_type` off the wire. Defaults to the class's own
@@ -555,11 +611,32 @@ export class InsufficientCredits extends RouterError {
  * It shares `402` with {@link InsufficientCredits} and is not the same thing:
  * that one says the workspace has run out of credits, whereas this says a
  * spend cap stopped the call, which says nothing about the credit balance.
- * The response body's `budget` names the exhausted cap, and `blocking_budgets`
- * lists every exhausted one; both are visible to a workspace Owner.
+ * The response body's `budget` names the exhausted cap, on {@link budget}, and
+ * `blocking_budgets` lists every exhausted one, on {@link blockingBudgets}.
  */
 export class BudgetExceeded extends RouterError {
   static override readonly errorType = "budget_exceeded";
+
+  /** The exhausted budget the body names, or `undefined` when it named none. */
+  readonly budget: SpendBudgetDetail | undefined;
+
+  /**
+   * Every exhausted hard budget the body lists; empty when it listed none. The
+   * contract makes this list visible to the workspace Owner.
+   */
+  readonly blockingBudgets: readonly SpendBudgetDetail[];
+
+  constructor(
+    message: string,
+    options: RouterErrorOptions & {
+      budget?: SpendBudgetDetail;
+      blockingBudgets?: readonly SpendBudgetDetail[];
+    } = {},
+  ) {
+    super(message, options);
+    this.budget = options.budget;
+    this.blockingBudgets = Object.freeze([...(options.blockingBudgets ?? [])]);
+  }
 }
 
 /** No such model — the `{provider}/{model}` pair is not one Router serves. */
@@ -900,6 +977,8 @@ interface RequestErrorBody {
   error_type?: unknown;
   refusal_subject?: unknown;
   code?: unknown;
+  budget?: unknown;
+  blocking_budgets?: unknown;
 }
 
 /**
@@ -938,6 +1017,41 @@ function parseDetailEntry(raw: unknown): ValidationErrorDetail | null {
   if (isRecord(ctx)) parsed.ctx = ctx;
   if ("input" in raw) parsed.input = input;
   return parsed;
+}
+
+/**
+ * Parse one `RouterSpendBudgetDetail`, keeping it only if its three required
+ * fields are present strings — the same rule as {@link parseDetailEntry}: a
+ * budget with no `scope_kind` is worse than no budget at all. An optional field
+ * of the wrong type is left out rather than failing the whole entry, and an
+ * amount counts only as a safe integer, since the contract declares `int64`
+ * and a JavaScript number past 2^53 no longer says which one it was.
+ * Frozen, so nothing holding the error can change what it reports.
+ */
+function parseSpendBudget(raw: unknown): SpendBudgetDetail | null {
+  if (!isRecord(raw)) return null;
+  const { scope_kind, resets_at, set_by } = raw;
+  if (typeof scope_kind !== "string" || typeof resets_at !== "string") return null;
+  if (typeof set_by !== "string") return null;
+  const parsed: { -readonly [K in keyof SpendBudgetDetail]: SpendBudgetDetail[K] } = {
+    scopeKind: scope_kind,
+    resetsAt: resets_at,
+    setBy: set_by,
+  };
+  // Absent stays absent: only a field the body carried is set, so
+  // `"id" in budget` never claims one it did not.
+  if (typeof raw.id === "string") parsed.id = raw.id;
+  if (typeof raw.scope_id === "string") parsed.scopeId = raw.scope_id;
+  if (typeof raw.mode === "string") parsed.mode = raw.mode;
+  if (isAmount(raw.limit_micro_usd)) parsed.limitMicroUsd = raw.limit_micro_usd;
+  if (isAmount(raw.spent_micro_usd)) parsed.spentMicroUsd = raw.spent_micro_usd;
+  if (isAmount(raw.limit_credits)) parsed.limitCredits = raw.limit_credits;
+  if (isAmount(raw.spent_credits)) parsed.spentCredits = raw.spent_credits;
+  return Object.freeze(parsed);
+}
+
+function isAmount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value);
 }
 
 /** Summarize a `detail[]` array into the one-line message the exception carries. */
@@ -1035,6 +1149,23 @@ export function toRouterError(status: number, headers: HeadersLike, body: unknow
       : status > 0
         ? `HTTP ${status}`
         : `the request completed with error_type '${errorType ?? ""}'`;
+
+  if (cls === BudgetExceeded) {
+    // Every entry that parses is kept and every one that does not is
+    // dropped, so a single malformed budget does not cost the caller the
+    // others. A `budget` that does not parse is `undefined`, as if absent.
+    const blockingBudgets = Array.isArray(envelope.blocking_budgets)
+      ? envelope.blocking_budgets
+          .map(parseSpendBudget)
+          .filter((b): b is SpendBudgetDetail => b !== null)
+      : [];
+    return new BudgetExceeded(message, {
+      ...options,
+      budget: parseSpendBudget(envelope.budget) ?? undefined,
+      blockingBudgets,
+    });
+  }
+
   return new (cls ?? RouterError)(message, options);
 }
 

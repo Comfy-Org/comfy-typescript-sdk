@@ -1113,6 +1113,21 @@ export class RequestHandle<TData = unknown> {
    */
   readonly estimate: CostEstimate | null;
 
+  /**
+   * The native input fields Router said the `model_provider` leg will drop,
+   * off the submit response's `X-Comfy-Router-Dropped-Params` — read exactly as
+   * `RunJsonResult.droppedParams` is on `run`, one entry per field and why.
+   *
+   * `null` means NOTHING WAS SAID, not "nothing dropped": the header is absent
+   * when no translation ran or nothing was dropped, and it is also not stored
+   * anywhere a later process could fetch it, so a handle rebuilt by
+   * `comfy.models.handle` is always `null` here. Unlike {@link estimate} it
+   * survives an idempotent replay, because Router stores the header with the
+   * `Idempotency-Key` record and replays it unchanged. The queued status and
+   * result routes never carry it, so this is the only place it can be read.
+   */
+  readonly droppedParams: readonly string[] | null;
+
   readonly #retry: RetryOptions | false;
 
   /** @internal — built by `comfy.models.submit` / `comfy.models.handle`. */
@@ -1121,10 +1136,12 @@ export class RequestHandle<TData = unknown> {
     requestId: string,
     retry: RetryOptions | false = {},
     estimate: CostEstimate | null = null,
+    droppedParams: readonly string[] | null = null,
   ) {
     this.model = model;
     this.requestId = requestId;
     this.estimate = estimate;
+    this.droppedParams = droppedParams === null ? null : Object.freeze([...droppedParams]);
     this.#retry = retry;
     Object.freeze(this);
   }
@@ -1562,6 +1579,7 @@ export async function submit<TData = unknown>(
         requestIdOf(body, response),
         options.retry ?? {},
         submitEstimateOf(body, response),
+        parseDroppedParams(response.headers.get(DROPPED_PARAMS_HEADER)),
       );
     },
     {

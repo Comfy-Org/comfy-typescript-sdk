@@ -19,6 +19,20 @@ entry. See CONTRIBUTING.md.
 
 ### Added
 
+- **`droppedParams` on the `RequestHandle` `comfy.models.submit` resolves
+  to.** It reads the acceptance's `X-Comfy-Router-Dropped-Params` header the
+  same way `models.run` reads its own: one entry per native field the
+  `model_provider` leg will drop, and why. `null` means nothing was said — no
+  header, or a handle rebuilt by `comfy.models.handle`, since the queued
+  status and result routes never carry it. Unlike `estimate` it survives an
+  idempotent replay, because Router replays the stored header.
+- **`budget` and `blockingBudgets` on `routerErrors.BudgetExceeded`**, read
+  from the `402` body's `budget` and `blocking_budgets` and typed as the new
+  `routerErrors.SpendBudgetDetail` (frozen, camelCased:
+  `scopeKind`, `resetsAt`, `setBy`, and the Owner-visible `id`, `scopeId`, `mode`,
+  `limitMicroUsd`, `spentMicroUsd`, `limitCredits`, `spentCredits`). `budget`
+  is `undefined` and `blockingBudgets` is empty when the body carries none; an
+  Owner-visible field the body left out stays absent, never zero.
 - **Two more Router error classes, `routerErrors.BudgetExceeded` and
   `routerErrors.BudgetCheckUnavailable`**, for the spend-cap buckets the
   vendored Router contract now declares. `BudgetExceeded` (`budget_exceeded`,

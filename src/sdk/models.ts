@@ -918,7 +918,10 @@ export interface Models {
    *
    * The handle's {@link RequestHandle.estimate} is the cost quote the server
    * returned with the acceptance, when it returned one it could be read from;
-   * `null` means no quote is available, never no charge.
+   * `null` means no quote is available, never no charge. Its
+   * {@link RequestHandle.droppedParams} is the acceptance's dropped-params
+   * disclosure, read as `run` reads its own; the queued status and result
+   * routes do not carry that header, so the handle is the only place to read it.
    *
    * The surface is gated SERVER SIDE: a caller the queue is not switched on for
    * is answered `403 not_enabled`, which arrives here as

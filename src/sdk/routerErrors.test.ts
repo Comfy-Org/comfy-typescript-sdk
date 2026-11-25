@@ -351,6 +351,73 @@ describe("toRouterError", () => {
     expect(toRouterError(402, new Headers(), null)).toBeInstanceOf(InsufficientCredits);
   });
 
+  it("reads a budget_exceeded body's budget detail, keeping only what it carried", () => {
+    // A non-Owner sees the three required fields and nothing else: the
+    // identifiers, mode and amounts are absent, and absent must stay absent —
+    // not `undefined`-valued keys, and never a zero that reads as "nothing spent".
+    const visible = { scope_kind: "workspace", resets_at: "2026-12-01T00:00:00Z", set_by: "owner" };
+    const capped = toRouterError(402, new Headers({ [ERROR_TYPE_HEADER]: "budget_exceeded" }), {
+      detail: "A hard spend cap has been reached.",
+      error_type: "budget_exceeded",
+      budget: visible,
+      blocking_budgets: [
+        visible,
+        // Dropped whole: a required field is missing or mistyped.
+        { scope_kind: "workspace", resets_at: "2026-12-01T00:00:00Z" },
+        { ...visible, set_by: 7 },
+        "workspace",
+        null,
+        // Kept, minus the optional fields that are not what the contract says.
+        { ...visible, id: 9, mode: "hard", spent_micro_usd: 2 ** 53, limit_credits: 1.5 },
+      ],
+    });
+    expect(capped).toBeInstanceOf(BudgetExceeded);
+    const { budget, blockingBudgets } = capped as BudgetExceeded;
+    const expected = { scopeKind: "workspace", resetsAt: "2026-12-01T00:00:00Z", setBy: "owner" };
+    expect(budget).toStrictEqual(expected);
+    expect(Object.keys(budget ?? {})).toEqual(["scopeKind", "resetsAt", "setBy"]);
+    expect(blockingBudgets).toStrictEqual([expected, { ...expected, mode: "hard" }]);
+    expect(Object.isFrozen(budget)).toBe(true);
+    expect(Object.isFrozen(blockingBudgets)).toBe(true);
+    expect(blockingBudgets.every((b) => Object.isFrozen(b))).toBe(true);
+  });
+
+  it("leaves budget undefined and blockingBudgets empty when the body carries no detail", () => {
+    for (const body of [
+      null,
+      { error_type: "budget_exceeded" },
+      { budget: "workspace", blocking_budgets: { scope_kind: "workspace" } },
+    ]) {
+      const capped = toRouterError(
+        402,
+        new Headers({ [ERROR_TYPE_HEADER]: "budget_exceeded" }),
+        body,
+      ) as BudgetExceeded;
+      expect(capped, JSON.stringify(body)).toBeInstanceOf(BudgetExceeded);
+      expect(capped.budget).toBeUndefined();
+      expect(capped.blockingBudgets).toEqual([]);
+    }
+    // Built by hand, as an integrator's test double would be.
+    const bare = new BudgetExceeded("capped");
+    expect(bare.budget).toBeUndefined();
+    expect(bare.blockingBudgets).toEqual([]);
+  });
+
+  it("reads budget detail off a queued completion that reports budget_exceeded", () => {
+    const err = errorFromCompletion(
+      {
+        status: "COMPLETED",
+        error_type: "budget_exceeded",
+        detail: "A hard spend cap has been reached.",
+        budget: { scope_kind: "workspace", resets_at: "2026-12-01T00:00:00Z", set_by: "owner" },
+      },
+      "req_1",
+    );
+    expect(err).toBeInstanceOf(BudgetExceeded);
+    expect((err as BudgetExceeded).budget?.scopeKind).toBe("workspace");
+    expect(err?.httpStatus).toBeNull();
+  });
+
   it("tells budget_check_unavailable from service_unavailable on a 503, keeping its Retry-After", () => {
     // Both answer `503` and both clear on their own; the bucket says which
     // dependency could not answer. The contract asks for a wait of
