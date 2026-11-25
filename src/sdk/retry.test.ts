@@ -92,6 +92,15 @@ describe("isRetryableStatus", () => {
     // a 503 naming it is precisely what the 5xx rule is for.
     expect(isRetryableStatus(503, "service_unavailable")).toBe(true);
     expect(TERMINAL_ERROR_TYPES.has("service_unavailable")).toBe(false);
+    // `budget_check_unavailable` is the other `503` that clears on its own (a
+    // spend cap that could not be checked), and the contract says to retry it
+    // after `Retry-After`. It is retried like `service_unavailable`, and it is
+    // not collectable: no generation is held under the key.
+    expect(isRetryableStatus(503, "budget_check_unavailable")).toBe(true);
+    expect(TERMINAL_ERROR_TYPES.has("budget_check_unavailable")).toBe(false);
+    expect(isCollectable(503, "budget_check_unavailable", 3)).toBe(false);
+    // `budget_exceeded` is a `402`, which the `status < 500` rule never retries.
+    expect(isRetryableStatus(402, "budget_exceeded")).toBe(false);
     expect(TERMINAL_ERROR_TYPES.has("not_enabled")).toBe(true);
     // `queue_timeout` arrives on a 504, which the `status >= 500` rule retries,
     // so without this entry an admission timeout burns the whole retry budget

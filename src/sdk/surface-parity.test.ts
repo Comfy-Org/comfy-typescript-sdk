@@ -261,6 +261,21 @@ const INTENTIONAL_ASYMMETRIES: readonly Asymmetry[] = [
     routerErrorClassesAheadOfPython: [["ByokCredentialRejected", "byok_credential_rejected"]],
   },
   {
+    id: "budget-buckets-land-first-in-typescript",
+    why:
+      "The vendored Router contract grew two spend-cap buckets, `budget_exceeded` (a hard spend " +
+      "cap was reached, answered `402`) and `budget_check_unavailable` (a hard spend cap could " +
+      "not be checked, answered `503`), and this SDK's spec-coverage gate requires a class per " +
+      "bucket the moment the spec declares one. The Python SDK is adding the same two classes on " +
+      "its own pull request, so its surface snapshot does not carry them yet. This is a LEAD, " +
+      "not a divergence: the rot guard below fails the moment the Python snapshot grows them, " +
+      "which is the signal to delete this entry.",
+    routerErrorClassesAheadOfPython: [
+      ["BudgetExceeded", "budget_exceeded"],
+      ["BudgetCheckUnavailable", "budget_check_unavailable"],
+    ],
+  },
+  {
     id: "realtime-sessions-land-first-in-typescript",
     why:
       "`comfy.realtime.connect` opens a Router realtime WebSocket session, and the Python SDK " +
