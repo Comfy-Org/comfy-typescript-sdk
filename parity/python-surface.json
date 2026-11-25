@@ -38,6 +38,8 @@
     "ProviderError",
     "ProviderTimeout",
     "InsufficientCredits",
+    "BudgetExceeded",
+    "BudgetCheckUnavailable",
     "ModelNotFound",
     "Unauthorized",
     "Forbidden",
@@ -52,7 +54,8 @@
     "QueueTimeout",
     "RequestNotFound",
     "QueueBacklogFull",
-    "ResultExpired"
+    "ResultExpired",
+    "ByokCredentialRejected"
   ],
   "routerErrorTypes": {
     "RouterError": "",
@@ -61,6 +64,8 @@
     "ProviderError": "provider_error",
     "ProviderTimeout": "provider_timeout",
     "InsufficientCredits": "insufficient_credits",
+    "BudgetExceeded": "budget_exceeded",
+    "BudgetCheckUnavailable": "budget_check_unavailable",
     "ModelNotFound": "model_not_found",
     "Unauthorized": "unauthorized",
     "Forbidden": "forbidden",
@@ -75,7 +80,8 @@
     "QueueTimeout": "queue_timeout",
     "RequestNotFound": "request_not_found",
     "QueueBacklogFull": "queue_backlog_full",
-    "ResultExpired": "result_expired"
+    "ResultExpired": "result_expired",
+    "ByokCredentialRejected": "byok_credential_rejected"
   },
   "routerErrorTypeOrder": [
     "invalid_input",
@@ -83,6 +89,8 @@
     "provider_error",
     "provider_timeout",
     "insufficient_credits",
+    "budget_exceeded",
+    "budget_check_unavailable",
     "model_not_found",
     "unauthorized",
     "forbidden",
@@ -97,7 +105,8 @@
     "queue_timeout",
     "request_not_found",
     "queue_backlog_full",
-    "result_expired"
+    "result_expired",
+    "byok_credential_rejected"
   ],
   "routerErrorTypeByStatus": {
     "401": "unauthorized",

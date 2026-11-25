@@ -8,7 +8,7 @@
  * values in this release: eight request-level and fifteen transport-level. This
  * module turns that value into a class an integrator can `catch`. The names
  * below are the shared set: the Python SDK spells every one of them
- * identically (bar the newest three, see the end of this comment), so a snippet, a doc page or a forum answer transfers between
+ * identically, so a snippet, a doc page or a forum answer transfers between
  * the two languages unchanged. They are the PascalCase of the wire value,
  * which is idiomatic in both languages — no per-language casing deviation was
  * needed, and none should be introduced.
@@ -62,12 +62,10 @@
  * so the name-only parity check cannot see this; it is declared in
  * `surface-parity.test.ts`'s `router-errors-namespaced` entry instead.
  *
- * Three of the twenty-three buckets — `byok_credential_rejected`,
- * `budget_exceeded` and `budget_check_unavailable`, the most recent the
- * vendored contract grew — are newer than the Python SDK's table. Until their
- * twins land they are declared as leading the Python SDK in
- * `surface-parity.test.ts`'s allowlist, which fails once the Python side
- * catches up so the entries cannot outlive the lead.
+ * A bucket the vendored contract grows before the Python SDK's table does is
+ * declared as leading the Python SDK in `surface-parity.test.ts`'s allowlist
+ * (`routerErrorClassesAheadOfPython`), which fails once the Python side catches
+ * up so the entry cannot outlive the lead. None is declared today.
  */
 
 /**

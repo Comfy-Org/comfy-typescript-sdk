@@ -261,7 +261,7 @@ Two things to know before you touch it:
   Python SDK's surface moved. Run `pnpm sync:python-surface`, commit the
   refreshed snapshot, then run `pnpm test` to see which symbols diverged.
 - **Deliberate divergences go in the `INTENTIONAL_ASYMMETRIES` allowlist** at
-  the top of the test, each with a stated reason. Ten are declared today.
+  the top of the test, each with a stated reason. Eight are declared today.
   Anything not declared there fails. Adding an entry is a design decision — the
   test also fails on an entry that no longer applies, so the list cannot rot
   into a blanket exemption.
@@ -272,8 +272,7 @@ Two things to know before you touch it:
   `exportedErrorClassesAheadOfPython` tolerate that in ONE direction —
   TypeScript leading — and each has a rot guard that fails the moment the
   Python snapshot grows the same name, which is the signal to delete the entry
-  rather than to grow it. The first carries `ByokCredentialRejected`, `BudgetExceeded` and
-  `BudgetCheckUnavailable`, and the third
+  rather than to grow it. The first carries none today, and the third
   carries `RealtimeUpgradeFailed` (raised by `comfy.realtime.connect`, which
   the Python SDK has no twin of yet). Do not reach for any of them to excuse
   something this SDK invented:
