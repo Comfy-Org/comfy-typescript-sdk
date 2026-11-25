@@ -17,6 +17,8 @@ Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
 entry. See CONTRIBUTING.md.
 -->
 
+## [0.6.0] - 2026-11-25
+
 ### Added
 
 - **`respondAsync` on `comfy.models.run`.** Opt in to sending
@@ -203,6 +205,7 @@ entry. See CONTRIBUTING.md.
 - `job.events()` now ends with a typed error (`Unauthorized` with code
   `credential_expired`, `Forbidden`, or `NotFound`) when the server sends the
   terminal `error` event, instead of silently reconnecting.
+- **A non-envelope `{message}` error body now keeps the server's message.** echo's request-decoder `400` and its `BodyLimit` `413` answer `{"message": "<diagnostic>"}` rather than an `ErrorEnvelope`, and that response used to collapse to `HTTP <status>` with the diagnostic lost. The message is now kept; the error's `code` is still the status-derived one (`"error"` for a `400` or `413`), and an envelope's own non-empty message still wins when a body carries both.
 
 ## [0.5.0] - 2026-10-10
 
@@ -310,7 +313,6 @@ entry. See CONTRIBUTING.md.
 
 ### Fixed
 
-- **A non-envelope `{message}` error body now keeps the server's message.** echo's request-decoder `400` and its `BodyLimit` `413` answer `{"message": "<diagnostic>"}` rather than an `ErrorEnvelope`, and that response used to collapse to `HTTP <status>` with the diagnostic lost. The message is now kept; the error's `code` is still the status-derived one (`"error"` for a `400` or `413`), and an envelope's own non-empty message still wins when a body carries both.
 - **`idempotencyKey` is now stamped onto _every_ error `comfy.models.run` and `comfy.models.submit` throw, including raw transport failures and aborts.** Previously only the `run` response-path `ComfyError` carried it; undici's transport-failure `TypeError` ("fetch failed"), an already-aborted signal's `AbortError`, and the queue path's `RouterError` (e.g. a bare `502` `ProviderError`) all escaped without it. On a transport failure the server never minted an `X-Comfy-Request-Id`, so the key is the only value that correlates the failure to the server-side record. It is now attached as an own `idempotencyKey` property on the raw throwable (its class, `name`, message and stack are otherwise untouched), and `routerErrors.RouterError` gained a typed `idempotencyKey` field. A failure to collect a generation additionally carries the `Retry-After` pace Router named, rather than reporting none. Where the throwable is one the caller owns and other calls share — an `AbortController`'s `signal.reason`, which `fetch` hands to every concurrent call on that controller — each call receives an equivalent per-call error carrying ITS OWN key instead, so no caller reads a key belonging to another generation and `controller.signal.reason` is left unmodified. Mirrors the Python SDK's `exceptions.translating(idempotency_key=…)`.
 - **The `droppedParams` doc comments now match the vendored Router contract.**
   The TSDoc on `parseDroppedParams` and `RunJsonResult.droppedParams` still
@@ -800,7 +802,8 @@ First public release of the Comfy API v2 TypeScript SDK (`@comfyorg/sdk`).
   Cloud, and serverless: upload and dedup inputs, submit a workflow, follow it
   (poll or SSE), and download outputs. Requires Node >= 22.
 
-[Unreleased]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Comfy-Org/comfy-typescript-sdk/compare/v0.2.0...v0.3.0
