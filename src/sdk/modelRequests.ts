@@ -147,27 +147,51 @@ export const CANCEL_TIMEOUT_MS = 10_000;
 export const MIN_REQUEST_TIMEOUT_MS = 1_000;
 
 /**
- * The most a queue envelope — the status, submit and cancel answers — is read
- * to, in bytes.
+ * The most a queue envelope — the status and cancel answers — is read to, in
+ * bytes, by default.
  *
  * Those answers are small JSON documents, and the status read repeats on every
  * poll, so an unbounded read would let one misbehaving response buffer without
- * limit once per poll. A caller has no option to raise it: unlike the result's
- * `maxBytes`, nothing a caller asks for makes an envelope legitimately larger.
- * An error envelope past it is truncated rather than refused (see
- * `readBodyWithin`), so the typed error survives. The same size as
- * `MIN_ERROR_BODY_BYTES` in `./models.ts`.
+ * limit once per poll. An error envelope past it is truncated rather than
+ * refused (see `readBodyWithin`), so the typed error survives. The same size
+ * as `MIN_ERROR_BODY_BYTES` in `./models.ts`.
  *
- * Submit's 2xx acceptance is the exception, read whole as before: it is read
- * once rather than once per poll, and it is the only place the new request's
- * `request_id` comes from, so refusing it would strand a generation the
- * server has already accepted — re-sending the same `Idempotency-Key` would
- * replay the same acceptance and fail the same way.
+ * The status read inside `get()` and `subscribe()` is the one a caller can
+ * raise, by passing `maxBytes` explicitly: that read is what stands between
+ * the caller and a generation already accepted and billed, and a completion's
+ * failure payload rides on it, so it needs the same way out a result past the
+ * cap has. See {@link statusEnvelopeBytes}.
  */
 const MAX_ENVELOPE_BYTES = 1_048_576;
 
 /**
- * Was `exc` raised for a 2xx envelope past {@link MAX_ENVELOPE_BYTES}?
+ * The most submit's 2xx acceptance is read to, in bytes.
+ *
+ * Larger than {@link MAX_ENVELOPE_BYTES} because the acceptance is read once
+ * rather than once per poll, and it is the only place the new request's
+ * `request_id` comes from, so refusing one strands a generation the server
+ * has already accepted. Bounded all the same: an unbounded read would let a
+ * declared-huge or endlessly streamed 2xx buffer in full, and `timeoutMs:
+ * null` leaves no clock to stop it. The refusal carries the call's
+ * `Idempotency-Key` (see `submit`), which is the only value that correlates
+ * it to the server-side record.
+ */
+const MAX_ACCEPTANCE_BYTES = 16_777_216;
+
+/**
+ * The limit a status poll reads to on behalf of `get()` or `subscribe()`.
+ *
+ * {@link MAX_ENVELOPE_BYTES} unless the caller passed `maxBytes` explicitly —
+ * the default 64 MiB result cap is not a reason to read 64 MiB on every poll —
+ * and then never below it: `null` lifts the bound, as it does on the result.
+ */
+function statusEnvelopeBytes(explicit: boolean, maxBytes: number | null): number | null {
+  if (!explicit) return MAX_ENVELOPE_BYTES;
+  return maxBytes === null ? null : Math.max(MAX_ENVELOPE_BYTES, maxBytes);
+}
+
+/**
+ * Was `exc` raised for a 2xx envelope past the limit {@link readEnvelope} read it to?
  *
  * Tested on `details.maxEnvelopeBytes`, which only {@link readEnvelope} sets,
  * as `isTooLarge` tests `details.maxBytes`: the code alone also names every
@@ -177,7 +201,8 @@ function isEnvelopeTooLarge(exc: unknown): boolean {
   return (
     exc instanceof ComfyError &&
     exc.code === "invalid_response" &&
-    typeof exc.details?.maxEnvelopeBytes === "number"
+    exc.details !== null &&
+    "maxEnvelopeBytes" in exc.details
   );
 }
 
@@ -453,6 +478,10 @@ export interface GetOptions extends WaitOptions {
    * It caps decoded bytes held, not time or bytes on the wire: a compressed
    * body that decodes to nothing never reaches it. Unlike `run`, this wait has
    * no deadline by default, so set `timeoutMs` or `signal` to bound that too.
+   *
+   * Passed explicitly, it also raises the 1 MiB limit each status poll reads
+   * to (never lowers it; `null` lifts it), so a request whose status answer
+   * is past that limit can still be collected.
    */
   maxBytes?: number | null;
 }
@@ -497,7 +526,8 @@ export interface SubscribeOptions extends SubmitOptions {
    * .get({ maxBytes })` and a larger cap. It is NOT cancelled: the generation is already paid for.
    *
    * As on {@link GetOptions.maxBytes}, it bounds neither time nor bytes on the
-   * wire, and there is no default deadline: use `timeoutMs` or `signal`.
+   * wire, and there is no default deadline: use `timeoutMs` or `signal`. And
+   * as there, an explicit value also raises the status polls' 1 MiB limit.
    */
   maxBytes?: number | null;
 }
@@ -870,12 +900,18 @@ interface QueueCall {
   bytes?: { maxBytes: number | null; subject: string; details?: Record<string, unknown> };
   /**
    * For an envelope read (`bytes` unset): merged into the `details` of the
-   * error a 2xx past {@link MAX_ENVELOPE_BYTES} raises, so a `subscribe`
+   * error a 2xx past its limit, or a deadline, raises, so a `subscribe`
    * caller, who holds no handle, can still find the request.
    */
   envelopeDetails?: Record<string, unknown>;
-  /** Read a 2xx envelope whole rather than within the cap — submit's only. */
-  uncappedAcceptance?: boolean;
+  /**
+   * For an envelope read: the most a 2xx is read to. Omit for
+   * {@link MAX_ENVELOPE_BYTES}; `null` lifts it, which only a caller's own
+   * `maxBytes: null` reaches (see {@link statusEnvelopeBytes}).
+   */
+  envelopeBytes?: number | null;
+  /** For an envelope read: how a caller raises {@link envelopeBytes}, if one can. */
+  envelopeHint?: string;
 }
 
 /**
@@ -968,7 +1004,7 @@ async function send(call: QueueCall): Promise<QueueResponse> {
         await response.body?.cancel().catch(() => undefined);
         bodyText = "";
       } else if (call.bytes === undefined) {
-        bodyText = decodeUtf8(await readEnvelope(response, call));
+        bodyText = await readEnvelope(response, call);
       } else if (response.ok && response.status !== 200) {
         // Only a 200 is a result. Any other 2xx — a 202 control answer — is
         // diagnosed from its status line alone, so its body is dropped unread
@@ -995,7 +1031,7 @@ async function send(call: QueueCall): Promise<QueueResponse> {
       // A body this call would not buffer is a verdict about the response,
       // not a transport failure: retrying would re-download it every attempt.
       if (isTooLarge(exc)) throw exc;
-      // Nor is an envelope past MAX_ENVELOPE_BYTES, for the same reason.
+      // Nor is an envelope past its limit, for the same reason.
       if (isEnvelopeTooLarge(exc)) throw exc;
       // A caller's abort is theirs: never retried, never re-dressed.
       if (call.signal?.aborted) throw exc;
@@ -1010,7 +1046,7 @@ async function send(call: QueueCall): Promise<QueueResponse> {
             code: "request_timeout",
             cause: exc,
             idempotencyKey: call.idempotencyKey ?? null,
-            details: call.bytes?.details ?? null,
+            details: call.bytes?.details ?? call.envelopeDetails ?? null,
           },
         );
       }
@@ -1042,47 +1078,58 @@ async function send(call: QueueCall): Promise<QueueResponse> {
 }
 
 /**
- * Buffer a status, submit or cancel answer within {@link MAX_ENVELOPE_BYTES}.
+ * Read a status, submit or cancel answer as text, within its limit.
  *
  * An error envelope is truncated at the cap by `readBodyWithin`; a truncated
  * one fails to parse in `decode`, which then types the error from the status
- * line and `X-Comfy-Error-Type` alone. A 2xx past it — other than submit's
- * acceptance, read whole (see {@link MAX_ENVELOPE_BYTES}) — is refused, as
- * `invalid_response`, not `response_too_large`, whose advice to raise
- * `maxBytes` names an option these calls do not have, and whose
- * `details.maxBytes` would mark it as a cap the caller set.
+ * line and `X-Comfy-Error-Type` alone. A 2xx past {@link QueueCall.envelopeBytes}
+ * is refused, as `invalid_response`, not `response_too_large`, whose
+ * `details.maxBytes` would mark it as the result cap. So is a 2xx the runtime
+ * cannot hold at all — a bare `RangeError` from buffering or decoding it,
+ * reachable once the limit is lifted — which would otherwise read as a
+ * transport failure and be re-sent and re-downloaded on every attempt.
  */
-async function readEnvelope(response: Response, call: QueueCall): Promise<Uint8Array> {
+async function readEnvelope(response: Response, call: QueueCall): Promise<string> {
+  const limit = response.ok
+    ? call.envelopeBytes === undefined
+      ? MAX_ENVELOPE_BYTES
+      : call.envelopeBytes
+    : MAX_ENVELOPE_BYTES;
   try {
-    return await readBodyWithin(
-      response,
-      response.ok && call.uncappedAcceptance === true ? null : MAX_ENVELOPE_BYTES,
-      `the model queue's ${call.what} call`,
-      call.idempotencyKey ?? null,
+    return decodeUtf8(
+      await readBodyWithin(
+        response,
+        limit,
+        `the model queue's ${call.what} call`,
+        call.idempotencyKey ?? null,
+      ),
     );
   } catch (exc) {
-    if (!isTooLarge(exc)) throw exc;
+    const unholdable = exc instanceof RangeError;
+    if (!unholdable && !isTooLarge(exc)) throw exc;
     // An error envelope is truncated, not refused, so the only breach one
     // raises is a failed allocation under the cap. The typed error comes from
     // the status line and `X-Comfy-Error-Type`, which do not need the body:
     // decode it as empty rather than trade that error for this one.
-    if (!response.ok) return new Uint8Array(0);
-    const breach = (exc as ComfyError).details ?? {};
+    if (!response.ok) return "";
+    const breach = unholdable ? {} : ((exc as ComfyError).details ?? {});
     const measured: Record<string, unknown> = {};
     for (const key of ["contentLength", "bytesRead", "allocationFailedAt"]) {
       if (key in breach) measured[key] = breach[key];
     }
+    const bound =
+      limit === null ? "with no envelope limit" : `under the ${String(limit)}-byte envelope limit`;
     const what =
-      "allocationFailedAt" in breach
-        ? `a body that could not be buffered under the ${String(MAX_ENVELOPE_BYTES)}-byte ` +
-          "envelope limit (see cause)"
-        : `a body past the ${String(MAX_ENVELOPE_BYTES)}-byte envelope limit`;
+      unholdable || "allocationFailedAt" in breach
+        ? `a body that could not be buffered ${bound} (see cause)`
+        : `a body past the ${String(limit)}-byte envelope limit`;
     throw invalidResponse(
-      `the model queue's ${call.what} call answered ${String(response.status)} with ${what}`,
+      `the model queue's ${call.what} call answered ${String(response.status)} with ${what}` +
+        (call.envelopeHint === undefined ? "" : `; ${call.envelopeHint}`),
       response.headers.get(REQUEST_ID_HEADER),
       response.status,
       exc,
-      { ...call.envelopeDetails, maxEnvelopeBytes: MAX_ENVELOPE_BYTES, ...measured },
+      { ...call.envelopeDetails, maxEnvelopeBytes: limit, ...measured },
     );
   }
 }
@@ -1264,6 +1311,7 @@ export class RequestHandle<TData = unknown> {
     signal?: AbortSignal;
     budgetMs: number | null;
     retry: RetryOptions | false;
+    envelopeBytes?: number | null;
   }): Promise<QueueUpdate> {
     const response = await send({
       method: "GET",
@@ -1274,6 +1322,9 @@ export class RequestHandle<TData = unknown> {
       what: "status",
       // `subscribe` hands back no handle when this poll fails.
       envelopeDetails: { queuedRequestId: this.requestId },
+      envelopeBytes: options.envelopeBytes,
+      envelopeHint:
+        "pass a larger maxBytes to get() or subscribe() to read a status answer up to it",
     });
     return updateFrom(decode(response, [200]), response, this.requestId, true);
   }
@@ -1300,6 +1351,20 @@ export class RequestHandle<TData = unknown> {
    * that cancelled the work it was iterating would make a `break` destructive.
    */
   async *events(options: WaitOptions = {}): AsyncGenerator<QueueUpdate, void, void> {
+    yield* this.follow(options, MAX_ENVELOPE_BYTES);
+  }
+
+  /**
+   * {@link events}, with each status poll read to `envelopeBytes` — the limit
+   * `get` and `subscribe` raise with an explicit `maxBytes` (see
+   * {@link statusEnvelopeBytes}). `events` itself takes no `maxBytes`.
+   *
+   * @internal
+   */
+  async *follow(
+    options: WaitOptions,
+    envelopeBytes: number | null,
+  ): AsyncGenerator<QueueUpdate, void, void> {
     const timeoutMs = options.timeoutMs ?? null;
     const retry = options.retry ?? this.#retry;
     const deadlineAt = timeoutMs === null ? null : Date.now() + timeoutMs;
@@ -1312,7 +1377,12 @@ export class RequestHandle<TData = unknown> {
       if (previous !== null && left !== null && left <= 0) {
         throw timedOut(this.requestId, timeoutMs ?? 0, previous);
       }
-      const update = await this.#poll({ signal: options.signal, budgetMs: left, retry });
+      const update = await this.#poll({
+        signal: options.signal,
+        budgetMs: left,
+        retry,
+        envelopeBytes,
+      });
       if (changed(previous, update)) yield update;
       previous = update;
       if (update.completed) return;
@@ -1355,7 +1425,8 @@ export class RequestHandle<TData = unknown> {
     const timeoutMs = options.timeoutMs ?? null;
     const deadlineAt = timeoutMs === null ? null : Date.now() + timeoutMs;
     let completion: QueueUpdate | null = null;
-    for await (const update of this.events(options)) completion = update;
+    const envelopeBytes = statusEnvelopeBytes(options.maxBytes !== undefined, maxBytes);
+    for await (const update of this.follow(options, envelopeBytes)) completion = update;
     return await this.collect(completion, {
       signal: options.signal,
       budgetMs: remainingMs(deadlineAt),
@@ -1675,7 +1746,7 @@ export async function submit<TData = unknown>(
         budgetMs: options.timeoutMs === undefined ? DEFAULT_SUBMIT_TIMEOUT_MS : options.timeoutMs,
         retry: options.retry ?? {},
         what: "submit",
-        uncappedAcceptance: true,
+        envelopeBytes: MAX_ACCEPTANCE_BYTES,
       });
       const body = decode(response, [200, 201, 202]);
       return new RequestHandle<TData>(
@@ -1722,11 +1793,10 @@ export async function subscribe<TData = unknown>(
     timeoutMs: deadlineAt === null ? undefined : remainingMs(deadlineAt),
   });
 
-  const iterator = handle.events({
-    signal: options.signal,
-    timeoutMs: remainingMs(deadlineAt),
-    retry: options.retry,
-  });
+  const iterator = handle.follow(
+    { signal: options.signal, timeoutMs: remainingMs(deadlineAt), retry: options.retry },
+    statusEnvelopeBytes(options.maxBytes !== undefined, maxBytes),
+  );
   let completion: QueueUpdate | null = null;
   try {
     for (;;) {

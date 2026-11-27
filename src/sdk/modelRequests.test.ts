@@ -2061,6 +2061,33 @@ describe("the status, submit and cancel envelope reads", () => {
     });
   }
 
+  it("lets an explicit maxBytes on get() read a status answer past the default cap", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = (request) => {
+        if (request.method === "GET" && request.path === STATUS_PATH) {
+          return { status: 200, body: { ...DONE, padding: OVERSIZED } };
+        }
+        if (request.method === "GET" && request.path === REQUEST_PATH) {
+          return { status: 200, body: { ok: true } };
+        }
+        return { status: 404, body: { detail: `unscripted ${request.method} ${request.path}` } };
+      };
+      const handle = comfy.models.handle(MODEL, REQUEST_ID);
+
+      // The default result cap does not raise the per-poll status limit...
+      const err = (await handle.get().catch((e: unknown) => e)) as ComfyError;
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("invalid_response");
+      expect(err.details?.maxEnvelopeBytes).toBe(ENVELOPE_CAP);
+      expect(err.message).toContain("pass a larger maxBytes");
+
+      // ...but an explicit one does, so the generation stays collectable.
+      const result = await handle.get({ maxBytes: 4 * ENVELOPE_CAP });
+      expect(result.data).toEqual({ ok: true });
+    });
+  });
+
   it("still reads a 202 submit acceptance past the cap, whose request_id nothing else carries", async () => {
     await withRouterStub(async (server) => {
       useStub(server);
@@ -2072,6 +2099,25 @@ describe("the status, submit and cancel envelope reads", () => {
       const handle = await comfy.models.submit(MODEL, {});
 
       expect(handle.requestId).toBe(REQUEST_ID);
+      expect(server.state.requests).toHaveLength(1);
+    });
+  });
+
+  it("bounds a submit acceptance too, once, with the idempotency key on the refusal", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      // 32 MiB with no Content-Length: past the acceptance's own limit.
+      server.state.respond = () => ({ status: 202, chunked: { chunkBytes: CHUNK, chunks: 512 } });
+
+      const err = (await comfy.models
+        .submit(MODEL, {}, { idempotencyKey: "key-1" })
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("invalid_response");
+      expect(err.details?.maxEnvelopeBytes).toBe(16 * ENVELOPE_CAP);
+      expect(err.details?.bytesRead).toBeLessThanOrEqual(16 * ENVELOPE_CAP + CHUNK);
+      expect(err.idempotencyKey).toBe("key-1");
       expect(server.state.requests).toHaveLength(1);
     });
   });
