@@ -147,6 +147,35 @@ export const CANCEL_TIMEOUT_MS = 10_000;
 export const MIN_REQUEST_TIMEOUT_MS = 1_000;
 
 /**
+ * The most a queue envelope — the status, submit and cancel answers — is read
+ * to, in bytes.
+ *
+ * Those answers are small JSON documents, and the status read repeats on every
+ * poll, so an unbounded read would let one misbehaving response buffer without
+ * limit once per poll. A caller has no option to raise it: unlike the result's
+ * `maxBytes`, nothing a caller asks for makes an envelope legitimately larger.
+ * An error envelope past it is truncated rather than refused (see
+ * `readBodyWithin`), so the typed error survives. The same size as
+ * `MIN_ERROR_BODY_BYTES` in `./models.ts`.
+ */
+const MAX_ENVELOPE_BYTES = 1_048_576;
+
+/**
+ * Was `exc` raised for a 2xx envelope past {@link MAX_ENVELOPE_BYTES}?
+ *
+ * Tested on `details.maxEnvelopeBytes`, which only {@link readEnvelope} sets,
+ * as `isTooLarge` tests `details.maxBytes`: the code alone also names every
+ * `invalid_response` `decode` raises about a body it did read.
+ */
+function isEnvelopeTooLarge(exc: unknown): boolean {
+  return (
+    exc instanceof ComfyError &&
+    exc.code === "invalid_response" &&
+    typeof exc.details?.maxEnvelopeBytes === "number"
+  );
+}
+
+/**
  * Routes for the queued form of a model request — submit, poll, collect,
  * cancel. They extend the run route with a `requests` collection under the
  * same model-ID-addressed prefix, because a queued request is the same
@@ -925,7 +954,7 @@ async function send(call: QueueCall): Promise<QueueResponse> {
         await response.body?.cancel().catch(() => undefined);
         bodyText = "";
       } else if (call.bytes === undefined) {
-        bodyText = await response.text();
+        bodyText = decodeUtf8(await readEnvelope(response, call));
       } else if (response.ok && response.status !== 200) {
         // Only a 200 is a result. Any other 2xx — a 202 control answer — is
         // diagnosed from its status line alone, so its body is dropped unread
@@ -952,6 +981,8 @@ async function send(call: QueueCall): Promise<QueueResponse> {
       // A body this call would not buffer is a verdict about the response,
       // not a transport failure: retrying would re-download it every attempt.
       if (isTooLarge(exc)) throw exc;
+      // Nor is an envelope past MAX_ENVELOPE_BYTES, for the same reason.
+      if (isEnvelopeTooLarge(exc)) throw exc;
       // A caller's abort is theirs: never retried, never re-dressed.
       if (call.signal?.aborted) throw exc;
       if (isTimeout(exc, call.signal)) {
@@ -993,6 +1024,42 @@ async function send(call: QueueCall): Promise<QueueResponse> {
       }
     }
     return { status: response.status, headers: response.headers, text: bodyText, body: bodyBytes };
+  }
+}
+
+/**
+ * Buffer a status, submit or cancel answer within {@link MAX_ENVELOPE_BYTES}.
+ *
+ * An error envelope is truncated at the cap by `readBodyWithin`; a truncated
+ * one fails to parse in `decode`, which then types the error from the status
+ * line and `X-Comfy-Error-Type` alone. A 2xx past it is refused — as
+ * `invalid_response`, not `response_too_large`, whose advice to raise
+ * `maxBytes` names an option these calls do not have, and whose
+ * `details.maxBytes` would mark it as a cap the caller set.
+ */
+async function readEnvelope(response: Response, call: QueueCall): Promise<Uint8Array> {
+  try {
+    return await readBodyWithin(
+      response,
+      MAX_ENVELOPE_BYTES,
+      `the model queue's ${call.what} call`,
+      call.idempotencyKey ?? null,
+    );
+  } catch (exc) {
+    if (!isTooLarge(exc)) throw exc;
+    const breach = (exc as ComfyError).details ?? {};
+    const measured: Record<string, unknown> = {};
+    for (const key of ["contentLength", "bytesRead", "allocationFailedAt"]) {
+      if (key in breach) measured[key] = breach[key];
+    }
+    throw invalidResponse(
+      `the model queue's ${call.what} call answered ${String(response.status)} with a body ` +
+        `past the ${String(MAX_ENVELOPE_BYTES)}-byte envelope limit`,
+      response.headers.get(REQUEST_ID_HEADER),
+      response.status,
+      exc,
+      { maxEnvelopeBytes: MAX_ENVELOPE_BYTES, ...measured },
+    );
   }
 }
 

@@ -2006,3 +2006,125 @@ describe("poll pacing", () => {
     });
   });
 });
+
+describe("the status, submit and cancel envelope reads", () => {
+  /** The cap `send` reads a queue envelope to; one byte past it breaches. */
+  const ENVELOPE_CAP = 1_048_576;
+  const OVERSIZED = "a".repeat(ENVELOPE_CAP + 1);
+  const CHUNK = 64 * 1024;
+  /** 4 MiB with no Content-Length: only counting the bytes can refuse it. */
+  const CHUNKED = { chunkBytes: CHUNK, chunks: 64 };
+
+  const variants = [
+    { name: "declared by Content-Length", oversized: { body: OVERSIZED } },
+    { name: "chunked, with no Content-Length", oversized: { chunked: CHUNKED } },
+  ] as const;
+
+  for (const variant of variants) {
+    it(`fails subscribe fast on an oversized 200 status body ${variant.name}`, async () => {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.respond = (request) => {
+          if (request.method === "POST" && request.path === SUBMIT_PATH) {
+            return { status: 202, body: { request_id: REQUEST_ID, status: "IN_QUEUE" } };
+          }
+          if (request.method === "GET" && request.path === STATUS_PATH) {
+            return { status: 200, ...variant.oversized };
+          }
+          return { status: 404, body: { detail: `unscripted ${request.method} ${request.path}` } };
+        };
+
+        const err = (await comfy.models
+          .subscribe(MODEL, {}, { timeoutMs: 30_000 })
+          .catch((e: unknown) => e)) as ComfyError;
+
+        expect(err).toBeInstanceOf(ComfyError);
+        expect(err.code).toBe("invalid_response");
+        expect(err.httpStatus).toBe(200);
+        expect(err.message).toContain("status call answered 200");
+        expect(err.details?.maxEnvelopeBytes).toBe(ENVELOPE_CAP);
+        // Not the caller-actionable cap breach: there is no maxBytes to raise.
+        expect(err.details).not.toHaveProperty("maxBytes");
+        // A verdict about the response, not a transport failure to retry.
+        const statusReads = server.state.requests.filter((r) => r.path === STATUS_PATH);
+        expect(statusReads).toHaveLength(1);
+        if ("body" in variant.oversized) {
+          expect(err.details?.contentLength).toBe(ENVELOPE_CAP + 1);
+        } else {
+          // Abandoned at the chunk that crossed the cap, not buffered in full.
+          expect(err.details?.bytesRead).toBeGreaterThan(ENVELOPE_CAP);
+          expect(err.details?.bytesRead).toBeLessThanOrEqual(ENVELOPE_CAP + CHUNK);
+        }
+      });
+    });
+  }
+
+  it("rejects an oversized 2xx submit as invalid_response, without retrying", async () => {
+    for (const variant of variants) {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.respond = () => ({ status: 202, ...variant.oversized });
+
+        const err = (await comfy.models
+          .submit(MODEL, {}, { idempotencyKey: "envelope-key" })
+          .catch((e: unknown) => e)) as ComfyError;
+
+        expect(err).toBeInstanceOf(ComfyError);
+        expect(err.code).toBe("invalid_response");
+        expect(err.httpStatus).toBe(202);
+        expect(err.details?.maxEnvelopeBytes).toBe(ENVELOPE_CAP);
+        // Stamped like every other submit failure.
+        expect(err.idempotencyKey).toBe("envelope-key");
+        expect(server.state.requests).toHaveLength(1);
+      });
+    }
+  });
+
+  it("keeps the typed router error on an oversized cancel error envelope", async () => {
+    for (const variant of variants) {
+      await withRouterStub(async (server) => {
+        useStub(server);
+        server.state.respond = () => ({
+          status: 404,
+          errorType: "request_not_found",
+          ...variant.oversized,
+        });
+
+        const err = (await comfy.models
+          .handle(MODEL, REQUEST_ID)
+          .cancel()
+          .catch((e: unknown) => e)) as routerErrors.RouterError;
+
+        expect(err).toBeInstanceOf(routerErrors.RequestNotFound);
+        expect(err.errorType).toBe("request_not_found");
+        expect(err.httpStatus).toBe(404);
+        expect(server.state.requests).toHaveLength(1);
+      });
+    }
+  });
+
+  it("still reads an ordinary 202 submit, 200 status and 204 cancel", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = (request) => {
+        if (request.method === "POST" && request.path === SUBMIT_PATH) {
+          return { status: 202, body: { request_id: REQUEST_ID, status: "IN_QUEUE" } };
+        }
+        if (request.method === "GET" && request.path === STATUS_PATH) {
+          return { status: 200, body: IN_PROGRESS };
+        }
+        if (request.method === "PUT" && request.path === CANCEL_PATH) {
+          return { status: 204 };
+        }
+        return { status: 404, body: { detail: `unscripted ${request.method} ${request.path}` } };
+      };
+
+      const handle = await comfy.models.submit(MODEL, {});
+      expect(handle.requestId).toBe(REQUEST_ID);
+      const update = await handle.status();
+      expect(update.status).toBe("IN_PROGRESS");
+      const cancelled = await handle.cancel();
+      expect(cancelled.status).toBe("");
+    });
+  });
+});
