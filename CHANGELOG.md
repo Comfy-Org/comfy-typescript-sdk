@@ -25,9 +25,13 @@ entry. See CONTRIBUTING.md.
   used to buffer those answers whole, once per poll. A 2xx past the limit now
   rejects with `invalid_response` (its `details.maxEnvelopeBytes` names the
   limit) and is not retried; there is no option to raise it, since nothing a
-  caller asks for makes those answers larger. An error body past the limit is
-  truncated instead, and still raises the typed router error its status and
-  `X-Comfy-Error-Type` name. The result read keeps its own `maxBytes`.
+  caller asks for makes those answers larger. Its `details.queuedRequestId`
+  names the request on a status or cancel read, so a `subscribe` caller can
+  still reach it. An error body past the limit is truncated instead, and still
+  raises the typed router error its status and `X-Comfy-Error-Type` name.
+  Submit's 2xx acceptance is the exception and is still read whole: it is the
+  only place the new request's id comes from, so refusing it would strand a
+  generation already accepted. The result read keeps its own `maxBytes`.
 
 ## [0.6.0] - 2026-11-25
 

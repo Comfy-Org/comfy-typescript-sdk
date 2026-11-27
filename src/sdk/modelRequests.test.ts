@@ -2043,6 +2043,8 @@ describe("the status, submit and cancel envelope reads", () => {
         expect(err.httpStatus).toBe(200);
         expect(err.message).toContain("status call answered 200");
         expect(err.details?.maxEnvelopeBytes).toBe(ENVELOPE_CAP);
+        // subscribe hands back no handle, so the error names the request.
+        expect(err.details?.queuedRequestId).toBe(REQUEST_ID);
         // Not the caller-actionable cap breach: there is no maxBytes to raise.
         expect(err.details).not.toHaveProperty("maxBytes");
         // A verdict about the response, not a transport failure to retry.
@@ -2059,25 +2061,37 @@ describe("the status, submit and cancel envelope reads", () => {
     });
   }
 
-  it("rejects an oversized 2xx submit as invalid_response, without retrying", async () => {
-    for (const variant of variants) {
-      await withRouterStub(async (server) => {
-        useStub(server);
-        server.state.respond = () => ({ status: 202, ...variant.oversized });
-
-        const err = (await comfy.models
-          .submit(MODEL, {}, { idempotencyKey: "envelope-key" })
-          .catch((e: unknown) => e)) as ComfyError;
-
-        expect(err).toBeInstanceOf(ComfyError);
-        expect(err.code).toBe("invalid_response");
-        expect(err.httpStatus).toBe(202);
-        expect(err.details?.maxEnvelopeBytes).toBe(ENVELOPE_CAP);
-        // Stamped like every other submit failure.
-        expect(err.idempotencyKey).toBe("envelope-key");
-        expect(server.state.requests).toHaveLength(1);
+  it("still reads a 202 submit acceptance past the cap, whose request_id nothing else carries", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = () => ({
+        status: 202,
+        body: { request_id: REQUEST_ID, status: "IN_QUEUE", input: OVERSIZED },
       });
-    }
+
+      const handle = await comfy.models.submit(MODEL, {});
+
+      expect(handle.requestId).toBe(REQUEST_ID);
+      expect(server.state.requests).toHaveLength(1);
+    });
+  });
+
+  it("names the request on an oversized 200 cancel answer", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      server.state.respond = () => ({ status: 200, body: OVERSIZED });
+
+      const err = (await comfy.models
+        .handle(MODEL, REQUEST_ID)
+        .cancel()
+        .catch((e: unknown) => e)) as ComfyError;
+
+      expect(err).toBeInstanceOf(ComfyError);
+      expect(err.code).toBe("invalid_response");
+      expect(err.details?.maxEnvelopeBytes).toBe(ENVELOPE_CAP);
+      expect(err.details?.queuedRequestId).toBe(REQUEST_ID);
+      expect(server.state.requests).toHaveLength(1);
+    });
   });
 
   it("keeps the typed router error on an oversized cancel error envelope", async () => {

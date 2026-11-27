@@ -157,6 +157,12 @@ export const MIN_REQUEST_TIMEOUT_MS = 1_000;
  * An error envelope past it is truncated rather than refused (see
  * `readBodyWithin`), so the typed error survives. The same size as
  * `MIN_ERROR_BODY_BYTES` in `./models.ts`.
+ *
+ * Submit's 2xx acceptance is the exception, read whole as before: it is read
+ * once rather than once per poll, and it is the only place the new request's
+ * `request_id` comes from, so refusing it would strand a generation the
+ * server has already accepted — re-sending the same `Idempotency-Key` would
+ * replay the same acceptance and fail the same way.
  */
 const MAX_ENVELOPE_BYTES = 1_048_576;
 
@@ -862,6 +868,14 @@ interface QueueCall {
    * error's `details`.
    */
   bytes?: { maxBytes: number | null; subject: string; details?: Record<string, unknown> };
+  /**
+   * For an envelope read (`bytes` unset): merged into the `details` of the
+   * error a 2xx past {@link MAX_ENVELOPE_BYTES} raises, so a `subscribe`
+   * caller, who holds no handle, can still find the request.
+   */
+  envelopeDetails?: Record<string, unknown>;
+  /** Read a 2xx envelope whole rather than within the cap — submit's only. */
+  uncappedAcceptance?: boolean;
 }
 
 /**
@@ -1032,7 +1046,8 @@ async function send(call: QueueCall): Promise<QueueResponse> {
  *
  * An error envelope is truncated at the cap by `readBodyWithin`; a truncated
  * one fails to parse in `decode`, which then types the error from the status
- * line and `X-Comfy-Error-Type` alone. A 2xx past it is refused — as
+ * line and `X-Comfy-Error-Type` alone. A 2xx past it — other than submit's
+ * acceptance, read whole (see {@link MAX_ENVELOPE_BYTES}) — is refused, as
  * `invalid_response`, not `response_too_large`, whose advice to raise
  * `maxBytes` names an option these calls do not have, and whose
  * `details.maxBytes` would mark it as a cap the caller set.
@@ -1041,24 +1056,33 @@ async function readEnvelope(response: Response, call: QueueCall): Promise<Uint8A
   try {
     return await readBodyWithin(
       response,
-      MAX_ENVELOPE_BYTES,
+      response.ok && call.uncappedAcceptance === true ? null : MAX_ENVELOPE_BYTES,
       `the model queue's ${call.what} call`,
       call.idempotencyKey ?? null,
     );
   } catch (exc) {
     if (!isTooLarge(exc)) throw exc;
+    // An error envelope is truncated, not refused, so the only breach one
+    // raises is a failed allocation under the cap. The typed error comes from
+    // the status line and `X-Comfy-Error-Type`, which do not need the body:
+    // decode it as empty rather than trade that error for this one.
+    if (!response.ok) return new Uint8Array(0);
     const breach = (exc as ComfyError).details ?? {};
     const measured: Record<string, unknown> = {};
     for (const key of ["contentLength", "bytesRead", "allocationFailedAt"]) {
       if (key in breach) measured[key] = breach[key];
     }
+    const what =
+      "allocationFailedAt" in breach
+        ? `a body that could not be buffered under the ${String(MAX_ENVELOPE_BYTES)}-byte ` +
+          "envelope limit (see cause)"
+        : `a body past the ${String(MAX_ENVELOPE_BYTES)}-byte envelope limit`;
     throw invalidResponse(
-      `the model queue's ${call.what} call answered ${String(response.status)} with a body ` +
-        `past the ${String(MAX_ENVELOPE_BYTES)}-byte envelope limit`,
+      `the model queue's ${call.what} call answered ${String(response.status)} with ${what}`,
       response.headers.get(REQUEST_ID_HEADER),
       response.status,
       exc,
-      { maxEnvelopeBytes: MAX_ENVELOPE_BYTES, ...measured },
+      { ...call.envelopeDetails, maxEnvelopeBytes: MAX_ENVELOPE_BYTES, ...measured },
     );
   }
 }
@@ -1248,6 +1272,8 @@ export class RequestHandle<TData = unknown> {
       budgetMs: options.budgetMs,
       retry: options.retry,
       what: "status",
+      // `subscribe` hands back no handle when this poll fails.
+      envelopeDetails: { queuedRequestId: this.requestId },
     });
     return updateFrom(decode(response, [200]), response, this.requestId, true);
   }
@@ -1568,6 +1594,7 @@ export class RequestHandle<TData = unknown> {
       budgetMs: options.timeoutMs === undefined ? null : options.timeoutMs,
       retry: options.retry ?? this.#retry,
       what: "cancel",
+      envelopeDetails: { queuedRequestId: this.requestId },
     });
     return updateFrom(decode(response, [200, 202, 204]), response, this.requestId, false);
   }
@@ -1648,6 +1675,7 @@ export async function submit<TData = unknown>(
         budgetMs: options.timeoutMs === undefined ? DEFAULT_SUBMIT_TIMEOUT_MS : options.timeoutMs,
         retry: options.retry ?? {},
         what: "submit",
+        uncappedAcceptance: true,
       });
       const body = decode(response, [200, 201, 202]);
       return new RequestHandle<TData>(
