@@ -2163,6 +2163,24 @@ describe("the status, submit and cancel envelope reads", () => {
     }
   });
 
+  it("rejects with the caller's abort reason when it is a RangeError, mid-body", async () => {
+    await withRouterStub(async (server) => {
+      useStub(server);
+      // Headers arrive, then the body stalls: the abort lands mid-read.
+      server.state.stallBody = true;
+      const controller = new AbortController();
+      const reason = new RangeError("stop");
+      setTimeout(() => controller.abort(reason), 200);
+
+      const err = await comfy.models
+        .handle(MODEL, REQUEST_ID)
+        .status({ signal: controller.signal, retry: false })
+        .catch((e: unknown) => e);
+
+      expect(err).toBe(reason);
+    });
+  });
+
   it("still reads an ordinary 202 submit, 200 status and 204 cancel", async () => {
     await withRouterStub(async (server) => {
       useStub(server);

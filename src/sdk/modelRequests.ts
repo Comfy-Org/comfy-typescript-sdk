@@ -1105,6 +1105,10 @@ async function readEnvelope(response: Response, call: QueueCall): Promise<string
       ),
     );
   } catch (exc) {
+    // A caller's abort is theirs, whatever its reason: an abort with a
+    // `RangeError` reason rejects the read with that reason, and classifying
+    // it below would re-dress it as a failed allocation.
+    if (call.signal?.aborted) throw exc;
     const unholdable = exc instanceof RangeError;
     if (!unholdable && !isTooLarge(exc)) throw exc;
     // An error envelope is truncated, not refused, so the only breach one
