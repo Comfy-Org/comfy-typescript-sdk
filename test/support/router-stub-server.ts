@@ -62,6 +62,11 @@ export interface ScriptedResponse {
   /** Extra response headers — `Retry-After` is the one the queue needs. An
    * array sends the header once per value, as a repeated header line. */
   headers?: Record<string, string | string[]>;
+  /** Send N chunks of `chunkBytes` bytes of `a` each with NO `Content-Length`
+   * in place of {@link body} — the per-response form of
+   * {@link RouterServerState.chunkedBody}, for a size the client can learn
+   * only by reading. */
+  chunked?: { chunkBytes: number; chunks: number };
 }
 
 export interface RouterServerState {
@@ -509,6 +514,15 @@ export class RouterStubServer {
       if (scripted.contentType !== undefined) {
         if (scripted.contentType === null) delete scriptedHeaders["Content-Type"];
         else scriptedHeaders["Content-Type"] = scripted.contentType;
+      }
+      if (scripted.chunked !== undefined) {
+        res.writeHead(scripted.status, scriptedHeaders);
+        const chunk = Buffer.alloc(scripted.chunked.chunkBytes, 0x61);
+        for (let i = 0; i < scripted.chunked.chunks; i += 1) {
+          if (!(await writeChunk(res, chunk))) return;
+        }
+        res.end();
+        return;
       }
       if (scripted.body === undefined) {
         res.writeHead(scripted.status, scriptedHeaders);

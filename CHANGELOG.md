@@ -17,6 +17,23 @@ Fixed / Security. Internal-only changes (refactors, tests, CI) do not need an
 entry. See CONTRIBUTING.md.
 -->
 
+### Changed
+
+- **The queue's status, submit and cancel reads are bounded.**
+  `comfy.models.submit`, `handle.status()`, `handle.cancel()` and the poll
+  loop behind `handle.events()`, `handle.get()` and `comfy.models.subscribe`
+  used to buffer those answers whole, once per poll. A status or cancel 2xx
+  past 1 MiB now rejects with `invalid_response` (its
+  `details.maxEnvelopeBytes` names the limit, and `details.queuedRequestId`
+  the request, so a `subscribe` caller can still reach it) and is not retried.
+  An explicit `maxBytes` on `get()` or `subscribe()` raises the status read's
+  limit to match (`null` lifts it), so a request whose status answer is that
+  large stays collectable. Submit's 2xx acceptance, which carries the only
+  copy of the new request's id, is read to 16 MiB instead, and a refusal
+  carries the call's `idempotencyKey`. An error body past the limit is
+  truncated instead, and still raises the typed router error its status and
+  `X-Comfy-Error-Type` name. The result read keeps its own `maxBytes`.
+
 ## [0.6.0] - 2026-11-25
 
 ### Added
